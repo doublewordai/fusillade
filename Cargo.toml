@@ -24,7 +24,7 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 async-trait = "0.1"
 futures = "0.3"
 parking_lot = "0.12"
