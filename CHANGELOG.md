@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0 (2025-11-25)
+
+
+### Features
+
+* initial fusillade release ([4102ab7](https://github.com/doublewordai/fusillade/commit/4102ab771d991e43101e59adbd4525801924ca2b))
+
 ## [0.3.0](https://github.com/doublewordai/control-layer/compare/fusillade-v0.2.0...fusillade-v0.3.0) (2025-11-24)
 
 
