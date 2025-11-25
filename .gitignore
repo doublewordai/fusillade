@@ -4,7 +4,7 @@ Cargo.lock
 
 # SQLx
 .env
-.sqlx
+# .sqlx should be committed for offline compilation
 
 # IDEs
 .vscode/
