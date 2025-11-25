@@ -4,25 +4,17 @@
 CREATE OR REPLACE FUNCTION update_output_file_size() 
 RETURNS TRIGGER AS $$
 DECLARE
-    batch_output_file_id UUID;
     jsonl_line_size INT;
+    rows_updated INT;
 BEGIN
     -- Only process completed requests
     IF NEW.state <> 'completed' THEN
         RETURN NEW;
     END IF;
 
-    -- Get the batch's output file ID
-    SELECT output_file_id INTO batch_output_file_id
-    FROM batches
-    WHERE id = NEW.batch_id;
-
-    IF batch_output_file_id IS NULL THEN
-        RETURN NEW;
-    END IF;
-
     -- Calculate approximate JSONL line size
-    -- Format: {"id":"batch_req_UUID","custom_id":"...","response":{"status_code":200,"request_id":null,"body":{...}}}\n
+    -- Format: {"id":"batch_req_UUID","custom_id":"...","response":{"status_code":200,"request_id":"...","body":{...}}}\n
+    -- Note: request_id comes from the response body, not a separate column
     jsonl_line_size := 
         8 +  -- '{"id":"'
         10 + -- 'batch_req_'
@@ -32,18 +24,35 @@ BEGIN
         14 + -- '","response":{'
         16 + -- '"status_code":'
         LENGTH(NEW.response_status::TEXT) +
-        16 + -- ',"request_id":'
-        4 +  -- 'null' (request_id is always null in our case)
         9 +  -- ',"body":'
         COALESCE(LENGTH(NEW.response_body), 0) +
+        -- Account for JSON escaping in response_body (quotes, backslashes, newlines, etc.)
+        CEIL(COALESCE(LENGTH(NEW.response_body), 0) * 0.1)::INT + -- add 10% for escaping
         4 +  -- '}}\n' (closing response, root, and newline)
-        10;  -- error margin for escaping/formatting
+        50;  -- error margin for formatting + request_id field if present in response
 
-    -- Update the output file size
-    UPDATE files
-    SET size_bytes = size_bytes + jsonl_line_size,
-        updated_at = NOW()
-    WHERE id = batch_output_file_id;
+    -- Update the output file size using optimized single query
+    -- Defensive: if update fails (file deleted, etc), don't block request state change
+    BEGIN
+        UPDATE files f
+        SET size_bytes = f.size_bytes + jsonl_line_size,
+            updated_at = NOW()
+        FROM batches b
+        WHERE f.id = b.output_file_id 
+          AND b.id = NEW.batch_id
+          AND b.output_file_id IS NOT NULL;
+        
+        GET DIAGNOSTICS rows_updated = ROW_COUNT;
+        
+        IF rows_updated = 0 THEN
+            RAISE WARNING 'Failed to update output file size for request % in batch %: file may not exist', 
+                NEW.id, NEW.batch_id;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        -- Log error but don't block the request state update
+        RAISE WARNING 'Error updating output file size for request % in batch %: %', 
+            NEW.id, NEW.batch_id, SQLERRM;
+    END;
 
     RETURN NEW;
 END;
@@ -60,21 +69,12 @@ EXECUTE FUNCTION update_output_file_size();
 CREATE OR REPLACE FUNCTION update_error_file_size()
 RETURNS TRIGGER AS $$
 DECLARE
-    batch_error_file_id UUID;
     jsonl_line_size INT;
     error_message_escaped TEXT;
+    rows_updated INT;
 BEGIN
     -- Only process failed requests
     IF NEW.state <> 'failed' THEN
-        RETURN NEW;
-    END IF;
-
-    -- Get the batch's error file ID
-    SELECT error_file_id INTO batch_error_file_id
-    FROM batches
-    WHERE id = NEW.batch_id;
-
-    IF batch_error_file_id IS NULL THEN
         RETURN NEW;
     END IF;
 
@@ -98,11 +98,28 @@ BEGIN
         5 +  -- '"}}\n' (closing quote, error object, root, newline)
         10;  -- error margin
 
-    -- Update the error file size
-    UPDATE files
-    SET size_bytes = size_bytes + jsonl_line_size,
-        updated_at = NOW()
-    WHERE id = batch_error_file_id;
+    -- Update the error file size using optimized single query
+    -- Defensive: if update fails (file deleted, etc), don't block request state change
+    BEGIN
+        UPDATE files f
+        SET size_bytes = f.size_bytes + jsonl_line_size,
+            updated_at = NOW()
+        FROM batches b
+        WHERE f.id = b.error_file_id 
+          AND b.id = NEW.batch_id
+          AND b.error_file_id IS NOT NULL;
+        
+        GET DIAGNOSTICS rows_updated = ROW_COUNT;
+        
+        IF rows_updated = 0 THEN
+            RAISE WARNING 'Failed to update error file size for request % in batch %: file may not exist', 
+                NEW.id, NEW.batch_id;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        -- Log error but don't block the request state update
+        RAISE WARNING 'Error updating error file size for request % in batch %: %', 
+            NEW.id, NEW.batch_id, SQLERRM;
+    END;
 
     RETURN NEW;
 END;
