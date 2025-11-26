@@ -5639,7 +5639,10 @@ mod tests {
 
         // Check that file size increased
         let file_after_one = manager.get_file(output_file_id).await.unwrap();
-        assert!(file_after_one.size_bytes > 0, "File size should increase after first completion");
+        assert!(
+            file_after_one.size_bytes > 0,
+            "File size should increase after first completion"
+        );
         let size_after_one = file_after_one.size_bytes;
 
         // Complete second request
@@ -5766,7 +5769,10 @@ mod tests {
 
         // Check that file size increased
         let file_after_one = manager.get_file(error_file_id).await.unwrap();
-        assert!(file_after_one.size_bytes > 0, "Error file size should increase after first failure");
+        assert!(
+            file_after_one.size_bytes > 0,
+            "Error file size should increase after first failure"
+        );
         let size_after_one = file_after_one.size_bytes;
 
         // Fail second request with a network error
@@ -5835,13 +5841,10 @@ mod tests {
         let request_id = requests[0].id();
 
         // Delete the output file (simulating file being moved/deleted while requests are processing)
-        sqlx::query!(
-            "DELETE FROM files WHERE id = $1",
-            *output_file_id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query!("DELETE FROM files WHERE id = $1", *output_file_id as Uuid)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         // Complete the request - this should succeed even though output file is gone
         // The trigger should handle the missing file gracefully
@@ -5867,7 +5870,10 @@ mod tests {
         .await;
 
         // The request update should succeed despite the file being deleted
-        assert!(result.is_ok(), "Request completion should succeed even when output file is missing");
+        assert!(
+            result.is_ok(),
+            "Request completion should succeed even when output file is missing"
+        );
 
         // Verify the request is actually in completed state
         let updated_requests = manager.get_batch_requests(batch.id).await.unwrap();
@@ -5915,13 +5921,10 @@ mod tests {
         let request_id = requests[0].id();
 
         // Delete the error file
-        sqlx::query!(
-            "DELETE FROM files WHERE id = $1",
-            *error_file_id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query!("DELETE FROM files WHERE id = $1", *error_file_id as Uuid)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         // Fail the request - this should succeed even though error file is gone
         let now = Utc::now();
@@ -5945,7 +5948,10 @@ mod tests {
         .await;
 
         // The request update should succeed despite the file being deleted
-        assert!(result.is_ok(), "Request failure should succeed even when error file is missing");
+        assert!(
+            result.is_ok(),
+            "Request failure should succeed even when error file is missing"
+        );
 
         // Verify the request is actually in failed state
         let updated_requests = manager.get_batch_requests(batch.id).await.unwrap();
