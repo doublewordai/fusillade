@@ -5557,4 +5557,570 @@ mod tests {
         // Drop trigger1 to unblock if still waiting
         drop(trigger1);
     }
+
+    #[sqlx::test]
+    async fn test_output_file_size_increments_on_completion(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file with 3 templates
+        let file_id = manager
+            .create_file(
+                "output-size-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req-1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"prompt":"test"}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"prompt":"test"}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-3".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"prompt":"test"}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/test".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let output_file_id = batch.output_file_id.unwrap();
+
+        // Get initial size (should be 0)
+        let initial_file = manager.get_file(output_file_id).await.unwrap();
+        assert_eq!(initial_file.size_bytes, 0);
+
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+
+        // Complete first request
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = $2,
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[0].id() as Uuid,
+            r#"{"result":"success"}"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Check that file size increased
+        let file_after_one = manager.get_file(output_file_id).await.unwrap();
+        assert!(file_after_one.size_bytes > 0, "File size should increase after first completion");
+        let size_after_one = file_after_one.size_bytes;
+
+        // Complete second request
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = $2,
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[1].id() as Uuid,
+            r#"{"result":"success"}"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Check that file size increased again
+        let file_after_two = manager.get_file(output_file_id).await.unwrap();
+        assert!(
+            file_after_two.size_bytes > size_after_one,
+            "File size should increase after second completion"
+        );
+
+        // Complete third request
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = $2,
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[2].id() as Uuid,
+            r#"{"result":"success"}"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Check that file size increased again
+        let file_after_three = manager.get_file(output_file_id).await.unwrap();
+        assert!(
+            file_after_three.size_bytes > file_after_two.size_bytes,
+            "File size should increase after third completion"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_error_file_size_increments_on_failure(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file with 2 templates
+        let file_id = manager
+            .create_file(
+                "error-size-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("err-1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("err-2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/test".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let error_file_id = batch.error_file_id.unwrap();
+
+        // Get initial size (should be 0)
+        let initial_file = manager.get_file(error_file_id).await.unwrap();
+        assert_eq!(initial_file.size_bytes, 0);
+
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+
+        // Fail first request with a retriable HTTP error
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'failed',
+                error = $2,
+                failed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[0].id() as Uuid,
+            serde_json::to_string(&FailureReason::RetriableHttpStatus {
+                status: 500,
+                body: "Internal Server Error".to_string(),
+            })
+            .unwrap(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Check that file size increased
+        let file_after_one = manager.get_file(error_file_id).await.unwrap();
+        assert!(file_after_one.size_bytes > 0, "Error file size should increase after first failure");
+        let size_after_one = file_after_one.size_bytes;
+
+        // Fail second request with a network error
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'failed',
+                error = $2,
+                failed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[1].id() as Uuid,
+            serde_json::to_string(&FailureReason::NetworkError {
+                error: "Connection timeout".to_string(),
+            })
+            .unwrap(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Check that file size increased again
+        let file_after_two = manager.get_file(error_file_id).await.unwrap();
+        assert!(
+            file_after_two.size_bytes > size_after_one,
+            "Error file size should increase after second failure"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_request_succeeds_when_output_file_deleted(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file and batch
+        let file_id = manager
+            .create_file(
+                "deleted-file-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/test".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let output_file_id = batch.output_file_id.unwrap();
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        let request_id = requests[0].id();
+
+        // Delete the output file (simulating file being moved/deleted while requests are processing)
+        sqlx::query!(
+            "DELETE FROM files WHERE id = $1",
+            *output_file_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Complete the request - this should succeed even though output file is gone
+        // The trigger should handle the missing file gracefully
+        let now = Utc::now();
+        let result = sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = $2,
+                claimed_at = $3,
+                started_at = $4,
+                completed_at = $5
+            WHERE id = $1
+            "#,
+            *request_id as Uuid,
+            r#"{"result":"success"}"#,
+            now,
+            now,
+            now,
+        )
+        .execute(&pool)
+        .await;
+
+        // The request update should succeed despite the file being deleted
+        assert!(result.is_ok(), "Request completion should succeed even when output file is missing");
+
+        // Verify the request is actually in completed state
+        let updated_requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert!(
+            matches!(updated_requests[0], AnyRequest::Completed(_)),
+            "Request should be in completed state"
+        );
+    }
+    #[sqlx::test]
+    async fn test_request_succeeds_when_error_file_deleted(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file and batch
+        let file_id = manager
+            .create_file(
+                "deleted-error-file-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/test".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let error_file_id = batch.error_file_id.unwrap();
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        let request_id = requests[0].id();
+
+        // Delete the error file
+        sqlx::query!(
+            "DELETE FROM files WHERE id = $1",
+            *error_file_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Fail the request - this should succeed even though error file is gone
+        let now = Utc::now();
+        let result = sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'failed',
+                error = $2,
+                failed_at = $3
+            WHERE id = $1
+            "#,
+            *request_id as Uuid,
+            serde_json::to_string(&FailureReason::NonRetriableHttpStatus {
+                status: 500,
+                body: "Server Error".to_string(),
+            })
+            .unwrap(),
+            now,
+        )
+        .execute(&pool)
+        .await;
+
+        // The request update should succeed despite the file being deleted
+        assert!(result.is_ok(), "Request failure should succeed even when error file is missing");
+
+        // Verify the request is actually in failed state
+        let updated_requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert!(
+            matches!(updated_requests[0], AnyRequest::Failed(_)),
+            "Request should be in failed state"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_file_size_consistent_with_multiple_concurrent_completions(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file with 10 templates
+        let file_id = manager
+            .create_file(
+                "concurrent-test".to_string(),
+                None,
+                (0..10)
+                    .map(|i| RequestTemplateInput {
+                        custom_id: Some(format!("req-{}", i)),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: format!(r#"{{"n":{}}}"#, i),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/test".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let output_file_id = batch.output_file_id.unwrap();
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+
+        // Complete all requests "concurrently" (in the same transaction context)
+        // This tests that the trigger handles concurrent updates correctly
+        for request in &requests {
+            sqlx::query!(
+                r#"
+                UPDATE requests
+                SET state = 'completed',
+                    response_status = 200,
+                    response_body = '{"result":"ok"}',
+                    completed_at = NOW()
+                WHERE id = $1
+                "#,
+                *request.id() as Uuid,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Verify that file size is greater than 0 and reflects all completions
+        let final_file = manager.get_file(output_file_id).await.unwrap();
+        assert!(
+            final_file.size_bytes > 0,
+            "File size should be greater than 0 after all completions"
+        );
+
+        // The size should be substantial for 10 requests
+        // Each JSONL line is roughly 100+ bytes
+        assert!(
+            final_file.size_bytes > 500,
+            "File size should reflect multiple completions (got {})",
+            final_file.size_bytes
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_mixed_completions_and_failures_update_both_files(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file with 4 templates
+        let file_id = manager
+            .create_file(
+                "mixed-test".to_string(),
+                None,
+                (0..4)
+                    .map(|i| RequestTemplateInput {
+                        custom_id: Some(format!("req-{}", i)),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/test".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let output_file_id = batch.output_file_id.unwrap();
+        let error_file_id = batch.error_file_id.unwrap();
+
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+
+        // Complete 2 requests
+        for request in &requests[0..2] {
+            sqlx::query!(
+                r#"
+                UPDATE requests
+                SET state = 'completed',
+                    response_status = 200,
+                    response_body = '{"result":"success"}',
+                    completed_at = NOW()
+                WHERE id = $1
+                "#,
+                *request.id() as Uuid,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Fail 2 requests
+        for request in &requests[2..4] {
+            sqlx::query!(
+                r#"
+                UPDATE requests
+                SET state = 'failed',
+                    error = $2,
+                    failed_at = NOW()
+                WHERE id = $1
+                "#,
+                *request.id() as Uuid,
+                serde_json::to_string(&FailureReason::RetriableHttpStatus {
+                    status: 503,
+                    body: "Service Unavailable".to_string(),
+                })
+                .unwrap(),
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Verify both output and error files have non-zero sizes
+        let output_file = manager.get_file(output_file_id).await.unwrap();
+        let error_file = manager.get_file(error_file_id).await.unwrap();
+
+        assert!(
+            output_file.size_bytes > 0,
+            "Output file should have non-zero size after completions"
+        );
+        assert!(
+            error_file.size_bytes > 0,
+            "Error file should have non-zero size after failures"
+        );
+    }
 }
