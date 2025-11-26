@@ -31,7 +31,7 @@ BEGIN
         4 +  -- '}}\n' (closing response, root, and newline)
         50;  -- error margin for formatting + request_id field if present in response
 
-    -- Update the output file size using optimized single query
+    -- Update the output file size using single query
     -- Defensive: if update fails (file deleted, etc), don't block request state change
     BEGIN
         UPDATE files f
