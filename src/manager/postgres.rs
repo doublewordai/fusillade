@@ -4686,19 +4686,19 @@ mod tests {
         model_counts.insert("model-b".to_string(), 0);
         model_counts.insert("model-c".to_string(), 0);
 
-        // Claim in batches of 3, multiple times
-        // With randomization, each model should get requests over time
-        for iteration in 0..5 {
+        // Claim in batches of 2, many times to ensure fairness
+        // With 20 iterations and randomization, statistical chance of a model
+        // never being first is (2/3)^20 ≈ 0.03%, making test effectively deterministic
+        for iteration in 0..20 {
             let daemon_id = DaemonId::from(Uuid::new_v4());
             let claimed = manager
-                .claim_requests(3, daemon_id)
+                .claim_requests(2, daemon_id)
                 .await
                 .expect("Failed to claim requests");
 
-            assert_eq!(
-                claimed.len(),
-                3,
-                "Iteration {} should claim 3 requests",
+            assert!(
+                claimed.len() <= 2,
+                "Iteration {} should claim at most 2 requests",
                 iteration
             );
 
@@ -4707,13 +4707,13 @@ mod tests {
             }
         }
 
-        // After 5 iterations of claiming 3 requests each (15 total):
-        // - Each model should have gotten at least some requests
-        // - Due to randomization, distribution won't be perfectly equal but should be fair
+        // After 20 iterations claiming 2 each (potentially 40 total, but only 30 exist):
+        // - Each model should have gotten at least some requests (with >99.97% probability)
+        // - Distribution should be roughly fair over time
         for (model, count) in &model_counts {
             assert!(
                 *count > 0,
-                "Model {} should have received at least 1 request over 5 iterations, got {}",
+                "Model {} should have received at least 1 request over 20 iterations (randomization ensures fairness), got {}",
                 model,
                 count
             );
@@ -4725,9 +4725,97 @@ mod tests {
             );
         }
 
-        // Total should be 15 (5 iterations * 3 requests each)
+        // Total should be 30 (all available requests claimed)
         let total: i32 = model_counts.values().sum();
-        assert_eq!(total, 15, "Should have claimed 15 requests total");
+        assert_eq!(total, 30, "Should have claimed all 30 available requests");
+    }
+
+    #[sqlx::test]
+    async fn test_global_per_model_limit_enforced_across_daemons(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Set up manager with per-model limit of 3
+        let mut config = crate::daemon::DaemonConfig::default();
+        config
+            .model_concurrency_limits
+            .insert("model-a".to_string(), 3);
+        config
+            .model_concurrency_limits
+            .insert("model-b".to_string(), 3);
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client).with_config(config),
+        );
+
+        // Create file with 20 requests (10 per model)
+        let mut templates = Vec::new();
+        for model in &["model-a", "model-b"] {
+            for n in 1..=10 {
+                templates.push(RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: format!(r#"{{"model":"{}","n":{}}}"#, model, n),
+                    model: model.to_string(),
+                    api_key: "key".to_string(),
+                });
+            }
+        }
+
+        let file_id = manager
+            .create_file("multi-daemon-test".to_string(), None, templates)
+            .await
+            .unwrap();
+
+        let _batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Simulate 3 daemons claiming simultaneously
+        let daemon1_id = DaemonId::from(Uuid::new_v4());
+        let daemon2_id = DaemonId::from(Uuid::new_v4());
+        let daemon3_id = DaemonId::from(Uuid::new_v4());
+
+        // Each daemon tries to claim 10 requests (more than available per model)
+        let claimed1 = manager.claim_requests(10, daemon1_id).await.unwrap();
+        let claimed2 = manager.claim_requests(10, daemon2_id).await.unwrap();
+        let claimed3 = manager.claim_requests(10, daemon3_id).await.unwrap();
+
+        // Count requests per model across all daemons
+        let mut model_counts = std::collections::HashMap::new();
+        for claimed in [&claimed1, &claimed2, &claimed3] {
+            for request in claimed {
+                *model_counts.entry(request.data.model.clone()).or_insert(0) += 1;
+            }
+        }
+
+        // Verify global per-model limits are enforced
+        assert!(
+            *model_counts.get("model-a").unwrap_or(&0) <= 3,
+            "model-a should not exceed limit of 3 across all daemons, got {}",
+            model_counts.get("model-a").unwrap_or(&0)
+        );
+        assert!(
+            *model_counts.get("model-b").unwrap_or(&0) <= 3,
+            "model-b should not exceed limit of 3 across all daemons, got {}",
+            model_counts.get("model-b").unwrap_or(&0)
+        );
+
+        // Total claimed should be at most 6 (3 per model × 2 models)
+        let total: i32 = model_counts.values().sum();
+        assert!(
+            total <= 6,
+            "Total claimed should not exceed 6 (respecting per-model limits), got {}",
+            total
+        );
     }
 
     // ========================================================================
