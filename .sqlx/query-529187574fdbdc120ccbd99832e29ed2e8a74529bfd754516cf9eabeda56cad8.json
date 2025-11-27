@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at\n            FROM files\n            WHERE id = $1\n            ",
+  "query": "\n            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at\n            FROM files\n            WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -25,41 +25,46 @@
       },
       {
         "ordinal": 4,
+        "name": "size_finalized",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
         "name": "status",
         "type_info": "Text"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "error_message",
         "type_info": "Text"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "purpose",
         "type_info": "Text"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "expires_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "deleted_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "uploaded_by",
         "type_info": "Text"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -75,6 +80,7 @@
       true,
       false,
       false,
+      false,
       true,
       true,
       true,
@@ -84,5 +90,5 @@
       false
     ]
   },
-  "hash": "d1656bc197d573cd4645e6ca99377491a063b361ac983533950a00901bf27b32"
+  "hash": "529187574fdbdc120ccbd99832e29ed2e8a74529bfd754516cf9eabeda56cad8"
 }

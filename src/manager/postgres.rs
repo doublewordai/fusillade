@@ -6,6 +6,7 @@
 use crate::request::AnyRequest;
 use futures::StreamExt;
 use std::pin::Pin;
+use std::process::Output;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -37,6 +38,7 @@ use crate::request::{
 };
 
 use super::DaemonExecutor;
+use super::utils::{calculate_error_size, calculate_output_size};
 
 /// PostgreSQL implementation of the Storage and DaemonExecutor traits.
 ///
@@ -218,6 +220,184 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
 
         Ok(false)
     }
+
+
+    async fn maybe_finalize_file_size(&self, file: &mut File) -> Result<()> {
+        // Only process virtual output/error files that are not yet finalized
+        if file.size_finalized {
+            return Ok(());
+        }
+
+        let file_type = match file.purpose {
+            Some(crate::batch::Purpose::BatchOutput) => OutputFileType::Output,
+            Some(crate::batch::Purpose::BatchError) => OutputFileType::Error,
+            _ => return Ok(()),
+        };
+
+        // Find the batch that owns this file
+        let batch = match self.get_batch_by_output_file_id(file.id, file_type).await? {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        // Calculate current size from request response_sizes
+        let state_filter = match file_type {
+            OutputFileType::Output => "completed",
+            OutputFileType::Error => "failed",
+        };
+
+        let size = sqlx::query_scalar!(
+            r#"
+            SELECT SUM(response_size)::BIGINT as "size"
+            FROM requests
+            WHERE batch_id = $1 AND state = $2
+            "#,
+            *batch.id as Uuid,
+            state_filter,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to calculate file size: {}", e))
+        })?;
+
+        let current_size = size.unwrap_or(0);
+
+        // Check if batch is complete
+        let batch_complete = batch.completed_at.is_some()
+            || batch.failed_at.is_some()
+            || batch.cancelled_at.is_some();
+
+        if !batch_complete {
+            // Batch still in progress - return current size but don't finalize
+            file.size_bytes = current_size;
+            return Ok(());
+        }
+
+        // Batch is complete - finalize both output and error files atomically
+        // Ensures we only finalize once, even if multiple concurrent get_file calls happen
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to being transaction: {}", e)))?;
+
+        // Finalize output file size (completed requests)
+        if let Some(output_file_id) = batch.output_file_id {
+            let output_size = sqlx::query_scalar!(
+                r#"
+                SELECT SUM(response_size)::BIGINT as "size"
+                FROM requests
+                WHERE batch_id = $1 AND state = 'completed'
+                "#,
+                *batch.id as Uuid,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to calculate output file size: {}", e))
+            })?;
+
+            sqlx::query!(
+                r#"
+                UPDATE files
+                SET size_bytes = $2, size_finalized = TRUE
+                WHERE id = $1 AND size_finalized = FALSE
+                "#,
+                *output_file_id as Uuid,
+                output_size.unwrap_or(0),
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to update output file size: {}", e))
+            })?;
+        }
+
+        // Finalize error file size (failed requests)
+        if let Some(error_file_id) = batch.error_file_id {
+            let error_size = sqlx::query_scalar!(
+                r#"
+                SELECT SUM(response_size)::BIGINT as "size"
+                FROM requests
+                WHERE batch_id = $1 AND state = 'failed'
+                "#,
+                *batch.id as Uuid,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to calculate error file size: {}", e))
+            })?;
+
+            sqlx::query!(
+                r#"
+                UPDATE files
+                SET size_bytes = $2, size_finalized = TRUE
+                WHERE id = $1 AND size_finalized = FALSE
+                "#,
+                *error_file_id as Uuid,
+                error_size.unwrap_or(0),
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to update error file size: {}", e))
+            })?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn get_file_from_db(&self, file_id: FileId) -> Result<File> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
+            FROM files
+            WHERE id = $1
+            "#,
+            *file_id as Uuid,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch file: {}", e)))?
+        .ok_or_else(|| FusilladeError::Other(anyhow!("File not found")))?;
+
+        let status = row
+            .status
+            .parse::<crate::batch::FileStatus>()
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Invalid file status '{}': {}", row.status, e))
+            })?;
+        
+        let purpose = row
+            .purpose
+            .map(|s| s.parse::<crate::batch::Purpose>())
+            .transpose()
+            .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
+
+        Ok(File {
+            id: FileId(row.id),
+            name: row.name,
+            description: row.description,
+            size_bytes: row.size_bytes,
+            size_finalized: row.size_finalized,
+            status,
+            error_message: row.error_message,
+            purpose,
+            expires_at: row.expires_at,
+            deleted_at: row.deleted_at,
+            uploaded_by: row.uploaded_by,
+            created_at: row.created_at,
+            updated_at: row.updated_at
+        })
+    }
+
+
 }
 
 // Implement Storage trait directly (no delegation)
@@ -395,6 +575,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 }
             }
             AnyRequest::Completed(req) => {
+                let response_size = calculate_output_size(
+                    &req.data.custom_id, 
+                    req.state.response_status as i16, 
+                    &req.state.response_body,
+                );
+
                 let rows_affected = sqlx::query!(
                     r#"
                     UPDATE requests SET
@@ -403,7 +589,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         response_body = $3,
                         claimed_at = $4,
                         started_at = $5,
-                        completed_at = $6
+                        completed_at = $6,
+                        response_size = $7
                     WHERE id = $1
                     "#,
                     *req.data.id as Uuid,
@@ -412,6 +599,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     req.state.claimed_at,
                     req.state.started_at,
                     req.state.completed_at,
+                    response_size,
                 )
                 .execute(&self.pool)
                 .await
@@ -428,19 +616,23 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     FusilladeError::Other(anyhow!("Failed to serialize failure reason: {}", e))
                 })?;
 
+                let response_size = calculate_error_size(&req.data.custom_id, &error_json);
+
                 let rows_affected = sqlx::query!(
                     r#"
                     UPDATE requests SET
                         state = 'failed',
                         retry_attempt = $2,
                         error = $3,
-                        failed_at = $4
+                        failed_at = $4,
+                        response_size = $5
                     WHERE id = $1
                     "#,
                     *req.data.id as Uuid,
                     req.state.retry_attempt as i32,
                     error_json,
                     req.state.failed_at,
+                    response_size
                 )
                 .execute(&self.pool)
                 .await
@@ -910,6 +1102,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let size_bytes = metadata.size_bytes.unwrap_or(0);
         let status = crate::batch::FileStatus::Processed.to_string();
         let purpose = metadata.purpose.clone();
+        let size_finalized = purpose.as_ref().map(|p| p == "batch").unwrap_or(false);
 
         // Calculate expires_at from expires_after if provided
         let expires_at = if let (Some(anchor), Some(seconds)) = (
@@ -938,13 +1131,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         sqlx::query!(
             r#"
             UPDATE files
-            SET name = COALESCE($2, name), description = $3, size_bytes = $4, status = $5, purpose = $6, expires_at = $7, uploaded_by = $8
+            SET name = COALESCE($2, name), description = $3, size_bytes = $4, size_finalized = $5, status = $6, purpose = $7, expires_at = $8, uploaded_by = $9
             WHERE id = $1
             "#,
             fid,
             name,
             description,
             size_bytes,
+            size_finalized,
             status,
             purpose,
             expires_at,
@@ -979,48 +1173,13 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn get_file(&self, file_id: FileId) -> Result<File> {
-        let row = sqlx::query!(
-            r#"
-            SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
-            FROM files
-            WHERE id = $1
-            "#,
-            *file_id as Uuid,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch file: {}", e)))?
-        .ok_or_else(|| FusilladeError::Other(anyhow!("File not found")))?;
-
-        let status = row
-            .status
-            .parse::<crate::batch::FileStatus>()
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Invalid file status '{}': {}", row.status, e))
-            })?;
-        let purpose = row
-            .purpose
-            .map(|s| s.parse::<crate::batch::Purpose>())
-            .transpose()
-            .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
-
-        let mut file = File {
-            id: FileId(row.id),
-            name: row.name,
-            description: row.description,
-            size_bytes: row.size_bytes,
-            status,
-            error_message: row.error_message,
-            purpose,
-            expires_at: row.expires_at,
-            deleted_at: row.deleted_at,
-            uploaded_by: row.uploaded_by,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        };
+        let mut file = self.get_file_from_db(file_id).await?;
 
         // Check and mark as expired if needed (passive expiration)
         self.check_and_mark_expired(&mut file).await?;
+
+        // Try to finalize size for virtual output/error files. Uses cached value once finalized
+        self.maybe_finalize_file_size(&mut file).await?;
 
         Ok(file)
     }
@@ -1109,23 +1268,45 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         };
 
         let mut query_builder = QueryBuilder::new(
-            "SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at FROM files",
+            r#"
+            SELECT 
+                f.id, f.name, f.description, f.size_bytes, f.size_finalized, 
+                f.status, f.error_message, f.purpose, f.expires_at, f.deleted_at, 
+                f.uploaded_by, f.created_at, f.updated_at,
+                b.id as batch_id,
+                b.completed_at as batch_completed_at,
+                b.failed_at as batch_failed_at,
+                b.cancelled_at as batch_cancelled_at,
+                size_calc.calculated_size
+            FROM files f
+            LEFT JOIN batches b ON (
+                (f.purpose = 'batch_output' AND b.output_file_id = f.id) OR
+                (f.purpose = 'batch_error' AND b.error_file_id = f.id)
+            )
+            LEFT JOIN LATERAL (
+                SELECT SUM(r.response_size)::BIGINT as calculated_size
+                FROM requests r
+                WHERE r.batch_id = b.id
+                AND ((f.purpose = 'batch_output' AND r.state = 'completed') OR
+                    (f.purpose = 'batch_error' AND r.state = 'failed'))
+            ) size_calc ON (f.purpose IN ('batch_output', 'batch_error') AND f.size_finalized = FALSE)
+            "#
         );
 
         // Build WHERE clause
         let mut has_where = false;
 
         if let Some(uploaded_by) = &filter.uploaded_by {
-            query_builder.push(" WHERE uploaded_by = ");
+            query_builder.push(" WHERE f.uploaded_by = ");
             query_builder.push_bind(uploaded_by);
             has_where = true;
         }
 
         if let Some(status) = &filter.status {
             if has_where {
-                query_builder.push(" AND status = ");
+                query_builder.push(" AND f.status = ");
             } else {
-                query_builder.push(" WHERE status = ");
+                query_builder.push(" WHERE f.status = ");
                 has_where = true;
             }
             query_builder.push_bind(status);
@@ -1133,9 +1314,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         if let Some(purpose) = &filter.purpose {
             if has_where {
-                query_builder.push(" AND purpose = ");
+                query_builder.push(" AND f.purpose = ");
             } else {
-                query_builder.push(" WHERE purpose = ");
+                query_builder.push(" WHERE f.purpose = ");
                 has_where = true;
             }
             query_builder.push_bind(purpose);
@@ -1151,13 +1332,13 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 query_builder.push(" WHERE ");
             }
 
-            query_builder.push("(created_at ");
+            query_builder.push("(f.created_at ");
             query_builder.push(comparison);
             query_builder.push(" ");
             query_builder.push_bind(after_ts);
-            query_builder.push(" OR (created_at = ");
+            query_builder.push(" OR (f.created_at = ");
             query_builder.push_bind(after_ts);
-            query_builder.push(" AND id ");
+            query_builder.push(" AND f.id ");
             query_builder.push(comparison);
             query_builder.push(" ");
             query_builder.push_bind(**after_id as Uuid);
@@ -1166,9 +1347,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         // Add ORDER BY
         let order_direction = if filter.ascending { "ASC" } else { "DESC" };
-        query_builder.push(" ORDER BY created_at ");
+        query_builder.push(" ORDER BY f.created_at ");
         query_builder.push(order_direction);
-        query_builder.push(", id ");
+        query_builder.push(", f.id ");
         query_builder.push(order_direction);
 
         // Add LIMIT
@@ -1195,9 +1376,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             let description: Option<String> = row
                 .try_get("description")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read description: {}", e)))?;
-            let size_bytes: i64 = row
+            let mut size_bytes: i64 = row
                 .try_get("size_bytes")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read size_bytes: {}", e)))?;
+            let size_finalized: bool = row
+                .try_get("size_finalized")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read size_finalized: {}", e)))?;
             let status_str: String = row
                 .try_get("status")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read status: {}", e)))?;
@@ -1232,11 +1416,62 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 .try_get("updated_at")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read updated_at: {}", e)))?;
 
+            // If this is a virtual file that's not finalized, use the calculated size
+            if !size_finalized 
+                && (purpose == Some(crate::batch::Purpose::BatchOutput) 
+                    || purpose == Some(crate::batch::Purpose::BatchError)) 
+            {
+                let calculated_size: Option<i64> = row
+                    .try_get("calculated_size")
+                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to read calculated_size: {}", e)))?;
+                
+                if let Some(calc_size) = calculated_size {
+                    size_bytes = calc_size;
+                }
+
+                // Check if batch is complete and finalize if needed
+                let batch_complete: Option<bool> = row.try_get::<Option<Uuid>, _>("batch_id")
+                    .ok()
+                    .flatten()
+                    .map(|_| {
+                        let completed_at: Option<chrono::DateTime<Utc>> = row.try_get("batch_completed_at").ok().flatten();
+                        let failed_at: Option<chrono::DateTime<Utc>> = row.try_get("batch_failed_at").ok().flatten();
+                        let cancelled_at: Option<chrono::DateTime<Utc>> = row.try_get("batch_cancelled_at").ok().flatten();
+                        completed_at.is_some() || failed_at.is_some() || cancelled_at.is_some()
+                    });
+
+                // If batch is complete, finalize the size (non-blocking)
+                if batch_complete == Some(true) {
+                    let file_id = FileId(id);
+                    let size = size_bytes;
+                    let pool = self.pool.clone();
+                    
+                    // Spawn a task to finalize in background - don't block listing
+                    tokio::spawn(async move {
+                        if let Err(e) = sqlx::query!(
+                            r#"
+                            UPDATE files
+                            SET size_bytes = $2, size_finalized = TRUE
+                            WHERE id = $1 AND size_finalized = FALSE
+                            "#,
+                            *file_id as Uuid,
+                            size,
+                        )
+                        .execute(&pool)
+                        .await
+                        {
+                            tracing::warn!("Failed to finalize file size for {}: {}", file_id, e);
+                        }
+                    });
+                }
+            }
+
             let mut file = File {
                 id: FileId(id),
                 name,
                 description,
                 size_bytes,
+                size_finalized,
                 status,
                 error_message,
                 purpose,
@@ -2359,8 +2594,8 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
 
         let file_id = sqlx::query_scalar!(
             r#"
-            INSERT INTO files (name, description, size_bytes, status, purpose, uploaded_by)
-            VALUES ($1, $2, 0, 'processed', 'batch_error', $3)
+            INSERT INTO files (name, description, size_bytes, size_finalized, status, purpose, uploaded_by)
+            VALUES ($1, $2, 0, FALSE, 'processed', 'batch_error', $3)
             RETURNING id
             "#,
             name,
