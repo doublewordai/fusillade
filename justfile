@@ -56,8 +56,8 @@ db-start:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    if docker ps -a --format '{{.Names}}' | grep -q "^test-postgres$"; then
-        if docker ps --format '{{.Names}}' | grep -q "^test-postgres$"; then
+    if docker ps -a --format '{{{{.Names}}}}' | grep -q "^test-postgres$"; then
+        if docker ps --format '{{{{.Names}}}}' | grep -q "^test-postgres$"; then
             echo "✅ test-postgres container is already running"
         else
             echo "Starting existing test-postgres container..."
@@ -90,7 +90,7 @@ db-stop *args="":
     #!/usr/bin/env bash
     set -euo pipefail
 
-    if docker ps --format '{{.Names}}' | grep -q "^test-postgres$"; then
+    if docker ps --format '{{{{.Names}}}}' | grep -q "^test-postgres$"; then
         echo "Stopping test-postgres container..."
         docker stop test-postgres
 
