@@ -18,7 +18,7 @@ pub fn calculate_output_size(
         // Account for JSON escaping in response_body (quotes, backslashes, newlines)
         (response_body.len() as f64 * 0.1).ceil() as usize + // add 10% for escaping
         4 +  // '}}\n' (closing response, root, and newline)
-        50;  // error margin for formatting + request_id field if present
+        50; // error margin for formatting + request_id field if present
 
     size as i32
 }
@@ -36,7 +36,7 @@ pub fn calculate_error_size(custom_id: &Option<String>, error_json: &str) -> i32
         error_json.len() + // The actual error message (already JSON-serialized)
         (error_json.len() as f64 * 0.2).ceil() as usize + // Add 20% for JSON escaping
         5 +  // '"}}\n' (closing quote, error object, root, newline)
-        10;  // error margin
+        10; // error margin
 
     size as i32
 }
