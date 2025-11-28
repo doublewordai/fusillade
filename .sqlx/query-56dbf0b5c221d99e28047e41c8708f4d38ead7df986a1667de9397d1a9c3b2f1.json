@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT SUM(response_size)::BIGINT as \"size\"\n            FROM requests\n            WHERE batch_id = $1 AND state = $2\n            ",
+  "query": "\n                SELECT SUM(response_size)::BIGINT as \"size\"\n                FROM requests\n                WHERE batch_id = $1 AND state = $2\n                ",
   "describe": {
     "columns": [
       {
@@ -19,5 +19,5 @@
       null
     ]
   },
-  "hash": "101c484cab7bdcd91c0665802918cb84906e7ab058fc462ab7353fc438c67b64"
+  "hash": "56dbf0b5c221d99e28047e41c8708f4d38ead7df986a1667de9397d1a9c3b2f1"
 }
