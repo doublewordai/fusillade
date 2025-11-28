@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.3.0...fusillade-v0.4.0) (2025-11-28)
+
+
+### Features
+
+* initial fusillade release ([4102ab7](https://github.com/doublewordai/fusillade/commit/4102ab771d991e43101e59adbd4525801924ca2b))
+* test release-please with manifest config ([081662d](https://github.com/doublewordai/fusillade/commit/081662d622397369f49f176a6a1f3c9d604d606d))
+
+
+### Bug Fixes
+
+* cancellations ([#17](https://github.com/doublewordai/fusillade/issues/17)) ([c9b9f25](https://github.com/doublewordai/fusillade/commit/c9b9f258a19dedb65e67842789e65ce52ef5bbea))
+* coordinate multiple replicas ([#13](https://github.com/doublewordai/fusillade/issues/13)) ([9838f21](https://github.com/doublewordai/fusillade/commit/9838f2148da42e7b7eabd8e8233be5787c7ba27a))
+* remove useless trigger ([#15](https://github.com/doublewordai/fusillade/issues/15)) ([828f30e](https://github.com/doublewordai/fusillade/commit/828f30edc039f35740ad7e8c78e2f84c9480110a))
+
 ## [0.3.0](https://github.com/doublewordai/control-layer/compare/fusillade-v0.2.0...fusillade-v0.3.0) (2025-11-24)
 
 
