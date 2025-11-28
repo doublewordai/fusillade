@@ -240,12 +240,15 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let now = Utc::now();
 
         // Get all models with pending requests (using denormalized model column)
+        // Exclude requests from cancelled batches
         let mut models = sqlx::query_scalar!(
             r#"
-            SELECT DISTINCT model
-            FROM requests
-            WHERE state = 'pending'
-                AND (not_before IS NULL OR not_before <= $1)
+            SELECT DISTINCT r.model
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            WHERE r.state = 'pending'
+                AND (r.not_before IS NULL OR r.not_before <= $1)
+                AND b.cancelling_at IS NULL
             "#,
             now
         )
@@ -298,10 +301,13 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 ),
                 to_claim AS (
                     SELECT r.id, r.template_id
-                    FROM requests r, available_slots
+                    FROM requests r
+                    JOIN batches b ON r.batch_id = b.id
+                    CROSS JOIN available_slots
                     WHERE r.state = 'pending'
                         AND r.model = $4
                         AND (r.not_before IS NULL OR r.not_before <= $3)
+                        AND b.cancelling_at IS NULL
                         AND available_slots.slots > 0
                     ORDER BY r.created_at ASC
                     LIMIT LEAST($5, (SELECT slots FROM available_slots))
@@ -1473,11 +1479,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             FROM batches b
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -1489,6 +1495,52 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
         .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+
+        // Lazy computation of terminal timestamps
+        // Check if batch is in terminal state and update timestamps if needed
+        let terminal_count = row.completed_requests + row.failed_requests + row.canceled_requests;
+        let is_terminal = terminal_count == row.total_requests && row.total_requests > 0;
+
+        let (finalizing_at, completed_at, failed_at) = if is_terminal
+            && row.completed_at.is_none()
+            && row.failed_at.is_none()
+            && row.cancelled_at.is_none()
+        {
+            let now = Utc::now();
+
+            // Determine which terminal state based on counts
+            let (finalizing, completed, failed) = if row.completed_requests > 0 {
+                // At least one completion = completed batch
+                (Some(now), Some(now), None)
+            } else {
+                // No completions = failed batch
+                (Some(now), None, Some(now))
+            };
+
+            // Update the database with the terminal timestamps
+            sqlx::query!(
+                r#"
+                UPDATE batches
+                SET finalizing_at = COALESCE(finalizing_at, $2),
+                    completed_at = COALESCE(completed_at, $3),
+                    failed_at = COALESCE(failed_at, $4)
+                WHERE id = $1
+                "#,
+                *batch_id as Uuid,
+                finalizing,
+                completed,
+                failed,
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
+            })?;
+
+            (finalizing, completed, failed)
+        } else {
+            (row.finalizing_at, row.completed_at, row.failed_at)
+        };
 
         Ok(Batch {
             id: BatchId(row.id),
@@ -1510,9 +1562,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             failed_requests: row.failed_requests,
             canceled_requests: row.canceled_requests,
             requests_started_at: row.requests_started_at,
-            finalizing_at: row.finalizing_at,
-            completed_at: row.completed_at,
-            failed_at: row.failed_at,
+            finalizing_at,
+            completed_at,
+            failed_at,
             cancelled_at: row.cancelled_at,
         })
     }
@@ -1536,11 +1588,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -1749,11 +1801,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             FROM batches b
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -1820,11 +1872,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -1858,11 +1910,17 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
         let now = Utc::now();
 
-        // Set cancelling_at on the batch
+        // Set both cancelling_at and cancelled_at
+        // cancelling_at = source of truth for "batch is being cancelled"
+        // cancelled_at = timestamp of user's cancellation action
+        // Pending requests won't be claimed (claim_requests checks cancelling_at)
+        // In-flight requests will be aborted via polling
+        // Counts will be computed based on cancelling_at + state
         sqlx::query!(
             r#"
             UPDATE batches
-            SET cancelling_at = $2
+            SET cancelling_at = $2,
+                cancelled_at = $2
             WHERE id = $1 AND cancelling_at IS NULL
             "#,
             *batch_id as Uuid,
@@ -1870,27 +1928,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to set cancelling_at: {}", e)))?;
-
-        // Cancel all pending/in-progress requests and notify daemons
-        sqlx::query!(
-            r#"
-            WITH canceled AS (
-                UPDATE requests
-                SET state = 'canceled', canceled_at = $2
-                WHERE batch_id = $1
-                    AND state IN ('pending', 'claimed', 'processing')
-                RETURNING id
-            )
-            SELECT pg_notify('request_cancellations', id::text)
-            FROM canceled
-            "#,
-            *batch_id as Uuid,
-            now,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel batch: {}", e)))?;
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to set cancellation timestamps: {}", e))
+        })?;
 
         Ok(())
     }
@@ -2729,126 +2769,14 @@ impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
             shutdown_token,
         ));
 
-        let manager = self.clone();
         let handle = tokio::spawn(async move {
-            // Create a cancellation stream from PostgreSQL LISTEN/NOTIFY
-            // If we can't create the stream, return error for fail-fast behavior
-            let cancellation_stream = manager.create_cancellation_stream().await?;
-            daemon.run(Some(cancellation_stream)).await
+            // Daemon will poll for cancelled batches periodically
+            daemon.run().await
         });
 
         tracing::info!("Daemon spawned successfully");
 
         Ok(handle)
-    }
-}
-
-impl<H: HttpClient + 'static> PostgresRequestManager<H> {
-    /// Create a stream of request cancellations from PostgreSQL LISTEN/NOTIFY.
-    async fn create_cancellation_stream(
-        &self,
-    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = RequestId> + Send>>> {
-        use futures::StreamExt;
-
-        // Clone the pool so the stream can create new listeners on reconnection
-        let pool = self.pool.clone();
-
-        // Create a stream that handles reconnection internally
-        // State: (pool, optional listener) - we keep the listener alive across iterations
-        type State = (PgPool, Option<sqlx::postgres::PgListener>);
-
-        let stream = futures::stream::unfold((pool, None), |(pool, listener_opt): State| async move {
-            const RECONNECT_DELAY_SECS: u64 = 5;
-
-            let mut listener = match listener_opt {
-                Some(l) => l,
-                None => {
-                    // Need to establish a connection
-                    'reconnect: loop {
-                        // Try to create a new listener
-                        let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
-                            Ok(l) => {
-                                tracing::debug!("Connected to PostgreSQL for cancellation stream");
-                                l
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    "Failed to connect listener for cancellations, retrying in {}s",
-                                    RECONNECT_DELAY_SECS
-                                );
-                                tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                                continue 'reconnect;
-                            }
-                        };
-
-                        // Try to listen to the channel
-                        if let Err(e) = listener.listen("request_cancellations").await {
-                            tracing::error!(
-                                error = %e,
-                                "Failed to LISTEN on request_cancellations channel, retrying in {}s",
-                                RECONNECT_DELAY_SECS
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                            continue 'reconnect;
-                        }
-
-                        tracing::info!("Listening for request cancellations via PostgreSQL NOTIFY");
-                        break listener;
-                    }
-                }
-            };
-
-            // Try to receive a notification from the active listener
-            loop {
-                match listener.try_recv().await {
-                    Ok(Some(notification)) => {
-                        // Parse the request ID from the payload (UUID string)
-                        match notification.payload().parse::<uuid::Uuid>() {
-                            Ok(uuid) => {
-                                // Valid cancellation - return it and keep the connection alive
-                                return Some((RequestId(uuid), (pool, Some(listener))));
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    payload = notification.payload(),
-                                    error = %e,
-                                    "Failed to parse request ID from notification, skipping"
-                                );
-                                // Skip invalid messages, continue listening on same connection
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::error!(
-                            "Connection closed while listening for cancellations, reconnecting in {}s",
-                            RECONNECT_DELAY_SECS
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                        // Drop the listener to trigger reconnect on next iteration
-                        return Some((RequestId(uuid::Uuid::nil()), (pool, None)));
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "PostgreSQL error while listening for cancellations, reconnecting in {}s",
-                            RECONNECT_DELAY_SECS
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                        // Drop the listener to trigger reconnect on next iteration
-                        return Some((RequestId(uuid::Uuid::nil()), (pool, None)));
-                    }
-                }
-            }
-        })
-        .filter(|request_id| {
-            // Filter out nil UUIDs (used for reconnection signaling)
-            let keep = !request_id.0.is_nil();
-            futures::future::ready(keep)
-        })
-        .boxed();
-
-        Ok(stream)
     }
 }
 
@@ -3114,11 +3042,12 @@ mod tests {
         assert_eq!(status_after.pending_requests, 0);
         assert_eq!(status_after.canceled_requests, 3);
 
-        // Get the actual requests to verify their state
+        // Get the actual requests - they remain in Pending state as an optimization
+        // but are logically canceled (the batch has cancelling_at set)
         let requests = manager.get_batch_requests(batch.id).await.unwrap();
         assert_eq!(requests.len(), 3);
         for request in requests {
-            assert!(matches!(request, AnyRequest::Canceled(_)));
+            assert!(matches!(request, AnyRequest::Pending(_)));
         }
     }
 
@@ -5353,7 +5282,6 @@ mod tests {
     async fn test_batch_cancellation_with_stream(pool: sqlx::PgPool) {
         use crate::http::HttpResponse;
         use std::time::Duration;
-        use tokio::sync::mpsc;
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = Arc::new(PostgresRequestManager::with_client(
@@ -5402,10 +5330,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Create a mock cancellation stream using mpsc channel
-        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<RequestId>();
-        let cancellation_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(cancel_rx);
-
         // Set up triggered responses that won't complete until we tell them to
         http_client.clear_calls();
         let trigger1 = http_client.add_response_with_trigger(
@@ -5415,7 +5339,7 @@ mod tests {
                 body: "ok".to_string(),
             }),
         );
-        let trigger2 = http_client.add_response_with_trigger(
+        let _trigger2 = http_client.add_response_with_trigger(
             "POST /test",
             Ok(HttpResponse {
                 status: 200,
@@ -5440,6 +5364,7 @@ mod tests {
             should_retry: Arc::new(|_| false),
             claim_timeout_ms: 5000,
             processing_timeout_ms: 10000,
+            cancellation_poll_interval_ms: 100, // Fast polling for tests
         };
 
         let daemon = Arc::new(crate::daemon::Daemon::new(
@@ -5449,16 +5374,15 @@ mod tests {
             shutdown_token.clone(),
         ));
 
-        // Run daemon with cancellation stream
+        // Run daemon (it will poll for cancelled batches)
         let daemon_handle = tokio::spawn({
             let daemon = daemon.clone();
-            async move { daemon.run(Some(cancellation_stream)).await }
+            async move { daemon.run().await }
         });
 
-        // Get the request IDs from the batch
+        // Verify we have 2 requests in the batch
         let requests = manager.get_batch_requests(batch.id).await.unwrap();
         assert_eq!(requests.len(), 2);
-        let request_ids: Vec<RequestId> = requests.iter().map(|r| r.id()).collect();
 
         // Wait for both requests to be processing (blocked on triggers)
         let manager_clone = manager.clone();
@@ -5479,45 +5403,25 @@ mod tests {
             "Both requests should reach processing state"
         );
 
-        // Send cancellation for first request via the stream
-        cancel_tx.send(request_ids[0]).unwrap();
+        // Cancel the batch - daemon will detect via polling (every 100ms in test)
+        manager.cancel_batch(batch.id).await.unwrap();
 
-        // Wait for first request to be canceled
+        // Wait for both requests to be canceled (batch-level cancellation via polling)
         let manager_clone = manager.clone();
-        let req_id_0 = request_ids[0];
-        let reached_canceled = wait_for(
+        let all_canceled = wait_for(
             || async {
                 if let Ok(reqs) = manager_clone.get_batch_requests(batch_id).await {
-                    if let Some(req) = reqs.iter().find(|r| r.id() == req_id_0) {
-                        return matches!(req, AnyRequest::Canceled(_));
-                    }
+                    return reqs.iter().all(|r| matches!(r, AnyRequest::Canceled(_)));
                 }
                 false
             },
-            Duration::from_secs(3),
+            Duration::from_secs(2), // Fast polling (100ms) should detect quickly
         )
         .await;
-        assert!(reached_canceled, "First request should be canceled");
-
-        // Trigger the second request to complete normally
-        trigger2.send(()).ok();
-
-        // Wait for second request to complete
-        let manager_clone = manager.clone();
-        let req_id_1 = request_ids[1];
-        let reached_completed = wait_for(
-            || async {
-                if let Ok(reqs) = manager_clone.get_batch_requests(batch_id).await {
-                    if let Some(req) = reqs.iter().find(|r| r.id() == req_id_1) {
-                        return matches!(req, AnyRequest::Completed(_));
-                    }
-                }
-                false
-            },
-            Duration::from_secs(3),
-        )
-        .await;
-        assert!(reached_completed, "Second request should complete");
+        assert!(
+            all_canceled,
+            "Both requests should be canceled via batch-level polling"
+        );
 
         // Shutdown daemon
         shutdown_token.cancel();

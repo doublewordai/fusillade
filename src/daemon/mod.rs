@@ -8,12 +8,11 @@ use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::FusilladeError;
+use crate::batch::BatchId;
 use crate::error::Result;
 use crate::http::{HttpClient, HttpResponse};
 use crate::manager::{DaemonStorage, Storage};
 use crate::request::{DaemonId, RequestCompletionResult};
-use crate::types::RequestId;
-use futures::StreamExt;
 
 pub mod transitions;
 pub mod types;
@@ -90,6 +89,10 @@ pub struct DaemonConfig {
     /// Maximum time a request can stay in "processing" state before being unclaimed
     /// and returned to pending (milliseconds). This handles daemon crashes during execution.
     pub processing_timeout_ms: u64,
+
+    /// Interval for polling database to check for cancelled batches (milliseconds)
+    /// Determines how quickly in-flight requests are aborted when their batch is cancelled
+    pub cancellation_poll_interval_ms: u64,
 }
 
 impl Default for DaemonConfig {
@@ -107,8 +110,9 @@ impl Default for DaemonConfig {
             status_log_interval_ms: Some(2000), // Log every 2 seconds by default
             heartbeat_interval_ms: 10000,       // Heartbeat every 10 seconds by default
             should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,       // 1 minute
-            processing_timeout_ms: 600000, // 10 minutes
+            claim_timeout_ms: 60000,             // 1 minute
+            processing_timeout_ms: 600000,       // 10 minutes
+            cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
         }
     }
 }
@@ -131,8 +135,9 @@ where
     requests_processed: Arc<AtomicU64>,
     requests_failed: Arc<AtomicU64>,
     shutdown_token: tokio_util::sync::CancellationToken,
-    /// Map of request_id -> cancellation token for user-initiated cancellation
-    cancellation_tokens: Arc<dashmap::DashMap<RequestId, tokio_util::sync::CancellationToken>>,
+    /// Map of batch_id -> cancellation token for batch-level cancellation
+    /// All requests in a batch share the same cancellation token
+    cancellation_tokens: Arc<dashmap::DashMap<BatchId, tokio_util::sync::CancellationToken>>,
 }
 
 impl<S, H> Daemon<S, H>
@@ -241,13 +246,9 @@ where
     /// This continuously claims and processes requests until an error occurs
     /// or the task is cancelled.
     ///
-    /// The `cancellation_stream` parameter is an optional stream that yields
-    /// `RequestId`s that should be cancelled (e.g., from PostgreSQL LISTEN/NOTIFY).
-    #[tracing::instrument(skip(self, cancellation_stream), fields(daemon_id = %self.daemon_id))]
-    pub async fn run<CS>(self: Arc<Self>, cancellation_stream: Option<CS>) -> Result<()>
-    where
-        CS: futures::Stream<Item = RequestId> + Unpin + Send + 'static,
-    {
+    /// The daemon periodically polls for cancelled batches and aborts in-flight requests.
+    #[tracing::instrument(skip(self), fields(daemon_id = %self.daemon_id))]
+    pub async fn run(self: Arc<Self>) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
 
         // Register daemon in database
@@ -344,37 +345,55 @@ where
             });
         }
 
-        // Spawn task to process cancellation stream if provided
-        if let Some(mut stream) = cancellation_stream {
-            let cancellation_tokens = self.cancellation_tokens.clone();
-            let shutdown_token = self.shutdown_token.clone();
-            tokio::spawn(async move {
-                tracing::info!("Cancellation stream listener started");
+        // Spawn periodic task to poll for cancelled batches and abort in-flight requests
+        let cancellation_tokens = self.cancellation_tokens.clone();
+        let storage = self.storage.clone();
+        let shutdown_token = self.shutdown_token.clone();
+        let cancellation_poll_interval_ms = self.config.cancellation_poll_interval_ms;
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(cancellation_poll_interval_ms));
+            tracing::info!(
+                interval_ms = cancellation_poll_interval_ms,
+                "Batch cancellation polling started"
+            );
 
-                loop {
-                    tokio::select! {
-                        Some(request_id) = stream.next() => {
-                            tracing::debug!(request_id = %request_id, "Received cancellation notification");
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Get all active batch IDs we're currently processing
+                        let active_batch_ids: Vec<BatchId> = cancellation_tokens
+                            .iter()
+                            .map(|entry| *entry.key())
+                            .collect();
 
-                            // Look up the cancellation token and cancel it
-                            if let Some(entry) = cancellation_tokens.get(&request_id) {
-                                entry.value().cancel();
-                                tracing::debug!(request_id = %request_id, "Cancelled request token");
-                            } else {
-                                tracing::debug!(
-                                    request_id = %request_id,
-                                    "Request not found in active requests (may have already completed)"
-                                );
-                            }
+                        if active_batch_ids.is_empty() {
+                            continue;
                         }
-                        _ = shutdown_token.cancelled() => {
-                            tracing::info!("Shutting down cancellation listener");
-                            break;
+
+                        // Query database to check which of these batches have been cancelled
+                        // Note: DaemonStorage doesn't have a method for this, so we'll check via the batch
+                        // For now, we'll check each batch individually
+                        for batch_id in active_batch_ids {
+                            // Try to get the batch - if it has cancelling_at set, cancel the token
+                            if let Ok(batch) = storage.get_batch(batch_id).await
+                                && batch.cancelling_at.is_some()
+                                    && let Some(entry) = cancellation_tokens.get(&batch_id) {
+                                        entry.value().cancel();
+                                        tracing::info!(batch_id = %batch_id, "Cancelled all requests in batch");
+                                        // Remove from map so we don't keep checking it
+                                        drop(entry);
+                                        cancellation_tokens.remove(&batch_id);
+                                    }
                         }
                     }
+                    _ = shutdown_token.cancelled() => {
+                        tracing::info!("Shutting down cancellation polling");
+                        break;
+                    }
                 }
-            });
-        }
+            }
+        });
 
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
@@ -440,12 +459,14 @@ where
 
                 for request in requests {
                     let request_id = request.data.id;
+                    let batch_id = request.data.batch_id;
 
                     // Try to acquire a semaphore permit for this model
                     match self.try_acquire_permit(&model).await {
                         Some(permit) => {
                             tracing::debug!(
                                 request_id = %request_id,
+                                batch_id = %batch_id,
                                 model = %model,
                                 "Acquired permit, spawning processing task"
                             );
@@ -462,12 +483,10 @@ where
                             let shutdown_token = self.shutdown_token.clone();
                             let cancellation_tokens = self.cancellation_tokens.clone();
 
-                            // Create a cancellation token for user-initiated cancellation
-                            let user_cancellation_token =
-                                tokio_util::sync::CancellationToken::new();
-
-                            // Register the token so the LISTEN task can cancel it
-                            cancellation_tokens.insert(request_id, user_cancellation_token.clone());
+                            // Get or create a cancellation token for this batch
+                            // All requests in the same batch share the same token
+                            let batch_cancellation_token =
+                                cancellation_tokens.entry(batch_id).or_default().clone();
 
                             // Increment in-flight counter
                             requests_in_flight.fetch_add(1, Ordering::Relaxed);
@@ -483,17 +502,16 @@ where
 
                                 tracing::info!(request_id = %request_id, "Processing request");
 
-                                // Process the request
+                                // Launch request processing (this goes on a background thread)
                                 let processing = request.process(
                                     http_client,
                                     timeout_ms,
                                     storage.as_ref()
                                 ).await?;
 
-                                // Create cancellation future that resolves to User or Shutdown
                                 let cancellation = async {
                                     tokio::select! {
-                                        _ = user_cancellation_token.cancelled() => {
+                                        _ = batch_cancellation_token.cancelled() => {
                                             crate::request::transitions::CancellationReason::User
                                         }
                                         _ = shutdown_token.cancelled() => {
@@ -563,8 +581,9 @@ where
                                     }
                                 }
 
-                                // Remove the cancellation token from the map
-                                cancellation_tokens.remove(&request_id);
+                                // Note: We don't remove the batch cancellation token here since
+                                // multiple requests in the same batch share it. Tokens are cleaned
+                                // up when the daemon shuts down or batch completes.
 
                                 Ok(())
                             });
@@ -637,6 +656,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100, // Fast polling for tests
         };
 
         let manager = Arc::new(
@@ -797,6 +817,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100, // Fast polling for tests
         };
 
         let manager = Arc::new(
@@ -1015,6 +1036,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100, // Fast polling for tests
         };
 
         let manager = Arc::new(
@@ -1142,6 +1164,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100, // Fast polling for tests
         };
 
         let manager = Arc::new(
