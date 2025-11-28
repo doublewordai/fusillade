@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE files\n            SET deleting_at = NOW()\n            WHERE id = $1 AND deleting_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b8894b540da5604aa2937794d2441463f66fff355fc0f3606cfca7e4294ab0c5"
+}

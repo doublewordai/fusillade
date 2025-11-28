@@ -1329,20 +1329,40 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn delete_file(&self, file_id: FileId) -> Result<()> {
+        // Mark file for deletion instead of deleting immediately
+        // A daemon background worker will complete the deletion asynchronously
         let rows_affected = sqlx::query!(
             r#"
-            DELETE FROM files
-            WHERE id = $1
+            UPDATE files
+            SET deleting_at = NOW()
+            WHERE id = $1 AND deleting_at IS NULL
             "#,
             *file_id as Uuid,
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete file: {}", e)))?
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark file for deletion: {}", e)))?
         .rows_affected();
 
         if rows_affected == 0 {
-            return Err(FusilladeError::Other(anyhow!("File not found")));
+            // Check if file exists but is already marked for deletion
+            let exists = sqlx::query!(
+                r#"
+                SELECT EXISTS(SELECT 1 FROM files WHERE id = $1) as "exists!"
+                "#,
+                *file_id as Uuid,
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to check file existence: {}", e)))?
+            .exists;
+
+            if exists {
+                // File exists but is already being deleted
+                return Ok(());
+            } else {
+                return Err(FusilladeError::Other(anyhow!("File not found")));
+            }
         }
 
         Ok(())
@@ -1390,6 +1410,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .await?;
 
         // Update batch with file IDs
+        // NOTE: initialized_at is NULL, meaning the batch needs initialization by a daemon
+        // The daemon will bulk insert requests from templates asynchronously
         sqlx::query!(
             r#"
             UPDATE batches
@@ -1406,23 +1428,19 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             FusilladeError::Other(anyhow!("Failed to update batch with file IDs: {}", e))
         })?;
 
-        // bulk insert requests from templates
-        let rows_affected = sqlx::query!(
+        // Verify the file has templates (without counting them all)
+        let has_templates = sqlx::query!(
             r#"
-            INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt, model)
-            SELECT $1, id, 'pending', custom_id, 0, model
-            FROM request_templates
-            WHERE file_id = $2
+            SELECT EXISTS(SELECT 1 FROM request_templates WHERE file_id = $1) as "exists!"
             "#,
-            batch_id,
             *input.file_id as Uuid,
         )
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create requests: {}", e)))?
-        .rows_affected();
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to check for templates: {}", e)))?
+        .exists;
 
-        if rows_affected == 0 {
+        if !has_templates {
             tx.rollback().await.map_err(|e| {
                 FusilladeError::Other(anyhow!(
                     "Failed to rollback transaction after zero templates: {}",
@@ -1433,22 +1451,6 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 "Cannot create batch from file with no templates"
             )));
         }
-
-        // Update batch metadata
-        // Note: Request state counts are computed on-demand, not stored
-        sqlx::query!(
-            r#"
-            UPDATE batches
-            SET total_requests = $2,
-                requests_started_at = NOW()
-            WHERE id = $1
-            "#,
-            batch_id,
-            rows_affected as i64
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update batch metadata: {}", e)))?;
 
         tx.commit()
             .await
@@ -1931,6 +1933,161 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to set cancellation timestamps: {}", e))
         })?;
+
+        Ok(())
+    }
+
+    async fn claim_pending_batch_initializations(
+        &self,
+        limit: usize,
+        daemon_id: DaemonId,
+    ) -> Result<Vec<BatchId>> {
+        let rows = sqlx::query!(
+            r#"
+            UPDATE batches
+            SET initializing_daemon_id = $1
+            WHERE id IN (
+                SELECT id
+                FROM batches
+                WHERE initialized_at IS NULL
+                  AND initializing_daemon_id IS NULL
+                ORDER BY created_at ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id
+            "#,
+            *daemon_id as Uuid,
+            limit as i64,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to claim batches for initialization: {}", e))
+        })?;
+
+        Ok(rows.into_iter().map(|r| BatchId(r.id)).collect())
+    }
+
+    async fn initialize_batch(&self, batch_id: BatchId) -> Result<()> {
+        let mut tx =
+            self.pool.begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
+        // Get the file_id for this batch
+        let file_id = sqlx::query!(
+            r#"
+            SELECT file_id
+            FROM batches
+            WHERE id = $1
+            "#,
+            *batch_id as Uuid,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch file_id: {}", e)))?
+        .file_id;
+
+        // Bulk insert requests from templates
+        let rows_affected = sqlx::query!(
+            r#"
+            INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt, model)
+            SELECT $1, id, 'pending', custom_id, 0, model
+            FROM request_templates
+            WHERE file_id = $2
+            "#,
+            *batch_id as Uuid,
+            file_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create requests: {}", e)))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            tx.rollback().await.map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to rollback transaction after zero templates: {}",
+                    e
+                ))
+            })?;
+            return Err(FusilladeError::Other(anyhow!(
+                "Cannot initialize batch from file with no templates"
+            )));
+        }
+
+        // Update batch metadata
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET total_requests = $2,
+                requests_started_at = NOW(),
+                initialized_at = NOW(),
+                initializing_daemon_id = NULL
+            WHERE id = $1
+            "#,
+            *batch_id as Uuid,
+            rows_affected as i64
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update batch metadata: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn claim_pending_file_deletions(
+        &self,
+        limit: usize,
+        daemon_id: DaemonId,
+    ) -> Result<Vec<FileId>> {
+        let rows = sqlx::query!(
+            r#"
+            UPDATE files
+            SET deleting_daemon_id = $1
+            WHERE id IN (
+                SELECT id
+                FROM files
+                WHERE deleting_at IS NOT NULL
+                  AND deleting_daemon_id IS NULL
+                ORDER BY deleting_at ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id
+            "#,
+            *daemon_id as Uuid,
+            limit as i64,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to claim files for deletion: {}", e)))?;
+
+        Ok(rows.into_iter().map(|r| FileId(r.id)).collect())
+    }
+
+    async fn complete_file_deletion(&self, file_id: FileId) -> Result<()> {
+        // Actually delete the file (cascades to batches, requests, templates)
+        let rows_affected = sqlx::query!(
+            r#"
+            DELETE FROM files
+            WHERE id = $1
+            "#,
+            *file_id as Uuid,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete file: {}", e)))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(FusilladeError::Other(anyhow!("File not found")));
+        }
 
         Ok(())
     }
@@ -2902,6 +3059,12 @@ mod tests {
             .await
             .expect("Failed to create batch");
 
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager
+            .initialize_batch(batch.id)
+            .await
+            .expect("Failed to initialize batch");
+
         // Get batch status
         let status = manager
             .get_batch_status(batch.id)
@@ -2963,6 +3126,9 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
 
@@ -3029,6 +3195,9 @@ mod tests {
             .await
             .unwrap();
 
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
+
         // Verify all are pending
         let status_before = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status_before.pending_requests, 3);
@@ -3086,6 +3255,9 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
 
         // Get all request IDs
         let requests = manager.get_batch_requests(batch.id).await.unwrap();
@@ -3218,6 +3390,11 @@ mod tests {
             .unwrap();
 
         // List batches for this file
+        // Initialize all batches (normally done asynchronously by daemon)
+        manager.initialize_batch(batch1.id).await.unwrap();
+        manager.initialize_batch(batch2.id).await.unwrap();
+        manager.initialize_batch(batch3.id).await.unwrap();
+
         let batches = manager.list_file_batches(file_id).await.unwrap();
 
         assert_eq!(batches.len(), 3);
@@ -3285,8 +3462,14 @@ mod tests {
         let status_before = manager.get_batch_status(batch.id).await;
         assert!(status_before.is_ok());
 
-        // Delete the file
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
+
+        // Delete the file (marks for deletion)
         manager.delete_file(file_id).await.unwrap();
+
+        // Complete the deletion (normally done asynchronously by daemon)
+        manager.complete_file_deletion(file_id).await.unwrap();
 
         // Verify file is gone
         let file_result = manager.get_file(file_id).await;
@@ -3339,6 +3522,9 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
 
         // Claim the request with daemon1
         let daemon1_id = DaemonId::from(Uuid::new_v4());
@@ -3410,6 +3596,9 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
 
         // Claim and manually set to processing state
         let daemon1_id = DaemonId::from(Uuid::new_v4());
@@ -3488,7 +3677,7 @@ mod tests {
             .await
             .unwrap();
 
-        manager
+        let batch = manager
             .create_batch(crate::batch::BatchInput {
                 file_id,
                 endpoint: "/v1/chat/completions".to_string(),
@@ -3498,6 +3687,9 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
 
         // Daemon1 claims first request
         let daemon1_id = DaemonId::from(Uuid::new_v4());
@@ -3556,7 +3748,7 @@ mod tests {
             .await
             .unwrap();
 
-        manager
+        let batch = manager
             .create_batch(crate::batch::BatchInput {
                 file_id,
                 endpoint: "/v1/chat/completions".to_string(),
@@ -3566,6 +3758,9 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
 
         // Manually set a request to claimed with retry_attempt=2
         sqlx::query!(
@@ -3650,6 +3845,12 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager
+            .initialize_batch(batch.id)
+            .await
+            .expect("Failed to initialize batch");
 
         // Verify virtual output and error files were created
         assert!(batch.output_file_id.is_some());
@@ -4238,6 +4439,9 @@ mod tests {
 
         let created_batch = manager.create_batch(batch_input).await.unwrap();
 
+        // Initialize the batch explicitly for testing (normally done by daemon)
+        manager.initialize_batch(created_batch.id).await.unwrap();
+
         // Retrieve the batch
         let retrieved_batch = manager
             .get_batch(created_batch.id)
@@ -4316,6 +4520,9 @@ mod tests {
             .await
             .unwrap();
 
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
+
         // Claim and complete some requests
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager.claim_requests(2, daemon_id).await.unwrap();
@@ -4381,6 +4588,9 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
 
         let all_requests = manager.get_batch_requests(batch.id).await.unwrap();
         let request_ids: Vec<_> = all_requests.iter().map(|r| r.id()).collect();
@@ -4496,6 +4706,9 @@ mod tests {
             .await
             .unwrap();
 
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
+
         let all_requests = manager.get_batch_requests(batch.id).await.unwrap();
         let request_ids: Vec<_> = all_requests.iter().map(|r| r.id()).collect();
 
@@ -4551,6 +4764,9 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
 
         let all_requests = manager.get_batch_requests(batch.id).await.unwrap();
         let real_id = all_requests[0].id();
@@ -4610,7 +4826,7 @@ mod tests {
             .await
             .unwrap();
 
-        let _batch = manager
+        let batch = manager
             .create_batch(crate::batch::BatchInput {
                 file_id,
                 endpoint: "/v1/chat/completions".to_string(),
@@ -4620,6 +4836,9 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
 
         // Simulate 3 daemons claiming simultaneously
         let daemon1_id = DaemonId::from(Uuid::new_v4());
@@ -5330,6 +5549,9 @@ mod tests {
             .await
             .unwrap();
 
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager.initialize_batch(batch.id).await.unwrap();
+
         // Set up triggered responses that won't complete until we tell them to
         http_client.clear_calls();
         let trigger1 = http_client.add_response_with_trigger(
@@ -5365,6 +5587,10 @@ mod tests {
             claim_timeout_ms: 5000,
             processing_timeout_ms: 10000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            batch_initialization_interval_ms: 100, // Fast polling for tests
+            batch_initialization_batch_size: 10,
+            file_deletion_interval_ms: 100, // Fast polling for tests
+            file_deletion_batch_size: 5,
         };
 
         let daemon = Arc::new(crate::daemon::Daemon::new(

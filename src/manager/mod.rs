@@ -107,6 +107,32 @@ pub trait Storage: Send + Sync {
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
 
+    /// Claim batches that need initialization (bulk insert of requests from templates).
+    /// This is called by background workers to asynchronously initialize batches.
+    /// Returns batch IDs that have been claimed for initialization.
+    async fn claim_pending_batch_initializations(
+        &self,
+        limit: usize,
+        daemon_id: DaemonId,
+    ) -> Result<Vec<BatchId>>;
+
+    /// Initialize a batch by bulk-inserting requests from templates.
+    /// This completes the batch initialization started by create_batch.
+    async fn initialize_batch(&self, batch_id: BatchId) -> Result<()>;
+
+    /// Claim files that need deletion (marked with deleting_at timestamp).
+    /// This is called by background workers to asynchronously delete files.
+    /// Returns file IDs that have been claimed for deletion.
+    async fn claim_pending_file_deletions(
+        &self,
+        limit: usize,
+        daemon_id: DaemonId,
+    ) -> Result<Vec<FileId>>;
+
+    /// Complete the deletion of a file (with cascade to batches and requests).
+    /// This completes the file deletion started by delete_file.
+    async fn complete_file_deletion(&self, file_id: FileId) -> Result<()>;
+
     /// The following methods are defined specifically for requests - i.e. independent of the
     /// files/batches they belong to.
     ///
