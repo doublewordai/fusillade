@@ -3042,11 +3042,12 @@ mod tests {
         assert_eq!(status_after.pending_requests, 0);
         assert_eq!(status_after.canceled_requests, 3);
 
-        // Get the actual requests to verify their state
+        // Get the actual requests - they remain in Pending state as an optimization
+        // but are logically canceled (the batch has cancelling_at set)
         let requests = manager.get_batch_requests(batch.id).await.unwrap();
         assert_eq!(requests.len(), 3);
         for request in requests {
-            assert!(matches!(request, AnyRequest::Canceled(_)));
+            assert!(matches!(request, AnyRequest::Pending(_)));
         }
     }
 
