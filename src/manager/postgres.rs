@@ -1479,11 +1479,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             FROM batches b
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -1495,6 +1495,52 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
         .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+
+        // Lazy computation of terminal timestamps
+        // Check if batch is in terminal state and update timestamps if needed
+        let terminal_count = row.completed_requests + row.failed_requests + row.canceled_requests;
+        let is_terminal = terminal_count == row.total_requests && row.total_requests > 0;
+
+        let (finalizing_at, completed_at, failed_at) = if is_terminal
+            && row.completed_at.is_none()
+            && row.failed_at.is_none()
+            && row.cancelled_at.is_none()
+        {
+            let now = Utc::now();
+
+            // Determine which terminal state based on counts
+            let (finalizing, completed, failed) = if row.completed_requests > 0 {
+                // At least one completion = completed batch
+                (Some(now), Some(now), None)
+            } else {
+                // No completions = failed batch
+                (Some(now), None, Some(now))
+            };
+
+            // Update the database with the terminal timestamps
+            sqlx::query!(
+                r#"
+                UPDATE batches
+                SET finalizing_at = COALESCE(finalizing_at, $2),
+                    completed_at = COALESCE(completed_at, $3),
+                    failed_at = COALESCE(failed_at, $4)
+                WHERE id = $1
+                "#,
+                *batch_id as Uuid,
+                finalizing,
+                completed,
+                failed,
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
+            })?;
+
+            (finalizing, completed, failed)
+        } else {
+            (row.finalizing_at, row.completed_at, row.failed_at)
+        };
 
         Ok(Batch {
             id: BatchId(row.id),
@@ -1516,9 +1562,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             failed_requests: row.failed_requests,
             canceled_requests: row.canceled_requests,
             requests_started_at: row.requests_started_at,
-            finalizing_at: row.finalizing_at,
-            completed_at: row.completed_at,
-            failed_at: row.failed_at,
+            finalizing_at,
+            completed_at,
+            failed_at,
             cancelled_at: row.cancelled_at,
         })
     }
@@ -1542,11 +1588,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -1755,11 +1801,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             FROM batches b
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -1826,11 +1872,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -1864,11 +1910,17 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
         let now = Utc::now();
 
-        // Set cancelling_at on the batch
+        // Set both cancelling_at and cancelled_at
+        // cancelling_at = source of truth for "batch is being cancelled"
+        // cancelled_at = timestamp of user's cancellation action
+        // Pending requests won't be claimed (claim_requests checks cancelling_at)
+        // In-flight requests will be aborted via polling
+        // Counts will be computed based on cancelling_at + state
         sqlx::query!(
             r#"
             UPDATE batches
-            SET cancelling_at = $2
+            SET cancelling_at = $2,
+                cancelled_at = $2
             WHERE id = $1 AND cancelling_at IS NULL
             "#,
             *batch_id as Uuid,
@@ -1876,22 +1928,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to set cancelling_at: {}", e)))?;
-
-        // Cancel only pending requests (we don't want to contend for locks with claiming daemons)
-        sqlx::query!(
-            r#"
-            UPDATE requests
-            SET state = 'canceled', canceled_at = $2
-            WHERE batch_id = $1
-                AND state = 'pending'
-            "#,
-            *batch_id as Uuid,
-            now,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel pending requests: {}", e)))?;
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to set cancellation timestamps: {}", e))
+        })?;
 
         Ok(())
     }
