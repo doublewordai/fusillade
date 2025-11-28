@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests\n            SET state = 'canceled', canceled_at = $2\n            WHERE batch_id = $1\n                AND state = 'pending'\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c090a6d58bdab1077f8fad6354717c5d91bc08953644168358a4191d6f8618d2"
+}
