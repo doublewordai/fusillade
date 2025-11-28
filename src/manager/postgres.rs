@@ -419,75 +419,146 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         let now = Utc::now();
 
-        // Atomically claim pending executions using SELECT FOR UPDATE
-        // Interleave requests from different models using ROW_NUMBER partitioning
-        // This ensures we claim requests round-robin across models rather than
-        // draining one model before moving to the next (important for per-model concurrency)
-        let rows = sqlx::query!(
+        // Get all models with pending requests (using denormalized model column)
+        // Exclude requests from cancelled batches
+        let mut models = sqlx::query_scalar!(
             r#"
-            WITH locked_requests AS (
-                SELECT r.id, r.template_id, t.model, r.created_at
-                FROM requests r
-                JOIN request_templates t ON r.template_id = t.id
-                WHERE r.state = 'pending'
-                    AND (r.not_before IS NULL OR r.not_before <= $2)
-                FOR UPDATE OF r SKIP LOCKED
-            ),
-            ranked AS (
-                SELECT
-                    id,
-                    template_id,
-                    ROW_NUMBER() OVER (PARTITION BY model ORDER BY created_at) as model_rn,
-                    created_at
-                FROM locked_requests
-            ),
-            to_claim AS (
-                SELECT id, template_id
-                FROM ranked
-                ORDER BY model_rn, created_at ASC
-                LIMIT $3
-            )
-            UPDATE requests r
-            SET
-                state = 'claimed',
-                daemon_id = $1,
-                claimed_at = $2
-            FROM to_claim tc
-            JOIN request_templates t ON tc.template_id = t.id
-            WHERE r.id = tc.id
-            RETURNING r.id, r.batch_id, r.template_id, r.retry_attempt,
-                      t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key
+            SELECT DISTINCT r.model
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            WHERE r.state = 'pending'
+                AND (r.not_before IS NULL OR r.not_before <= $1)
+                AND b.cancelling_at IS NULL
             "#,
-            *daemon_id as Uuid,
-            now,
-            limit as i64,
+            now
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to claim requests: {}", e)))?;
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to get models with pending requests: {}", e))
+        })?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| Request {
-                state: Claimed {
-                    daemon_id,
-                    claimed_at: now,
-                    retry_attempt: row.retry_attempt as u32,
-                },
-                data: RequestData {
-                    id: RequestId(row.id),
-                    batch_id: BatchId(row.batch_id),
-                    template_id: TemplateId(row.template_id),
-                    custom_id: row.custom_id,
-                    endpoint: row.endpoint,
-                    method: row.method,
-                    path: row.path,
-                    body: row.body,
-                    model: row.model,
-                    api_key: row.api_key,
-                },
-            })
-            .collect())
+        // Randomize model order to prevent starvation when hitting global limit
+        {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
+            models.shuffle(&mut rng);
+        } // Drop rng before async operations
+
+        tracing::debug!(
+            model_count = models.len(),
+            "Found models with pending requests"
+        );
+
+        // Claim from models sequentially until we hit the global limit
+        let mut all_claimed = Vec::new();
+        let mut remaining_limit = limit;
+
+        for model in models {
+            if remaining_limit == 0 {
+                break;
+            }
+
+            let model_limit = self
+                .config
+                .model_concurrency_limits
+                .get(&model)
+                .map(|entry| *entry.value())
+                .unwrap_or(self.config.default_model_concurrency);
+
+            // Atomically count in-progress requests and claim available slots in a single query
+            // This ensures the count and claim are consistent (no race condition)
+            let rows = sqlx::query!(
+                r#"
+                WITH in_progress_count AS (
+                    SELECT COUNT(*)::BIGINT as count
+                    FROM requests
+                    WHERE model = $4
+                        AND state IN ('claimed', 'processing')
+                ),
+                available_slots AS (
+                    SELECT GREATEST(0, $2::BIGINT - (SELECT count FROM in_progress_count)) as slots
+                ),
+                to_claim AS (
+                    SELECT r.id, r.template_id
+                    FROM requests r
+                    JOIN batches b ON r.batch_id = b.id
+                    CROSS JOIN available_slots
+                    WHERE r.state = 'pending'
+                        AND r.model = $4
+                        AND (r.not_before IS NULL OR r.not_before <= $3)
+                        AND b.cancelling_at IS NULL
+                        AND available_slots.slots > 0
+                    ORDER BY r.created_at ASC
+                    LIMIT LEAST($5, (SELECT slots FROM available_slots))
+                    FOR UPDATE OF r SKIP LOCKED
+                )
+                UPDATE requests r
+                SET
+                    state = 'claimed',
+                    daemon_id = $1,
+                    claimed_at = $3
+                FROM to_claim tc
+                JOIN request_templates t ON tc.template_id = t.id
+                WHERE r.id = tc.id
+                RETURNING r.id, r.batch_id, r.template_id, r.retry_attempt,
+                          t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key
+                "#,
+                *daemon_id as Uuid,
+                model_limit as i64,
+                now,
+                &model,
+                remaining_limit as i64,
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to claim requests for model {}: {}",
+                    model,
+                    e
+                ))
+            })?;
+
+            let claimed_count = rows.len();
+            if claimed_count > 0 {
+                tracing::debug!(
+                    model = %model,
+                    claimed = claimed_count,
+                    remaining_limit = remaining_limit - claimed_count,
+                    "Claimed requests for model"
+                );
+
+                remaining_limit -= claimed_count;
+
+                all_claimed.extend(rows.into_iter().map(|row| Request {
+                    state: Claimed {
+                        daemon_id,
+                        claimed_at: now,
+                        retry_attempt: row.retry_attempt as u32,
+                    },
+                    data: RequestData {
+                        id: RequestId(row.id),
+                        batch_id: BatchId(row.batch_id),
+                        template_id: TemplateId(row.template_id),
+                        custom_id: row.custom_id,
+                        endpoint: row.endpoint,
+                        method: row.method,
+                        path: row.path,
+                        body: row.body,
+                        model: row.model,
+                        api_key: row.api_key,
+                    },
+                }));
+            }
+        }
+
+        tracing::debug!(
+            total_claimed = all_claimed.len(),
+            "Finished claiming requests across all models"
+        );
+
+        Ok(all_claimed)
     }
 
     async fn persist<T: RequestState + Clone>(&self, request: &Request<T>) -> Result<()>
@@ -1573,8 +1644,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         // bulk insert requests from templates
         let rows_affected = sqlx::query!(
             r#"
-            INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt)
-            SELECT $1, id, 'pending', custom_id, 0
+            INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt, model)
+            SELECT $1, id, 'pending', custom_id, 0, model
             FROM request_templates
             WHERE file_id = $2
             "#,
@@ -1643,11 +1714,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             FROM batches b
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -1659,6 +1730,52 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
         .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+
+        // Lazy computation of terminal timestamps
+        // Check if batch is in terminal state and update timestamps if needed
+        let terminal_count = row.completed_requests + row.failed_requests + row.canceled_requests;
+        let is_terminal = terminal_count == row.total_requests && row.total_requests > 0;
+
+        let (finalizing_at, completed_at, failed_at) = if is_terminal
+            && row.completed_at.is_none()
+            && row.failed_at.is_none()
+            && row.cancelled_at.is_none()
+        {
+            let now = Utc::now();
+
+            // Determine which terminal state based on counts
+            let (finalizing, completed, failed) = if row.completed_requests > 0 {
+                // At least one completion = completed batch
+                (Some(now), Some(now), None)
+            } else {
+                // No completions = failed batch
+                (Some(now), None, Some(now))
+            };
+
+            // Update the database with the terminal timestamps
+            sqlx::query!(
+                r#"
+                UPDATE batches
+                SET finalizing_at = COALESCE(finalizing_at, $2),
+                    completed_at = COALESCE(completed_at, $3),
+                    failed_at = COALESCE(failed_at, $4)
+                WHERE id = $1
+                "#,
+                *batch_id as Uuid,
+                finalizing,
+                completed,
+                failed,
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
+            })?;
+
+            (finalizing, completed, failed)
+        } else {
+            (row.finalizing_at, row.completed_at, row.failed_at)
+        };
 
         Ok(Batch {
             id: BatchId(row.id),
@@ -1680,9 +1797,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             failed_requests: row.failed_requests,
             canceled_requests: row.canceled_requests,
             requests_started_at: row.requests_started_at,
-            finalizing_at: row.finalizing_at,
-            completed_at: row.completed_at,
-            failed_at: row.failed_at,
+            finalizing_at,
+            completed_at,
+            failed_at,
             cancelled_at: row.cancelled_at,
         })
     }
@@ -1706,11 +1823,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -1919,11 +2036,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             FROM batches b
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -1990,11 +2107,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -2028,11 +2145,17 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
         let now = Utc::now();
 
-        // Set cancelling_at on the batch
+        // Set both cancelling_at and cancelled_at
+        // cancelling_at = source of truth for "batch is being cancelled"
+        // cancelled_at = timestamp of user's cancellation action
+        // Pending requests won't be claimed (claim_requests checks cancelling_at)
+        // In-flight requests will be aborted via polling
+        // Counts will be computed based on cancelling_at + state
         sqlx::query!(
             r#"
             UPDATE batches
-            SET cancelling_at = $2
+            SET cancelling_at = $2,
+                cancelled_at = $2
             WHERE id = $1 AND cancelling_at IS NULL
             "#,
             *batch_id as Uuid,
@@ -2040,27 +2163,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to set cancelling_at: {}", e)))?;
-
-        // Cancel all pending/in-progress requests and notify daemons
-        sqlx::query!(
-            r#"
-            WITH canceled AS (
-                UPDATE requests
-                SET state = 'canceled', canceled_at = $2
-                WHERE batch_id = $1
-                    AND state IN ('pending', 'claimed', 'processing')
-                RETURNING id
-            )
-            SELECT pg_notify('request_cancellations', id::text)
-            FROM canceled
-            "#,
-            *batch_id as Uuid,
-            now,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel batch: {}", e)))?;
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to set cancellation timestamps: {}", e))
+        })?;
 
         Ok(())
     }
@@ -2899,126 +3004,14 @@ impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
             shutdown_token,
         ));
 
-        let manager = self.clone();
         let handle = tokio::spawn(async move {
-            // Create a cancellation stream from PostgreSQL LISTEN/NOTIFY
-            // If we can't create the stream, return error for fail-fast behavior
-            let cancellation_stream = manager.create_cancellation_stream().await?;
-            daemon.run(Some(cancellation_stream)).await
+            // Daemon will poll for cancelled batches periodically
+            daemon.run().await
         });
 
         tracing::info!("Daemon spawned successfully");
 
         Ok(handle)
-    }
-}
-
-impl<H: HttpClient + 'static> PostgresRequestManager<H> {
-    /// Create a stream of request cancellations from PostgreSQL LISTEN/NOTIFY.
-    async fn create_cancellation_stream(
-        &self,
-    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = RequestId> + Send>>> {
-        use futures::StreamExt;
-
-        // Clone the pool so the stream can create new listeners on reconnection
-        let pool = self.pool.clone();
-
-        // Create a stream that handles reconnection internally
-        // State: (pool, optional listener) - we keep the listener alive across iterations
-        type State = (PgPool, Option<sqlx::postgres::PgListener>);
-
-        let stream = futures::stream::unfold((pool, None), |(pool, listener_opt): State| async move {
-            const RECONNECT_DELAY_SECS: u64 = 5;
-
-            let mut listener = match listener_opt {
-                Some(l) => l,
-                None => {
-                    // Need to establish a connection
-                    'reconnect: loop {
-                        // Try to create a new listener
-                        let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
-                            Ok(l) => {
-                                tracing::debug!("Connected to PostgreSQL for cancellation stream");
-                                l
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    "Failed to connect listener for cancellations, retrying in {}s",
-                                    RECONNECT_DELAY_SECS
-                                );
-                                tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                                continue 'reconnect;
-                            }
-                        };
-
-                        // Try to listen to the channel
-                        if let Err(e) = listener.listen("request_cancellations").await {
-                            tracing::error!(
-                                error = %e,
-                                "Failed to LISTEN on request_cancellations channel, retrying in {}s",
-                                RECONNECT_DELAY_SECS
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                            continue 'reconnect;
-                        }
-
-                        tracing::info!("Listening for request cancellations via PostgreSQL NOTIFY");
-                        break listener;
-                    }
-                }
-            };
-
-            // Try to receive a notification from the active listener
-            loop {
-                match listener.try_recv().await {
-                    Ok(Some(notification)) => {
-                        // Parse the request ID from the payload (UUID string)
-                        match notification.payload().parse::<uuid::Uuid>() {
-                            Ok(uuid) => {
-                                // Valid cancellation - return it and keep the connection alive
-                                return Some((RequestId(uuid), (pool, Some(listener))));
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    payload = notification.payload(),
-                                    error = %e,
-                                    "Failed to parse request ID from notification, skipping"
-                                );
-                                // Skip invalid messages, continue listening on same connection
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::error!(
-                            "Connection closed while listening for cancellations, reconnecting in {}s",
-                            RECONNECT_DELAY_SECS
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                        // Drop the listener to trigger reconnect on next iteration
-                        return Some((RequestId(uuid::Uuid::nil()), (pool, None)));
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "PostgreSQL error while listening for cancellations, reconnecting in {}s",
-                            RECONNECT_DELAY_SECS
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                        // Drop the listener to trigger reconnect on next iteration
-                        return Some((RequestId(uuid::Uuid::nil()), (pool, None)));
-                    }
-                }
-            }
-        })
-        .filter(|request_id| {
-            // Filter out nil UUIDs (used for reconnection signaling)
-            let keep = !request_id.0.is_nil();
-            futures::future::ready(keep)
-        })
-        .boxed();
-
-        Ok(stream)
     }
 }
 
@@ -3284,11 +3277,12 @@ mod tests {
         assert_eq!(status_after.pending_requests, 0);
         assert_eq!(status_after.canceled_requests, 3);
 
-        // Get the actual requests to verify their state
+        // Get the actual requests - they remain in Pending state as an optimization
+        // but are logically canceled (the batch has cancelling_at set)
         let requests = manager.get_batch_requests(batch.id).await.unwrap();
         assert_eq!(requests.len(), 3);
         for request in requests {
-            assert!(matches!(request, AnyRequest::Canceled(_)));
+            assert!(matches!(request, AnyRequest::Pending(_)));
         }
     }
 
@@ -4814,103 +4808,40 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_claim_requests_interleaves_by_model(pool: sqlx::PgPool) {
+    async fn test_global_per_model_limit_enforced_across_daemons(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
-        // Create a file with 9 templates: 3 for each of 3 different models
-        // We create them in order: all model-a, then all model-b, then all model-c
+        // Set up manager with per-model limit of 3
+        let mut config = crate::daemon::DaemonConfig::default();
+        config
+            .model_concurrency_limits
+            .insert("model-a".to_string(), 3);
+        config
+            .model_concurrency_limits
+            .insert("model-b".to_string(), 3);
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client).with_config(config),
+        );
+
+        // Create file with 20 requests (10 per model)
+        let mut templates = Vec::new();
+        for model in &["model-a", "model-b"] {
+            for n in 1..=10 {
+                templates.push(RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: format!(r#"{{"model":"{}","n":{}}}"#, model, n),
+                    model: model.to_string(),
+                    api_key: "key".to_string(),
+                });
+            }
+        }
+
         let file_id = manager
-            .create_file(
-                "interleave-test".to_string(),
-                None,
-                vec![
-                    // model-a requests
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"a","n":1}"#.to_string(),
-                        model: "model-a".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"a","n":2}"#.to_string(),
-                        model: "model-a".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"a","n":3}"#.to_string(),
-                        model: "model-a".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    // model-b requests
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"b","n":1}"#.to_string(),
-                        model: "model-b".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"b","n":2}"#.to_string(),
-                        model: "model-b".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"b","n":3}"#.to_string(),
-                        model: "model-b".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    // model-c requests
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"c","n":1}"#.to_string(),
-                        model: "model-c".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"c","n":2}"#.to_string(),
-                        model: "model-c".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"c","n":3}"#.to_string(),
-                        model: "model-c".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                ],
-            )
+            .create_file("multi-daemon-test".to_string(), None, templates)
             .await
             .unwrap();
 
@@ -4925,76 +4856,43 @@ mod tests {
             .await
             .unwrap();
 
-        let daemon_id = DaemonId::from(Uuid::new_v4());
+        // Simulate 3 daemons claiming simultaneously
+        let daemon1_id = DaemonId::from(Uuid::new_v4());
+        let daemon2_id = DaemonId::from(Uuid::new_v4());
+        let daemon3_id = DaemonId::from(Uuid::new_v4());
 
-        // Claim 6 requests - should get 2 from each model in round-robin order
-        let claimed = manager
-            .claim_requests(6, daemon_id)
-            .await
-            .expect("Failed to claim requests");
+        // Each daemon tries to claim 10 requests (more than available per model)
+        let claimed1 = manager.claim_requests(10, daemon1_id).await.unwrap();
+        let claimed2 = manager.claim_requests(10, daemon2_id).await.unwrap();
+        let claimed3 = manager.claim_requests(10, daemon3_id).await.unwrap();
 
-        assert_eq!(claimed.len(), 6);
-
-        // Extract the models in order
-        let models: Vec<&str> = claimed.iter().map(|r| r.data.model.as_str()).collect();
-
-        // With interleaving, we should see a round-robin pattern:
-        // First 3 requests should be from 3 different models
-        // Next 3 requests should also be from the same 3 different models
-        // The order of models isn't guaranteed, but the pattern should repeat
-        let first_three: Vec<&str> = models[0..3].to_vec();
-        let second_three: Vec<&str> = models[3..6].to_vec();
-
-        // Verify all unique (first batch has one from each model)
-        let mut first_sorted = first_three.clone();
-        first_sorted.sort();
-        first_sorted.dedup();
-        assert_eq!(
-            first_sorted.len(),
-            3,
-            "First 3 requests should be from 3 different models"
-        );
-        assert_eq!(
-            first_sorted,
-            vec!["model-a", "model-b", "model-c"],
-            "First 3 requests should cover all 3 models"
-        );
-
-        // Verify the pattern repeats (same order)
-        assert_eq!(
-            first_three, second_three,
-            "The round-robin pattern should repeat: got {:?} then {:?}",
-            first_three, second_three
-        );
-
-        // Verify each model's requests are in chronological order (n=1 before n=2)
-        for model in &["model-a", "model-b", "model-c"] {
-            let model_requests: Vec<&str> = claimed
-                .iter()
-                .filter(|r| r.data.model == *model)
-                .map(|r| r.data.body.as_str())
-                .collect();
-
-            // Should have 2 requests per model
-            assert_eq!(
-                model_requests.len(),
-                2,
-                "Should have 2 requests for {}",
-                model
-            );
-
-            // First should be n=1, second should be n=2
-            assert!(
-                model_requests[0].contains(r#""n":1"#),
-                "First request for {} should be n=1",
-                model
-            );
-            assert!(
-                model_requests[1].contains(r#""n":2"#),
-                "Second request for {} should be n=2",
-                model
-            );
+        // Count requests per model across all daemons
+        let mut model_counts = std::collections::HashMap::new();
+        for claimed in [&claimed1, &claimed2, &claimed3] {
+            for request in claimed {
+                *model_counts.entry(request.data.model.clone()).or_insert(0) += 1;
+            }
         }
+
+        // Verify global per-model limits are enforced
+        assert!(
+            *model_counts.get("model-a").unwrap_or(&0) <= 3,
+            "model-a should not exceed limit of 3 across all daemons, got {}",
+            model_counts.get("model-a").unwrap_or(&0)
+        );
+        assert!(
+            *model_counts.get("model-b").unwrap_or(&0) <= 3,
+            "model-b should not exceed limit of 3 across all daemons, got {}",
+            model_counts.get("model-b").unwrap_or(&0)
+        );
+
+        // Total claimed should be at most 6 (3 per model × 2 models)
+        let total: i32 = model_counts.values().sum();
+        assert!(
+            total <= 6,
+            "Total claimed should not exceed 6 (respecting per-model limits), got {}",
+            total
+        );
     }
 
     // ========================================================================
@@ -5619,7 +5517,6 @@ mod tests {
     async fn test_batch_cancellation_with_stream(pool: sqlx::PgPool) {
         use crate::http::HttpResponse;
         use std::time::Duration;
-        use tokio::sync::mpsc;
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = Arc::new(PostgresRequestManager::with_client(
@@ -5668,10 +5565,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Create a mock cancellation stream using mpsc channel
-        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<RequestId>();
-        let cancellation_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(cancel_rx);
-
         // Set up triggered responses that won't complete until we tell them to
         http_client.clear_calls();
         let trigger1 = http_client.add_response_with_trigger(
@@ -5681,7 +5574,7 @@ mod tests {
                 body: "ok".to_string(),
             }),
         );
-        let trigger2 = http_client.add_response_with_trigger(
+        let _trigger2 = http_client.add_response_with_trigger(
             "POST /test",
             Ok(HttpResponse {
                 status: 200,
@@ -5706,6 +5599,7 @@ mod tests {
             should_retry: Arc::new(|_| false),
             claim_timeout_ms: 5000,
             processing_timeout_ms: 10000,
+            cancellation_poll_interval_ms: 100, // Fast polling for tests
         };
 
         let daemon = Arc::new(crate::daemon::Daemon::new(
@@ -5715,16 +5609,15 @@ mod tests {
             shutdown_token.clone(),
         ));
 
-        // Run daemon with cancellation stream
+        // Run daemon (it will poll for cancelled batches)
         let daemon_handle = tokio::spawn({
             let daemon = daemon.clone();
-            async move { daemon.run(Some(cancellation_stream)).await }
+            async move { daemon.run().await }
         });
 
-        // Get the request IDs from the batch
+        // Verify we have 2 requests in the batch
         let requests = manager.get_batch_requests(batch.id).await.unwrap();
         assert_eq!(requests.len(), 2);
-        let request_ids: Vec<RequestId> = requests.iter().map(|r| r.id()).collect();
 
         // Wait for both requests to be processing (blocked on triggers)
         let manager_clone = manager.clone();
@@ -5745,45 +5638,25 @@ mod tests {
             "Both requests should reach processing state"
         );
 
-        // Send cancellation for first request via the stream
-        cancel_tx.send(request_ids[0]).unwrap();
+        // Cancel the batch - daemon will detect via polling (every 100ms in test)
+        manager.cancel_batch(batch.id).await.unwrap();
 
-        // Wait for first request to be canceled
+        // Wait for both requests to be canceled (batch-level cancellation via polling)
         let manager_clone = manager.clone();
-        let req_id_0 = request_ids[0];
-        let reached_canceled = wait_for(
+        let all_canceled = wait_for(
             || async {
                 if let Ok(reqs) = manager_clone.get_batch_requests(batch_id).await {
-                    if let Some(req) = reqs.iter().find(|r| r.id() == req_id_0) {
-                        return matches!(req, AnyRequest::Canceled(_));
-                    }
+                    return reqs.iter().all(|r| matches!(r, AnyRequest::Canceled(_)));
                 }
                 false
             },
-            Duration::from_secs(3),
+            Duration::from_secs(2), // Fast polling (100ms) should detect quickly
         )
         .await;
-        assert!(reached_canceled, "First request should be canceled");
-
-        // Trigger the second request to complete normally
-        trigger2.send(()).ok();
-
-        // Wait for second request to complete
-        let manager_clone = manager.clone();
-        let req_id_1 = request_ids[1];
-        let reached_completed = wait_for(
-            || async {
-                if let Ok(reqs) = manager_clone.get_batch_requests(batch_id).await {
-                    if let Some(req) = reqs.iter().find(|r| r.id() == req_id_1) {
-                        return matches!(req, AnyRequest::Completed(_));
-                    }
-                }
-                false
-            },
-            Duration::from_secs(3),
-        )
-        .await;
-        assert!(reached_completed, "Second request should complete");
+        assert!(
+            all_canceled,
+            "Both requests should be canceled via batch-level polling"
+        );
 
         // Shutdown daemon
         shutdown_token.cancel();
