@@ -239,75 +239,140 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         let now = Utc::now();
 
-        // Atomically claim pending executions using SELECT FOR UPDATE
-        // Interleave requests from different models using ROW_NUMBER partitioning
-        // This ensures we claim requests round-robin across models rather than
-        // draining one model before moving to the next (important for per-model concurrency)
-        let rows = sqlx::query!(
+        // Get all models with pending requests (using denormalized model column)
+        let mut models = sqlx::query_scalar!(
             r#"
-            WITH locked_requests AS (
-                SELECT r.id, r.template_id, t.model, r.created_at
-                FROM requests r
-                JOIN request_templates t ON r.template_id = t.id
-                WHERE r.state = 'pending'
-                    AND (r.not_before IS NULL OR r.not_before <= $2)
-                FOR UPDATE OF r SKIP LOCKED
-            ),
-            ranked AS (
-                SELECT
-                    id,
-                    template_id,
-                    ROW_NUMBER() OVER (PARTITION BY model ORDER BY created_at) as model_rn,
-                    created_at
-                FROM locked_requests
-            ),
-            to_claim AS (
-                SELECT id, template_id
-                FROM ranked
-                ORDER BY model_rn, created_at ASC
-                LIMIT $3
-            )
-            UPDATE requests r
-            SET
-                state = 'claimed',
-                daemon_id = $1,
-                claimed_at = $2
-            FROM to_claim tc
-            JOIN request_templates t ON tc.template_id = t.id
-            WHERE r.id = tc.id
-            RETURNING r.id, r.batch_id, r.template_id, r.retry_attempt,
-                      t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key
+            SELECT DISTINCT model
+            FROM requests
+            WHERE state = 'pending'
+                AND (not_before IS NULL OR not_before <= $1)
             "#,
-            *daemon_id as Uuid,
-            now,
-            limit as i64,
+            now
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to claim requests: {}", e)))?;
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to get models with pending requests: {}", e))
+        })?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| Request {
-                state: Claimed {
-                    daemon_id,
-                    claimed_at: now,
-                    retry_attempt: row.retry_attempt as u32,
-                },
-                data: RequestData {
-                    id: RequestId(row.id),
-                    batch_id: BatchId(row.batch_id),
-                    template_id: TemplateId(row.template_id),
-                    custom_id: row.custom_id,
-                    endpoint: row.endpoint,
-                    method: row.method,
-                    path: row.path,
-                    body: row.body,
-                    model: row.model,
-                    api_key: row.api_key,
-                },
-            })
-            .collect())
+        // Randomize model order to prevent starvation when hitting global limit
+        {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
+            models.shuffle(&mut rng);
+        } // Drop rng before async operations
+
+        tracing::debug!(
+            model_count = models.len(),
+            "Found models with pending requests"
+        );
+
+        // Claim from models sequentially until we hit the global limit
+        let mut all_claimed = Vec::new();
+        let mut remaining_limit = limit;
+
+        for model in models {
+            if remaining_limit == 0 {
+                break;
+            }
+
+            let model_limit = self
+                .config
+                .model_concurrency_limits
+                .get(&model)
+                .map(|entry| *entry.value())
+                .unwrap_or(self.config.default_model_concurrency);
+
+            // Atomically count in-progress requests and claim available slots in a single query
+            // This ensures the count and claim are consistent (no race condition)
+            let rows = sqlx::query!(
+                r#"
+                WITH in_progress_count AS (
+                    SELECT COUNT(*)::BIGINT as count
+                    FROM requests
+                    WHERE model = $4
+                        AND state IN ('claimed', 'processing')
+                ),
+                available_slots AS (
+                    SELECT GREATEST(0, $2::BIGINT - (SELECT count FROM in_progress_count)) as slots
+                ),
+                to_claim AS (
+                    SELECT r.id, r.template_id
+                    FROM requests r, available_slots
+                    WHERE r.state = 'pending'
+                        AND r.model = $4
+                        AND (r.not_before IS NULL OR r.not_before <= $3)
+                        AND available_slots.slots > 0
+                    ORDER BY r.created_at ASC
+                    LIMIT LEAST($5, (SELECT slots FROM available_slots))
+                    FOR UPDATE OF r SKIP LOCKED
+                )
+                UPDATE requests r
+                SET
+                    state = 'claimed',
+                    daemon_id = $1,
+                    claimed_at = $3
+                FROM to_claim tc
+                JOIN request_templates t ON tc.template_id = t.id
+                WHERE r.id = tc.id
+                RETURNING r.id, r.batch_id, r.template_id, r.retry_attempt,
+                          t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key
+                "#,
+                *daemon_id as Uuid,
+                model_limit as i64,
+                now,
+                &model,
+                remaining_limit as i64,
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to claim requests for model {}: {}",
+                    model,
+                    e
+                ))
+            })?;
+
+            let claimed_count = rows.len();
+            if claimed_count > 0 {
+                tracing::debug!(
+                    model = %model,
+                    claimed = claimed_count,
+                    remaining_limit = remaining_limit - claimed_count,
+                    "Claimed requests for model"
+                );
+
+                remaining_limit -= claimed_count;
+
+                all_claimed.extend(rows.into_iter().map(|row| Request {
+                    state: Claimed {
+                        daemon_id,
+                        claimed_at: now,
+                        retry_attempt: row.retry_attempt as u32,
+                    },
+                    data: RequestData {
+                        id: RequestId(row.id),
+                        batch_id: BatchId(row.batch_id),
+                        template_id: TemplateId(row.template_id),
+                        custom_id: row.custom_id,
+                        endpoint: row.endpoint,
+                        method: row.method,
+                        path: row.path,
+                        body: row.body,
+                        model: row.model,
+                        api_key: row.api_key,
+                    },
+                }));
+            }
+        }
+
+        tracing::debug!(
+            total_claimed = all_claimed.len(),
+            "Finished claiming requests across all models"
+        );
+
+        Ok(all_claimed)
     }
 
     async fn persist<T: RequestState + Clone>(&self, request: &Request<T>) -> Result<()>
@@ -1338,8 +1403,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         // bulk insert requests from templates
         let rows_affected = sqlx::query!(
             r#"
-            INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt)
-            SELECT $1, id, 'pending', custom_id, 0
+            INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt, model)
+            SELECT $1, id, 'pending', custom_id, 0, model
             FROM request_templates
             WHERE file_id = $2
             "#,
@@ -4579,103 +4644,40 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_claim_requests_interleaves_by_model(pool: sqlx::PgPool) {
+    async fn test_global_per_model_limit_enforced_across_daemons(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
-        // Create a file with 9 templates: 3 for each of 3 different models
-        // We create them in order: all model-a, then all model-b, then all model-c
+        // Set up manager with per-model limit of 3
+        let mut config = crate::daemon::DaemonConfig::default();
+        config
+            .model_concurrency_limits
+            .insert("model-a".to_string(), 3);
+        config
+            .model_concurrency_limits
+            .insert("model-b".to_string(), 3);
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client).with_config(config),
+        );
+
+        // Create file with 20 requests (10 per model)
+        let mut templates = Vec::new();
+        for model in &["model-a", "model-b"] {
+            for n in 1..=10 {
+                templates.push(RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: format!(r#"{{"model":"{}","n":{}}}"#, model, n),
+                    model: model.to_string(),
+                    api_key: "key".to_string(),
+                });
+            }
+        }
+
         let file_id = manager
-            .create_file(
-                "interleave-test".to_string(),
-                None,
-                vec![
-                    // model-a requests
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"a","n":1}"#.to_string(),
-                        model: "model-a".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"a","n":2}"#.to_string(),
-                        model: "model-a".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"a","n":3}"#.to_string(),
-                        model: "model-a".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    // model-b requests
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"b","n":1}"#.to_string(),
-                        model: "model-b".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"b","n":2}"#.to_string(),
-                        model: "model-b".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"b","n":3}"#.to_string(),
-                        model: "model-b".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    // model-c requests
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"c","n":1}"#.to_string(),
-                        model: "model-c".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"c","n":2}"#.to_string(),
-                        model: "model-c".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"model":"c","n":3}"#.to_string(),
-                        model: "model-c".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                ],
-            )
+            .create_file("multi-daemon-test".to_string(), None, templates)
             .await
             .unwrap();
 
@@ -4690,76 +4692,43 @@ mod tests {
             .await
             .unwrap();
 
-        let daemon_id = DaemonId::from(Uuid::new_v4());
+        // Simulate 3 daemons claiming simultaneously
+        let daemon1_id = DaemonId::from(Uuid::new_v4());
+        let daemon2_id = DaemonId::from(Uuid::new_v4());
+        let daemon3_id = DaemonId::from(Uuid::new_v4());
 
-        // Claim 6 requests - should get 2 from each model in round-robin order
-        let claimed = manager
-            .claim_requests(6, daemon_id)
-            .await
-            .expect("Failed to claim requests");
+        // Each daemon tries to claim 10 requests (more than available per model)
+        let claimed1 = manager.claim_requests(10, daemon1_id).await.unwrap();
+        let claimed2 = manager.claim_requests(10, daemon2_id).await.unwrap();
+        let claimed3 = manager.claim_requests(10, daemon3_id).await.unwrap();
 
-        assert_eq!(claimed.len(), 6);
-
-        // Extract the models in order
-        let models: Vec<&str> = claimed.iter().map(|r| r.data.model.as_str()).collect();
-
-        // With interleaving, we should see a round-robin pattern:
-        // First 3 requests should be from 3 different models
-        // Next 3 requests should also be from the same 3 different models
-        // The order of models isn't guaranteed, but the pattern should repeat
-        let first_three: Vec<&str> = models[0..3].to_vec();
-        let second_three: Vec<&str> = models[3..6].to_vec();
-
-        // Verify all unique (first batch has one from each model)
-        let mut first_sorted = first_three.clone();
-        first_sorted.sort();
-        first_sorted.dedup();
-        assert_eq!(
-            first_sorted.len(),
-            3,
-            "First 3 requests should be from 3 different models"
-        );
-        assert_eq!(
-            first_sorted,
-            vec!["model-a", "model-b", "model-c"],
-            "First 3 requests should cover all 3 models"
-        );
-
-        // Verify the pattern repeats (same order)
-        assert_eq!(
-            first_three, second_three,
-            "The round-robin pattern should repeat: got {:?} then {:?}",
-            first_three, second_three
-        );
-
-        // Verify each model's requests are in chronological order (n=1 before n=2)
-        for model in &["model-a", "model-b", "model-c"] {
-            let model_requests: Vec<&str> = claimed
-                .iter()
-                .filter(|r| r.data.model == *model)
-                .map(|r| r.data.body.as_str())
-                .collect();
-
-            // Should have 2 requests per model
-            assert_eq!(
-                model_requests.len(),
-                2,
-                "Should have 2 requests for {}",
-                model
-            );
-
-            // First should be n=1, second should be n=2
-            assert!(
-                model_requests[0].contains(r#""n":1"#),
-                "First request for {} should be n=1",
-                model
-            );
-            assert!(
-                model_requests[1].contains(r#""n":2"#),
-                "Second request for {} should be n=2",
-                model
-            );
+        // Count requests per model across all daemons
+        let mut model_counts = std::collections::HashMap::new();
+        for claimed in [&claimed1, &claimed2, &claimed3] {
+            for request in claimed {
+                *model_counts.entry(request.data.model.clone()).or_insert(0) += 1;
+            }
         }
+
+        // Verify global per-model limits are enforced
+        assert!(
+            *model_counts.get("model-a").unwrap_or(&0) <= 3,
+            "model-a should not exceed limit of 3 across all daemons, got {}",
+            model_counts.get("model-a").unwrap_or(&0)
+        );
+        assert!(
+            *model_counts.get("model-b").unwrap_or(&0) <= 3,
+            "model-b should not exceed limit of 3 across all daemons, got {}",
+            model_counts.get("model-b").unwrap_or(&0)
+        );
+
+        // Total claimed should be at most 6 (3 per model × 2 models)
+        let total: i32 = model_counts.values().sum();
+        assert!(
+            total <= 6,
+            "Total claimed should not exceed 6 (respecting per-model limits), got {}",
+            total
+        );
     }
 
     // ========================================================================

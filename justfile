@@ -56,8 +56,8 @@ db-start:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    if docker ps -a --format '{{.Names}}' | grep -q "^test-postgres$"; then
-        if docker ps --format '{{.Names}}' | grep -q "^test-postgres$"; then
+    if docker ps -a --format '{{{{.Names}}}}' | grep -q "^test-postgres$"; then
+        if docker ps --format '{{{{.Names}}}}' | grep -q "^test-postgres$"; then
             echo "✅ test-postgres container is already running"
         else
             echo "Starting existing test-postgres container..."
@@ -70,7 +70,7 @@ db-start:
           -e POSTGRES_PASSWORD=password \
           -e POSTGRES_HOST_AUTH_METHOD=trust \
           -p 5432:5432 \
-          -v test-postgres-data:/var/lib/postgresql/data \
+          -v test-postgres-data:/var/lib/postgresql/ \
           -d postgres:latest \
           postgres -c fsync=off
     fi
@@ -90,7 +90,7 @@ db-stop *args="":
     #!/usr/bin/env bash
     set -euo pipefail
 
-    if docker ps --format '{{.Names}}' | grep -q "^test-postgres$"; then
+    if docker ps --format '{{{{.Names}}}}' | grep -q "^test-postgres$"; then
         echo "Stopping test-postgres container..."
         docker stop test-postgres
 
