@@ -820,7 +820,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                 r#"
                                 SELECT EXISTS(
                                     SELECT 1 FROM files
-                                    WHERE name = $1 
+                                    WHERE name = $1
                                     AND ($2::TEXT IS NULL AND uploaded_by IS NULL OR uploaded_by = $2)
                                 ) as "exists!"
                                 "#,
@@ -831,7 +831,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             .await
                             .map_err(|e| {
                                 FusilladeError::Other(anyhow!(
-                                    "Failed to check filename uniqueness: {}", 
+                                    "Failed to check filename uniqueness: {}",
                                     e
                                 ))
                             })?;
@@ -4577,7 +4577,7 @@ mod tests {
         let http_client = Arc::new(MockHttpClient::new());
 
         // Set up manager with per-model limit of 3
-        let mut config = crate::daemon::DaemonConfig::default();
+        let config = crate::daemon::DaemonConfig::default();
         config
             .model_concurrency_limits
             .insert("model-a".to_string(), 3);
