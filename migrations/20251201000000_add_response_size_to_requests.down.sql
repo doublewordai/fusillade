@@ -1,5 +1,5 @@
 -- Remove size finalization tracking from files
-DROP INDEX IF EXISTS idx_files_size_finalized;
+DROP INDEX IF EXISTS idx_files_unfinalized_batch_files;
 
 ALTER TABLE files
 DROP COLUMN IF EXISTS size_finalized;

@@ -53,7 +53,7 @@ pub fn calculate_jsonl_output_overhead_per_line(
     response_status: i16,
 ) -> i64 {
     // Base structure without custom_id or body
-    let mut overhead = 8 +  // '{"id":"'
+    let mut overhead = 7 +  // '{"id":"'
         10 + // 'batch_req_'
         36 + // UUID length
         2; // '",'
@@ -71,12 +71,12 @@ pub fn calculate_jsonl_output_overhead_per_line(
         }
     };
 
-    overhead += 12 + // ',"response":{'
-        16 + // '"status_code":'
+    overhead += 13 + // ',"response":{'
+        14 + // '"status_code":'
         response_status.to_string().len() +
-        9 +  // ',"body":'
+        8 +  // ',"body":'
         // Note: actual body size will be added separately by caller
-        4 +  // '}}\n' (closing response, root, and newline)
+        3 +  // '}}\n' (closing response, root, and newline)
         50; // Fixed error margin (see function docs for breakdown)
 
     overhead as i64
@@ -97,7 +97,7 @@ pub fn calculate_jsonl_output_overhead_per_line(
 /// message size should already include JSON serialization overhead from the caller.
 pub fn calculate_jsonl_error_overhead_per_line(custom_id: &Option<String>) -> i64 {
     // Base structure without custom_id or error message
-    let mut overhead = 8 +  // '{"id":"'
+    let mut overhead = 7 +  // '{"id":"'
         10 + // 'batch_req_'
         36 + // UUID length
         2; // '",'
@@ -106,8 +106,8 @@ pub fn calculate_jsonl_error_overhead_per_line(custom_id: &Option<String>) -> i6
     // Note: custom_id value is assumed to be already JSON-escaped by the caller
     overhead += match custom_id {
         Some(id) => {
-            // '","custom_id":"' (14 chars) + value + closing '"' (1 char)
-            14 + id.len() + 1
+            // '","custom_id":"' (14 chars) + value + closing '"'
+            13 + id.len() + 1
         }
         None => {
             // '","custom_id":null' (16 chars)
@@ -116,10 +116,10 @@ pub fn calculate_jsonl_error_overhead_per_line(custom_id: &Option<String>) -> i6
     };
 
     overhead += 10 + // ',"response":'
-        23 + // 'null,"error":{"code":'
-        27 + // 'null,"message":"'
+        21 + // 'null,"error":{"code":'
+        16 + // 'null,"message":"'
         // Note: actual error message size will be added separately by caller
-        5 +  // '"}}\n'
+        4 +  // '"}}\n'
         20; // Fixed error margin (see function docs)
 
     overhead as i64

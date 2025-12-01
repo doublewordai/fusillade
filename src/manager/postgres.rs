@@ -224,7 +224,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
 
     /// Generate a consistent advisory lock key for a file
     fn file_lock_key(file_id: FileId) -> i64 {
-        (file_id.0.as_u128().wrapping_rem(i64::MAX as u128)) as i64
+        file_id.0.as_u128() as u64 as i64
     }
 
     /// Calculate the estimated file size for a virtual batch file.

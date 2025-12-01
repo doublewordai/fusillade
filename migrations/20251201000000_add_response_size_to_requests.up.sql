@@ -19,7 +19,7 @@ INCLUDE (response_size);
 ALTER TABLE files
 ADD COLUMN size_finalized BOOLEAN NOT NULL DEFAULT FALSE;
 
--- Partial index for finding unfinaliz virtual batch files
+-- Partial index for finding unfinalized virtual batch files
 -- These are the only files where we need to calculate size on-the-fly
 CREATE INDEX idx_files_unfinalized_batch_files
 ON files(purpose, size_finalized)
