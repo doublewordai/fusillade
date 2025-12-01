@@ -269,42 +269,39 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
 
         // Get raw size sum from LATERAL join
         let raw_size_sum: Option<i64> = row.try_get("calculated_size").ok().flatten();
+        let raw_sum = raw_size_sum.unwrap_or(0);
 
-        if let Some(raw_sum) = raw_size_sum {
-            // Get request count for this file type
-            let completed: Option<i64> = row.try_get("completed_requests").ok().flatten();
-            let failed: Option<i64> = row.try_get("failed_requests").ok().flatten();
+        // Get request count for this file type
+        let completed: Option<i64> = row.try_get("completed_requests").ok().flatten();
+        let failed: Option<i64> = row.try_get("failed_requests").ok().flatten();
 
-            let request_count = if purpose == &Some(crate::batch::Purpose::BatchOutput) {
-                completed.unwrap_or(0)
-            } else {
-                failed.unwrap_or(0)
-            };
+        let request_count = if purpose == &Some(crate::batch::Purpose::BatchOutput) {
+            completed.unwrap_or(0)
+        } else {
+            failed.unwrap_or(0)
+        };
 
-            if request_count == 0 {
-                return Ok(Some(0));
-            }
-
-            // Add JSONL overhead
-            let estimated_size = if purpose == &Some(crate::batch::Purpose::BatchOutput) {
-                estimate_output_file_size(raw_sum, request_count, None)
-            } else {
-                estimate_error_file_size(raw_sum, request_count, None)
-            };
-
-            // If estimation failed (overflow), log a warning and return None
-            if estimated_size.is_none() {
-                tracing::warn!(
-                    "File size estimation overflow for {:?} file with {} requests",
-                    purpose,
-                    request_count
-                );
-            }
-
-            return Ok(estimated_size);
+        if request_count == 0 {
+            return Ok(Some(0));
         }
 
-        Ok(None)
+        // Add JSONL overhead
+        let estimated_size = if purpose == &Some(crate::batch::Purpose::BatchOutput) {
+            estimate_output_file_size(raw_sum, request_count, None)
+        } else {
+            estimate_error_file_size(raw_sum, request_count, None)
+        };
+
+        // If estimation failed (overflow), log a warning and return None
+        if estimated_size.is_none() {
+            tracing::warn!(
+                "File size estimation overflow for {:?} file with {} requests",
+                purpose,
+                request_count
+            );
+        }
+
+        Ok(estimated_size)
     }
 
     /// Check if a batch is complete based on request counts.
