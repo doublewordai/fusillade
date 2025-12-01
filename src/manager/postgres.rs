@@ -37,8 +37,10 @@ use crate::request::{
 };
 
 use super::DaemonExecutor;
-use super::utils::{calculate_error_size, calculate_output_size};
-
+use super::utils::{
+    calculate_error_message_size, calculate_response_body_size, estimate_error_file_size,
+    estimate_output_file_size,
+};
 /// PostgreSQL implementation of the Storage and DaemonExecutor traits.
 ///
 /// This manager uses PostgreSQL for persistent storage and runs a daemon for processing requests.
@@ -244,146 +246,82 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
             batch.completed_requests + batch.failed_requests + batch.canceled_requests;
         let is_complete = terminal_count == batch.total_requests && batch.total_requests > 0;
 
-        if !is_complete {
-            // Batch still in progress - calculate current size but don't finalize
-            let state_filter = match file_type {
-                OutputFileType::Output => "completed",
-                OutputFileType::Error => "failed",
-            };
+        let state_filter = match file_type {
+            OutputFileType::Output => "completed",
+            OutputFileType::Error => "failed",
+        };
 
-            let size = sqlx::query_scalar!(
-                r#"
-                SELECT SUM(response_size)::BIGINT as "size"
-                FROM requests
-                WHERE batch_id = $1 AND state = $2
-                "#,
-                *batch.id as Uuid,
-                state_filter,
-            )
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to calculate file size: {}", e)))?;
-
-            file.size_bytes = size.unwrap_or(0);
-            return Ok(());
-        }
-
-        // Batch is complete - finalize both output and error files atomically
-        // Use an advisory lock to prevent concurrent finalization attempts
-        let lock_acquired = sqlx::query_scalar!(
-            "SELECT pg_try_advisory_xact_lock(hashtext($1))",
-            format!("finalize_batch_{}", batch.id.0)
+        let raw_size_sum = sqlx::query_scalar!(
+            r#"
+            SELECT COALESCE(SUM(response_size), 0)::BIGINT as "sum!"
+            FROM requests
+            WHERE batch_id = $1 AND state = $2
+            "#,
+            *batch.id as Uuid,
+            state_filter,
         )
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to acquire lock: {}", e)))?
-        .unwrap_or(false);
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to calculate file size: {}", e)))?;
 
-        if !lock_acquired {
-            // Another request is already finalizing, just return current sizes
-            let state_filter = match file_type {
-                OutputFileType::Output => "completed",
-                OutputFileType::Error => "failed",
-            };
+        // Get request count for overhead calculation
+        let request_count = match file_type {
+            OutputFileType::Output => batch.completed_requests,
+            OutputFileType::Error => batch.failed_requests,
+        };
 
-            let size = sqlx::query_scalar!(
-                r#"
-                SELECT SUM(response_size)::BIGINT as "size"
-                FROM requests
-                WHERE batch_id = $1 AND state = $2
-                "#,
-                *batch.id as Uuid,
-                state_filter,
-            )
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to calculate file size: {}", e)))?;
+        // Add JSONL formatting overhead
+        // Use conservative estimates: avg custom_id length of 20, status code 200
+        let estimated_size = match file_type {
+            OutputFileType::Output => {
+                estimate_output_file_size(raw_size_sum, request_count, 20, 200)
+            }
+            OutputFileType::Error => estimate_error_file_size(raw_size_sum, request_count, 20),
+        };
 
-            file.size_bytes = size.unwrap_or(0);
+        // Update with JSONL-formatted estimate
+        file.size_bytes = estimated_size;
+
+        // Don't finalzie if not complete
+        if !is_complete {
             return Ok(());
         }
 
-        // We have the lock - finalize both files in a transaction
-        let mut tx =
-            self.pool.begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        // Batch is complete - try to finalize this file
+        // Use session-scoped advisory lock to prevent concurrent finalization
+        let lock_key = file.id.0.as_u128() as i64;
 
-        // Calculate and finalize output file
-        if let Some(output_file_id) = batch.output_file_id {
-            let output_size = sqlx::query_scalar!(
-                r#"
-                SELECT SUM(response_size)::BIGINT as "size"
-                FROM requests
-                WHERE batch_id = $1 AND state = 'completed'
-                "#,
-                *batch.id as Uuid,
-            )
-            .fetch_one(&mut *tx)
+        let lock_acquired = sqlx::query_scalar!("SELECT pg_try_advisory_lock($1)", lock_key)
+            .fetch_one(&self.pool)
             .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to calculate output file size: {}", e))
-            })?;
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to acquire lock: {}", e)))?
+            .unwrap_or(false);
 
-            sqlx::query!(
-                r#"
-                UPDATE files
-                SET size_bytes = $2, size_finalized = TRUE
-                WHERE id = $1 AND size_finalized = FALSE
-                "#,
-                *output_file_id as Uuid,
-                output_size.unwrap_or(0),
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to update output file size: {}", e))
-            })?;
+        // We didnt get the lock - another process is finalizing (would write same data)
+        if !lock_acquired {
+            return Ok(());
         }
 
-        // Calculate and finalize error file
-        if let Some(error_file_id) = batch.error_file_id {
-            let error_size = sqlx::query_scalar!(
-                r#"
-                SELECT SUM(response_size)::BIGINT as "size"
-                FROM requests
-                WHERE batch_id = $1 AND state = 'failed'
-                "#,
-                *batch.id as Uuid,
-            )
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to calculate error file size: {}", e))
-            })?;
+        // We have the lock - finalize the file size with the estimated size
+        sqlx::query!(
+            r#"
+            UPDATE files
+            SET size_bytes = $2, size_finalized = TRUE
+            WHERE id = $1 AND size_finalized = FALSE
+            "#,
+            *file.id as Uuid,
+            estimated_size,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file size: {}", e)))?;
 
-            sqlx::query!(
-                r#"
-                UPDATE files
-                SET size_bytes = $2, size_finalized = TRUE
-                WHERE id = $1 AND size_finalized = FALSE
-                "#,
-                *error_file_id as Uuid,
-                error_size.unwrap_or(0),
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to update error file size: {}", e))
-            })?;
-        }
+        // Release the lock
+        let _ = sqlx::query_scalar!("SELECT pg_advisory_unlock($1)", lock_key)
+            .fetch_one(&self.pool)
+            .await;
 
-        tx.commit()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
-
-        // Update in-memory file object
-        if file.id == batch.output_file_id.unwrap_or(FileId(Uuid::nil()))
-            || file.id == batch.error_file_id.unwrap_or(FileId(Uuid::nil()))
-        {
-            file.size_finalized = true;
-        }
-
+        file.size_finalized = true;
         Ok(())
     }
 
@@ -678,11 +616,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 }
             }
             AnyRequest::Completed(req) => {
-                let response_size = calculate_output_size(
-                    &req.data.custom_id,
-                    req.state.response_status as i16,
-                    &req.state.response_body,
-                );
+                // Store the raw response body size
+                let response_size = calculate_response_body_size(&req.state.response_body);
 
                 let rows_affected = sqlx::query!(
                     r#"
@@ -719,7 +654,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     FusilladeError::Other(anyhow!("Failed to serialize failure reason: {}", e))
                 })?;
 
-                let response_size = calculate_error_size(&req.data.custom_id, &error_json);
+                // Store raw error message size
+                let response_size = calculate_error_message_size(&error_json);
 
                 let rows_affected = sqlx::query!(
                     r#"
@@ -1535,71 +1471,99 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 && (purpose == Some(crate::batch::Purpose::BatchOutput)
                     || purpose == Some(crate::batch::Purpose::BatchError))
             {
-                // Use the calculated size from the LATERAL join
-                let calculated_size: Option<i64> = row.try_get("calculated_size").map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to read calculated_size: {}", e))
-                })?;
+                // Get raw size sum and request count from LATERAL join
+                let raw_size_sum: Option<i64> = row.try_get("calculated_size").ok().flatten();
 
-                if let Some(calc_size) = calculated_size {
-                    size_bytes = calc_size;
-                }
+                if let Some(raw_sum) = raw_size_sum {
+                    // Add JSONL formatting overhead
+                    let batch_id: Option<Uuid> = row.try_get("batch_id").ok().flatten();
+                    if let Some(_batch_id) = batch_id {
+                        let total: Option<i64> = row.try_get("total_requests").ok().flatten();
+                        let completed: Option<i64> =
+                            row.try_get("completed_requests").ok().flatten();
+                        let failed: Option<i64> = row.try_get("failed_requests").ok().flatten();
+                        let canceled: Option<i64> = row.try_get("canceled_requests").ok().flatten();
+                        let in_progress: Option<i64> =
+                            row.try_get("in_progress_requests").ok().flatten();
 
-                // Check if batch is complete and spawn background finalization
-                let batch_id: Option<Uuid> = row.try_get("batch_id").ok().flatten();
-                if let Some(_batch_id) = batch_id {
-                    let total: Option<i64> = row.try_get("total_requests").ok().flatten();
-                    let completed: Option<i64> = row.try_get("completed_requests").ok().flatten();
-                    let failed: Option<i64> = row.try_get("failed_requests").ok().flatten();
-                    let canceled: Option<i64> = row.try_get("canceled_requests").ok().flatten();
-                    let in_progress: Option<i64> =
-                        row.try_get("in_progress_requests").ok().flatten();
+                        // Calculate request count for this file type
+                        let request_count = if purpose == Some(crate::batch::Purpose::BatchOutput) {
+                            completed.unwrap_or(0)
+                        } else {
+                            failed.unwrap_or(0)
+                        };
 
-                    // Check if batch is complete (all requests terminal)
-                    if let (Some(total_count), Some(comp), Some(fail), Some(canc), Some(prog)) =
-                        (total, completed, failed, canceled, in_progress)
-                    {
-                        let terminal_count = comp + fail + canc;
-                        let is_complete =
-                            terminal_count == total_count && prog == 0 && total_count > 0;
+                        // Add JSONL overhead to get estimated file size
+                        let estimated_size = if purpose == Some(crate::batch::Purpose::BatchOutput)
+                        {
+                            estimate_output_file_size(raw_sum, request_count, 20, 200)
+                        } else {
+                            estimate_error_file_size(raw_sum, request_count, 20)
+                        };
 
-                        if is_complete {
-                            // Spawn background finalization task - don't block listing
-                            let file_id = FileId(id);
-                            let size = size_bytes;
-                            let pool = self.pool.clone();
+                        size_bytes = estimated_size;
 
-                            tokio::spawn(async move {
-                                // Try to acquire advisory lock (non-blocking)
-                                let lock_result = sqlx::query_scalar!(
-                                    "SELECT pg_try_advisory_xact_lock(hashtext($1))",
-                                    format!("finalize_file_{}", file_id.0)
-                                )
-                                .fetch_one(&pool)
-                                .await;
+                        // Check if batch is complete (all requests terminal)
+                        if let (Some(total_count), Some(comp), Some(fail), Some(canc), Some(prog)) =
+                            (total, completed, failed, canceled, in_progress)
+                        {
+                            let terminal_count = comp + fail + canc;
+                            let is_complete =
+                                terminal_count == total_count && prog == 0 && total_count > 0;
 
-                                if let Ok(Some(true)) = lock_result {
-                                    // We got the lock - finalize the file
-                                    if let Err(e) = sqlx::query!(
-                                        r#"
-                                        UPDATE files
-                                        SET size_bytes = $2, size_finalized = TRUE
-                                        WHERE id = $1 AND size_finalized = FALSE
-                                        "#,
-                                        *file_id as Uuid,
-                                        size,
+                            if is_complete {
+                                // Spawn background finalization task - don't block listing
+                                let file_id = FileId(id);
+                                let size = size_bytes;
+                                let pool = self.pool.clone();
+
+                                tokio::spawn(async move {
+                                    // Try to acquire advisory lock (non-blocking, session-scoped)
+                                    // Use a consistent hash of the file_id to generate a lock key
+                                    let lock_key = file_id.0.as_u128() as i64;
+
+                                    let lock_acquired = sqlx::query_scalar!(
+                                        "SELECT pg_try_advisory_lock($1)",
+                                        lock_key
                                     )
-                                    .execute(&pool)
+                                    .fetch_one(&pool)
                                     .await
-                                    {
-                                        tracing::warn!(
-                                            "Failed to finalize file size for {}: {}",
-                                            file_id,
-                                            e
-                                        );
+                                    .unwrap_or(Some(false))
+                                    .unwrap_or(false);
+
+                                    if lock_acquired {
+                                        // We got the lock - finalize the file
+                                        let result = sqlx::query!(
+                                            r#"
+                                            UPDATE files
+                                            SET size_bytes = $2, size_finalized = TRUE
+                                            WHERE id = $1 AND size_finalized = FALSE
+                                            "#,
+                                            *file_id as Uuid,
+                                            size,
+                                        )
+                                        .execute(&pool)
+                                        .await;
+
+                                        if let Err(e) = result {
+                                            tracing::warn!(
+                                                "Failed to finalize file size for {}: {}",
+                                                file_id,
+                                                e
+                                            );
+                                        }
+
+                                        // Release the lock
+                                        let _ = sqlx::query_scalar!(
+                                            "SELECT pg_advisory_unlock($1)",
+                                            lock_key
+                                        )
+                                        .fetch_one(&pool)
+                                        .await;
                                     }
-                                }
-                                // If we didn't get the lock, someone else is finalizing - that's fine
-                            });
+                                    // If we didn't get the lock, someone else is finalizing - that's fine
+                                });
+                            }
                         }
                     }
                 }
