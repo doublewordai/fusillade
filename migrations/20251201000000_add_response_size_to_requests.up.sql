@@ -10,7 +10,7 @@ COMMENT ON COLUMN requests.response_size IS
 
 -- Add index to efficiently sum response sizes by batch and state
 CREATE INDEX idx_requests_batch_state_size 
-ON requests(batch_id, state, response_size);
+ON requests(batch_id, state);
 
 -- Add flag to track if file size has been finalized
 -- This prevents re-aggregation on every fetch for completed batches with 0-size files
