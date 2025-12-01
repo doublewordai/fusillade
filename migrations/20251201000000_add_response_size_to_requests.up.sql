@@ -10,17 +10,21 @@ COMMENT ON COLUMN requests.response_size IS
 
 -- Add index to efficiently sum response sizes by batch and state
 CREATE INDEX idx_requests_batch_state_size 
-ON requests(batch_id, state);
+ON requests(batch_id, state)
+INCLUDE (response_size);
 
 -- Add flag to track if file size has been finalized
--- This prevents re-aggregation on every fetch for completed batches with 0-size files
+-- This prevents re-aggregation on every fetch for completed batches
 
 ALTER TABLE files
 ADD COLUMN size_finalized BOOLEAN NOT NULL DEFAULT FALSE;
 
-CREATE INDEX idx_files_size_finalized 
-ON files(id) 
-WHERE size_finalized = FALSE;
+-- Partial index for finding unfinaliz virtual batch files
+-- These are the only files where we need to calculate size on-the-fly
+CREATE INDEX idx_files_unfinalized_batch_files
+ON files(purpose, size_finalized)
+WHERE size_finalized = FALSE 
+  AND purpose IN ('batch_output', 'batch_error');
 
 COMMENT ON COLUMN files.size_finalized IS 
     'Whether the size_bytes value has been finalized from request response_size aggregation. FALSE means size needs to be calculated/cached, TRUE means size_bytes is final.';

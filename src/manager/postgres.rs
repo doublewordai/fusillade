@@ -224,7 +224,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
 
     /// Generate a consistent advisory lock key for a file
     fn file_lock_key(file_id: FileId) -> i64 {
-        file_id.0.as_u128() as i64
+        (file_id.0.as_u128().wrapping_rem(i64::MAX as u128)) as i64
     }
 
     /// Calculate the estimated file size for a virtual batch file.
@@ -246,12 +246,8 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
 
         // Add JSONL overhead to get estimated file size - return directly
         match file_type {
-            OutputFileType::Output => {
-                estimate_output_file_size(raw_size_sum, request_count, 20, 200)
-            }
-            OutputFileType::Error => {
-                estimate_error_file_size(raw_size_sum, request_count, 20)
-            }
+            OutputFileType::Output => estimate_output_file_size(raw_size_sum, request_count, None),
+            OutputFileType::Error => estimate_error_file_size(raw_size_sum, request_count, None),
         }
     }
 
@@ -291,9 +287,9 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
 
             // Add JSONL overhead
             let estimated_size = if purpose == &Some(crate::batch::Purpose::BatchOutput) {
-                estimate_output_file_size(raw_sum, request_count, 20, 200)
+                estimate_output_file_size(raw_sum, request_count, None)
             } else {
-                estimate_error_file_size(raw_sum, request_count, 20)
+                estimate_error_file_size(raw_sum, request_count, None)
             };
 
             // If estimation failed (overflow), log a warning and return None
@@ -329,11 +325,32 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         let lock_key = Self::file_lock_key(file_id);
 
         // Try to acquire advisory lock (non-blocking)
-        let lock_acquired = sqlx::query_scalar!("SELECT pg_try_advisory_lock($1)", lock_key)
+        let lock_acquired = match sqlx::query_scalar!("SELECT pg_try_advisory_lock($1)", lock_key)
             .fetch_one(pool)
             .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to acquire lock: {}", e)))?
-            .unwrap_or(false);
+        {
+            Ok(Some(acquired)) => acquired,
+            Ok(None) => {
+                // Unexpected - pg_try_advisory_lock shouldn't return NULL
+                tracing::warn!(
+                    file_id = %file_id,
+                    "Advisory lock query returned NULL unexpectedly"
+                );
+                false
+            }
+            Err(e) => {
+                // Database error - this IS a problem
+                tracing::error!(
+                    file_id = %file_id,
+                    error = %e,
+                    "Database error while trying to acquire advisory lock"
+                );
+                return Err(FusilladeError::Other(anyhow!(
+                    "Failed to acquire lock: {}",
+                    e
+                )));
+            }
+        };
 
         if !lock_acquired {
             // Another process is finalizing
@@ -354,10 +371,17 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file size: {}", e)));
 
-        // Release the lock
-        let _ = sqlx::query_scalar!("SELECT pg_advisory_unlock($1)", lock_key)
+        // Release the lock - only log if release fails (which is unusual)
+        if let Err(e) = sqlx::query_scalar!("SELECT pg_advisory_unlock($1)", lock_key)
             .fetch_one(pool)
-            .await;
+            .await
+        {
+            tracing::warn!(
+                file_id = %file_id,
+                error = %e,
+                "Failed to release advisory lock (will be released on connection return to pool)"
+            );
+        }
 
         result?;
         Ok(true)
@@ -378,11 +402,11 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         let canceled: Option<i64> = row.try_get("canceled_requests").ok().flatten();
         let in_progress: Option<i64> = row.try_get("in_progress_requests").ok().flatten();
 
-        if let (Some(total_count), Some(comp), Some(fail), Some(canc), Some(prog)) =
+        if let (Some(total_count), Some(comp), Some(fail), Some(canc), Some(_prog)) =
             (total, completed, failed, canceled, in_progress)
         {
             let terminal_count = comp + fail + canc;
-            let is_complete = terminal_count == total_count && prog == 0 && total_count > 0;
+            let is_complete = terminal_count == total_count && total_count > 0;
 
             if is_complete {
                 // Spawn background finalization - don't block listing
@@ -1472,7 +1496,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 WHERE r.batch_id = b.id
                 AND ((f.purpose = 'batch_output' AND r.state = 'completed') OR
                     (f.purpose = 'batch_error' AND r.state = 'failed'))
-            ) size_calc ON (f.purpose IN ('batch_output', 'batch_error') AND f.size_finalized = FALSE)
+            ) size_calc ON (f.purpose IN ('batch_output', 'batch_error') AND f.size_finalized = FALSE AND b.id IS NOT NULL)
             "#,
         );
 

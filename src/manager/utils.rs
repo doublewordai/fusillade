@@ -1,3 +1,22 @@
+/// Default average custom_id length for JSONL overhead estimation.
+///
+/// This is a conservative estimate used when actual custom_id data isn't available.
+/// Based on typical UUID format (36 chars) or short identifiers (10-20 chars).
+///
+/// Why 20? It's a middle ground that works well for most use cases:
+/// - Short IDs (e.g., "req-123"): ~10 bytes
+/// - UUIDs (e.g., "550e8400-e29b-41d4-a716-446655440000"): 36 bytes
+/// - Custom strings: typically 10-30 bytes
+pub const DEFAULT_AVG_CUSTOM_ID_LENGTH: usize = 20;
+
+/// Default status code for JSONL overhead estimation.
+///
+/// Uses 200 (OK) as the default since:
+/// - Most successful API calls return 2xx status codes
+/// - 200 is 3 digits, same as most status codes (100-599)
+/// - Overhead difference between codes is minimal (1-3 bytes)
+pub const DEFAULT_AVG_STATUS_CODE: i16 = 200;
+
 /// Calculate the raw size of a response body in bytes.
 /// This is the actual response content size, not the JSONL-formatted size.
 /// Returns None if the size exceeds i64::MAX.
@@ -114,9 +133,11 @@ pub fn calculate_jsonl_error_overhead_per_line(custom_id: &Option<String>) -> i6
 pub fn estimate_output_file_size(
     raw_body_size_sum: i64,
     request_count: i64,
-    avg_custom_id_len: usize,
-    avg_status_code: i16,
+    avg_custom_id_len: Option<usize>,
 ) -> Option<i64> {
+    let avg_custom_id_len = avg_custom_id_len.unwrap_or(DEFAULT_AVG_CUSTOM_ID_LENGTH);
+    let avg_status_code = DEFAULT_AVG_STATUS_CODE;
+
     // Average overhead per line
     let avg_overhead = calculate_jsonl_output_overhead_per_line(
         &Some("x".repeat(avg_custom_id_len)),
@@ -136,8 +157,10 @@ pub fn estimate_output_file_size(
 pub fn estimate_error_file_size(
     raw_error_size_sum: i64,
     request_count: i64,
-    avg_custom_id_len: usize,
+    avg_custom_id_len: Option<usize>,
 ) -> Option<i64> {
+    let avg_custom_id_len = avg_custom_id_len.unwrap_or(DEFAULT_AVG_CUSTOM_ID_LENGTH);
+
     // Average overhead per line
     let avg_overhead =
         calculate_jsonl_error_overhead_per_line(&Some("x".repeat(avg_custom_id_len)));
