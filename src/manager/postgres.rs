@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::Stream;
 use sqlx::Row;
-use sqlx::postgres::{PgListener, PgPool, PgRow};
+use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -263,8 +263,6 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         purpose: &Option<crate::batch::Purpose>,
         size_finalized: bool,
     ) -> Result<Option<i64>> {
-        use sqlx::Row;
-
         // Skip if already finalized or not a virtual file
         if size_finalized
             || (purpose != &Some(crate::batch::Purpose::BatchOutput)
@@ -382,40 +380,9 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 let pool = self.pool.clone();
 
                 tokio::spawn(async move {
-                    // Use session-scoped advisory lock (non-blocking)
-                    let lock_key = file_id.0.as_u128() as i64;
-
-                    let lock_acquired =
-                        sqlx::query_scalar!("SELECT pg_try_advisory_lock($1)", lock_key)
-                            .fetch_one(&pool)
-                            .await
-                            .unwrap_or(Some(false))
-                            .unwrap_or(false);
-
-                    if lock_acquired {
-                        // Finalize the file
-                        let result = sqlx::query!(
-                            r#"
-                            UPDATE files
-                            SET size_bytes = $2, size_finalized = TRUE
-                            WHERE id = $1 AND size_finalized = FALSE
-                            "#,
-                            *file_id as Uuid,
-                            estimated_size,
-                        )
-                        .execute(&pool)
-                        .await;
-
-                        if let Err(e) = result {
-                            tracing::warn!("Failed to finalize file size for {}: {}", file_id, e);
-                        }
-
-                        // Release the lock
-                        let _ = sqlx::query_scalar!("SELECT pg_advisory_unlock($1)", lock_key)
-                            .fetch_one(&pool)
-                            .await;
+                    if let Err(e) = Self::finalize_file_size(&pool, file_id, estimated_size).await {
+                        tracing::warn!("Failed to finalize file size for {}: {}", file_id, e);
                     }
-                    // If we didn't get the lock, someone else is finalizing - that's fine
                 });
             }
         }
@@ -4907,7 +4874,7 @@ mod tests {
         let http_client = Arc::new(MockHttpClient::new());
 
         // Set up manager with per-model limit of 3
-        let mut config = crate::daemon::DaemonConfig::default();
+        let config = crate::daemon::DaemonConfig::default();
         config
             .model_concurrency_limits
             .insert("model-a".to_string(), 3);
