@@ -115,6 +115,10 @@ impl HttpClient for ReqwestHttpClient {
             tracing::trace!(request_id = %request.id, "Added Authorization header");
         }
 
+        // Add fusillade request ID header for analytics correlation
+        req = req.header("X-Fusillade-Request-Id", request.id.to_string());
+        tracing::trace!(request_id = %request.id, "Added X-Fusillade-Request-Id header");
+
         // Only add body and Content-Type for methods that support a body
         let method_upper = request.method.to_uppercase();
         if method_upper != "GET"
