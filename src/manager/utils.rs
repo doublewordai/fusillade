@@ -4,7 +4,7 @@ pub fn calculate_output_size(
     custom_id: &Option<String>,
     response_status: i16,
     response_body: &str,
-) -> i32 {
+) -> i64 {
     let size = 8 +  // '{"id":"'
         10 + // 'batch_req_'
         36 + // UUID length
@@ -20,12 +20,12 @@ pub fn calculate_output_size(
         4 +  // '}}\n' (closing response, root, and newline)
         50; // error margin for formatting + request_id field if present
 
-    size as i32
+    size as i64
 }
 
 /// Calculate estimated JSONL line size for a failed request.
 /// Format: {"id":"batch_req_UUID","custom_id":"...","response":null,"error":{"code":null,"message":"..."}}\n
-pub fn calculate_error_size(custom_id: &Option<String>, error_json: &str) -> i32 {
+pub fn calculate_error_size(custom_id: &Option<String>, error_json: &str) -> i64 {
     let size = 8 +  // '{"id":"'
         10 + // 'batch_req_'
         36 + // UUID length
@@ -38,5 +38,5 @@ pub fn calculate_error_size(custom_id: &Option<String>, error_json: &str) -> i32
         5 +  // '"}}\n' (closing quote, error object, root, newline)
         10; // error margin
 
-    size as i32
+    size as i64
 }

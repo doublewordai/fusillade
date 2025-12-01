@@ -2,7 +2,7 @@
 -- This avoids expensive file size recomputation and eliminates trigger-based row updates
 
 ALTER TABLE requests
-ADD COLUMN response_size INT NOT NULL DEFAULT 0;
+ADD COLUMN response_size BIGINT NOT NULL DEFAULT 0;
 
 -- Add comment explaining the column
 COMMENT ON COLUMN requests.response_size IS 
