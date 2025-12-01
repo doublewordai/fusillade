@@ -244,15 +244,15 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
             return Some(0);
         }
 
-        // Add JSONL overhead to get estimated file size
-        let estimated_size = match file_type {
+        // Add JSONL overhead to get estimated file size - return directly
+        match file_type {
             OutputFileType::Output => {
                 estimate_output_file_size(raw_size_sum, request_count, 20, 200)
             }
-            OutputFileType::Error => estimate_error_file_size(raw_size_sum, request_count, 20),
-        };
-
-        Some(estimated_size)
+            OutputFileType::Error => {
+                estimate_error_file_size(raw_size_sum, request_count, 20)
+            }
+        }
     }
 
     /// Calculate estimated file size from a list_files query row.
@@ -296,7 +296,16 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 estimate_error_file_size(raw_sum, request_count, 20)
             };
 
-            return Ok(Some(estimated_size));
+            // If estimation failed (overflow), log a warning and return None
+            if estimated_size.is_none() {
+                tracing::warn!(
+                    "File size estimation overflow for {:?} file with {} requests",
+                    purpose,
+                    request_count
+                );
+            }
+
+            return Ok(estimated_size);
         }
 
         Ok(None)
@@ -739,7 +748,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             }
             AnyRequest::Completed(req) => {
                 // Store the raw response body size
-                let response_size = calculate_response_body_size(&req.state.response_body);
+                let response_size = calculate_response_body_size(&req.state.response_body)
+                    .ok_or_else(|| FusilladeError::Other(anyhow!("Response body too large")))?;
 
                 let rows_affected = sqlx::query!(
                     r#"
@@ -777,7 +787,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 })?;
 
                 // Store raw error message size
-                let response_size = calculate_error_message_size(&error_json);
+                let response_size = calculate_error_message_size(&error_json)
+                    .ok_or_else(|| FusilladeError::Other(anyhow!("Error message too large")))?;
 
                 let rows_affected = sqlx::query!(
                     r#"
