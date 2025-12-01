@@ -116,8 +116,9 @@ impl HttpClient for ReqwestHttpClient {
         }
 
         // Add fusillade request ID header for analytics correlation
-        req = req.header("X-Fusillade-Request-Id", request.id.to_string());
-        tracing::trace!(request_id = %request.id, "Added X-Fusillade-Request-Id header");
+        // Use the full UUID (request.id.0) instead of the Display impl which only shows 8 chars
+        req = req.header("X-Fusillade-Request-Id", request.id.0.to_string());
+        tracing::trace!(request_id = %request.id, full_uuid = %request.id.0, "Added X-Fusillade-Request-Id header");
 
         // Only add body and Content-Type for methods that support a body
         let method_upper = request.method.to_uppercase();
