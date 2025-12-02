@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/doublewordai/fusillade/compare/fusillade-v0.5.0...fusillade-v0.5.1) (2025-12-02)
+
+
+### Bug Fixes
+
+* batch id header ([#22](https://github.com/doublewordai/fusillade/issues/22)) ([9fd20f3](https://github.com/doublewordai/fusillade/commit/9fd20f394490e5cab2c3aa30f918ab598f918f9e))
+
 ## [0.5.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.4.0...fusillade-v0.5.0) (2025-12-01)
 
 
