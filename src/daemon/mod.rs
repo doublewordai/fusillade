@@ -93,6 +93,20 @@ pub struct DaemonConfig {
     /// Interval for polling database to check for cancelled batches (milliseconds)
     /// Determines how quickly in-flight requests are aborted when their batch is cancelled
     pub cancellation_poll_interval_ms: u64,
+
+    /// Interval for polling database to initialize pending batches (milliseconds)
+    /// Determines how quickly new batches are initialized (requests bulk-inserted)
+    pub batch_initialization_interval_ms: u64,
+
+    /// Maximum number of batches to claim for initialization in each iteration
+    pub batch_initialization_batch_size: usize,
+
+    /// Interval for polling database to delete pending files (milliseconds)
+    /// Determines how quickly marked files are actually deleted
+    pub file_deletion_interval_ms: u64,
+
+    /// Maximum number of files to claim for deletion in each iteration
+    pub file_deletion_batch_size: usize,
 }
 
 impl Default for DaemonConfig {
@@ -110,9 +124,13 @@ impl Default for DaemonConfig {
             status_log_interval_ms: Some(2000), // Log every 2 seconds by default
             heartbeat_interval_ms: 10000,       // Heartbeat every 10 seconds by default
             should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,             // 1 minute
-            processing_timeout_ms: 600000,       // 10 minutes
-            cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
+            claim_timeout_ms: 60000,                // 1 minute
+            processing_timeout_ms: 600000,          // 10 minutes
+            cancellation_poll_interval_ms: 5000,    // Poll every 5 seconds by default
+            batch_initialization_interval_ms: 1000, // Poll every 1 second by default
+            batch_initialization_batch_size: 10,    // Initialize up to 10 batches at a time
+            file_deletion_interval_ms: 5000,        // Poll every 5 seconds by default
+            file_deletion_batch_size: 5,            // Delete up to 5 files at a time
         }
     }
 }
@@ -395,6 +413,126 @@ where
             }
         });
 
+        // Spawn periodic task to initialize pending batches
+        let storage = self.storage.clone();
+        let daemon_id = self.daemon_id;
+        let shutdown_token = self.shutdown_token.clone();
+        let batch_initialization_interval_ms = self.config.batch_initialization_interval_ms;
+        let batch_initialization_batch_size = self.config.batch_initialization_batch_size;
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(batch_initialization_interval_ms));
+            tracing::info!(
+                interval_ms = batch_initialization_interval_ms,
+                batch_size = batch_initialization_batch_size,
+                "Batch initialization polling started"
+            );
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Claim batches that need initialization
+                        match storage.claim_pending_batch_initializations(
+                            batch_initialization_batch_size,
+                            daemon_id
+                        ).await {
+                            Ok(batch_ids) => {
+                                if !batch_ids.is_empty() {
+                                    tracing::info!(count = batch_ids.len(), "Claimed batches for initialization");
+
+                                    // Initialize each batch
+                                    for batch_id in batch_ids {
+                                        match storage.initialize_batch(batch_id).await {
+                                            Ok(()) => {
+                                                tracing::info!(batch_id = %batch_id, "Batch initialized successfully");
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    batch_id = %batch_id,
+                                                    error = %e,
+                                                    "Failed to initialize batch"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "Failed to claim batches for initialization"
+                                );
+                            }
+                        }
+                    }
+                    _ = shutdown_token.cancelled() => {
+                        tracing::info!("Shutting down batch initialization polling");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Spawn periodic task to delete pending files
+        let storage = self.storage.clone();
+        let daemon_id = self.daemon_id;
+        let shutdown_token = self.shutdown_token.clone();
+        let file_deletion_interval_ms = self.config.file_deletion_interval_ms;
+        let file_deletion_batch_size = self.config.file_deletion_batch_size;
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(file_deletion_interval_ms));
+            tracing::info!(
+                interval_ms = file_deletion_interval_ms,
+                batch_size = file_deletion_batch_size,
+                "File deletion polling started"
+            );
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Claim files that need deletion
+                        match storage.claim_pending_file_deletions(
+                            file_deletion_batch_size,
+                            daemon_id
+                        ).await {
+                            Ok(file_ids) => {
+                                if !file_ids.is_empty() {
+                                    tracing::info!(count = file_ids.len(), "Claimed files for deletion");
+
+                                    // Delete each file
+                                    for file_id in file_ids {
+                                        match storage.complete_file_deletion(file_id).await {
+                                            Ok(()) => {
+                                                tracing::info!(file_id = %file_id, "File deleted successfully");
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    file_id = %file_id,
+                                                    error = %e,
+                                                    "Failed to delete file"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "Failed to claim files for deletion"
+                                );
+                            }
+                        }
+                    }
+                    _ = shutdown_token.cancelled() => {
+                        tracing::info!("Shutting down file deletion polling");
+                        break;
+                    }
+                }
+            }
+        });
+
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
         let run_result = loop {
@@ -657,6 +795,10 @@ mod tests {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            batch_initialization_interval_ms: 100, // Fast polling for tests
+            batch_initialization_batch_size: 10,
+            file_deletion_interval_ms: 100, // Fast polling for tests
+            file_deletion_batch_size: 5,
         };
 
         let manager = Arc::new(
@@ -692,6 +834,12 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager
+            .initialize_batch(batch.id)
+            .await
+            .expect("Failed to initialize batch");
 
         // Get the created request from the batch
         let requests = manager
@@ -818,6 +966,10 @@ mod tests {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            batch_initialization_interval_ms: 100, // Fast polling for tests
+            batch_initialization_batch_size: 10,
+            file_deletion_interval_ms: 100, // Fast polling for tests
+            file_deletion_batch_size: 5,
         };
 
         let manager = Arc::new(
@@ -1037,6 +1189,10 @@ mod tests {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            batch_initialization_interval_ms: 100, // Fast polling for tests
+            batch_initialization_batch_size: 10,
+            file_deletion_interval_ms: 100, // Fast polling for tests
+            file_deletion_batch_size: 5,
         };
 
         let manager = Arc::new(
@@ -1072,6 +1228,12 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+
+        // Initialize the batch (normally done asynchronously by daemon)
+        manager
+            .initialize_batch(batch.id)
+            .await
+            .expect("Failed to initialize batch");
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -1165,6 +1327,10 @@ mod tests {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            batch_initialization_interval_ms: 100, // Fast polling for tests
+            batch_initialization_batch_size: 10,
+            file_deletion_interval_ms: 100, // Fast polling for tests
+            file_deletion_batch_size: 5,
         };
 
         let manager = Arc::new(
