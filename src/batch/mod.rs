@@ -190,6 +190,7 @@ pub struct File {
     pub uploaded_by: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub size_finalized: bool,
 }
 
 /// A request template defining how to make a request.

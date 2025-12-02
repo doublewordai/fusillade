@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+mod utils;
 
 /// Storage trait for persisting and querying requests.
 ///

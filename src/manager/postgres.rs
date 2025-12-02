@@ -37,7 +37,10 @@ use crate::request::{
 };
 
 use super::DaemonExecutor;
-
+use super::utils::{
+    calculate_error_message_size, calculate_response_body_size, estimate_error_file_size,
+    estimate_output_file_size,
+};
 /// PostgreSQL implementation of the Storage and DaemonExecutor traits.
 ///
 /// This manager uses PostgreSQL for persistent storage and runs a daemon for processing requests.
@@ -217,6 +220,305 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         }
 
         Ok(false)
+    }
+
+    /// Generate a consistent advisory lock key for a file
+    fn file_lock_key(file_id: FileId) -> i64 {
+        file_id.0.as_u128() as u64 as i64
+    }
+
+    /// Calculate the estimated file size for a virtual batch file.
+    /// Returns None if this isn't a virtual file or calculation isn't possible.
+    fn calculate_virtual_file_size_from_batch(
+        &self,
+        batch: &Batch,
+        file_type: OutputFileType,
+        raw_size_sum: i64,
+    ) -> Option<i64> {
+        let request_count = match file_type {
+            OutputFileType::Output => batch.completed_requests,
+            OutputFileType::Error => batch.failed_requests,
+        };
+
+        if request_count == 0 {
+            return Some(0);
+        }
+
+        // Add JSONL overhead to get estimated file size - return directly
+        match file_type {
+            OutputFileType::Output => estimate_output_file_size(raw_size_sum, request_count, None),
+            OutputFileType::Error => estimate_error_file_size(raw_size_sum, request_count, None),
+        }
+    }
+
+    /// Calculate estimated file size from a list_files query row.
+    /// Returns None if this isn't a virtual file or if it's already finalized.
+    fn calculate_virtual_file_size_from_row(
+        &self,
+        row: &sqlx::postgres::PgRow,
+        purpose: &Option<crate::batch::Purpose>,
+        size_finalized: bool,
+    ) -> Result<Option<i64>> {
+        // Skip if already finalized or not a virtual file
+        if size_finalized
+            || (purpose != &Some(crate::batch::Purpose::BatchOutput)
+                && purpose != &Some(crate::batch::Purpose::BatchError))
+        {
+            return Ok(None);
+        }
+
+        // Get raw size sum from LATERAL join
+        let raw_size_sum: Option<i64> = row.try_get("calculated_size").ok().flatten();
+        let raw_sum = raw_size_sum.unwrap_or(0);
+
+        // Get request count for this file type
+        let completed: Option<i64> = row.try_get("completed_requests").ok().flatten();
+        let failed: Option<i64> = row.try_get("failed_requests").ok().flatten();
+
+        let request_count = if purpose == &Some(crate::batch::Purpose::BatchOutput) {
+            completed.unwrap_or(0)
+        } else {
+            failed.unwrap_or(0)
+        };
+
+        if request_count == 0 {
+            return Ok(Some(0));
+        }
+
+        // Add JSONL overhead
+        let estimated_size = if purpose == &Some(crate::batch::Purpose::BatchOutput) {
+            estimate_output_file_size(raw_sum, request_count, None)
+        } else {
+            estimate_error_file_size(raw_sum, request_count, None)
+        };
+
+        // If estimation failed (overflow), log a warning and return None
+        if estimated_size.is_none() {
+            tracing::warn!(
+                "File size estimation overflow for {:?} file with {} requests",
+                purpose,
+                request_count
+            );
+        }
+
+        Ok(estimated_size)
+    }
+
+    /// Check if a batch is complete based on request counts.
+    fn is_batch_complete(batch: &Batch) -> bool {
+        let terminal_count =
+            batch.completed_requests + batch.failed_requests + batch.canceled_requests;
+        terminal_count == batch.total_requests && batch.total_requests > 0
+    }
+
+    /// Finalize a virtual file's size in the database.
+    /// Uses an advisory lock to prevent concurrent finalization.
+    /// Returns whether the finalization was performed.
+    async fn finalize_file_size(
+        pool: &PgPool,
+        file_id: FileId,
+        estimated_size: i64,
+    ) -> Result<bool> {
+        let lock_key = Self::file_lock_key(file_id);
+
+        // Try to acquire advisory lock (non-blocking)
+        let lock_acquired = match sqlx::query_scalar!("SELECT pg_try_advisory_lock($1)", lock_key)
+            .fetch_one(pool)
+            .await
+        {
+            Ok(Some(acquired)) => acquired,
+            Ok(None) => {
+                // Unexpected - pg_try_advisory_lock shouldn't return NULL
+                tracing::warn!(
+                    file_id = %file_id,
+                    "Advisory lock query returned NULL unexpectedly"
+                );
+                false
+            }
+            Err(e) => {
+                // Database error - this IS a problem
+                tracing::error!(
+                    file_id = %file_id,
+                    error = %e,
+                    "Database error while trying to acquire advisory lock"
+                );
+                return Err(FusilladeError::Other(anyhow!(
+                    "Failed to acquire lock: {}",
+                    e
+                )));
+            }
+        };
+
+        if !lock_acquired {
+            // Another process is finalizing
+            return Ok(false);
+        }
+
+        // We have the lock - finalize the file
+        let result = sqlx::query!(
+            r#"
+            UPDATE files
+            SET size_bytes = $2, size_finalized = TRUE
+            WHERE id = $1 AND size_finalized = FALSE
+            "#,
+            *file_id as Uuid,
+            estimated_size,
+        )
+        .execute(pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file size: {}", e)));
+
+        // Release the lock - only log if release fails (which is unusual)
+        if let Err(e) = sqlx::query_scalar!("SELECT pg_advisory_unlock($1)", lock_key)
+            .fetch_one(pool)
+            .await
+        {
+            tracing::warn!(
+                file_id = %file_id,
+                error = %e,
+                "Failed to release advisory lock (will be released on connection return to pool)"
+            );
+        }
+
+        result?;
+        Ok(true)
+    }
+
+    /// Spawn a background task to finalize a completed batch's virtual file.
+    /// Returns immediately - finalization happens asynchronously.
+    fn spawn_finalize_if_complete(
+        &self,
+        row: &sqlx::postgres::PgRow,
+        file_id: FileId,
+        estimated_size: i64,
+    ) {
+        // Check if batch is complete
+        let total: Option<i64> = row.try_get("total_requests").ok().flatten();
+        let completed: Option<i64> = row.try_get("completed_requests").ok().flatten();
+        let failed: Option<i64> = row.try_get("failed_requests").ok().flatten();
+        let canceled: Option<i64> = row.try_get("canceled_requests").ok().flatten();
+        let in_progress: Option<i64> = row.try_get("in_progress_requests").ok().flatten();
+
+        if let (Some(total_count), Some(comp), Some(fail), Some(canc), Some(_prog)) =
+            (total, completed, failed, canceled, in_progress)
+        {
+            let terminal_count = comp + fail + canc;
+            let is_complete = terminal_count == total_count && total_count > 0;
+
+            if is_complete {
+                // Spawn background finalization - don't block listing
+                let pool = self.pool.clone();
+
+                tokio::spawn(async move {
+                    if let Err(e) = Self::finalize_file_size(&pool, file_id, estimated_size).await {
+                        tracing::warn!("Failed to finalize file size for {}: {}", file_id, e);
+                    }
+                });
+            }
+        }
+    }
+
+    async fn maybe_finalize_file_size(&self, file: &mut File) -> Result<()> {
+        // Only process virtual output/error files that are not yet finalized
+        if file.size_finalized {
+            return Ok(());
+        }
+
+        let file_type = match file.purpose {
+            Some(crate::batch::Purpose::BatchOutput) => OutputFileType::Output,
+            Some(crate::batch::Purpose::BatchError) => OutputFileType::Error,
+            _ => return Ok(()),
+        };
+
+        // Find the batch that owns this file
+        let batch = match self.get_batch_by_output_file_id(file.id, file_type).await? {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        let state_filter = match file_type {
+            OutputFileType::Output => "completed",
+            OutputFileType::Error => "failed",
+        };
+
+        let raw_size_sum = sqlx::query_scalar!(
+            r#"
+            SELECT COALESCE(SUM(response_size), 0)::BIGINT as "sum!"
+            FROM requests
+            WHERE batch_id = $1 AND state = $2
+            "#,
+            *batch.id as Uuid,
+            state_filter,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to calculate file size: {}", e)))?;
+
+        // Calculate estimated size with JSONL overhead using shared helper
+        let estimated_size = self
+            .calculate_virtual_file_size_from_batch(&batch, file_type, raw_size_sum)
+            .unwrap_or(0);
+
+        // Update with JSONL-formatted estimate
+        file.size_bytes = estimated_size;
+
+        // Early exit if batch is not complete
+        if !Self::is_batch_complete(&batch) {
+            return Ok(());
+        }
+
+        // Batch is complete - try to finalize this file
+        let finalized = Self::finalize_file_size(&self.pool, file.id, estimated_size).await?;
+
+        if finalized {
+            file.size_finalized = true;
+        }
+
+        Ok(())
+    }
+
+    async fn get_file_from_db(&self, file_id: FileId) -> Result<File> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
+            FROM files
+            WHERE id = $1
+            "#,
+            *file_id as Uuid,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch file: {}", e)))?
+        .ok_or_else(|| FusilladeError::Other(anyhow!("File not found")))?;
+
+        let status = row
+            .status
+            .parse::<crate::batch::FileStatus>()
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Invalid file status '{}': {}", row.status, e))
+            })?;
+
+        let purpose = row
+            .purpose
+            .map(|s| s.parse::<crate::batch::Purpose>())
+            .transpose()
+            .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
+
+        Ok(File {
+            id: FileId(row.id),
+            name: row.name,
+            description: row.description,
+            size_bytes: row.size_bytes,
+            size_finalized: row.size_finalized,
+            status,
+            error_message: row.error_message,
+            purpose,
+            expires_at: row.expires_at,
+            deleted_at: row.deleted_at,
+            uploaded_by: row.uploaded_by,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
     }
 }
 
@@ -466,6 +768,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 }
             }
             AnyRequest::Completed(req) => {
+                // Store the raw response body size
+                let response_size = calculate_response_body_size(&req.state.response_body)
+                    .ok_or_else(|| FusilladeError::Other(anyhow!("Response body too large")))?;
+
                 let rows_affected = sqlx::query!(
                     r#"
                     UPDATE requests SET
@@ -474,7 +780,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         response_body = $3,
                         claimed_at = $4,
                         started_at = $5,
-                        completed_at = $6
+                        completed_at = $6,
+                        response_size = $7
                     WHERE id = $1
                     "#,
                     *req.data.id as Uuid,
@@ -483,6 +790,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     req.state.claimed_at,
                     req.state.started_at,
                     req.state.completed_at,
+                    response_size,
                 )
                 .execute(&self.pool)
                 .await
@@ -499,19 +807,25 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     FusilladeError::Other(anyhow!("Failed to serialize failure reason: {}", e))
                 })?;
 
+                // Store raw error message size
+                let response_size = calculate_error_message_size(&error_json)
+                    .ok_or_else(|| FusilladeError::Other(anyhow!("Error message too large")))?;
+
                 let rows_affected = sqlx::query!(
                     r#"
                     UPDATE requests SET
                         state = 'failed',
                         retry_attempt = $2,
                         error = $3,
-                        failed_at = $4
+                        failed_at = $4,
+                        response_size = $5
                     WHERE id = $1
                     "#,
                     *req.data.id as Uuid,
                     req.state.retry_attempt as i32,
                     error_json,
                     req.state.failed_at,
+                    response_size
                 )
                 .execute(&self.pool)
                 .await
@@ -1009,7 +1323,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         sqlx::query!(
             r#"
             UPDATE files
-            SET name = COALESCE($2, name), description = $3, size_bytes = $4, status = $5, purpose = $6, expires_at = $7, uploaded_by = $8
+            SET name = COALESCE($2, name), description = $3, size_bytes = $4, size_finalized = TRUE, status = $5, purpose = $6, expires_at = $7, uploaded_by = $8
             WHERE id = $1
             "#,
             fid,
@@ -1050,48 +1364,13 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn get_file(&self, file_id: FileId) -> Result<File> {
-        let row = sqlx::query!(
-            r#"
-            SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
-            FROM files
-            WHERE id = $1
-            "#,
-            *file_id as Uuid,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch file: {}", e)))?
-        .ok_or_else(|| FusilladeError::Other(anyhow!("File not found")))?;
-
-        let status = row
-            .status
-            .parse::<crate::batch::FileStatus>()
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Invalid file status '{}': {}", row.status, e))
-            })?;
-        let purpose = row
-            .purpose
-            .map(|s| s.parse::<crate::batch::Purpose>())
-            .transpose()
-            .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
-
-        let mut file = File {
-            id: FileId(row.id),
-            name: row.name,
-            description: row.description,
-            size_bytes: row.size_bytes,
-            status,
-            error_message: row.error_message,
-            purpose,
-            expires_at: row.expires_at,
-            deleted_at: row.deleted_at,
-            uploaded_by: row.uploaded_by,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        };
+        let mut file = self.get_file_from_db(file_id).await?;
 
         // Check and mark as expired if needed (passive expiration)
         self.check_and_mark_expired(&mut file).await?;
+
+        // Try to finalize size for virtual output/error files. Uses cached value once finalized
+        self.maybe_finalize_file_size(&mut file).await?;
 
         Ok(file)
     }
@@ -1180,23 +1459,56 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         };
 
         let mut query_builder = QueryBuilder::new(
-            "SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at FROM files",
+            r#"
+            SELECT 
+                f.id, f.name, f.description, f.size_bytes, f.size_finalized, 
+                f.status, f.error_message, f.purpose, f.expires_at, f.deleted_at, 
+                f.uploaded_by, f.created_at, f.updated_at,
+                b.id as batch_id,
+                b.total_requests,
+                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
+                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests,
+                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
+                size_calc.calculated_size
+            FROM files f
+            LEFT JOIN batches b ON (
+                (f.purpose = 'batch_output' AND b.output_file_id = f.id) OR
+                (f.purpose = 'batch_error' AND b.error_file_id = f.id)
+            )
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE r.state = 'completed') as completed,
+                    COUNT(*) FILTER (WHERE r.state = 'failed') as failed,
+                    COUNT(*) FILTER (WHERE r.state = 'canceled') as canceled,
+                    COUNT(*) FILTER (WHERE r.state IN ('claimed', 'processing')) as in_progress
+                FROM requests r
+                WHERE r.batch_id = b.id
+            ) counts ON (f.purpose IN ('batch_output', 'batch_error'))
+            LEFT JOIN LATERAL (
+                SELECT SUM(r.response_size)::BIGINT as calculated_size
+                FROM requests r
+                WHERE r.batch_id = b.id
+                AND ((f.purpose = 'batch_output' AND r.state = 'completed') OR
+                    (f.purpose = 'batch_error' AND r.state = 'failed'))
+            ) size_calc ON (f.purpose IN ('batch_output', 'batch_error') AND f.size_finalized = FALSE AND b.id IS NOT NULL)
+            "#,
         );
 
         // Build WHERE clause
         let mut has_where = false;
 
         if let Some(uploaded_by) = &filter.uploaded_by {
-            query_builder.push(" WHERE uploaded_by = ");
+            query_builder.push(" WHERE f.uploaded_by = ");
             query_builder.push_bind(uploaded_by);
             has_where = true;
         }
 
         if let Some(status) = &filter.status {
             if has_where {
-                query_builder.push(" AND status = ");
+                query_builder.push(" AND f.status = ");
             } else {
-                query_builder.push(" WHERE status = ");
+                query_builder.push(" WHERE f.status = ");
                 has_where = true;
             }
             query_builder.push_bind(status);
@@ -1204,9 +1516,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         if let Some(purpose) = &filter.purpose {
             if has_where {
-                query_builder.push(" AND purpose = ");
+                query_builder.push(" AND f.purpose = ");
             } else {
-                query_builder.push(" WHERE purpose = ");
+                query_builder.push(" WHERE f.purpose = ");
                 has_where = true;
             }
             query_builder.push_bind(purpose);
@@ -1222,13 +1534,13 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 query_builder.push(" WHERE ");
             }
 
-            query_builder.push("(created_at ");
+            query_builder.push("(f.created_at ");
             query_builder.push(comparison);
             query_builder.push(" ");
             query_builder.push_bind(after_ts);
-            query_builder.push(" OR (created_at = ");
+            query_builder.push(" OR (f.created_at = ");
             query_builder.push_bind(after_ts);
-            query_builder.push(" AND id ");
+            query_builder.push(" AND f.id ");
             query_builder.push(comparison);
             query_builder.push(" ");
             query_builder.push_bind(**after_id as Uuid);
@@ -1237,9 +1549,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         // Add ORDER BY
         let order_direction = if filter.ascending { "ASC" } else { "DESC" };
-        query_builder.push(" ORDER BY created_at ");
+        query_builder.push(" ORDER BY f.created_at ");
         query_builder.push(order_direction);
-        query_builder.push(", id ");
+        query_builder.push(", f.id ");
         query_builder.push(order_direction);
 
         // Add LIMIT
@@ -1266,9 +1578,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             let description: Option<String> = row
                 .try_get("description")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read description: {}", e)))?;
-            let size_bytes: i64 = row
+            let mut size_bytes: i64 = row
                 .try_get("size_bytes")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read size_bytes: {}", e)))?;
+            let size_finalized: bool = row.try_get("size_finalized").map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to read size_finalized: {}", e))
+            })?;
             let status_str: String = row
                 .try_get("status")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read status: {}", e)))?;
@@ -1303,11 +1618,23 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 .try_get("updated_at")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read updated_at: {}", e)))?;
 
+            // Calculate size for virtual files if not yet finalized
+            if let Some(estimated_size) =
+                self.calculate_virtual_file_size_from_row(&row, &purpose, size_finalized)?
+            {
+                size_bytes = estimated_size;
+
+                // Spawn background finalization if batch is complete
+                let file_id = FileId(id);
+                self.spawn_finalize_if_complete(&row, file_id, estimated_size);
+            }
+
             let mut file = File {
                 id: FileId(id),
                 name,
                 description,
                 size_bytes,
+                size_finalized,
                 status,
                 error_message,
                 purpose,
@@ -2437,8 +2764,8 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
 
         let file_id = sqlx::query_scalar!(
             r#"
-            INSERT INTO files (name, description, size_bytes, status, purpose, uploaded_by)
-            VALUES ($1, $2, 0, 'processed', 'batch_output', $3)
+            INSERT INTO files (name, description, size_bytes, size_finalized, status, purpose, uploaded_by)
+            VALUES ($1, $2, 0, FALSE, 'processed', 'batch_output', $3)
             RETURNING id
             "#,
             name,
@@ -2464,8 +2791,8 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
 
         let file_id = sqlx::query_scalar!(
             r#"
-            INSERT INTO files (name, description, size_bytes, status, purpose, uploaded_by)
-            VALUES ($1, $2, 0, 'processed', 'batch_error', $3)
+            INSERT INTO files (name, description, size_bytes, size_finalized, status, purpose, uploaded_by)
+            VALUES ($1, $2, 0, FALSE, 'processed', 'batch_error', $3)
             RETURNING id
             "#,
             name,
@@ -5429,5 +5756,708 @@ mod tests {
 
         // Drop trigger1 to unblock if still waiting
         drop(trigger1);
+    }
+
+    #[sqlx::test]
+    async fn test_virtual_files_lazy_finalized_via_get_file(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create batch with 3 requests (not 2) so we can have an incomplete batch
+        let file_id = manager
+            .create_file(
+                "lazy-finalize-get-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req-1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-3".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/test".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let output_file_id = batch.output_file_id.unwrap();
+        let error_file_id = batch.error_file_id.unwrap();
+
+        // Complete one request, fail one request (leaving one pending = incomplete batch)
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = $2,
+                response_size = $3,
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[0].id() as Uuid,
+            r#"{"result":"success"}"#,
+            19i64, // Raw body size
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'failed',
+                error = $2,
+                response_size = $3,
+                failed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[1].id() as Uuid,
+            r#"{"code":"rate_limit","message":"Too many requests"}"#,
+            52i64, // Raw error size
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Get output file - should calculate size (not finalized yet, batch incomplete)
+        let output_file = manager.get_file(output_file_id).await.unwrap();
+        assert!(
+            !output_file.size_finalized,
+            "Output file should not be finalized (batch incomplete)"
+        );
+        assert!(
+            output_file.size_bytes > 0,
+            "Output file should have estimated size > 0"
+        );
+
+        // Get error file - should calculate size (not finalized yet, batch incomplete)
+        let error_file = manager.get_file(error_file_id).await.unwrap();
+        assert!(
+            !error_file.size_finalized,
+            "Error file should not be finalized (batch incomplete)"
+        );
+        assert!(
+            error_file.size_bytes > 0,
+            "Error file should have estimated size > 0"
+        );
+
+        // Now complete the batch by marking remaining request as completed
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = '{"done":true}',
+                response_size = 14,
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[2].id() as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Get files again - should now finalize
+        let output_file_after = manager.get_file(output_file_id).await.unwrap();
+        assert!(
+            output_file_after.size_finalized,
+            "Output file should be finalized after batch complete"
+        );
+
+        let error_file_after = manager.get_file(error_file_id).await.unwrap();
+        assert!(
+            error_file_after.size_finalized,
+            "Error file should be finalized after batch complete"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_virtual_files_lazy_finalized_via_list_files(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create batch
+        let file_id = manager
+            .create_file(
+                "lazy-finalize-list-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/test".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("user1".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let output_file_id = batch.output_file_id.unwrap();
+
+        // Complete the request
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = '{"ok":true}',
+                response_size = 12,
+                completed_at = NOW()
+            WHERE batch_id = $1
+            "#,
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // List files - should calculate and finalize (batch complete)
+        let files = manager
+            .list_files(crate::batch::FileFilter {
+                purpose: Some(crate::batch::Purpose::BatchOutput.to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let output_file = files.iter().find(|f| f.id == output_file_id).unwrap();
+        assert!(output_file.size_bytes > 0, "Should have calculated size");
+
+        // Give background finalization a moment to complete
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Verify finalization was persisted in DB
+        let db_file = sqlx::query!(
+            "SELECT size_finalized FROM files WHERE id = $1",
+            *output_file_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(db_file.size_finalized);
+    }
+
+    #[sqlx::test]
+    async fn test_list_files_respects_pagination_only_updates_current_page(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create 3 batches
+        let mut output_file_ids = Vec::new();
+
+        for i in 0..3 {
+            let file_id = manager
+                .create_file(
+                    format!("batch-{}", i),
+                    None,
+                    vec![RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let batch = manager
+                .create_batch(BatchInput {
+                    file_id,
+                    endpoint: "/v1/test".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    created_by: Some("user1".to_string()),
+                })
+                .await
+                .unwrap();
+
+            output_file_ids.push(batch.output_file_id.unwrap());
+
+            // Complete all batches
+            sqlx::query!(
+                r#"
+                UPDATE requests
+                SET state = 'completed',
+                    response_status = 200,
+                    response_body = '{"done":true}',
+                    response_size = 14,
+                    completed_at = NOW()
+                WHERE batch_id = $1
+                "#,
+                *batch.id as Uuid,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // List first page (limit=2) - should only finalize those 2
+        let page1 = manager
+            .list_files(crate::batch::FileFilter {
+                purpose: Some(crate::batch::Purpose::BatchOutput.to_string()),
+                uploaded_by: Some("user1".to_string()),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(page1.len(), 2, "First page should have 2 files");
+
+        // Give background finalization a moment to complete
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Check which files were finalized in DB
+        let finalized_count = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) as "count!"
+            FROM files
+            WHERE id = ANY($1) AND size_finalized = TRUE
+            "#,
+            &output_file_ids
+                .iter()
+                .map(|id| **id as Uuid)
+                .collect::<Vec<_>>(),
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Should have finalized exactly 2 (the ones on page 1)
+        assert_eq!(finalized_count, 2, "Only page 1 files should be finalized");
+
+        // List second page - should finalize the remaining one
+        let page2 = manager
+            .list_files(crate::batch::FileFilter {
+                purpose: Some(crate::batch::Purpose::BatchOutput.to_string()),
+                uploaded_by: Some("user1".to_string()),
+                after: Some(page1.last().unwrap().id),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(page2.len(), 1, "Second page should have 1 file");
+
+        // Give background finalization a moment
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Now all 3 should be finalized
+        let all_finalized = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) as "count!"
+            FROM files
+            WHERE id = ANY($1) AND size_finalized = TRUE
+            "#,
+            &output_file_ids
+                .iter()
+                .map(|id| **id as Uuid)
+                .collect::<Vec<_>>(),
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(all_finalized, 3, "All files should now be finalized");
+    }
+
+    #[sqlx::test]
+    async fn test_incomplete_batch_gives_estimate_not_finalized(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create batch with 3 requests
+        let file_id = manager
+            .create_file(
+                "incomplete-batch-test".to_string(),
+                None,
+                (0..3)
+                    .map(|_| RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/test".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let output_file_id = batch.output_file_id.unwrap();
+        let error_file_id = batch.error_file_id.unwrap();
+
+        // Complete only 1 out of 3 requests, fail another
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = '{"partial":true}',
+                response_size = 17,
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[0].id() as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'failed',
+                error = '{"error":"test"}',
+                response_size = 16,
+                failed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[1].id() as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Get files multiple times - should give estimates but not finalize
+        for _ in 0..3 {
+            let output_file = manager.get_file(output_file_id).await.unwrap();
+            assert!(
+                !output_file.size_finalized,
+                "Output file should NOT be finalized (batch incomplete)"
+            );
+            assert!(output_file.size_bytes > 0, "Should have non-zero estimate");
+
+            let error_file = manager.get_file(error_file_id).await.unwrap();
+            assert!(
+                !error_file.size_finalized,
+                "Error file should NOT be finalized (batch incomplete)"
+            );
+            assert!(error_file.size_bytes > 0, "Should have non-zero estimate");
+        }
+
+        // Verify nothing was finalized in DB
+        let output_db = sqlx::query!(
+            "SELECT size_finalized FROM files WHERE id = $1",
+            *output_file_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!output_db.size_finalized);
+
+        let error_db = sqlx::query!(
+            "SELECT size_finalized FROM files WHERE id = $1",
+            *error_file_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!error_db.size_finalized);
+    }
+
+    #[sqlx::test]
+    async fn test_finalized_file_uses_cached_value_no_recomputation(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create and complete a batch
+        let file_id = manager
+            .create_file(
+                "cached-value-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/test".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let output_file_id = batch.output_file_id.unwrap();
+
+        // Complete the batch
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = '{"cached":true}',
+                response_size = 16,
+                completed_at = NOW()
+            WHERE batch_id = $1
+            "#,
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Get file - should finalize
+        let file1 = manager.get_file(output_file_id).await.unwrap();
+        assert!(file1.size_finalized);
+        let finalized_size = file1.size_bytes;
+
+        // Tamper with the response_size in DB to simulate data change
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET response_size = 999999
+            WHERE batch_id = $1
+            "#,
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Get file again - should use cached value, NOT recalculate from tampered data
+        let file2 = manager.get_file(output_file_id).await.unwrap();
+        assert!(file2.size_finalized);
+        assert_eq!(
+            file2.size_bytes, finalized_size,
+            "Should use cached finalized value, not recalculate"
+        );
+
+        // List files - should also use cached value
+        let files = manager
+            .list_files(crate::batch::FileFilter {
+                purpose: Some(crate::batch::Purpose::BatchOutput.to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let listed_file = files.iter().find(|f| f.id == output_file_id).unwrap();
+        assert_eq!(
+            listed_file.size_bytes, finalized_size,
+            "List should use cached value too"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_normal_files_finalized_immediately_no_calculation(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a regular input file (purpose='batch' or NULL)
+        let file_id = manager
+            .create_file(
+                "normal-file-test".to_string(),
+                Some("A normal input file".to_string()),
+                vec![
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Get the file
+        let file = manager.get_file(file_id).await.unwrap();
+
+        // Normal files should be finalized immediately (size_finalized=TRUE on creation)
+        assert!(
+            file.size_finalized,
+            "Normal input files should be finalized immediately"
+        );
+        assert_eq!(file.size_bytes, 0, "Input files have size 0 by default");
+
+        // Verify in DB
+        let db_file = sqlx::query!(
+            "SELECT size_finalized, purpose FROM files WHERE id = $1",
+            *file_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(db_file.size_finalized, "Should be finalized in DB");
+        assert!(
+            db_file.purpose.is_none() || db_file.purpose.as_deref() == Some("batch"),
+            "Should not be a virtual output/error file"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_empty_virtual_files_finalized_at_zero(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create batch where all requests fail (output file will be empty)
+        let file_id = manager
+            .create_file(
+                "all-fail-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/test".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let output_file_id = batch.output_file_id.unwrap();
+        let error_file_id = batch.error_file_id.unwrap();
+
+        // Fail all requests (no completions)
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'failed',
+                error = '{"error":"all failed"}',
+                response_size = 22,
+                failed_at = NOW()
+            WHERE batch_id = $1
+            "#,
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Get output file - should finalize at size 0 (no completed requests)
+        let output_file = manager.get_file(output_file_id).await.unwrap();
+        assert!(
+            output_file.size_finalized,
+            "Empty output file should be finalized"
+        );
+        assert_eq!(
+            output_file.size_bytes, 0,
+            "Output file with no completions should have size 0"
+        );
+
+        // Get error file - should finalize with actual error content
+        let error_file = manager.get_file(error_file_id).await.unwrap();
+        assert!(error_file.size_finalized, "Error file should be finalized");
+        assert!(
+            error_file.size_bytes > 0,
+            "Error file should have size > 0 (2 failed requests)"
+        );
     }
 }
