@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.5.1...fusillade-v0.6.0) (2025-12-02)
+
+
+### Features
+
+* Output & Error File sizes ([#14](https://github.com/doublewordai/fusillade/issues/14))  ([a19b0ff](https://github.com/doublewordai/fusillade/commit/a19b0ff292ee60be0714ef83fbd659c13ac8709c))
+
 ## [0.5.1](https://github.com/doublewordai/fusillade/compare/fusillade-v0.5.0...fusillade-v0.5.1) (2025-12-02)
 
 
