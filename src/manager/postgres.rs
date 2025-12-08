@@ -2262,6 +2262,44 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(())
     }
 
+    async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
+        tracing::info!(count = ids.len(), "Retrying failed requests");
+
+        let mut results = Vec::new();
+
+        for id in ids {
+            // Get the request from storage
+            let get_results = self.get_requests(vec![id]).await?;
+            let request_result = get_results.into_iter().next().unwrap();
+
+            let result = match request_result {
+                Ok(AnyRequest::Failed(req)) => {
+                    // Reset to pending state with retry_attempt = 0
+                    let pending_request = Request {
+                        state: Pending {
+                            retry_attempt: 0,
+                            not_before: None,
+                        },
+                        data: req.data,
+                    };
+
+                    self.persist(&pending_request).await?;
+                    Ok(())
+                }
+                Ok(_) => Err(crate::error::FusilladeError::InvalidState(
+                    id,
+                    "non-failed state".to_string(),
+                    "failed state".to_string(),
+                )),
+                Err(e) => Err(e),
+            };
+
+            results.push(result);
+        }
+
+        Ok(results)
+    }
+
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>> {
         let rows = sqlx::query!(
             r#"
