@@ -6659,4 +6659,1035 @@ mod tests {
             "Error file should have size > 0 (2 failed requests)"
         );
     }
+
+    #[sqlx::test]
+    async fn test_find_at_risk_batches_threshold_filtering(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Batch 1: Expires in 30 minutes (within 1-hour threshold)
+        let file1 = manager
+            .create_file(
+                "batch-30min".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-30min".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch1 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file1,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch1.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch 2: Expires in 2 hours (outside 1-hour threshold)
+        let file2 = manager
+            .create_file(
+                "batch-2hours".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-2hours".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":2}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch2 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file2,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '2 hours' WHERE id = $1",
+            *batch2.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch 3: No expiration (NULL expires_at)
+        let file3 = manager
+            .create_file(
+                "batch-no-expiry".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-no-expiry".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":3}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch3 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file3,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Query with 1-hour threshold (3600 seconds)
+        let at_risk = manager.find_at_risk_batches(3600).await.unwrap();
+
+        // Only batch1 (30 min) should be returned
+        assert_eq!(at_risk.len(), 1, "Only batch within threshold should be returned");
+        assert_eq!(at_risk[0].id, batch1.id, "Should return the 30-minute batch");
+
+        // Query with 3-hour threshold
+        let at_risk_long = manager.find_at_risk_batches(3600 * 3).await.unwrap();
+
+        // Both batch1 and batch2 should be returned
+        assert_eq!(at_risk_long.len(), 2, "Both batches within 3-hour threshold");
+        assert!(
+            at_risk_long.iter().any(|b| b.id == batch1.id),
+            "Should include 30-minute batch"
+        );
+        assert!(
+            at_risk_long.iter().any(|b| b.id == batch2.id),
+            "Should include 2-hour batch"
+        );
+
+        // Batch with NULL expiration should never appear
+        assert!(
+            !at_risk_long.iter().any(|b| b.id == batch3.id),
+            "Should NOT include batch with NULL expiration"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_find_at_risk_batches_terminal_state_exclusions(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Batch 1: Completed (terminal)
+        let file1 = manager
+            .create_file(
+                "completed-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-completed".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch1 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file1,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes', completed_at = NOW() WHERE id = $1",
+            *batch1.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch 2: Failed (terminal)
+        let file2 = manager
+            .create_file(
+                "failed-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-failed".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":2}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch2 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file2,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes', failed_at = NOW() WHERE id = $1",
+            *batch2.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch 3: Cancelled (terminal)
+        let file3 = manager
+            .create_file(
+                "cancelled-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-cancelled".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":3}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch3 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file3,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes', cancelled_at = NOW() WHERE id = $1",
+            *batch3.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch 4: Cancelling (non-terminal, should be INCLUDED)
+        let file4 = manager
+            .create_file(
+                "cancelling-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-cancelling".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":4}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch4 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file4,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes', cancelling_at = NOW() WHERE id = $1",
+            *batch4.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch 5: Active (no terminal state, should be INCLUDED)
+        let file5 = manager
+            .create_file(
+                "active-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-active".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":5}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch5 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file5,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch5.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Query with 1-hour threshold
+        let at_risk = manager.find_at_risk_batches(3600).await.unwrap();
+
+        // Only non-terminal batches should be returned (batch4 and batch5)
+        assert_eq!(
+            at_risk.len(),
+            2,
+            "Should only return batches without terminal states"
+        );
+        assert!(
+            !at_risk.iter().any(|b| b.id == batch1.id),
+            "Should NOT include completed batch"
+        );
+        assert!(
+            !at_risk.iter().any(|b| b.id == batch2.id),
+            "Should NOT include failed batch"
+        );
+        assert!(
+            !at_risk.iter().any(|b| b.id == batch3.id),
+            "Should NOT include cancelled batch"
+        );
+        assert!(
+            at_risk.iter().any(|b| b.id == batch4.id),
+            "Should include cancelling batch (non-terminal)"
+        );
+        assert!(
+            at_risk.iter().any(|b| b.id == batch5.id),
+            "Should include active batch"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_find_at_risk_batches_request_state_filtering(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Batch 1: Only completed requests (should NOT be returned)
+        let file1 = manager
+            .create_file(
+                "all-completed-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-completed".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch1 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file1,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch1.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                completed_at = NOW(),
+                response_status = 200,
+                response_body = '{"result":"ok"}',
+                response_size = 16
+            WHERE batch_id = $1
+            "#,
+            *batch1.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch 2: Has pending requests (should be returned)
+        let file2 = manager
+            .create_file(
+                "pending-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-pending".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":2}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch2 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file2,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch2.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch 3: Has claimed requests (should be returned)
+        let file3 = manager
+            .create_file(
+                "claimed-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-claimed".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":3}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch3 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file3,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch3.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let daemon_id = Uuid::new_v4();
+        sqlx::query!(
+            "UPDATE requests SET state = 'claimed', daemon_id = $2, claimed_at = NOW() WHERE batch_id = $1",
+            *batch3.id as Uuid,
+            daemon_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch 4: Has processing requests (should be returned)
+        let file4 = manager
+            .create_file(
+                "processing-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-processing".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":4}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch4 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file4,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch4.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'processing',
+                daemon_id = $2,
+                claimed_at = NOW() - INTERVAL '1 second',
+                started_at = NOW()
+            WHERE batch_id = $1
+            "#,
+            *batch4.id as Uuid,
+            daemon_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch 5: Mixed states (some pending, some completed - should be returned)
+        let file5 = manager
+            .create_file(
+                "mixed-batch".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req-mixed-1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":5}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-mixed-2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":6}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch5 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file5,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch5.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Mark one request as completed, leave one pending
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                completed_at = NOW(),
+                response_status = 200,
+                response_body = '{"result":"ok"}',
+                response_size = 16
+            WHERE batch_id = $1 AND custom_id = 'req-mixed-1'
+            "#,
+            *batch5.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Query with 1-hour threshold
+        let at_risk = manager.find_at_risk_batches(3600).await.unwrap();
+
+        // Should return batches 2, 3, 4, 5 (all with active requests)
+        assert_eq!(
+            at_risk.len(),
+            4,
+            "Should return batches with pending/claimed/processing requests"
+        );
+        assert!(
+            !at_risk.iter().any(|b| b.id == batch1.id),
+            "Should NOT include batch with only completed requests"
+        );
+        assert!(
+            at_risk.iter().any(|b| b.id == batch2.id),
+            "Should include batch with pending requests"
+        );
+        assert!(
+            at_risk.iter().any(|b| b.id == batch3.id),
+            "Should include batch with claimed requests"
+        );
+        assert!(
+            at_risk.iter().any(|b| b.id == batch4.id),
+            "Should include batch with processing requests"
+        );
+        assert!(
+            at_risk.iter().any(|b| b.id == batch5.id),
+            "Should include batch with mixed request states"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_find_at_risk_batches_ordering(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create batches in non-sorted order to test ordering
+        // Batch B: Expires in 50 minutes (middle priority)
+        let file_b = manager
+            .create_file(
+                "batch-50min".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-50min".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":"b"}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch_b = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_b,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '50 minutes' WHERE id = $1",
+            *batch_b.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Small delay to ensure different created_at
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Batch A: Expires in 10 minutes (highest priority)
+        let file_a = manager
+            .create_file(
+                "batch-10min".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-10min".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":"a"}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch_a = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_a,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '10 minutes' WHERE id = $1",
+            *batch_a.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Small delay
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Batch C: Expires in 30 minutes (lowest priority of the three)
+        let file_c = manager
+            .create_file(
+                "batch-30min".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-30min".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":"c"}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch_c = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_c,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch_c.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Query with 1-hour threshold (all three should be returned)
+        let at_risk = manager.find_at_risk_batches(3600).await.unwrap();
+
+        // Should return all 3 batches in expiration order (A, C, B)
+        assert_eq!(at_risk.len(), 3, "Should return all 3 batches within threshold");
+        assert_eq!(
+            at_risk[0].id, batch_a.id,
+            "First should be batch expiring soonest (10 min)"
+        );
+        assert_eq!(
+            at_risk[1].id, batch_c.id,
+            "Second should be batch expiring in middle (30 min)"
+        );
+        assert_eq!(
+            at_risk[2].id, batch_b.id,
+            "Third should be batch expiring latest (50 min)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_find_at_risk_batches_multiple_thresholds(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create batches at different expiration times
+        // Batch 1: 15 minutes
+        let file1 = manager
+            .create_file(
+                "batch-15min".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-15min".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch1 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file1,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '15 minutes' WHERE id = $1",
+            *batch1.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch 2: 45 minutes
+        let file2 = manager
+            .create_file(
+                "batch-45min".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-45min".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":2}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch2 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file2,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '45 minutes' WHERE id = $1",
+            *batch2.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch 3: 90 minutes
+        let file3 = manager
+            .create_file(
+                "batch-90min".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-90min".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":3}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch3 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file3,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '90 minutes' WHERE id = $1",
+            *batch3.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Simulate SLA daemon querying with different thresholds
+        // Query 1: 30-minute threshold (critical)
+        let critical = manager.find_at_risk_batches(30 * 60).await.unwrap();
+        assert_eq!(critical.len(), 1, "30-min threshold: only 15-min batch");
+        assert_eq!(critical[0].id, batch1.id);
+
+        // Query 2: 60-minute threshold (warning)
+        let warning = manager.find_at_risk_batches(60 * 60).await.unwrap();
+        assert_eq!(warning.len(), 2, "60-min threshold: 15-min and 45-min batches");
+        assert!(warning.iter().any(|b| b.id == batch1.id));
+        assert!(warning.iter().any(|b| b.id == batch2.id));
+
+        // Query 3: 120-minute threshold (info)
+        let info = manager.find_at_risk_batches(120 * 60).await.unwrap();
+        assert_eq!(info.len(), 3, "120-min threshold: all three batches");
+        assert!(info.iter().any(|b| b.id == batch1.id));
+        assert!(info.iter().any(|b| b.id == batch2.id));
+        assert!(info.iter().any(|b| b.id == batch3.id));
+    }
+
+    #[sqlx::test]
+    async fn test_find_at_risk_batches_edge_cases(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Edge case 1: Empty database
+        let empty_result = manager.find_at_risk_batches(3600).await.unwrap();
+        assert_eq!(empty_result.len(), 0, "Empty database should return empty vec");
+
+        // Edge case 2: Create batch outside threshold
+        let file1 = manager
+            .create_file(
+                "far-future-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-far".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch1 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file1,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '10 hours' WHERE id = $1",
+            *batch1.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let no_match = manager.find_at_risk_batches(3600).await.unwrap();
+        assert_eq!(
+            no_match.len(),
+            0,
+            "Batch outside threshold should return empty vec"
+        );
+
+        // Edge case 3: Very small threshold (should still work)
+        let file2 = manager
+            .create_file(
+                "immediate-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-immediate".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":2}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch2 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file2,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 seconds' WHERE id = $1",
+            *batch2.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let urgent = manager.find_at_risk_batches(60).await.unwrap();
+        assert_eq!(urgent.len(), 1, "Should find batch expiring in 30 seconds");
+        assert_eq!(urgent[0].id, batch2.id);
+
+        // Edge case 4: Zero threshold (only expired batches)
+        let expired = manager.find_at_risk_batches(0).await.unwrap();
+        assert_eq!(
+            expired.len(),
+            0,
+            "Zero threshold should not return future batches"
+        );
+    }
 }
+
