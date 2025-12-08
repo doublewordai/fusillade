@@ -6772,14 +6772,25 @@ mod tests {
         let at_risk = manager.find_at_risk_batches(3600).await.unwrap();
 
         // Only batch1 (30 min) should be returned
-        assert_eq!(at_risk.len(), 1, "Only batch within threshold should be returned");
-        assert_eq!(at_risk[0].id, batch1.id, "Should return the 30-minute batch");
+        assert_eq!(
+            at_risk.len(),
+            1,
+            "Only batch within threshold should be returned"
+        );
+        assert_eq!(
+            at_risk[0].id, batch1.id,
+            "Should return the 30-minute batch"
+        );
 
         // Query with 3-hour threshold
         let at_risk_long = manager.find_at_risk_batches(3600 * 3).await.unwrap();
 
         // Both batch1 and batch2 should be returned
-        assert_eq!(at_risk_long.len(), 2, "Both batches within 3-hour threshold");
+        assert_eq!(
+            at_risk_long.len(),
+            2,
+            "Both batches within 3-hour threshold"
+        );
         assert!(
             at_risk_long.iter().any(|b| b.id == batch1.id),
             "Should include 30-minute batch"
@@ -7435,7 +7446,11 @@ mod tests {
         let at_risk = manager.find_at_risk_batches(3600).await.unwrap();
 
         // Should return all 3 batches in expiration order (A, C, B)
-        assert_eq!(at_risk.len(), 3, "Should return all 3 batches within threshold");
+        assert_eq!(
+            at_risk.len(),
+            3,
+            "Should return all 3 batches within threshold"
+        );
         assert_eq!(
             at_risk[0].id, batch_a.id,
             "First should be batch expiring soonest (10 min)"
@@ -7575,7 +7590,11 @@ mod tests {
 
         // Query 2: 60-minute threshold (warning)
         let warning = manager.find_at_risk_batches(60 * 60).await.unwrap();
-        assert_eq!(warning.len(), 2, "60-min threshold: 15-min and 45-min batches");
+        assert_eq!(
+            warning.len(),
+            2,
+            "60-min threshold: 15-min and 45-min batches"
+        );
         assert!(warning.iter().any(|b| b.id == batch1.id));
         assert!(warning.iter().any(|b| b.id == batch2.id));
 
@@ -7594,7 +7613,11 @@ mod tests {
 
         // Edge case 1: Empty database
         let empty_result = manager.find_at_risk_batches(3600).await.unwrap();
-        assert_eq!(empty_result.len(), 0, "Empty database should return empty vec");
+        assert_eq!(
+            empty_result.len(),
+            0,
+            "Empty database should return empty vec"
+        );
 
         // Edge case 2: Create batch outside threshold
         let file1 = manager
@@ -7690,4 +7713,3 @@ mod tests {
         );
     }
 }
-
