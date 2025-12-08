@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT b.id as batch_id, b.expires_at\n            FROM batches b\n            JOIN requests r ON r.batch_id = b.id\n            WHERE b.expires_at < NOW() + make_interval(secs => $1)\n              AND b.completed_at IS NULL\n              AND b.failed_at IS NULL\n              AND b.cancelled_at IS NULL\n              AND r.state IN ('pending', 'claimed', 'processing')\n            ORDER BY b.expires_at ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "cce8e15ec6aca56629ee3ae5e1a1fbee1356e96ecc881b345f340e329f68afe3"
+}

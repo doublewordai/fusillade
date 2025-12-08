@@ -40,6 +40,49 @@ fn default_should_retry_fn() -> ShouldRetryFn {
     Arc::new(default_should_retry)
 }
 
+/// Default SLA check interval (1 minute)
+fn default_sla_check_interval_seconds() -> u64 {
+    60
+}
+
+/// Log level for SLA threshold violations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlaLogLevel {
+    /// Log as warning
+    Warn,
+    /// Log as error
+    Error,
+}
+
+/// Action to take when a batch crosses an SLA threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlaAction {
+    /// Log the SLA violation at the specified level
+    Log {
+        /// Log level (warn or error)
+        level: SlaLogLevel,
+    },
+    // Future actions:
+    // Escalate,  // Call realtime API
+    // Notify,    // Send notification/webhook
+    // Abort,     // Cancel the batch
+}
+
+/// SLA threshold configuration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SlaThreshold {
+    /// Human-readable name for this threshold (e.g., "warning", "critical")
+    pub name: String,
+
+    /// Trigger when time remaining is less than this many seconds
+    pub threshold_seconds: i64,
+
+    /// Action to take when threshold is crossed
+    pub action: SlaAction,
+}
+
 /// Configuration for the daemon.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
@@ -93,6 +136,37 @@ pub struct DaemonConfig {
     /// Interval for polling database to check for cancelled batches (milliseconds)
     /// Determines how quickly in-flight requests are aborted when their batch is cancelled
     pub cancellation_poll_interval_ms: u64,
+
+    /// How often to check for batches approaching SLA deadlines (seconds)
+    /// Default: 60 (1 minute)
+    /// Only used if sla_thresholds is non-empty
+    #[serde(default = "default_sla_check_interval_seconds")]
+    pub sla_check_interval_seconds: u64,
+
+    /// SLA threshold configurations.
+    /// Each threshold defines a time limit and action to take when batches approach expiration.
+    /// The daemon will query the database once per threshold to find at-risk batches.
+    ///
+    /// Example: Two thresholds (warning at 1 hour, critical at 15 minutes)
+    /// ```
+    /// use fusillade::daemon::{SlaThreshold, SlaAction, SlaLogLevel};
+    ///
+    /// vec![
+    ///     SlaThreshold {
+    ///         name: "warning".to_string(),
+    ///         threshold_seconds: 3600,
+    ///         action: SlaAction::Log { level: SlaLogLevel::Warn },
+    ///     },
+    ///     SlaThreshold {
+    ///         name: "critical".to_string(),
+    ///         threshold_seconds: 900,
+    ///         action: SlaAction::Log { level: SlaLogLevel::Error },
+    ///     },
+    /// ]
+    /// # ;
+    /// ```
+    #[serde(default)]
+    pub sla_thresholds: Vec<SlaThreshold>,
 }
 
 impl Default for DaemonConfig {
@@ -113,6 +187,23 @@ impl Default for DaemonConfig {
             claim_timeout_ms: 60000,             // 1 minute
             processing_timeout_ms: 600000,       // 10 minutes
             cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
+            sla_check_interval_seconds: default_sla_check_interval_seconds(),
+            sla_thresholds: vec![
+                SlaThreshold {
+                    name: "warning".to_string(),
+                    threshold_seconds: 3600, // 1 hour
+                    action: SlaAction::Log {
+                        level: SlaLogLevel::Warn,
+                    },
+                },
+                SlaThreshold {
+                    name: "critical".to_string(),
+                    threshold_seconds: 900, // 15 minutes
+                    action: SlaAction::Log {
+                        level: SlaLogLevel::Error,
+                    },
+                },
+            ],
         }
     }
 }
@@ -395,6 +486,90 @@ where
             }
         });
 
+        // SLA Monitoring Task
+        // Periodically checks for batches approaching their SLA deadline and logs warnings/errors
+        if !self.config.sla_thresholds.is_empty() {
+            let storage = self.storage.clone();
+            let shutdown_token = self.shutdown_token.clone();
+            let sla_thresholds = self.config.sla_thresholds.clone();
+            let sla_check_interval_seconds = self.config.sla_check_interval_seconds;
+
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(sla_check_interval_seconds));
+
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            // Query once per configured threshold
+                            for threshold in &sla_thresholds {
+                                match storage.find_at_risk_batches(threshold.threshold_seconds).await {
+                                    Ok(batches) => {
+                                        for batch in batches {
+                                            // Calculate time remaining in daemon layer
+                                            let time_remaining_secs = if let Some(expires_at) = batch.expires_at {
+                                                (expires_at - chrono::Utc::now()).num_seconds()
+                                            } else {
+                                                continue; // Skip batches without expiration
+                                            };
+
+                                            // Count pending and active requests
+                                            let pending_count = batch.pending_requests;
+                                            let active_count = batch.in_progress_requests;
+
+                                            // Perform action based on threshold configuration
+                                            match threshold.action {
+                                                SlaAction::Log { level } => {
+                                                    match level {
+                                                        SlaLogLevel::Error => {
+                                                            tracing::error!(
+                                                                batch_id = %batch.id,
+                                                                expires_at = ?batch.expires_at,
+                                                                time_remaining_secs = time_remaining_secs,
+                                                                pending_count = pending_count,
+                                                                active_count = active_count,
+                                                                threshold_seconds = threshold.threshold_seconds,
+                                                                sla_name = %threshold.name,
+                                                                "Batch approaching SLA deadline"
+                                                            );
+                                                        }
+                                                        SlaLogLevel::Warn => {
+                                                            tracing::warn!(
+                                                                batch_id = %batch.id,
+                                                                expires_at = ?batch.expires_at,
+                                                                time_remaining_secs = time_remaining_secs,
+                                                                pending_count = pending_count,
+                                                                active_count = active_count,
+                                                                threshold_seconds = threshold.threshold_seconds,
+                                                                sla_name = %threshold.name,
+                                                                "Batch approaching SLA deadline"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                // Future actions can be added here
+                                                // SlaAction::Escalate => { ... }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            "Failed to check SLA thresholds"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ = shutdown_token.cancelled() => {
+                            tracing::debug!("SLA checker shutting down");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
         let run_result = loop {
@@ -657,6 +832,8 @@ mod tests {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            sla_check_interval_seconds: 60,
+            sla_thresholds: vec![], // Disable SLA monitoring in tests
         };
 
         let manager = Arc::new(
@@ -818,6 +995,8 @@ mod tests {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            sla_check_interval_seconds: 60,
+            sla_thresholds: vec![], // Disable SLA monitoring in tests
         };
 
         let manager = Arc::new(
@@ -1037,6 +1216,8 @@ mod tests {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            sla_check_interval_seconds: 60,
+            sla_thresholds: vec![], // Disable SLA monitoring in tests
         };
 
         let manager = Arc::new(
@@ -1165,6 +1346,8 @@ mod tests {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            sla_check_interval_seconds: 60,
+            sla_thresholds: vec![], // Disable SLA monitoring in tests
         };
 
         let manager = Arc::new(

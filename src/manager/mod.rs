@@ -105,6 +105,23 @@ pub trait Storage: Send + Sync {
     /// Get all requests for a batch.
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>>;
 
+    /// Find batches at risk of missing their SLA deadline.
+    ///
+    /// Returns batches where:
+    /// - `expires_at` is set
+    /// - `expires_at < NOW() + threshold_seconds`
+    /// - Not in terminal state (completed/failed/cancelled)
+    /// - Has pending or active requests
+    ///
+    /// Ordered by urgency (soonest expiration first).
+    ///
+    /// # Arguments
+    /// - `threshold_seconds`: Time remaining threshold (e.g., 3600 for 1 hour)
+    ///
+    /// # Returns
+    /// Vector of `Batch` objects matching the SLA threshold criteria
+    async fn find_at_risk_batches(&self, threshold_seconds: i64) -> Result<Vec<Batch>>;
+
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
 

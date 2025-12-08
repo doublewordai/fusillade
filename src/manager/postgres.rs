@@ -2238,6 +2238,35 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .collect())
     }
 
+    async fn find_at_risk_batches(&self, threshold_seconds: i64) -> Result<Vec<Batch>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT DISTINCT b.id as batch_id, b.expires_at
+            FROM batches b
+            JOIN requests r ON r.batch_id = b.id
+            WHERE b.expires_at < NOW() + make_interval(secs => $1)
+              AND b.completed_at IS NULL
+              AND b.failed_at IS NULL
+              AND b.cancelled_at IS NULL
+              AND r.state IN ('pending', 'claimed', 'processing')
+            ORDER BY b.expires_at ASC
+            "#,
+            threshold_seconds as f64
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to find at-risk batches: {}", e)))?;
+
+        // Fetch full batch details for each at-risk batch
+        let mut batches = Vec::new();
+        for row in rows {
+            let batch = self.get_batch(BatchId(row.batch_id)).await?;
+            batches.push(batch);
+        }
+
+        Ok(batches)
+    }
+
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
         let now = Utc::now();
 
@@ -5696,6 +5725,8 @@ mod tests {
             claim_timeout_ms: 5000,
             processing_timeout_ms: 10000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            sla_check_interval_seconds: 60,
+            sla_thresholds: vec![], // Disable SLA monitoring in tests
         };
 
         let daemon = Arc::new(crate::daemon::Daemon::new(
@@ -6512,7 +6543,10 @@ mod tests {
             .expect("Failed to claim requests");
 
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].data.batch_id, batch1.id, "First claim should be from most urgent batch (30 min expiration)");
+        assert_eq!(
+            claimed[0].data.batch_id, batch1.id,
+            "First claim should be from most urgent batch (30 min expiration)"
+        );
         assert_eq!(claimed[0].data.custom_id, Some("urgent-1".to_string()));
 
         // Claim another - should get medium priority (batch2, 2 hours)
@@ -6522,7 +6556,10 @@ mod tests {
             .expect("Failed to claim requests");
 
         assert_eq!(claimed2.len(), 1);
-        assert_eq!(claimed2[0].data.batch_id, batch2.id, "Second claim should be from medium priority batch (2 hour expiration)");
+        assert_eq!(
+            claimed2[0].data.batch_id, batch2.id,
+            "Second claim should be from medium priority batch (2 hour expiration)"
+        );
         assert_eq!(claimed2[0].data.custom_id, Some("medium-1".to_string()));
 
         // Claim last one - should get no-SLA batch (batch3)
@@ -6532,7 +6569,10 @@ mod tests {
             .expect("Failed to claim requests");
 
         assert_eq!(claimed3.len(), 1);
-        assert_eq!(claimed3[0].data.batch_id, batch3.id, "Third claim should be from no-SLA batch (NULL expiration)");
+        assert_eq!(
+            claimed3[0].data.batch_id, batch3.id,
+            "Third claim should be from no-SLA batch (NULL expiration)"
+        );
         assert_eq!(claimed3[0].data.custom_id, Some("no-sla-1".to_string()));
     }
 
