@@ -611,7 +611,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         AND (r.not_before IS NULL OR r.not_before <= $3)
                         AND b.cancelling_at IS NULL
                         AND available_slots.slots > 0
-                    ORDER BY r.created_at ASC
+                    ORDER BY
+                        -- Priority 1: Batches by expiration time (soonest first)
+                        b.expires_at ASC NULLS LAST,
+                        -- Priority 2: FIFO within same batch
+                        r.created_at ASC
                     LIMIT LEAST($5, (SELECT slots FROM available_slots))
                     FOR UPDATE OF r SKIP LOCKED
                 )
@@ -6375,6 +6379,161 @@ mod tests {
             db_file.purpose.is_none() || db_file.purpose.as_deref() == Some("batch"),
             "Should not be a virtual output/error file"
         );
+    }
+
+    #[sqlx::test]
+    async fn test_sla_based_claim_priority(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create three batches with different expiration times
+        // IMPORTANT: Create in REVERSE order of SLA priority to test that SLA ordering works
+        // (not just relying on FIFO/created_at ordering)
+
+        // Batch 3: No expiration (LOWEST SLA PRIORITY, created FIRST)
+        let file3 = manager
+            .create_file(
+                "no-sla-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("no-sla-1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"no_sla":true}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch3 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file3,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // batch3.expires_at remains NULL (no SLA)
+
+        // Small delay to ensure different created_at timestamps
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Batch 2: Expires in 2 hours (MEDIUM SLA PRIORITY, created SECOND)
+        let file2 = manager
+            .create_file(
+                "medium-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("medium-1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"medium":true}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch2 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file2,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Set batch2 to expire in 2 hours
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '2 hours' WHERE id = $1",
+            *batch2.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Small delay to ensure different created_at timestamps
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Batch 1: Expires in 30 minutes (HIGHEST SLA PRIORITY, created LAST)
+        let file1 = manager
+            .create_file(
+                "urgent-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("urgent-1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"urgent":true}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch1 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file1,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Set batch1 to expire in 30 minutes
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch1.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+
+        // Claim 1 request - should get the most urgent one (batch1, 30 min)
+        let claimed = manager
+            .claim_requests(1, daemon_id)
+            .await
+            .expect("Failed to claim requests");
+
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].data.batch_id, batch1.id, "First claim should be from most urgent batch (30 min expiration)");
+        assert_eq!(claimed[0].data.custom_id, Some("urgent-1".to_string()));
+
+        // Claim another - should get medium priority (batch2, 2 hours)
+        let claimed2 = manager
+            .claim_requests(1, daemon_id)
+            .await
+            .expect("Failed to claim requests");
+
+        assert_eq!(claimed2.len(), 1);
+        assert_eq!(claimed2[0].data.batch_id, batch2.id, "Second claim should be from medium priority batch (2 hour expiration)");
+        assert_eq!(claimed2[0].data.custom_id, Some("medium-1".to_string()));
+
+        // Claim last one - should get no-SLA batch (batch3)
+        let claimed3 = manager
+            .claim_requests(1, daemon_id)
+            .await
+            .expect("Failed to claim requests");
+
+        assert_eq!(claimed3.len(), 1);
+        assert_eq!(claimed3[0].data.batch_id, batch3.id, "Third claim should be from no-SLA batch (NULL expiration)");
+        assert_eq!(claimed3[0].data.custom_id, Some("no-sla-1".to_string()));
     }
 
     #[sqlx::test]
