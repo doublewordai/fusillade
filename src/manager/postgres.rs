@@ -1460,9 +1460,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         let mut query_builder = QueryBuilder::new(
             r#"
-            SELECT 
-                f.id, f.name, f.description, f.size_bytes, f.size_finalized, 
-                f.status, f.error_message, f.purpose, f.expires_at, f.deleted_at, 
+            SELECT
+                f.id, f.name, f.description, f.size_bytes, f.size_finalized,
+                f.status, f.error_message, f.purpose, f.expires_at, f.deleted_at,
                 f.uploaded_by, f.created_at, f.updated_at,
                 b.id as batch_id,
                 b.total_requests,
@@ -2266,6 +2266,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         tracing::info!(count = ids.len(), "Retrying failed requests");
 
         let mut results = Vec::new();
+        let mut batch_ids_to_reset = std::collections::HashSet::new();
 
         for id in ids {
             // Get the request from storage
@@ -2274,6 +2275,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
             let result = match request_result {
                 Ok(AnyRequest::Failed(req)) => {
+                    // Track the batch ID for timestamp reset
+                    batch_ids_to_reset.insert(req.data.batch_id);
+
                     // Reset to pending state with retry_attempt = 0
                     let pending_request = Request {
                         state: Pending {
@@ -2295,6 +2299,28 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             };
 
             results.push(result);
+        }
+
+        // Reset batch timestamps for all affected batches
+        // This allows finalizing_at and completed_at to be recalculated when the batch finishes again
+        for batch_id in batch_ids_to_reset {
+            sqlx::query!(
+                r#"
+                UPDATE batches
+                SET finalizing_at = NULL,
+                    completed_at = NULL,
+                    failed_at = NULL
+                WHERE id = $1
+                "#,
+                *batch_id as Uuid
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to reset batch timestamps: {}", e))
+            })?;
+
+            tracing::info!(batch_id = %batch_id, "Reset batch timestamps for retry");
         }
 
         Ok(results)
