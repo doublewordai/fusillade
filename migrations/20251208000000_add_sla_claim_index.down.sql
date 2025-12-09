@@ -5,7 +5,7 @@
 
 -- Remove indexes
 DROP INDEX IF EXISTS idx_batches_active_by_expiration;
-DROP INDEX IF EXISTS idx_requests_pending_sla;
+DROP INDEX IF EXISTS idx_requests_pending_by_batch;
 
 -- Recreate the old partial index
 CREATE INDEX idx_batches_expires_at ON batches(expires_at) WHERE expires_at IS NOT NULL;

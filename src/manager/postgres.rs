@@ -651,11 +651,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         AND (r.not_before IS NULL OR r.not_before <= $3)
                         AND b.cancelling_at IS NULL
                         AND available_slots.slots > 0
-                    ORDER BY
-                        -- Priority 1: Batches by expiration time (soonest first)
-                        b.expires_at ASC NULLS LAST,
-                        -- Priority 2: FIFO within same batch
-                        r.created_at ASC
+                    ORDER BY b.expires_at ASC
                     LIMIT LEAST($5, (SELECT slots FROM available_slots))
                     FOR UPDATE OF r SKIP LOCKED
                 )
@@ -2248,7 +2244,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
               AND b.cancelled_at IS NULL
               AND b.cancelling_at IS NULL
               AND r.state = 'pending'
-            ORDER BY b.expires_at ASC, r.created_at ASC
+            ORDER BY b.expires_at ASC
             "#,
             threshold_seconds as f64
         )
