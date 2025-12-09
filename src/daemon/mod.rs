@@ -503,52 +503,45 @@ where
                         _ = interval.tick() => {
                             // Query once per configured threshold
                             for threshold in &sla_thresholds {
-                                match storage.find_at_risk_batches(threshold.threshold_seconds).await {
-                                    Ok(batches) => {
-                                        for batch in batches {
-                                            // Calculate time remaining in daemon layer
-                                            let time_remaining_secs = if let Some(expires_at) = batch.expires_at {
-                                                (expires_at - chrono::Utc::now()).num_seconds()
-                                            } else {
-                                                continue; // Skip batches without expiration
-                                            };
+                                match storage.find_at_risk_requests(threshold.threshold_seconds).await {
+                                    Ok(requests) => {
+                                        // Group requests by batch for aggregated logging
+                                        let mut batch_counts: std::collections::HashMap<crate::batch::BatchId, usize> = std::collections::HashMap::new();
+                                        for request in &requests {
+                                            *batch_counts.entry(request.data.batch_id).or_insert(0) += 1;
+                                        }
 
-                                            // Count pending and active requests
-                                            let pending_count = batch.pending_requests;
-                                            let active_count = batch.in_progress_requests;
-
+                                        for (batch_id, pending_count) in batch_counts {
                                             // Perform action based on threshold configuration
                                             match threshold.action {
                                                 SlaAction::Log { level } => {
                                                     match level {
                                                         SlaLogLevel::Error => {
                                                             tracing::error!(
-                                                                batch_id = %batch.id,
-                                                                expires_at = ?batch.expires_at,
-                                                                time_remaining_secs = time_remaining_secs,
+                                                                batch_id = %batch_id,
                                                                 pending_count = pending_count,
-                                                                active_count = active_count,
                                                                 threshold_seconds = threshold.threshold_seconds,
                                                                 sla_name = %threshold.name,
-                                                                "Batch approaching SLA deadline"
+                                                                "Pending requests at risk of missing SLA"
                                                             );
                                                         }
                                                         SlaLogLevel::Warn => {
                                                             tracing::warn!(
-                                                                batch_id = %batch.id,
-                                                                expires_at = ?batch.expires_at,
-                                                                time_remaining_secs = time_remaining_secs,
+                                                                batch_id = %batch_id,
                                                                 pending_count = pending_count,
-                                                                active_count = active_count,
                                                                 threshold_seconds = threshold.threshold_seconds,
                                                                 sla_name = %threshold.name,
-                                                                "Batch approaching SLA deadline"
+                                                                "Pending requests at risk of missing SLA"
                                                             );
                                                         }
                                                     }
                                                 }
-                                                // Future actions can be added here
-                                                // SlaAction::Escalate => { ... }
+                                                // Future actions can be added here:
+                                                // SlaAction::Escalate => {
+                                                //     - Could claim these specific requests with priority
+                                                //     - Could trigger scale-up of workers
+                                                //     - Could send alerts with request IDs
+                                                // }
                                             }
                                         }
                                     }

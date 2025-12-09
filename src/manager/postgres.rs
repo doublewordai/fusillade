@@ -68,6 +68,46 @@ pub struct PostgresRequestManager<H: HttpClient> {
     download_buffer_size: usize,
 }
 
+/// Macro to construct a `Batch` from a database row.
+///
+/// This eliminates the duplication of mapping database row fields to Batch objects
+/// across multiple query methods.
+///
+/// # Example
+/// ```ignore
+/// let row = sqlx::query!(...).fetch_one(&pool).await?;
+/// let batch = batch_from_row!(row);
+/// ```
+macro_rules! batch_from_row {
+    ($row:expr) => {
+        Batch {
+            id: BatchId($row.id),
+            file_id: FileId($row.file_id),
+            endpoint: $row.endpoint,
+            completion_window: $row.completion_window,
+            metadata: $row.metadata,
+            output_file_id: $row.output_file_id.map(FileId),
+            error_file_id: $row.error_file_id.map(FileId),
+            created_by: $row.created_by,
+            created_at: $row.created_at,
+            expires_at: $row.expires_at,
+            cancelling_at: $row.cancelling_at,
+            errors: $row.errors,
+            total_requests: $row.total_requests,
+            requests_started_at: $row.requests_started_at,
+            finalizing_at: $row.finalizing_at,
+            completed_at: $row.completed_at,
+            failed_at: $row.failed_at,
+            cancelled_at: $row.cancelled_at,
+            pending_requests: $row.pending_requests,
+            in_progress_requests: $row.in_progress_requests,
+            completed_requests: $row.completed_requests,
+            failed_requests: $row.failed_requests,
+            canceled_requests: $row.canceled_requests,
+        }
+    };
+}
+
 impl PostgresRequestManager<crate::http::ReqwestHttpClient> {
     /// Create a new PostgreSQL request manager with default settings.
     ///
@@ -1686,11 +1726,28 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             })?;
 
         // Calculate expires_at from completion_window
+        // IMPORTANT: expires_at is required for queue prioritization and SLA monitoring
+        // Batches without it will never be processed, so we fail-fast on invalid completion_window
         let now = Utc::now();
-        let expires_at = humantime::parse_duration(&input.completion_window)
-            .ok()
-            .and_then(|std_duration| chrono::Duration::from_std(std_duration).ok())
-            .and_then(|duration| now.checked_add_signed(duration));
+        let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Invalid completion_window '{}': {}. Expected format like '24h', '7d', etc.",
+                input.completion_window,
+                e
+            ))
+        })?;
+        let chrono_duration = chrono::Duration::from_std(std_duration).map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to convert completion_window duration: {}",
+                e
+            ))
+        })?;
+        let expires_at = now.checked_add_signed(chrono_duration).ok_or_else(|| {
+            FusilladeError::Other(anyhow!(
+                "Expiration time overflow when calculating expires_at from completion_window '{}'",
+                input.completion_window
+            ))
+        })?;
 
         // Create batch with new fields
         let row = sqlx::query!(
@@ -1994,31 +2051,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 .await
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by output file: {}", e)))?;
 
-                Ok(row.map(|row| Batch {
-                    id: BatchId(row.id),
-                    file_id: FileId(row.file_id),
-                    created_at: row.created_at,
-                    metadata: row.metadata,
-                    completion_window: row.completion_window,
-                    endpoint: row.endpoint,
-                    output_file_id: row.output_file_id.map(FileId),
-                    error_file_id: row.error_file_id.map(FileId),
-                    created_by: row.created_by,
-                    expires_at: row.expires_at,
-                    cancelling_at: row.cancelling_at,
-                    errors: row.errors,
-                    total_requests: row.total_requests,
-                    pending_requests: row.pending_requests,
-                    in_progress_requests: row.in_progress_requests,
-                    completed_requests: row.completed_requests,
-                    failed_requests: row.failed_requests,
-                    canceled_requests: row.canceled_requests,
-                    requests_started_at: row.requests_started_at,
-                    finalizing_at: row.finalizing_at,
-                    completed_at: row.completed_at,
-                    failed_at: row.failed_at,
-                    cancelled_at: row.cancelled_at,
-                }))
+                Ok(row.map(|row| batch_from_row!(row)))
             }
             OutputFileType::Error => {
                 let row = sqlx::query!(
@@ -2057,31 +2090,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 .await
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by error file: {}", e)))?;
 
-                Ok(row.map(|row| Batch {
-                    id: BatchId(row.id),
-                    file_id: FileId(row.file_id),
-                    created_at: row.created_at,
-                    metadata: row.metadata,
-                    completion_window: row.completion_window,
-                    endpoint: row.endpoint,
-                    output_file_id: row.output_file_id.map(FileId),
-                    error_file_id: row.error_file_id.map(FileId),
-                    created_by: row.created_by,
-                    expires_at: row.expires_at,
-                    cancelling_at: row.cancelling_at,
-                    errors: row.errors,
-                    total_requests: row.total_requests,
-                    pending_requests: row.pending_requests,
-                    in_progress_requests: row.in_progress_requests,
-                    completed_requests: row.completed_requests,
-                    failed_requests: row.failed_requests,
-                    canceled_requests: row.canceled_requests,
-                    requests_started_at: row.requests_started_at,
-                    finalizing_at: row.finalizing_at,
-                    completed_at: row.completed_at,
-                    failed_at: row.failed_at,
-                    cancelled_at: row.cancelled_at,
-                }))
+                Ok(row.map(|row| batch_from_row!(row)))
             }
         }
     }
@@ -2154,34 +2163,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| Batch {
-                id: BatchId(row.id),
-                file_id: FileId(row.file_id),
-                created_at: row.created_at,
-                metadata: row.metadata,
-                completion_window: row.completion_window,
-                endpoint: row.endpoint,
-                output_file_id: row.output_file_id.map(FileId),
-                error_file_id: row.error_file_id.map(FileId),
-                created_by: row.created_by,
-                expires_at: row.expires_at,
-                cancelling_at: row.cancelling_at,
-                errors: row.errors,
-                total_requests: row.total_requests,
-                pending_requests: row.pending_requests,
-                in_progress_requests: row.in_progress_requests,
-                completed_requests: row.completed_requests,
-                failed_requests: row.failed_requests,
-                canceled_requests: row.canceled_requests,
-                requests_started_at: row.requests_started_at,
-                finalizing_at: row.finalizing_at,
-                completed_at: row.completed_at,
-                failed_at: row.failed_at,
-                cancelled_at: row.cancelled_at,
-            })
-            .collect())
+        Ok(rows.into_iter().map(|row| batch_from_row!(row)).collect())
     }
 
     async fn list_file_batches(&self, file_id: FileId) -> Result<Vec<BatchStatus>> {
@@ -2238,33 +2220,64 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .collect())
     }
 
-    async fn find_at_risk_batches(&self, threshold_seconds: i64) -> Result<Vec<Batch>> {
+    async fn find_at_risk_requests(&self, threshold_seconds: i64) -> Result<Vec<Request<Pending>>> {
+        // Find pending requests from batches at risk of missing SLA
+        // Matches claim_requests pattern: request-level query with batch JOIN for prioritization
         let rows = sqlx::query!(
             r#"
-            SELECT DISTINCT b.id as batch_id, b.expires_at
-            FROM batches b
-            JOIN requests r ON r.batch_id = b.id
+            SELECT
+                r.id,
+                r.batch_id,
+                r.template_id,
+                r.retry_attempt,
+                r.not_before,
+                t.custom_id,
+                t.endpoint,
+                t.method,
+                t.path,
+                t.body,
+                t.model,
+                t.api_key,
+                b.expires_at
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            JOIN request_templates t ON r.template_id = t.id
             WHERE b.expires_at < NOW() + make_interval(secs => $1)
               AND b.completed_at IS NULL
               AND b.failed_at IS NULL
               AND b.cancelled_at IS NULL
-              AND r.state IN ('pending', 'claimed', 'processing')
-            ORDER BY b.expires_at ASC
+              AND b.cancelling_at IS NULL
+              AND r.state = 'pending'
+            ORDER BY b.expires_at ASC, r.created_at ASC
             "#,
             threshold_seconds as f64
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to find at-risk batches: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to find at-risk requests: {}", e)))?;
 
-        // Fetch full batch details for each at-risk batch
-        let mut batches = Vec::new();
-        for row in rows {
-            let batch = self.get_batch(BatchId(row.batch_id)).await?;
-            batches.push(batch);
-        }
-
-        Ok(batches)
+        // Map rows to Request<Pending>
+        Ok(rows
+            .into_iter()
+            .map(|row| Request {
+                data: RequestData {
+                    id: RequestId(row.id),
+                    batch_id: BatchId(row.batch_id),
+                    template_id: TemplateId(row.template_id),
+                    custom_id: row.custom_id,
+                    endpoint: row.endpoint,
+                    method: row.method,
+                    path: row.path,
+                    body: row.body,
+                    model: row.model,
+                    api_key: row.api_key,
+                },
+                state: Pending {
+                    retry_attempt: row.retry_attempt as u32,
+                    not_before: row.not_before,
+                },
+            })
+            .collect())
     }
 
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
@@ -3149,6 +3162,12 @@ mod tests {
     };
     use crate::http::MockHttpClient;
 
+    // =========================================================================
+    // FILE OPERATIONS
+    // =========================================================================
+    // Tests for create_file, get_file, list_files, delete_file
+    // Basic CRUD operations for file management
+
     #[sqlx::test]
     async fn test_create_and_get_file(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
@@ -3206,6 +3225,12 @@ mod tests {
             _ => panic!("Expected template"),
         }
     }
+
+    // =========================================================================
+    // BATCH OPERATIONS
+    // =========================================================================
+    // Tests for create_batch, get_batch, list_batches, cancel_batch
+    // Batch lifecycle management and status tracking
 
     #[sqlx::test]
     async fn test_create_batch_and_get_status(pool: sqlx::PgPool) {
@@ -3287,6 +3312,12 @@ mod tests {
             assert!(request.is_pending());
         }
     }
+
+    // =========================================================================
+    // REQUEST OPERATIONS
+    // =========================================================================
+    // Tests for claim_requests, cancel_requests, get_requests
+    // Request claiming, cancellation, and retrieval
 
     #[sqlx::test]
     async fn test_claim_requests(pool: sqlx::PgPool) {
@@ -3657,6 +3688,15 @@ mod tests {
         assert!(status_after.is_err());
     }
 
+    // =========================================================================
+    // REQUEST LIFECYCLE & UNCLAIMING
+    // =========================================================================
+    // Tests for automatic request lifecycle management and unclaiming logic:
+    // - Unclaiming stale claimed requests (claimed but not processing)
+    // - Unclaiming stale processing requests (stuck in processing)
+    // - Not unclaiming recently claimed requests
+    // - Preserving retry_attempt across unclaim operations
+
     #[sqlx::test]
     async fn test_unclaim_stale_claimed_requests(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
@@ -3954,6 +3994,14 @@ mod tests {
         assert_eq!(claimed[0].state.retry_attempt, 2);
     }
 
+    // =========================================================================
+    // BATCH OUTPUT & ERROR STREAMING
+    // =========================================================================
+    // Tests for streaming batch results:
+    // - get_file_content_stream for output and error files
+    // - Virtual file IDs for batch results
+    // - Streaming completed and failed requests
+
     #[sqlx::test]
     async fn test_batch_output_and_error_streaming(pool: sqlx::PgPool) {
         use futures::StreamExt;
@@ -4162,9 +4210,13 @@ mod tests {
         }
     }
 
-    // ========================================================================
-    // Daemon storage tests
-    // ========================================================================
+    // =========================================================================
+    // DAEMON STORAGE
+    // =========================================================================
+    // Tests for daemon state persistence:
+    // - persist_daemon and get_daemon
+    // - Heartbeat updates
+    // - list_daemons with filtering
 
     #[sqlx::test]
     async fn test_daemon_persist_and_get(pool: sqlx::PgPool) {
@@ -4386,6 +4438,15 @@ mod tests {
         }
     }
 
+    // =========================================================================
+    // FILE STREAMING (create_file_stream)
+    // =========================================================================
+    // Tests for streaming file uploads:
+    // - Creating files from streams (metadata, templates, outputs)
+    // - Metadata and template ordering edge cases
+    // - Error handling in streams
+    // - Filename generation and conflict detection
+
     #[sqlx::test]
     async fn test_create_file_stream_with_metadata_and_templates(pool: sqlx::PgPool) {
         use crate::batch::{FileMetadata, FileStreamItem};
@@ -4564,6 +4625,15 @@ mod tests {
             _ => panic!("Expected ValidationError"),
         }
     }
+
+    // =========================================================================
+    // GET OPERATIONS (get_batch, get_requests)
+    // =========================================================================
+    // Tests for retrieving batch and request data:
+    // - get_batch with various states
+    // - get_batch error handling (not found)
+    // - get_requests with different states
+    // - Custom ID preservation and handling
 
     #[sqlx::test]
     async fn test_get_batch(pool: sqlx::PgPool) {
@@ -4932,6 +5002,13 @@ mod tests {
         assert!(results[2].is_err()); // Fake ID
     }
 
+    // =========================================================================
+    // CONCURRENCY & GLOBAL LIMITS
+    // =========================================================================
+    // Tests for per-model concurrency limits:
+    // - Global per-model limits enforced across daemons
+    // - Request claiming respects concurrent processing limits
+
     #[sqlx::test]
     async fn test_global_per_model_limit_enforced_across_daemons(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
@@ -5020,9 +5097,15 @@ mod tests {
         );
     }
 
-    // ========================================================================
-    // Filename uniqueness tests
-    // ========================================================================
+    // =========================================================================
+    // FILENAME HANDLING & UNIQUENESS
+    // =========================================================================
+    // Tests for filename validation and uniqueness constraints:
+    // - Duplicate filename handling (same user, different users, null user)
+    // - Filename timing edge cases (before template, after stub)
+    // - Auto-generated vs real filenames
+    // - Multiple metadata updates
+    // - Empty file handling
 
     #[sqlx::test]
     async fn test_duplicate_filename_same_user_rejected(pool: sqlx::PgPool) {
@@ -5793,6 +5876,17 @@ mod tests {
         drop(trigger1);
     }
 
+    // =========================================================================
+    // VIRTUAL FILES & SIZE CALCULATION
+    // =========================================================================
+    // Tests for lazy size calculation and finalization of virtual files:
+    // - Lazy finalization via get_file
+    // - Lazy finalization via list_files
+    // - Pagination behavior during finalization
+    // - Size estimation for incomplete batches
+    // - Cached value usage for finalized files
+    // - Empty virtual file handling
+
     #[sqlx::test]
     async fn test_virtual_files_lazy_finalized_via_get_file(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
@@ -6412,6 +6506,15 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // QUEUE PRIORITIZATION TESTS (claim_requests)
+    // =========================================================================
+    // Tests for SLA-based queue prioritization behavior:
+    // - Batches with sooner expires_at prioritized higher
+    // - Cancelling batches excluded from queue
+    // - Past expires_at batches still claimable (SLA target, not hard deadline)
+    // - Uses index: idx_batches_active_by_expiration
+
     #[sqlx::test]
     async fn test_sla_based_claim_priority(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
@@ -6660,8 +6763,20 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // SLA MONITORING TESTS (find_at_risk_requests)
+    // =========================================================================
+    // Tests for finding requests at risk of missing their batch SLA deadline:
+    // - Threshold filtering (only returns batches expiring within threshold)
+    // - Terminal state exclusions (excludes completed/failed/cancelled/cancelling)
+    // - Request state filtering (only pending, not claimed/processing)
+    // - FIFO ordering (by expires_at ASC, then created_at ASC)
+    // - Multiple threshold scenarios
+    // - Edge cases (empty DB, no matches, zero threshold)
+    // - Uses index: idx_requests_pending_sla
+
     #[sqlx::test]
-    async fn test_find_at_risk_batches_threshold_filtering(pool: sqlx::PgPool) {
+    async fn test_find_at_risk_requests_threshold_filtering(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
@@ -6769,46 +6884,46 @@ mod tests {
             .unwrap();
 
         // Query with 1-hour threshold (3600 seconds)
-        let at_risk = manager.find_at_risk_batches(3600).await.unwrap();
+        let at_risk = manager.find_at_risk_requests(3600).await.unwrap();
 
-        // Only batch1 (30 min) should be returned
+        // Only batch1 (30 min) should have pending requests returned
         assert_eq!(
             at_risk.len(),
             1,
-            "Only batch within threshold should be returned"
+            "Only requests from batch within threshold should be returned"
         );
         assert_eq!(
-            at_risk[0].id, batch1.id,
-            "Should return the 30-minute batch"
+            at_risk[0].data.batch_id, batch1.id,
+            "Should return request from the 30-minute batch"
         );
 
         // Query with 3-hour threshold
-        let at_risk_long = manager.find_at_risk_batches(3600 * 3).await.unwrap();
+        let at_risk_long = manager.find_at_risk_requests(3600 * 3).await.unwrap();
 
-        // Both batch1 and batch2 should be returned
+        // Both batch1 and batch2 should have requests returned
         assert_eq!(
             at_risk_long.len(),
             2,
-            "Both batches within 3-hour threshold"
+            "Requests from both batches within 3-hour threshold"
         );
         assert!(
-            at_risk_long.iter().any(|b| b.id == batch1.id),
-            "Should include 30-minute batch"
+            at_risk_long.iter().any(|r| r.data.batch_id == batch1.id),
+            "Should include request from 30-minute batch"
         );
         assert!(
-            at_risk_long.iter().any(|b| b.id == batch2.id),
-            "Should include 2-hour batch"
+            at_risk_long.iter().any(|r| r.data.batch_id == batch2.id),
+            "Should include request from 2-hour batch"
         );
 
-        // Batch with NULL expiration should never appear
+        // Batch with NULL expiration should never have requests appear
         assert!(
-            !at_risk_long.iter().any(|b| b.id == batch3.id),
-            "Should NOT include batch with NULL expiration"
+            !at_risk_long.iter().any(|r| r.data.batch_id == batch3.id),
+            "Should NOT include requests from batch with NULL expiration"
         );
     }
 
     #[sqlx::test]
-    async fn test_find_at_risk_batches_terminal_state_exclusions(pool: sqlx::PgPool) {
+    async fn test_find_at_risk_requests_terminal_state_exclusions(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
@@ -6998,38 +7113,38 @@ mod tests {
         .unwrap();
 
         // Query with 1-hour threshold
-        let at_risk = manager.find_at_risk_batches(3600).await.unwrap();
+        let at_risk = manager.find_at_risk_requests(3600).await.unwrap();
 
-        // Only non-terminal batches should be returned (batch4 and batch5)
+        // Only active batches (non-terminal, not cancelling) should have requests returned
         assert_eq!(
             at_risk.len(),
-            2,
-            "Should only return batches without terminal states"
+            1,
+            "Should only return pending requests from active batches"
         );
         assert!(
-            !at_risk.iter().any(|b| b.id == batch1.id),
-            "Should NOT include completed batch"
+            !at_risk.iter().any(|r| r.data.batch_id == batch1.id),
+            "Should NOT include requests from completed batch"
         );
         assert!(
-            !at_risk.iter().any(|b| b.id == batch2.id),
-            "Should NOT include failed batch"
+            !at_risk.iter().any(|r| r.data.batch_id == batch2.id),
+            "Should NOT include requests from failed batch"
         );
         assert!(
-            !at_risk.iter().any(|b| b.id == batch3.id),
-            "Should NOT include cancelled batch"
+            !at_risk.iter().any(|r| r.data.batch_id == batch3.id),
+            "Should NOT include requests from cancelled batch"
         );
         assert!(
-            at_risk.iter().any(|b| b.id == batch4.id),
-            "Should include cancelling batch (non-terminal)"
+            !at_risk.iter().any(|r| r.data.batch_id == batch4.id),
+            "Should NOT include requests from cancelling batch (being cancelled)"
         );
         assert!(
-            at_risk.iter().any(|b| b.id == batch5.id),
-            "Should include active batch"
+            at_risk.iter().any(|r| r.data.batch_id == batch5.id),
+            "Should include pending requests from active batch"
         );
     }
 
     #[sqlx::test]
-    async fn test_find_at_risk_batches_request_state_filtering(pool: sqlx::PgPool) {
+    async fn test_find_at_risk_requests_request_state_filtering(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
@@ -7289,38 +7404,39 @@ mod tests {
         .unwrap();
 
         // Query with 1-hour threshold
-        let at_risk = manager.find_at_risk_batches(3600).await.unwrap();
+        let at_risk = manager.find_at_risk_requests(3600).await.unwrap();
 
-        // Should return batches 2, 3, 4, 5 (all with active requests)
+        // Should return only PENDING requests (batches 2 and 5)
+        // Claimed/processing requests are already being worked on, so not "at risk" in queue
         assert_eq!(
             at_risk.len(),
-            4,
-            "Should return batches with pending/claimed/processing requests"
+            2,
+            "Should return only pending requests (not claimed/processing)"
         );
         assert!(
-            !at_risk.iter().any(|b| b.id == batch1.id),
+            !at_risk.iter().any(|r| r.data.batch_id == batch1.id),
             "Should NOT include batch with only completed requests"
         );
         assert!(
-            at_risk.iter().any(|b| b.id == batch2.id),
-            "Should include batch with pending requests"
+            at_risk.iter().any(|r| r.data.batch_id == batch2.id),
+            "Should include pending request from batch2"
         );
         assert!(
-            at_risk.iter().any(|b| b.id == batch3.id),
-            "Should include batch with claimed requests"
+            !at_risk.iter().any(|r| r.data.batch_id == batch3.id),
+            "Should NOT include claimed requests (already being worked on)"
         );
         assert!(
-            at_risk.iter().any(|b| b.id == batch4.id),
-            "Should include batch with processing requests"
+            !at_risk.iter().any(|r| r.data.batch_id == batch4.id),
+            "Should NOT include processing requests (already being worked on)"
         );
         assert!(
-            at_risk.iter().any(|b| b.id == batch5.id),
-            "Should include batch with mixed request states"
+            at_risk.iter().any(|r| r.data.batch_id == batch5.id),
+            "Should include pending request from batch5 (ignores completed one)"
         );
     }
 
     #[sqlx::test]
-    async fn test_find_at_risk_batches_ordering(pool: sqlx::PgPool) {
+    async fn test_find_at_risk_requests_ordering(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
@@ -7443,7 +7559,7 @@ mod tests {
         .unwrap();
 
         // Query with 1-hour threshold (all three should be returned)
-        let at_risk = manager.find_at_risk_batches(3600).await.unwrap();
+        let at_risk = manager.find_at_risk_requests(3600).await.unwrap();
 
         // Should return all 3 batches in expiration order (A, C, B)
         assert_eq!(
@@ -7452,21 +7568,21 @@ mod tests {
             "Should return all 3 batches within threshold"
         );
         assert_eq!(
-            at_risk[0].id, batch_a.id,
-            "First should be batch expiring soonest (10 min)"
+            at_risk[0].data.batch_id, batch_a.id,
+            "First should be request from batch expiring soonest (10 min)"
         );
         assert_eq!(
-            at_risk[1].id, batch_c.id,
-            "Second should be batch expiring in middle (30 min)"
+            at_risk[1].data.batch_id, batch_c.id,
+            "Second should be request from batch expiring in middle (30 min)"
         );
         assert_eq!(
-            at_risk[2].id, batch_b.id,
-            "Third should be batch expiring latest (50 min)"
+            at_risk[2].data.batch_id, batch_b.id,
+            "Third should be request from batch expiring latest (50 min)"
         );
     }
 
     #[sqlx::test]
-    async fn test_find_at_risk_batches_multiple_thresholds(pool: sqlx::PgPool) {
+    async fn test_find_at_risk_requests_multiple_thresholds(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
@@ -7584,35 +7700,35 @@ mod tests {
 
         // Simulate SLA daemon querying with different thresholds
         // Query 1: 30-minute threshold (critical)
-        let critical = manager.find_at_risk_batches(30 * 60).await.unwrap();
+        let critical = manager.find_at_risk_requests(30 * 60).await.unwrap();
         assert_eq!(critical.len(), 1, "30-min threshold: only 15-min batch");
-        assert_eq!(critical[0].id, batch1.id);
+        assert_eq!(critical[0].data.batch_id, batch1.id);
 
         // Query 2: 60-minute threshold (warning)
-        let warning = manager.find_at_risk_batches(60 * 60).await.unwrap();
+        let warning = manager.find_at_risk_requests(60 * 60).await.unwrap();
         assert_eq!(
             warning.len(),
             2,
             "60-min threshold: 15-min and 45-min batches"
         );
-        assert!(warning.iter().any(|b| b.id == batch1.id));
-        assert!(warning.iter().any(|b| b.id == batch2.id));
+        assert!(warning.iter().any(|r| r.data.batch_id == batch1.id));
+        assert!(warning.iter().any(|r| r.data.batch_id == batch2.id));
 
         // Query 3: 120-minute threshold (info)
-        let info = manager.find_at_risk_batches(120 * 60).await.unwrap();
+        let info = manager.find_at_risk_requests(120 * 60).await.unwrap();
         assert_eq!(info.len(), 3, "120-min threshold: all three batches");
-        assert!(info.iter().any(|b| b.id == batch1.id));
-        assert!(info.iter().any(|b| b.id == batch2.id));
-        assert!(info.iter().any(|b| b.id == batch3.id));
+        assert!(info.iter().any(|r| r.data.batch_id == batch1.id));
+        assert!(info.iter().any(|r| r.data.batch_id == batch2.id));
+        assert!(info.iter().any(|r| r.data.batch_id == batch3.id));
     }
 
     #[sqlx::test]
-    async fn test_find_at_risk_batches_edge_cases(pool: sqlx::PgPool) {
+    async fn test_find_at_risk_requests_edge_cases(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
         // Edge case 1: Empty database
-        let empty_result = manager.find_at_risk_batches(3600).await.unwrap();
+        let empty_result = manager.find_at_risk_requests(3600).await.unwrap();
         assert_eq!(
             empty_result.len(),
             0,
@@ -7656,7 +7772,7 @@ mod tests {
         .await
         .unwrap();
 
-        let no_match = manager.find_at_risk_batches(3600).await.unwrap();
+        let no_match = manager.find_at_risk_requests(3600).await.unwrap();
         assert_eq!(
             no_match.len(),
             0,
@@ -7700,12 +7816,12 @@ mod tests {
         .await
         .unwrap();
 
-        let urgent = manager.find_at_risk_batches(60).await.unwrap();
+        let urgent = manager.find_at_risk_requests(60).await.unwrap();
         assert_eq!(urgent.len(), 1, "Should find batch expiring in 30 seconds");
-        assert_eq!(urgent[0].id, batch2.id);
+        assert_eq!(urgent[0].data.batch_id, batch2.id);
 
         // Edge case 4: Zero threshold (only expired batches)
-        let expired = manager.find_at_risk_batches(0).await.unwrap();
+        let expired = manager.find_at_risk_requests(0).await.unwrap();
         assert_eq!(
             expired.len(),
             0,

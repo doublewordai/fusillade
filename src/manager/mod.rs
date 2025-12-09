@@ -10,7 +10,7 @@ use crate::batch::{
 use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::http::HttpClient;
-use crate::request::{AnyRequest, Claimed, DaemonId, Request, RequestId, RequestState};
+use crate::request::{AnyRequest, Claimed, DaemonId, Pending, Request, RequestId, RequestState};
 use async_trait::async_trait;
 use futures::stream::Stream;
 use std::pin::Pin;
@@ -105,22 +105,29 @@ pub trait Storage: Send + Sync {
     /// Get all requests for a batch.
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>>;
 
-    /// Find batches at risk of missing their SLA deadline.
+    /// Find pending requests at risk of missing their batch's SLA deadline.
     ///
-    /// Returns batches where:
+    /// Returns pending requests (stuck in queue) where the batch:
     /// - `expires_at` is set
     /// - `expires_at < NOW() + threshold_seconds`
     /// - Not in terminal state (completed/failed/cancelled)
-    /// - Has pending or active requests
     ///
-    /// Ordered by urgency (soonest expiration first).
+    /// Filters to only `pending` state requests - excludes claimed/processing requests
+    /// that are already being worked on.
+    ///
+    /// Ordered by urgency (soonest batch expiration first).
     ///
     /// # Arguments
     /// - `threshold_seconds`: Time remaining threshold (e.g., 3600 for 1 hour)
     ///
     /// # Returns
-    /// Vector of `Batch` objects matching the SLA threshold criteria
-    async fn find_at_risk_batches(&self, threshold_seconds: i64) -> Result<Vec<Batch>>;
+    /// Vector of `Request<Pending>` that are stuck in queue and at risk
+    ///
+    /// # Note
+    /// Currently only returns `pending` requests. Should we also include `claimed` or
+    /// `processing` requests that have been stuck for too long? For now, focusing on
+    /// requests stuck in the queue that need escalation/prioritization.
+    async fn find_at_risk_requests(&self, threshold_seconds: i64) -> Result<Vec<Request<Pending>>>;
 
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
