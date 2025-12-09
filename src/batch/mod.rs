@@ -445,3 +445,15 @@ impl BatchStatus {
         }
     }
 }
+
+/// Aggregated statistics for a model's templates in a file.
+/// Used for efficient cost estimation without streaming all template data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelTemplateStats {
+    /// The model name
+    pub model: String,
+    /// Number of request templates using this model
+    pub request_count: i64,
+    /// Total size of all request bodies in bytes
+    pub total_body_bytes: i64,
+}
