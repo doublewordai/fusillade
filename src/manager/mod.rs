@@ -68,6 +68,16 @@ pub trait Storage: Send + Sync {
         offset: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>>;
 
+    /// Get aggregated statistics for request templates grouped by model.
+    /// This is optimized for cost estimation - it only fetches model names and body sizes,
+    /// avoiding the overhead of streaming full template data.
+    ///
+    /// Returns a vector of per-model statistics including request count and total body bytes.
+    async fn get_file_template_stats(
+        &self,
+        file_id: FileId,
+    ) -> Result<Vec<crate::batch::ModelTemplateStats>>;
+
     /// Delete a file (cascades to batches and executions).
     async fn delete_file(&self, file_id: FileId) -> Result<()>;
 

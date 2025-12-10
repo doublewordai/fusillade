@@ -1233,10 +1233,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
                     // Insert the template immediately with line_number for ordering
                     let fid = file_id.unwrap();
+                    let body_byte_size = template.body.len() as i64;
                     sqlx::query!(
                         r#"
-                        INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key, line_number)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key, line_number, body_byte_size)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                         "#,
                         fid,
                         template.custom_id,
@@ -1247,6 +1248,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         template.model,
                         template.api_key,
                         template_count as i32,
+                        body_byte_size,
                     )
                     .execute(&mut *tx)
                     .await
@@ -1387,6 +1389,40 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     }
 
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    async fn get_file_template_stats(
+        &self,
+        file_id: FileId,
+    ) -> Result<Vec<crate::batch::ModelTemplateStats>> {
+        // Single optimized query that aggregates by model using pre-computed body_byte_size
+        // This avoids the expensive LENGTH(body) calculation on large text fields
+        let stats = sqlx::query!(
+            r#"
+            SELECT
+                model,
+                COUNT(*)::BIGINT as "request_count!",
+                SUM(body_byte_size)::BIGINT as "total_body_bytes!"
+            FROM request_templates
+            WHERE file_id = $1
+            GROUP BY model
+            ORDER BY model
+            "#,
+            *file_id as Uuid,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch template stats: {}", e)))?;
+
+        Ok(stats
+            .into_iter()
+            .map(|row| crate::batch::ModelTemplateStats {
+                model: row.model,
+                request_count: row.request_count,
+                total_body_bytes: row.total_body_bytes,
+            })
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     fn get_file_content_stream(
         &self,
         file_id: FileId,
@@ -1460,9 +1496,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         let mut query_builder = QueryBuilder::new(
             r#"
-            SELECT 
-                f.id, f.name, f.description, f.size_bytes, f.size_finalized, 
-                f.status, f.error_message, f.purpose, f.expires_at, f.deleted_at, 
+            SELECT
+                f.id, f.name, f.description, f.size_bytes, f.size_finalized,
+                f.status, f.error_message, f.purpose, f.expires_at, f.deleted_at,
                 f.uploaded_by, f.created_at, f.updated_at,
                 b.id as batch_id,
                 b.total_requests,
