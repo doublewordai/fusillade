@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.6.0...fusillade-v0.7.0) (2025-12-10)
+
+
+### Features
+
+* get_file_template_stats ([#26](https://github.com/doublewordai/fusillade/issues/26)) ([cdd2487](https://github.com/doublewordai/fusillade/commit/cdd248727601b6ea3bcbf01e0cc432b31f214b44))
+
 ## [0.6.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.5.1...fusillade-v0.6.0) (2025-12-02)
 
 
