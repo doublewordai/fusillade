@@ -358,7 +358,8 @@ pub struct Batch {
     /// User who created this batch
     pub created_by: Option<String>,
     /// When the batch will expire (created_at + completion_window)
-    pub expires_at: Option<DateTime<Utc>>,
+    /// This is required for queue prioritization and SLA monitoring
+    pub expires_at: DateTime<Utc>,
     /// When batch cancellation was initiated
     pub cancelling_at: Option<DateTime<Utc>>,
     /// Batch-level errors (validation errors, system errors, etc.)
