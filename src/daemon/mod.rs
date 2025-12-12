@@ -87,12 +87,12 @@ pub struct SlaThreshold {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum RetryLimit {
-    /// Fixed number of retry attempts (default behavior)
+    /// Fixed number of retry attempts
     FixedAttempts {
         /// Maximum number of retry attempts before giving up
         max_retries: u32,
     },
-    /// Retry until batch deadline with configurable safety buffer
+    /// Retry until batch deadline with configurable safety buffer (default behavior)
     UntilBatchDeadline {
         /// Minimum number of retries to guarantee (regardless of deadline)
         min_retries: u32,
@@ -104,7 +104,10 @@ pub enum RetryLimit {
 
 impl Default for RetryLimit {
     fn default() -> Self {
-        RetryLimit::FixedAttempts { max_retries: 5 }
+        RetryLimit::UntilBatchDeadline {
+            min_retries: 3,
+            stop_before_deadline_ms: 3_600_000, // 1 hour buffer
+        }
     }
 }
 
