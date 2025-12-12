@@ -106,7 +106,7 @@ impl Default for RetryLimit {
     fn default() -> Self {
         RetryLimit::UntilBatchDeadline {
             min_retries: 3,
-            stop_before_deadline_ms: 3_600_000, // 1 hour buffer
+            stop_before_deadline_ms: 900_000, // 15 min buffer
         }
     }
 }
