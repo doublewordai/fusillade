@@ -138,6 +138,7 @@ impl Request<Pending> {
                 daemon_id,
                 claimed_at: chrono::Utc::now(),
                 retry_attempt: self.state.retry_attempt, // Carry over retry attempt
+                batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
             },
         };
         storage.persist(&request).await?;
@@ -163,6 +164,7 @@ impl Request<Claimed> {
             state: Pending {
                 retry_attempt: self.state.retry_attempt, // Preserve retry attempt
                 not_before: None,                        // Can be claimed immediately
+                batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
             },
         };
         storage.persist(&request).await?;
@@ -205,6 +207,7 @@ impl Request<Claimed> {
             claimed_at: self.state.claimed_at,
             started_at: chrono::Utc::now(),
             retry_attempt: self.state.retry_attempt, // Carry over retry attempt
+            batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
             result_rx: Arc::new(Mutex::new(rx)),
             abort_handle: task_handle.abort_handle(),
         };
@@ -226,9 +229,9 @@ impl Request<Claimed> {
 }
 
 /// Configuration for retry behavior.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RetryConfig {
-    pub max_retries: u32,
+    pub retry_limit: crate::daemon::RetryLimit,
     pub backoff_ms: u64,
     pub backoff_factor: u64,
     pub max_backoff_ms: u64,
@@ -237,7 +240,7 @@ pub struct RetryConfig {
 impl From<&crate::daemon::DaemonConfig> for RetryConfig {
     fn from(config: &crate::daemon::DaemonConfig) -> Self {
         RetryConfig {
-            max_retries: config.max_retries,
+            retry_limit: config.retry_limit.clone(),
             backoff_ms: config.backoff_ms,
             backoff_factor: config.backoff_factor,
             max_backoff_ms: config.max_backoff_ms,
@@ -253,22 +256,17 @@ impl Request<Failed> {
     /// - Calculated not_before timestamp for exponential backoff
     ///
     /// If no retries remain, returns None and the request stays Failed.
+    ///
+    /// Supports two retry strategies:
+    /// - FixedAttempts: Retry up to a fixed number of times
+    /// - UntilBatchDeadline: Retry until the batch deadline (with safety buffer)
     pub async fn retry<S: Storage + ?Sized>(
         self,
         retry_attempt: u32,
         config: RetryConfig,
         storage: &S,
     ) -> Result<Option<Request<Pending>>> {
-        // Check if we have retries left
-        if retry_attempt >= config.max_retries {
-            tracing::debug!(
-                request_id = %self.data.id,
-                retry_attempt,
-                max_retries = config.max_retries,
-                "No retries remaining, request remains failed"
-            );
-            return Ok(None);
-        }
+        use crate::daemon::RetryLimit;
 
         // Calculate exponential backoff: backoff_ms * (backoff_factor ^ retry_attempt)
         let backoff_duration = {
@@ -278,14 +276,79 @@ impl Request<Failed> {
             exponential.min(config.max_backoff_ms)
         };
 
-        let not_before =
-            chrono::Utc::now() + chrono::Duration::milliseconds(backoff_duration as i64);
+        let now = chrono::Utc::now();
+        let not_before = now + chrono::Duration::milliseconds(backoff_duration as i64);
+
+        // Check retry limits based on strategy
+        let should_retry = match &config.retry_limit {
+            RetryLimit::FixedAttempts { max_retries } => {
+                if retry_attempt >= *max_retries {
+                    tracing::debug!(
+                        request_id = %self.data.id,
+                        retry_attempt,
+                        max_retries,
+                        "No retries remaining (fixed attempts), request remains failed"
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+            RetryLimit::UntilBatchDeadline {
+                min_retries,
+                stop_before_deadline_ms,
+            } => {
+                // Always allow minimum retries regardless of deadline
+                if retry_attempt < *min_retries {
+                    tracing::debug!(
+                        request_id = %self.data.id,
+                        retry_attempt,
+                        min_retries,
+                        "Retrying (within minimum retry guarantee)"
+                    );
+                    true
+                } else {
+                    // Check if we have time before the deadline
+                    let deadline_with_buffer = self.state.batch_expires_at
+                        - chrono::Duration::milliseconds(*stop_before_deadline_ms as i64);
+
+                    // Check if the next retry would start before the deadline
+                    if not_before < deadline_with_buffer {
+                        let time_until_deadline = deadline_with_buffer - now;
+                        tracing::debug!(
+                            request_id = %self.data.id,
+                            retry_attempt,
+                            time_until_deadline_seconds = time_until_deadline.num_seconds(),
+                            batch_expires_at = %self.state.batch_expires_at,
+                            "Retrying (deadline-aware: time remaining)"
+                        );
+                        true
+                    } else {
+                        let time_until_deadline = self.state.batch_expires_at - now;
+                        tracing::warn!(
+                            request_id = %self.data.id,
+                            retry_attempt,
+                            time_until_deadline_seconds = time_until_deadline.num_seconds(),
+                            batch_expires_at = %self.state.batch_expires_at,
+                            stop_before_deadline_ms,
+                            "No retries remaining (deadline-aware: would exceed batch deadline), request remains failed"
+                        );
+                        false
+                    }
+                }
+            }
+        };
+
+        if !should_retry {
+            return Ok(None);
+        }
 
         tracing::info!(
             request_id = %self.data.id,
             retry_attempt = retry_attempt + 1,
             backoff_ms = backoff_duration,
             not_before = %not_before,
+            batch_expires_at = %self.state.batch_expires_at,
             "Retrying failed request with exponential backoff"
         );
 
@@ -294,6 +357,7 @@ impl Request<Failed> {
             state: Pending {
                 retry_attempt: retry_attempt + 1,
                 not_before: Some(not_before),
+                batch_expires_at: self.state.batch_expires_at,
             },
         };
 
@@ -383,6 +447,7 @@ impl Request<Processing> {
                         },
                         failed_at: chrono::Utc::now(),
                         retry_attempt: self.state.retry_attempt,
+                        batch_expires_at: self.state.batch_expires_at,
                     };
                     let request = Request {
                         data: self.data,
@@ -400,6 +465,7 @@ impl Request<Processing> {
                         },
                         failed_at: chrono::Utc::now(),
                         retry_attempt: self.state.retry_attempt,
+                        batch_expires_at: self.state.batch_expires_at,
                     };
                     let request = Request {
                         data: self.data,
@@ -432,6 +498,7 @@ impl Request<Processing> {
                     },
                     failed_at: chrono::Utc::now(),
                     retry_attempt: self.state.retry_attempt,
+                    batch_expires_at: self.state.batch_expires_at,
                 };
                 let request = Request {
                     data: self.data,
@@ -446,6 +513,7 @@ impl Request<Processing> {
                     reason: FailureReason::TaskTerminated,
                     failed_at: chrono::Utc::now(),
                     retry_attempt: self.state.retry_attempt,
+                    batch_expires_at: self.state.batch_expires_at,
                 };
                 let request = Request {
                     data: self.data,

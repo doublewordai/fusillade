@@ -83,6 +83,31 @@ pub struct SlaThreshold {
     pub action: SlaAction,
 }
 
+/// Retry limit strategy.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum RetryLimit {
+    /// Fixed number of retry attempts (default behavior)
+    FixedAttempts {
+        /// Maximum number of retry attempts before giving up
+        max_retries: u32,
+    },
+    /// Retry until batch deadline with configurable safety buffer
+    UntilBatchDeadline {
+        /// Minimum number of retries to guarantee (regardless of deadline)
+        min_retries: u32,
+        /// Stop retrying this many milliseconds before the batch expires
+        /// This provides a safety buffer to ensure the final attempt completes
+        stop_before_deadline_ms: u64,
+    },
+}
+
+impl Default for RetryLimit {
+    fn default() -> Self {
+        RetryLimit::FixedAttempts { max_retries: 5 }
+    }
+}
+
 /// Configuration for the daemon.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
@@ -98,8 +123,8 @@ pub struct DaemonConfig {
     /// How long to sleep between claim iterations
     pub claim_interval_ms: u64,
 
-    /// Maximum number of retry attempts before giving up
-    pub max_retries: u32,
+    /// Retry limit strategy (fixed attempts or deadline-aware)
+    pub retry_limit: RetryLimit,
 
     /// Base backoff duration in milliseconds (will be exponentially increased)
     pub backoff_ms: u64,
@@ -176,7 +201,7 @@ impl Default for DaemonConfig {
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             claim_interval_ms: 1000,
-            max_retries: 5,
+            retry_limit: RetryLimit::default(),
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
@@ -814,7 +839,7 @@ mod tests {
             claim_interval_ms: 10, // Very fast for testing
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            max_retries: 3,
+            retry_limit: RetryLimit::FixedAttempts { max_retries: 3 },
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
@@ -977,7 +1002,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits,
-            max_retries: 3,
+            retry_limit: RetryLimit::FixedAttempts { max_retries: 3 },
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
@@ -1198,7 +1223,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            max_retries: 5,
+            retry_limit: RetryLimit::FixedAttempts { max_retries: 5 },
             backoff_ms: 10, // Very fast backoff for testing
             backoff_factor: 2,
             max_backoff_ms: 100,
@@ -1328,7 +1353,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
-            max_retries: 3,
+            retry_limit: RetryLimit::FixedAttempts { max_retries: 3 },
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
