@@ -293,16 +293,16 @@ impl Request<Failed> {
             );
         } else {
             // Beyond minimum retries, check max_retries cap
-            if let Some(max_retries) = config.retry_limits.max_retries {
-                if retry_attempt >= max_retries {
-                    tracing::debug!(
-                        request_id = %self.data.id,
-                        retry_attempt,
-                        max_retries,
-                        "No retries remaining (reached max_retries), request remains failed"
-                    );
-                    return Ok(None);
-                }
+            if let Some(max_retries) = config.retry_limits.max_retries
+                && retry_attempt >= max_retries
+            {
+                tracing::debug!(
+                    request_id = %self.data.id,
+                    retry_attempt,
+                    max_retries,
+                    "No retries remaining (reached max_retries), request remains failed"
+                );
+                return Ok(None);
             }
 
             // Check deadline constraint if configured
