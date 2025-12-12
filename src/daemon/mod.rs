@@ -1495,4 +1495,255 @@ mod tests {
         assert!(all_completed, "All 10 requests should have completed");
         assert_eq!(http_client.call_count(), 10);
     }
+
+    #[sqlx::test]
+    async fn test_deadline_aware_retry_respects_min_retries(pool: sqlx::PgPool) {
+        // Test that min_retries is guaranteed even when very close to deadline
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Provide exactly 4 failures (initial + 3 retries), then success
+        // This tests that min_retries=3 is respected (gets 4 total attempts)
+        for _ in 0..4 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 500,
+                    body: r#"{"error":"server error"}"#.to_string(),
+                }),
+            );
+        }
+        // Final attempt succeeds
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success"}"#.to_string(),
+            }),
+        );
+
+        // Use deadline-aware retry with min_retries = 3
+        // Set stop_before_deadline to 1 hour (batch will expire in 24h, so plenty of time)
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            retry_limit: RetryLimit::UntilBatchDeadline {
+                min_retries: 3,
+                stop_before_deadline_ms: 3_600_000, // 1 hour buffer
+            },
+            backoff_ms: 10, // Fast backoff for testing
+            backoff_factor: 2,
+            max_backoff_ms: 100,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100,
+            sla_check_interval_seconds: 60,
+            sla_thresholds: vec![],
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
+
+        // Create a batch with 24h completion window
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test deadline-aware retry".to_string()),
+                vec![crate::RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let requests = manager
+            .get_batch_requests(batch.id)
+            .await
+            .expect("Failed to get batch requests");
+        let request_id = requests[0].id();
+
+        // Start the daemon
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for request to succeed after retries (should make at least 4 attempts: initial + 3 retries)
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut final_state = None;
+
+        while start.elapsed() < timeout {
+            let results = manager
+                .get_requests(vec![request_id])
+                .await
+                .expect("Failed to get request");
+
+            if let Some(Ok(any_request)) = results.first() {
+                if let crate::AnyRequest::Completed(req) = any_request {
+                    final_state = Some(req.clone());
+                    break;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown_token.cancel();
+
+        let _completed = final_state.expect("Request should have completed");
+
+        // Should have made exactly 5 HTTP calls (4 failures + 1 success)
+        // This verifies that min_retries=3 was respected (initial + 3 retries = 4 attempts, then success on 5th)
+        assert_eq!(
+            http_client.call_count(),
+            5,
+            "Expected exactly 5 HTTP calls (4 failures + 1 success), got {}",
+            http_client.call_count()
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
+        // Test that retries stop when approaching the deadline
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // All requests will fail
+        for _ in 0..20 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 500,
+                    body: r#"{"error":"server error"}"#.to_string(),
+                }),
+            );
+        }
+
+        // Use deadline-aware retry with a short completion window and short buffer
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            retry_limit: RetryLimit::UntilBatchDeadline {
+                min_retries: 1,
+                stop_before_deadline_ms: 500, // 500ms buffer before deadline
+            },
+            backoff_ms: 50,
+            backoff_factor: 2,
+            max_backoff_ms: 200,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100,
+            sla_check_interval_seconds: 60,
+            sla_thresholds: vec![],
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
+
+        // Create a batch with a very short completion window (2 seconds)
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test deadline cutoff".to_string()),
+                vec![crate::RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "2s".to_string(), // Very short window
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let requests = manager
+            .get_batch_requests(batch.id)
+            .await
+            .expect("Failed to get batch requests");
+        let request_id = requests[0].id();
+
+        // Start the daemon
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for the deadline to pass
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Check the request state
+        let results = manager
+            .get_requests(vec![request_id])
+            .await
+            .expect("Failed to get request");
+
+        shutdown_token.cancel();
+
+        if let Some(Ok(crate::AnyRequest::Failed(failed))) = results.first() {
+            // Should have stopped retrying due to deadline
+            // With 2s window and 500ms buffer, should stop around 1.5s
+            // With 50ms initial backoff, 100ms, 200ms... should do a few retries but not many
+            assert!(
+                failed.state.retry_attempt < 10,
+                "Expected retries to stop before reaching many attempts due to deadline, got {}",
+                failed.state.retry_attempt
+            );
+
+            // Should have made fewer calls than we provided (20)
+            assert!(
+                http_client.call_count() < 20,
+                "Expected deadline to stop retries before exhausting all mock responses, got {} calls",
+                http_client.call_count()
+            );
+        } else {
+            panic!("Expected request to be in Failed state");
+        }
+    }
 }
