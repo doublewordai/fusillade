@@ -2353,13 +2353,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
         tracing::info!(count = ids.len(), "Retrying failed requests");
 
+        // Get all requests in a single bulk query to avoid N+1 problem
+        let get_results = self.get_requests(ids.clone()).await?;
+
         let mut results = Vec::new();
 
-        for id in ids {
-            // Get the request from storage
-            let get_results = self.get_requests(vec![id]).await?;
-            let request_result = get_results.into_iter().next().unwrap();
-
+        for (id, request_result) in ids.iter().zip(get_results.into_iter()) {
             let result = match request_result {
                 Ok(AnyRequest::Failed(req)) => {
                     // Reset to pending state with retry_attempt = 0
@@ -2376,7 +2375,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     Ok(())
                 }
                 Ok(_) => Err(crate::error::FusilladeError::InvalidState(
-                    id,
+                    *id,
                     "non-failed state".to_string(),
                     "failed state".to_string(),
                 )),
@@ -5884,7 +5883,7 @@ mod tests {
             default_model_concurrency: 5,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             claim_interval_ms: 10,
-            retry_limit: crate::daemon::RetryLimit::default(),
+            retry_limits: crate::daemon::RetryLimits::default(),
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,

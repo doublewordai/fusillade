@@ -83,30 +83,79 @@ pub struct SlaThreshold {
     pub action: SlaAction,
 }
 
-/// Retry limit strategy.
+/// Retry limit configuration.
+///
+/// This struct provides flexible retry strategies by allowing you to configure:
+/// - Minimum retries (always attempted regardless of deadline)
+/// - Maximum retries (hard cap on retry attempts)
+/// - Deadline-aware retry (stop before batch expiration)
+///
+/// The deadline is read from the batch state in the database and carried over
+/// through state transitions. The `stop_before_deadline_ms` parameter here
+/// provides a safety buffer to ensure the final attempt completes before the SLA.
+///
+/// All fields work together to provide fine-grained control:
+/// - Setting only `min_retries` ensures at least that many attempts
+/// - Setting `max_retries` caps the total number of retries
+/// - Setting `stop_before_deadline_ms` enables deadline-aware retry logic
+/// - Combining all three gives you guaranteed minimums, hard caps, and SLA safety
+///
+/// # Examples
+///
+/// ```rust
+/// # use fusillade::daemon::RetryLimits;
+/// // Default: retry up to deadline with minimum guarantees
+/// let default = RetryLimits::default();
+///
+/// // Fixed attempts only (traditional behavior)
+/// let fixed = RetryLimits {
+///     min_retries: 0,
+///     max_retries: Some(5),
+///     stop_before_deadline_ms: None,
+/// };
+///
+/// // Aggressive retry with long deadline
+/// let aggressive = RetryLimits {
+///     min_retries: 5,
+///     max_retries: None,  // No cap
+///     stop_before_deadline_ms: Some(1_800_000),  // 30 min buffer
+/// };
+///
+/// // Conservative with both limits
+/// let conservative = RetryLimits {
+///     min_retries: 1,
+///     max_retries: Some(3),
+///     stop_before_deadline_ms: Some(3_600_000),  // 1 hour buffer
+/// };
+/// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum RetryLimit {
-    /// Fixed number of retry attempts
-    FixedAttempts {
-        /// Maximum number of retry attempts before giving up
-        max_retries: u32,
-    },
-    /// Retry until batch deadline with configurable safety buffer (default behavior)
-    UntilBatchDeadline {
-        /// Minimum number of retries to guarantee (regardless of deadline)
-        min_retries: u32,
-        /// Stop retrying this many milliseconds before the batch expires
-        /// This provides a safety buffer to ensure the final attempt completes
-        stop_before_deadline_ms: u64,
-    },
+pub struct RetryLimits {
+    /// Minimum number of retries to guarantee (regardless of deadline or max_retries).
+    /// Default: 0
+    #[serde(default)]
+    pub min_retries: u32,
+
+    /// Maximum number of retry attempts before giving up.
+    /// If None, only limited by deadline (if set).
+    /// Default: None (unlimited)
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+
+    /// Stop retrying this many milliseconds before the batch expires.
+    /// Positive values stop before the deadline (safety buffer).
+    /// Negative values allow retrying after the deadline.
+    /// If None, retries are not deadline-aware.
+    /// Default: None
+    #[serde(default)]
+    pub stop_before_deadline_ms: Option<i64>,
 }
 
-impl Default for RetryLimit {
+impl Default for RetryLimits {
     fn default() -> Self {
-        RetryLimit::UntilBatchDeadline {
+        RetryLimits {
             min_retries: 3,
-            stop_before_deadline_ms: 900_000, // 15 min buffer
+            max_retries: None,
+            stop_before_deadline_ms: Some(900_000), // 15 min buffer
         }
     }
 }
@@ -126,8 +175,8 @@ pub struct DaemonConfig {
     /// How long to sleep between claim iterations
     pub claim_interval_ms: u64,
 
-    /// Retry limit strategy (fixed attempts or deadline-aware)
-    pub retry_limit: RetryLimit,
+    /// Retry limit configuration
+    pub retry_limits: RetryLimits,
 
     /// Base backoff duration in milliseconds (will be exponentially increased)
     pub backoff_ms: u64,
@@ -204,7 +253,7 @@ impl Default for DaemonConfig {
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             claim_interval_ms: 1000,
-            retry_limit: RetryLimit::default(),
+            retry_limits: RetryLimits::default(),
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
@@ -842,7 +891,11 @@ mod tests {
             claim_interval_ms: 10, // Very fast for testing
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            retry_limit: RetryLimit::FixedAttempts { max_retries: 3 },
+            retry_limits: RetryLimits {
+                min_retries: 0,
+                max_retries: Some(3),
+                stop_before_deadline_ms: None,
+            },
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
@@ -1005,7 +1058,11 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits,
-            retry_limit: RetryLimit::FixedAttempts { max_retries: 3 },
+            retry_limits: RetryLimits {
+                min_retries: 0,
+                max_retries: Some(3),
+                stop_before_deadline_ms: None,
+            },
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
@@ -1226,7 +1283,11 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            retry_limit: RetryLimit::FixedAttempts { max_retries: 5 },
+            retry_limits: RetryLimits {
+                min_retries: 0,
+                max_retries: Some(5),
+                stop_before_deadline_ms: None,
+            },
             backoff_ms: 10, // Very fast backoff for testing
             backoff_factor: 2,
             max_backoff_ms: 100,
@@ -1356,7 +1417,11 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
-            retry_limit: RetryLimit::FixedAttempts { max_retries: 3 },
+            retry_limits: RetryLimits {
+                min_retries: 0,
+                max_retries: Some(3),
+                stop_before_deadline_ms: None,
+            },
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
@@ -1531,9 +1596,10 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            retry_limit: RetryLimit::UntilBatchDeadline {
+            retry_limits: RetryLimits {
                 min_retries: 3,
-                stop_before_deadline_ms: 3_600_000, // 1 hour buffer
+                max_retries: None,
+                stop_before_deadline_ms: Some(3_600_000), // 1 hour buffer
             },
             backoff_ms: 10, // Fast backoff for testing
             backoff_factor: 2,
@@ -1653,9 +1719,10 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            retry_limit: RetryLimit::UntilBatchDeadline {
+            retry_limits: RetryLimits {
                 min_retries: 1,
-                stop_before_deadline_ms: 500, // 500ms buffer before deadline
+                max_retries: None,
+                stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
             },
             backoff_ms: 50,
             backoff_factor: 2,
