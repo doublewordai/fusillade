@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id, r.state,\n                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at\n            FROM requests r\n            JOIN request_templates t ON r.template_id = t.id\n            WHERE r.batch_id = $1\n            ORDER BY r.created_at ASC\n            ",
+  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id, r.state,\n                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at\n            FROM requests r\n            JOIN request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.batch_id = $1\n            ORDER BY r.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -112,6 +112,11 @@
         "ordinal": 21,
         "name": "canceled_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 22,
+        "name": "batch_expires_at",
+        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
@@ -141,8 +146,9 @@
       true,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
-  "hash": "c17ad4522c1bcbdbd6dd8abdd7bd8dedff70039c4c71c62ca01018c470cf3c49"
+  "hash": "3c36bb3f8924b61ddfb8816193a50f693fc373e0c7064bd673c3d247f94bb7ba"
 }
