@@ -63,12 +63,16 @@
 //!
 //! # Retry Configuration
 //!
-//! Exponential backoff is configured via [`RetryConfig`]:
+//! Exponential backoff and retry limits are configured via [`RetryConfig`]:
 //!
 //! ```rust
 //! # use fusillade::request::transitions::RetryConfig;
+//! # use fusillade::daemon::RetryLimit;
 //! let config = RetryConfig {
-//!     max_retries: 3,           // Retry up to 3 times
+//!     retry_limit: RetryLimit::UntilBatchDeadline {
+//!         min_retries: 3,
+//!         stop_before_deadline_ms: 3_600_000,
+//!     },
 //!     backoff_ms: 1000,         // Start with 1 second
 //!     backoff_factor: 2,        // Double each time (1s, 2s, 4s)
 //!     max_backoff_ms: 60000,    // Cap at 60 seconds
