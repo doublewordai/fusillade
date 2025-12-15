@@ -68,9 +68,9 @@
 //! ```rust
 //! # use fusillade::request::transitions::RetryConfig;
 //! let config = RetryConfig {
-//!     max_retries: 1000,
-//!     backoff_ms: 1000,         // Start with 1 second
+//!     max_retries: Some(1000),
 //!     stop_before_deadline_ms: Some(900_000),
+//!     backoff_ms: 1000,         // Start with 1 second
 //!     backoff_factor: 2,        // Double each time (1s, 2s, 4s)
 //!     max_backoff_ms: 60000,    // Cap at 60 seconds
 //! };
@@ -231,7 +231,7 @@ impl Request<Claimed> {
 /// Configuration for retry behavior.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
-    pub max_retries: u32,
+    pub max_retries: Option<u32>,
     pub stop_before_deadline_ms: Option<i64>,
     pub backoff_ms: u64,
     pub backoff_factor: u64,
@@ -260,7 +260,6 @@ impl Request<Failed> {
     /// If no retries remain, returns None and the request stays Failed.
     ///
     /// The retry logic considers:
-    /// - min_retries: Always guaranteed regardless of other limits
     /// - max_retries: Hard cap on total retry attempts
     /// - stop_before_deadline_ms: Deadline-aware retry (stops before batch expiration)
     pub async fn retry<S: Storage + ?Sized>(
@@ -280,44 +279,50 @@ impl Request<Failed> {
         let now = chrono::Utc::now();
         let not_before = now + chrono::Duration::milliseconds(backoff_duration as i64);
 
-        if retry_attempt >= config.max_retries {
+        if let Some(max_retries) = config.max_retries
+            && retry_attempt >= max_retries
+        {
             tracing::debug!(
                 request_id = %self.data.id,
                 retry_attempt,
-                config.max_retries,
+                max_retries,
                 "No retries remaining (reached max_retries), request remains failed"
             );
             return Ok(None);
         }
 
-        // Check deadline constraint if configured
-        if let Some(stop_before_deadline_ms) = config.stop_before_deadline_ms {
-            let deadline_with_buffer = self.state.batch_expires_at
-                - chrono::Duration::milliseconds(stop_before_deadline_ms);
+        // Determine the effective deadline (with or without buffer)
+        let effective_deadline = if let Some(stop_before_deadline_ms) =
+            config.stop_before_deadline_ms
+        {
+            self.state.batch_expires_at - chrono::Duration::milliseconds(stop_before_deadline_ms)
+        } else {
+            // No buffer configured - use the actual deadline
+            self.state.batch_expires_at
+        };
 
-            // Check if the next retry would start before the deadline
-            if not_before >= deadline_with_buffer {
-                let time_until_deadline = self.state.batch_expires_at - now;
-                tracing::warn!(
-                    request_id = %self.data.id,
-                    retry_attempt,
-                    time_until_deadline_seconds = time_until_deadline.num_seconds(),
-                    batch_expires_at = %self.state.batch_expires_at,
-                    stop_before_deadline_ms,
-                    "No retries remaining (would exceed batch deadline), request remains failed"
-                );
-                return Ok(None);
-            }
-
-            let time_until_deadline = deadline_with_buffer - now;
-            tracing::debug!(
+        // Check if the next retry would start before the effective deadline
+        if not_before >= effective_deadline {
+            let time_until_deadline = self.state.batch_expires_at - now;
+            tracing::warn!(
                 request_id = %self.data.id,
                 retry_attempt,
                 time_until_deadline_seconds = time_until_deadline.num_seconds(),
                 batch_expires_at = %self.state.batch_expires_at,
-                "Retrying (deadline-aware: time remaining)"
+                stop_before_deadline_ms = config.stop_before_deadline_ms,
+                "No retries remaining (would exceed batch deadline), request remains failed"
             );
+            return Ok(None);
         }
+
+        let time_until_deadline = effective_deadline - now;
+        tracing::debug!(
+            request_id = %self.data.id,
+            retry_attempt,
+            time_until_deadline_seconds = time_until_deadline.num_seconds(),
+            batch_expires_at = %self.state.batch_expires_at,
+            "Retrying (deadline-aware: time remaining)"
+        );
 
         tracing::info!(
             request_id = %self.data.id,

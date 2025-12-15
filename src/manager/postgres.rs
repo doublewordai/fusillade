@@ -5883,7 +5883,7 @@ mod tests {
             default_model_concurrency: 5,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             claim_interval_ms: 10,
-            max_retries: 10_000,
+            max_retries: Some(10_000),
             stop_before_deadline_ms: Some(900_000),
             backoff_ms: 100,
             backoff_factor: 2,
