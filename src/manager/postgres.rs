@@ -642,7 +642,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     SELECT GREATEST(0, $2::BIGINT - (SELECT count FROM in_progress_count)) as slots
                 ),
                 to_claim AS (
-                    SELECT r.id, r.template_id
+                    SELECT r.id, r.template_id, r.batch_id
                     FROM requests r
                     JOIN batches b ON r.batch_id = b.id
                     CROSS JOIN available_slots
@@ -662,9 +662,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     claimed_at = $3
                 FROM to_claim tc
                 JOIN request_templates t ON tc.template_id = t.id
+                JOIN batches b ON tc.batch_id = b.id
                 WHERE r.id = tc.id
                 RETURNING r.id, r.batch_id, r.template_id, r.retry_attempt,
-                          t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key
+                          t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
+                          b.expires_at as batch_expires_at
                 "#,
                 *daemon_id as Uuid,
                 model_limit as i64,
@@ -698,6 +700,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         daemon_id,
                         claimed_at: now,
                         retry_attempt: row.retry_attempt as u32,
+                        batch_expires_at: row.batch_expires_at,
                     },
                     data: RequestData {
                         id: RequestId(row.id),
@@ -910,9 +913,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 r.id, r.batch_id, r.template_id, r.state,
                 t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
-                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at
+                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
+                b.expires_at as batch_expires_at
             FROM requests r
             JOIN request_templates t ON r.template_id = t.id
+            JOIN batches b ON r.batch_id = b.id
             WHERE r.id = ANY($1)
             "#,
             &uuid_ids,
@@ -947,6 +952,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     state: Pending {
                         retry_attempt: row.retry_attempt as u32,
                         not_before: row.not_before,
+                        batch_expires_at: row.batch_expires_at,
                     },
                     data,
                 })),
@@ -959,6 +965,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             FusilladeError::Other(anyhow!("Missing claimed_at for claimed request"))
                         })?,
                         retry_attempt: row.retry_attempt as u32,
+                        batch_expires_at: row.batch_expires_at,
                     },
                     data,
                 })),
@@ -987,6 +994,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                 ))
                             })?,
                             retry_attempt: row.retry_attempt as u32,
+                            batch_expires_at: row.batch_expires_at,
                             result_rx: Arc::new(Mutex::new(rx)),
                             abort_handle,
                         },
@@ -1047,6 +1055,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                 ))
                             })?,
                             retry_attempt: row.retry_attempt as u32,
+                            batch_expires_at: row.batch_expires_at,
                         },
                         data,
                     }))
@@ -2307,6 +2316,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 state: Pending {
                     retry_attempt: row.retry_attempt as u32,
                     not_before: row.not_before,
+                    batch_expires_at: row.expires_at,
                 },
             })
             .collect())
@@ -2340,6 +2350,44 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(())
     }
 
+    async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
+        tracing::info!(count = ids.len(), "Retrying failed requests");
+
+        // Get all requests in a single bulk query to avoid N+1 problem
+        let get_results = self.get_requests(ids.clone()).await?;
+
+        let mut results = Vec::new();
+
+        for (id, request_result) in ids.iter().zip(get_results.into_iter()) {
+            let result = match request_result {
+                Ok(AnyRequest::Failed(req)) => {
+                    // Reset to pending state with retry_attempt = 0
+                    let pending_request = Request {
+                        state: Pending {
+                            retry_attempt: 0,
+                            not_before: None,
+                            batch_expires_at: req.state.batch_expires_at,
+                        },
+                        data: req.data,
+                    };
+
+                    self.persist(&pending_request).await?;
+                    Ok(())
+                }
+                Ok(_) => Err(crate::error::FusilladeError::InvalidState(
+                    *id,
+                    "non-failed state".to_string(),
+                    "failed state".to_string(),
+                )),
+                Err(e) => Err(e),
+            };
+
+            results.push(result);
+        }
+
+        Ok(results)
+    }
+
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>> {
         let rows = sqlx::query!(
             r#"
@@ -2347,9 +2395,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 r.id, r.batch_id, r.template_id, r.state,
                 t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
-                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at
+                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
+                b.expires_at as batch_expires_at
             FROM requests r
             JOIN request_templates t ON r.template_id = t.id
+            JOIN batches b ON r.batch_id = b.id
             WHERE r.batch_id = $1
             ORDER BY r.created_at ASC
             "#,
@@ -2382,6 +2432,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     state: Pending {
                         retry_attempt: row.retry_attempt as u32,
                         not_before: row.not_before,
+                        batch_expires_at: row.batch_expires_at,
                     },
                     data,
                 }),
@@ -2398,6 +2449,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             ))
                         })?,
                         retry_attempt: row.retry_attempt as u32,
+                        batch_expires_at: row.batch_expires_at,
                     },
                     data,
                 }),
@@ -2422,6 +2474,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                 ))
                             })?,
                             retry_attempt: row.retry_attempt as u32,
+                            batch_expires_at: row.batch_expires_at,
                             result_rx: Arc::new(Mutex::new(rx)),
                             abort_handle,
                         },
@@ -2482,6 +2535,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                 ))
                             })?,
                             retry_attempt: row.retry_attempt as u32,
+                            batch_expires_at: row.batch_expires_at,
                         },
                         data,
                     })
@@ -5829,7 +5883,8 @@ mod tests {
             default_model_concurrency: 5,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             claim_interval_ms: 10,
-            max_retries: 3,
+            max_retries: Some(10_000),
+            stop_before_deadline_ms: Some(900_000),
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,

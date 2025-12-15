@@ -142,6 +142,24 @@ pub trait Storage: Send + Sync {
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
 
+    /// Retry failed requests by resetting them to pending state.
+    ///
+    /// This resets the specified failed requests to pending state with retry_attempt = 0,
+    /// allowing them to be picked up by the daemon for reprocessing.
+    ///
+    /// # Arguments
+    /// * `ids` - Request IDs to retry
+    ///
+    /// # Returns
+    /// A vector of results, one for each request ID. Each result indicates whether
+    /// the retry succeeded or failed.
+    ///
+    /// # Errors
+    /// Individual retry results may fail if:
+    /// - Request ID doesn't exist
+    /// - Request is not in failed state
+    async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>>;
+
     /// The following methods are defined specifically for requests - i.e. independent of the
     /// files/batches they belong to.
     ///
