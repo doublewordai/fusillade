@@ -1757,7 +1757,7 @@ mod tests {
             //    but still stopped before too many attempts
             // Allow 9-12 attempts to account for timing variations with CI slower CI CPUs
             assert!(
-                retry_count >= 9 && retry_count <= 12,
+                retry_count >= 9 && retry_count < 12,
                 "Expected 9-12 retry attempts (should retry until deadline with no buffer), got {}",
                 retry_count
             );
