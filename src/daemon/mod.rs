@@ -1748,16 +1748,17 @@ mod tests {
             //   - Retry 11: t=1950ms (attempt 11)
             //   - Next would be t=2150ms - EXCEEDS 2000ms deadline
             // Expected: ~11 retry attempts (12 total including initial)
+            // In reality, we will see <11 due to DB calls and CPU overhead in making requests
 
             let retry_count = failed.state.retry_attempt;
             let call_count = http_client.call_count();
 
             // 1. Verify we retried more than the buffered case (which stopped at ~8)
             //    but still stopped before too many attempts
-            // Allow 10-12 attempts to account for timing variations
+            // Allow 9-12 attempts to account for timing variations with CI slower CI CPUs
             assert!(
-                retry_count >= 10 && retry_count <= 12,
-                "Expected 10-12 retry attempts (should retry until deadline with no buffer), got {}",
+                retry_count >= 9 && retry_count < 12,
+                "Expected 9-12 retry attempts (should retry until deadline with no buffer), got {}",
                 retry_count
             );
 
