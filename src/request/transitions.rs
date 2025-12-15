@@ -236,7 +236,9 @@ impl Request<Claimed> {
 /// Configuration for retry behavior.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
-    pub retry_limits: crate::daemon::RetryLimits,
+    pub min_retries: Option<u32>,
+    pub max_retries: Option<u32>,
+    pub stop_before_deadline_ms: Option<i64>,
     pub backoff_ms: u64,
     pub backoff_factor: u64,
     pub max_backoff_ms: u64,
@@ -245,7 +247,9 @@ pub struct RetryConfig {
 impl From<&crate::daemon::DaemonConfig> for RetryConfig {
     fn from(config: &crate::daemon::DaemonConfig) -> Self {
         RetryConfig {
-            retry_limits: config.retry_limits.clone(),
+            min_retries: config.min_retries,
+            max_retries: config.max_retries,
+            stop_before_deadline_ms: config.stop_before_deadline_ms,
             backoff_ms: config.backoff_ms,
             backoff_factor: config.backoff_factor,
             max_backoff_ms: config.max_backoff_ms,
@@ -284,16 +288,17 @@ impl Request<Failed> {
         let not_before = now + chrono::Duration::milliseconds(backoff_duration as i64);
 
         // Check if we're within minimum retry guarantee
-        if retry_attempt < config.retry_limits.min_retries {
+        let min_retries = config.min_retries.unwrap_or(0);
+        if retry_attempt < min_retries {
             tracing::debug!(
                 request_id = %self.data.id,
                 retry_attempt,
-                min_retries = config.retry_limits.min_retries,
+                min_retries,
                 "Retrying (within minimum retry guarantee)"
             );
         } else {
             // Beyond minimum retries, check max_retries cap
-            if let Some(max_retries) = config.retry_limits.max_retries
+            if let Some(max_retries) = config.max_retries
                 && retry_attempt >= max_retries
             {
                 tracing::debug!(
@@ -306,7 +311,7 @@ impl Request<Failed> {
             }
 
             // Check deadline constraint if configured
-            if let Some(stop_before_deadline_ms) = config.retry_limits.stop_before_deadline_ms {
+            if let Some(stop_before_deadline_ms) = config.stop_before_deadline_ms {
                 let deadline_with_buffer = self.state.batch_expires_at
                     - chrono::Duration::milliseconds(stop_before_deadline_ms);
 

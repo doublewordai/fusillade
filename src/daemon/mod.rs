@@ -83,83 +83,6 @@ pub struct SlaThreshold {
     pub action: SlaAction,
 }
 
-/// Retry limit configuration.
-///
-/// This struct provides flexible retry strategies by allowing you to configure:
-/// - Minimum retries (always attempted regardless of deadline)
-/// - Maximum retries (hard cap on retry attempts)
-/// - Deadline-aware retry (stop before batch expiration)
-///
-/// The deadline is read from the batch state in the database and carried over
-/// through state transitions. The `stop_before_deadline_ms` parameter here
-/// provides a safety buffer to ensure the final attempt completes before the SLA.
-///
-/// All fields work together to provide fine-grained control:
-/// - Setting only `min_retries` ensures at least that many attempts
-/// - Setting `max_retries` caps the total number of retries
-/// - Setting `stop_before_deadline_ms` enables deadline-aware retry logic
-/// - Combining all three gives you guaranteed minimums, hard caps, and SLA safety
-///
-/// # Examples
-///
-/// ```rust
-/// # use fusillade::daemon::RetryLimits;
-/// // Default: retry up to deadline with minimum guarantees
-/// let default = RetryLimits::default();
-///
-/// // Fixed attempts only (traditional behavior)
-/// let fixed = RetryLimits {
-///     min_retries: 0,
-///     max_retries: Some(5),
-///     stop_before_deadline_ms: None,
-/// };
-///
-/// // Aggressive retry with long deadline
-/// let aggressive = RetryLimits {
-///     min_retries: 5,
-///     max_retries: None,  // No cap
-///     stop_before_deadline_ms: Some(1_800_000),  // 30 min buffer
-/// };
-///
-/// // Conservative with both limits
-/// let conservative = RetryLimits {
-///     min_retries: 1,
-///     max_retries: Some(3),
-///     stop_before_deadline_ms: Some(3_600_000),  // 1 hour buffer
-/// };
-/// ```
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RetryLimits {
-    /// Minimum number of retries to guarantee (regardless of deadline or max_retries).
-    /// Default: 0
-    #[serde(default)]
-    pub min_retries: u32,
-
-    /// Maximum number of retry attempts before giving up.
-    /// If None, only limited by deadline (if set).
-    /// Default: None (unlimited)
-    #[serde(default)]
-    pub max_retries: Option<u32>,
-
-    /// Stop retrying this many milliseconds before the batch expires.
-    /// Positive values stop before the deadline (safety buffer).
-    /// Negative values allow retrying after the deadline.
-    /// If None, retries are not deadline-aware.
-    /// Default: None
-    #[serde(default)]
-    pub stop_before_deadline_ms: Option<i64>,
-}
-
-impl Default for RetryLimits {
-    fn default() -> Self {
-        RetryLimits {
-            min_retries: 3,
-            max_retries: None,
-            stop_before_deadline_ms: Some(900_000), // 15 min buffer
-        }
-    }
-}
-
 /// Configuration for the daemon.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
@@ -175,8 +98,24 @@ pub struct DaemonConfig {
     /// How long to sleep between claim iterations
     pub claim_interval_ms: u64,
 
-    /// Retry limit configuration
-    pub retry_limits: RetryLimits,
+    /// Maximum number of retry attempts before giving up.
+    /// If None, only limited by deadline (if set).
+    /// Default: None (unlimited)
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+
+    /// Minimum number of retries to guarantee (regardless of deadline or max_retries).
+    /// Default: 0
+    #[serde(default)]
+    pub min_retries: Option<u32>,
+
+    /// Stop retrying this many milliseconds before the batch expires.
+    /// Positive values stop before the deadline (safety buffer).
+    /// Negative values allow retrying after the deadline.
+    /// If None, retries are not deadline-aware.
+    /// Default: None
+    #[serde(default)]
+    pub stop_before_deadline_ms: Option<i64>,
 
     /// Base backoff duration in milliseconds (will be exponentially increased)
     pub backoff_ms: u64,
@@ -253,7 +192,9 @@ impl Default for DaemonConfig {
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             claim_interval_ms: 1000,
-            retry_limits: RetryLimits::default(),
+            max_retries: Some(10000),
+            stop_before_deadline_ms: Some(900_000),
+            min_retries: Some(3),
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
@@ -891,11 +832,9 @@ mod tests {
             claim_interval_ms: 10, // Very fast for testing
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            retry_limits: RetryLimits {
-                min_retries: 0,
-                max_retries: Some(3),
-                stop_before_deadline_ms: None,
-            },
+            min_retries: Some(0),
+            max_retries: Some(3),
+            stop_before_deadline_ms: None,
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
@@ -1058,11 +997,9 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits,
-            retry_limits: RetryLimits {
-                min_retries: 0,
-                max_retries: Some(3),
-                stop_before_deadline_ms: None,
-            },
+            min_retries: Some(0),
+            max_retries: Some(3),
+            stop_before_deadline_ms: None,
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
@@ -1283,11 +1220,9 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            retry_limits: RetryLimits {
-                min_retries: 0,
-                max_retries: Some(5),
-                stop_before_deadline_ms: None,
-            },
+            min_retries: Some(0),
+            max_retries: Some(5),
+            stop_before_deadline_ms: None,
             backoff_ms: 10, // Very fast backoff for testing
             backoff_factor: 2,
             max_backoff_ms: 100,
@@ -1417,11 +1352,9 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
-            retry_limits: RetryLimits {
-                min_retries: 0,
-                max_retries: Some(3),
-                stop_before_deadline_ms: None,
-            },
+            min_retries: Some(0),
+            max_retries: Some(3),
+            stop_before_deadline_ms: None,
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
@@ -1596,12 +1529,10 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            retry_limits: RetryLimits {
-                min_retries: 3,
-                max_retries: None,
-                stop_before_deadline_ms: Some(3_600_000), // 1 hour buffer
-            },
-            backoff_ms: 10, // Fast backoff for testing
+            min_retries: Some(3),
+            max_retries: None,
+            stop_before_deadline_ms: Some(3_600_000), // 1 hour buffer
+            backoff_ms: 10,                           // Fast backoff for testing
             backoff_factor: 2,
             max_backoff_ms: 100,
             timeout_ms: 5000,
@@ -1719,11 +1650,9 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            retry_limits: RetryLimits {
-                min_retries: 1,
-                max_retries: None,
-                stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
-            },
+            min_retries: Some(1),
+            max_retries: None,
+            stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
             backoff_ms: 50,
             backoff_factor: 2,
             max_backoff_ms: 200,
@@ -1797,23 +1726,61 @@ mod tests {
         shutdown_token.cancel();
 
         if let Some(Ok(crate::AnyRequest::Failed(failed))) = results.first() {
-            // Should have stopped retrying due to deadline
-            // With 2s window and 500ms buffer, should stop around 1.5s
-            // With 50ms initial backoff, 100ms, 200ms... should do a few retries but not many
+            // Calculate expected retry attempts:
+            // - Completion window: 2000ms
+            // - Buffer: 500ms
+            // - Effective deadline: 1500ms
+            // - Backoff sequence: 50ms, 100ms, 200ms, 200ms, 200ms, 200ms, 200ms
+            // - Timeline:
+            //   - Initial attempt: t=0ms (attempt 0)
+            //   - Retry 1: t=50ms (attempt 1)
+            //   - Retry 2: t=150ms (attempt 2)
+            //   - Retry 3: t=350ms (attempt 3)
+            //   - Retry 4: t=550ms (attempt 4)
+            //   - Retry 5: t=750ms (attempt 5)
+            //   - Retry 6: t=950ms (attempt 6)
+            //   - Retry 7: t=1150ms (attempt 7)
+            //   - Retry 8: t=1350ms (attempt 8)
+            //   - Next would be t=1550ms - EXCEEDS 1500ms deadline
+            // Expected: 8 retry attempts (9 total including initial)
+
+            let retry_count = failed.state.retry_attempt;
+            let call_count = http_client.call_count();
+
+            // 1. Verify minimum retries were honored (min_retries = 1)
             assert!(
-                failed.state.retry_attempt < 10,
-                "Expected retries to stop before reaching many attempts due to deadline, got {}",
-                failed.state.retry_attempt
+                retry_count >= 1,
+                "Expected at least min_retries (1) retry attempts, got {}",
+                retry_count
             );
 
-            // Should have made fewer calls than we provided (20)
+            // 2. Verify we stopped before too many retries (deadline constraint)
+            // Allow 7-9 attempts to account for timing variations in test execution
             assert!(
-                http_client.call_count() < 20,
-                "Expected deadline to stop retries before exhausting all mock responses, got {} calls",
-                http_client.call_count()
+                retry_count >= 7 && retry_count <= 9,
+                "Expected 7-9 retry attempts based on deadline and backoff calculation, got {}",
+                retry_count
+            );
+
+            // 3. Verify HTTP call count matches retry attempts (1 initial + N retries)
+            assert_eq!(
+                call_count,
+                (retry_count + 1) as usize,
+                "Expected call count to match retry attempts + 1 initial attempt, got {} calls for {} retry attempts",
+                call_count,
+                retry_count
+            );
+
+            // 4. Verify the request actually has error details from the last attempt
+            assert!(
+                !failed.state.reason.to_error_message().is_empty(),
+                "Expected failed request to have failure reason"
             );
         } else {
-            panic!("Expected request to be in Failed state");
+            panic!(
+                "Expected request to be in Failed state, got {:?}",
+                results.first()
+            );
         }
     }
 }
