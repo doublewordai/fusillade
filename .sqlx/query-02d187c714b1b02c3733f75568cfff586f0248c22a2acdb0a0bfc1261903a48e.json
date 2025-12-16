@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id, r.state,\n                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at\n            FROM requests r\n            JOIN request_templates t ON r.template_id = t.id\n            WHERE r.batch_id = $1\n            ORDER BY r.created_at ASC\n            ",
+  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id, r.state,\n                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id\n            FROM requests r\n            JOIN request_templates t ON r.template_id = t.id\n            WHERE r.batch_id = $1\n            ORDER BY r.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -112,6 +112,26 @@
         "ordinal": 21,
         "name": "canceled_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 22,
+        "name": "escalated_from_request_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 23,
+        "name": "is_escalated",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 24,
+        "name": "superseded_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 25,
+        "name": "superseded_by_request_id",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
@@ -141,8 +161,12 @@
       true,
       true,
       true,
+      true,
+      true,
+      false,
+      true,
       true
     ]
   },
-  "hash": "c17ad4522c1bcbdbd6dd8abdd7bd8dedff70039c4c71c62ca01018c470cf3c49"
+  "hash": "02d187c714b1b02c3733f75568cfff586f0248c22a2acdb0a0bfc1261903a48e"
 }

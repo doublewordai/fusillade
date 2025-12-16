@@ -171,13 +171,14 @@ pub trait Storage: Send + Sync {
                         req.cancel(self).await?;
                         Ok(())
                     }
-                    AnyRequest::Completed(_) | AnyRequest::Failed(_) | AnyRequest::Canceled(_) => {
-                        Err(crate::error::FusilladeError::InvalidState(
-                            id,
-                            "terminal state".to_string(),
-                            "cancellable state".to_string(),
-                        ))
-                    }
+                    AnyRequest::Completed(_)
+                    | AnyRequest::Failed(_)
+                    | AnyRequest::Canceled(_)
+                    | AnyRequest::Superseded(_) => Err(crate::error::FusilladeError::InvalidState(
+                        id,
+                        "terminal state".to_string(),
+                        "cancellable state".to_string(),
+                    )),
                 },
                 Err(e) => Err(e),
             };

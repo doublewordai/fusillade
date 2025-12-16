@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id, r.state,\n                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at\n            FROM requests r\n            JOIN request_templates t ON r.template_id = t.id\n            WHERE r.id = ANY($1)\n            ",
+  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id, r.state,\n                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id\n            FROM requests r\n            JOIN request_templates t ON r.template_id = t.id\n            WHERE r.id = ANY($1)\n            ",
   "describe": {
     "columns": [
       {
@@ -112,6 +112,26 @@
         "ordinal": 21,
         "name": "canceled_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 22,
+        "name": "escalated_from_request_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 23,
+        "name": "is_escalated",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 24,
+        "name": "superseded_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 25,
+        "name": "superseded_by_request_id",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
@@ -141,8 +161,12 @@
       true,
       true,
       true,
+      true,
+      true,
+      false,
+      true,
       true
     ]
   },
-  "hash": "35c9feefaf72f092d9177963f1c8adf12a20a6b936a66d8f09a849b485306194"
+  "hash": "3bf4d032318c18ed3762aa7061d295af762c778104b30c684b3fdcb1bc4e5f22"
 }

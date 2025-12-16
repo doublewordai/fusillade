@@ -45,6 +45,11 @@ fn default_sla_check_interval_seconds() -> u64 {
     60
 }
 
+/// Default priority endpoints (empty map)
+fn default_priority_endpoints() -> Arc<dashmap::DashMap<String, PriorityEndpointConfig>> {
+    Arc::new(dashmap::DashMap::new())
+}
+
 /// Log level for SLA threshold violations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,6 +58,22 @@ pub enum SlaLogLevel {
     Warn,
     /// Log as error
     Error,
+}
+
+/// Configuration for a priority endpoint used in SLA escalation.
+///
+/// When a request is escalated, it's cloned and sent to the priority endpoint
+/// specified in this configuration, while the original continues processing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PriorityEndpointConfig {
+    /// Priority endpoint URL (e.g., "https://priority-api.openai.com")
+    pub endpoint: String,
+
+    /// Optional override for API key (if None, uses original request's API key)
+    pub api_key: Option<String>,
+
+    /// Optional override for path (if None, uses original request's path)
+    pub path_override: Option<String>,
 }
 
 /// Action to take when a batch crosses an SLA threshold.
@@ -64,8 +85,12 @@ pub enum SlaAction {
         /// Log level (warn or error)
         level: SlaLogLevel,
     },
+    /// Escalate at-risk requests to priority endpoints
+    ///
+    /// Creates a cloned request sent to the priority endpoint configured for the model,
+    /// while the original request continues processing. First to complete wins.
+    Escalate,
     // Future actions:
-    // Escalate,  // Call realtime API
     // Notify,    // Send notification/webhook
     // Abort,     // Cancel the batch
 }
@@ -94,6 +119,12 @@ pub struct DaemonConfig {
 
     /// Per-model concurrency overrides (shared, can be updated dynamically)
     pub model_concurrency_limits: Arc<dashmap::DashMap<String, usize>>,
+
+    /// Per-model priority endpoint configurations for SLA escalation
+    /// Maps model name -> priority endpoint config
+    /// When a request is escalated, it's cloned and sent to the priority endpoint for that model
+    #[serde(skip, default = "default_priority_endpoints")]
+    pub priority_endpoints: Arc<dashmap::DashMap<String, PriorityEndpointConfig>>,
 
     /// How long to sleep between claim iterations
     pub claim_interval_ms: u64,
@@ -175,6 +206,7 @@ impl Default for DaemonConfig {
             claim_batch_size: 100,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            priority_endpoints: default_priority_endpoints(),
             claim_interval_ms: 1000,
             max_retries: 5,
             backoff_ms: 1000,
@@ -188,22 +220,7 @@ impl Default for DaemonConfig {
             processing_timeout_ms: 600000,       // 10 minutes
             cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
             sla_check_interval_seconds: default_sla_check_interval_seconds(),
-            sla_thresholds: vec![
-                SlaThreshold {
-                    name: "warning".to_string(),
-                    threshold_seconds: 3600, // 1 hour
-                    action: SlaAction::Log {
-                        level: SlaLogLevel::Warn,
-                    },
-                },
-                SlaThreshold {
-                    name: "critical".to_string(),
-                    threshold_seconds: 900, // 15 minutes
-                    action: SlaAction::Log {
-                        level: SlaLogLevel::Error,
-                    },
-                },
-            ],
+            sla_thresholds: vec![],
         }
     }
 }
@@ -536,12 +553,14 @@ where
                                                         }
                                                     }
                                                 }
-                                                // Future actions can be added here:
-                                                // SlaAction::Escalate => {
-                                                //     - Could claim these specific requests with priority
-                                                //     - Could trigger scale-up of workers
-                                                //     - Could send alerts with request IDs
-                                                // }
+                                                SlaAction::Escalate => {
+                                                    // TODO: Implement escalation logic in Phase 3
+                                                    tracing::warn!(
+                                                        batch_id = %batch_id,
+                                                        pending_count = pending_count,
+                                                        "Escalation not yet implemented"
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -825,8 +844,7 @@ mod tests {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![], // Disable SLA monitoring in tests
+            ..Default::default()
         };
 
         let manager = Arc::new(
@@ -889,20 +907,20 @@ mod tests {
                 .await
                 .expect("Failed to get request");
 
-            if let Some(Ok(any_request)) = results.first() {
-                if any_request.is_terminal() {
-                    if let crate::AnyRequest::Completed(req) = any_request {
-                        // Verify the request was completed successfully
-                        assert_eq!(req.state.response_status, 200);
-                        assert_eq!(req.state.response_body, r#"{"result":"success"}"#);
-                        completed = true;
-                        break;
-                    } else {
-                        panic!(
-                            "Request reached terminal state but was not completed: {:?}",
-                            any_request
-                        );
-                    }
+            if let Some(Ok(any_request)) = results.first()
+                && any_request.is_terminal()
+            {
+                if let crate::AnyRequest::Completed(req) = any_request {
+                    // Verify the request was completed successfully
+                    assert_eq!(req.state.response_status, 200);
+                    assert_eq!(req.state.response_body, r#"{"result":"success"}"#);
+                    completed = true;
+                    break;
+                } else {
+                    panic!(
+                        "Request reached terminal state but was not completed: {:?}",
+                        any_request
+                    );
                 }
             }
 
@@ -988,8 +1006,7 @@ mod tests {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![], // Disable SLA monitoring in tests
+            ..Default::default()
         };
 
         let manager = Arc::new(
@@ -1209,8 +1226,7 @@ mod tests {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![], // Disable SLA monitoring in tests
+            ..Default::default()
         };
 
         let manager = Arc::new(
@@ -1272,17 +1288,17 @@ mod tests {
                 .await
                 .expect("Failed to get request");
 
-            if let Some(Ok(any_request)) = results.first() {
-                if let crate::AnyRequest::Completed(req) = any_request {
-                    // Verify the request eventually completed successfully
-                    assert_eq!(req.state.response_status, 200);
-                    assert_eq!(
-                        req.state.response_body,
-                        r#"{"result":"success after retries"}"#
-                    );
-                    completed = true;
-                    break;
-                }
+            if let Some(Ok(any_request)) = results.first()
+                && let crate::AnyRequest::Completed(req) = any_request
+            {
+                // Verify the request eventually completed successfully
+                assert_eq!(req.state.response_status, 200);
+                assert_eq!(
+                    req.state.response_body,
+                    r#"{"result":"success after retries"}"#
+                );
+                completed = true;
+                break;
             }
 
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1339,8 +1355,7 @@ mod tests {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![], // Disable SLA monitoring in tests
+            ..Default::default()
         };
 
         let manager = Arc::new(

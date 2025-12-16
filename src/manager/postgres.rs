@@ -664,6 +664,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 JOIN request_templates t ON tc.template_id = t.id
                 WHERE r.id = tc.id
                 RETURNING r.id, r.batch_id, r.template_id, r.retry_attempt,
+                          r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,
                           t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key
                 "#,
                 *daemon_id as Uuid,
@@ -710,6 +711,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         body: row.body,
                         model: row.model,
                         api_key: row.api_key,
+                        escalated_from_request_id: row.escalated_from_request_id.map(RequestId),
+                        is_escalated: row.is_escalated,
+                        superseded_at: row.superseded_at,
+                        superseded_by_request_id: row.superseded_by_request_id.map(RequestId),
                     },
                 }));
             }
@@ -896,6 +901,28 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     return Err(FusilladeError::RequestNotFound(req.data.id));
                 }
             }
+            AnyRequest::Superseded(req) => {
+                let rows_affected = sqlx::query!(
+                    r#"
+                    UPDATE requests SET
+                        state = 'superseded',
+                        superseded_at = $2,
+                        superseded_by_request_id = $3
+                    WHERE id = $1
+                    "#,
+                    *req.data.id as Uuid,
+                    req.state.superseded_at,
+                    *req.state.superseded_by_request_id as Uuid,
+                )
+                .execute(&self.pool)
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to update request: {}", e)))?
+                .rows_affected();
+
+                if rows_affected == 0 {
+                    return Err(FusilladeError::RequestNotFound(req.data.id));
+                }
+            }
         }
 
         Ok(())
@@ -910,7 +937,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 r.id, r.batch_id, r.template_id, r.state,
                 t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
-                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at
+                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
+                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id
             FROM requests r
             JOIN request_templates t ON r.template_id = t.id
             WHERE r.id = ANY($1)
@@ -938,6 +966,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 body: row.body,
                 model: row.model,
                 api_key: row.api_key,
+                escalated_from_request_id: row.escalated_from_request_id.map(RequestId),
+                is_escalated: row.is_escalated,
+                superseded_at: row.superseded_at,
+                superseded_by_request_id: row.superseded_by_request_id.map(RequestId),
             };
 
             let state = &row.state;
@@ -1058,6 +1090,24 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                 "Missing canceled_at for canceled request"
                             ))
                         })?,
+                    },
+                    data,
+                })),
+                "superseded" => Ok(AnyRequest::Superseded(Request {
+                    state: crate::request::types::Superseded {
+                        superseded_at: row.superseded_at.ok_or_else(|| {
+                            FusilladeError::Other(anyhow!(
+                                "Missing superseded_at for superseded request"
+                            ))
+                        })?,
+                        superseded_by_request_id: RequestId(
+                            row.superseded_by_request_id.ok_or_else(|| {
+                                FusilladeError::Other(anyhow!(
+                                    "Missing superseded_by_request_id for superseded request"
+                                ))
+                            })?,
+                        ),
+                        was_escalated: row.is_escalated,
                     },
                     data,
                 })),
@@ -2227,6 +2277,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 r.template_id,
                 r.retry_attempt,
                 r.not_before,
+                r.escalated_from_request_id,
+                r.is_escalated,
+                r.superseded_at,
+                r.superseded_by_request_id,
                 t.custom_id,
                 t.endpoint,
                 t.method,
@@ -2267,6 +2321,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     body: row.body,
                     model: row.model,
                     api_key: row.api_key,
+                    escalated_from_request_id: row.escalated_from_request_id.map(RequestId),
+                    is_escalated: row.is_escalated,
+                    superseded_at: row.superseded_at,
+                    superseded_by_request_id: row.superseded_by_request_id.map(RequestId),
                 },
                 state: Pending {
                     retry_attempt: row.retry_attempt as u32,
@@ -2311,7 +2369,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 r.id, r.batch_id, r.template_id, r.state,
                 t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
-                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at
+                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
+                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id
             FROM requests r
             JOIN request_templates t ON r.template_id = t.id
             WHERE r.batch_id = $1
@@ -2337,6 +2396,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 body: row.body,
                 model: row.model,
                 api_key: row.api_key,
+                escalated_from_request_id: row.escalated_from_request_id.map(RequestId),
+                is_escalated: row.is_escalated,
+                superseded_at: row.superseded_at,
+                superseded_by_request_id: row.superseded_by_request_id.map(RequestId),
             };
 
             let state = &row.state;
@@ -4866,6 +4929,7 @@ mod tests {
                 Ok(AnyRequest::Completed(_)) => "completed",
                 Ok(AnyRequest::Failed(_)) => "failed",
                 Ok(AnyRequest::Canceled(_)) => "canceled",
+                Ok(AnyRequest::Superseded(_)) => "superseded",
                 Err(_) => "error",
             })
             .collect();
@@ -5804,8 +5868,7 @@ mod tests {
             claim_timeout_ms: 5000,
             processing_timeout_ms: 10000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![], // Disable SLA monitoring in tests
+            ..Default::default()
         };
 
         let daemon = Arc::new(crate::daemon::Daemon::new(

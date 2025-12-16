@@ -409,6 +409,10 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
         };
 
         let response = mock.execute(&request, "test-key", 5000).await.unwrap();
@@ -452,6 +456,10 @@ mod tests {
             body: "".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
         };
 
         let response1 = mock.execute(&request, "key", 5000).await.unwrap();
@@ -478,6 +486,10 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
         };
 
         let result = mock.execute(&request, "key", 5000).await;
@@ -507,6 +519,10 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
         };
 
         // Spawn the request execution (it will block waiting for trigger)
