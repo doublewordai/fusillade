@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/doublewordai/fusillade/compare/fusillade-v0.8.1...fusillade-v0.8.2) (2025-12-17)
+
+
+### Bug Fixes
+
+* remove test column from requests ([#33](https://github.com/doublewordai/fusillade/issues/33)) ([508e2a7](https://github.com/doublewordai/fusillade/commit/508e2a786b81a4fab9525d6f222030405261f4bf))
+
 ## [0.8.1](https://github.com/doublewordai/fusillade/compare/fusillade-v0.8.0...fusillade-v0.8.1) (2025-12-17)
 
 
