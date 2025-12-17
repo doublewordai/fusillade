@@ -133,6 +133,9 @@ pub struct Pending {
     /// Earliest time this request can be claimed (for exponential backoff)
     /// None means it can be claimed immediately
     pub not_before: Option<DateTime<Utc>>,
+
+    /// When the batch expires (used for deadline-aware retry logic)
+    pub batch_expires_at: DateTime<Utc>,
 }
 
 impl RequestState for Pending {}
@@ -147,6 +150,8 @@ pub struct Claimed {
     pub claimed_at: DateTime<Utc>,
     /// Number of times this request has been attempted (carried over from Pending)
     pub retry_attempt: u32,
+    /// When the batch expires (carried over from Pending)
+    pub batch_expires_at: DateTime<Utc>,
 }
 
 impl RequestState for Claimed {}
@@ -159,6 +164,8 @@ pub struct Processing {
     pub started_at: DateTime<Utc>,
     /// Number of times this request has been attempted (carried over from Claimed)
     pub retry_attempt: u32,
+    /// When the batch expires (carried over from Claimed)
+    pub batch_expires_at: DateTime<Utc>,
     /// Channel receiver for the HTTP request result (wrapped in Arc<Mutex<>> for Sync)
     #[serde(skip)]
     pub result_rx: Arc<Mutex<mpsc::Receiver<Result<HttpResponse>>>>,
@@ -246,6 +253,8 @@ pub struct Failed {
     pub failed_at: DateTime<Utc>,
     /// Number of times this request has been attempted when it failed
     pub retry_attempt: u32,
+    /// When the batch expires (carried over from Processing)
+    pub batch_expires_at: DateTime<Utc>,
 }
 
 impl RequestState for Failed {}

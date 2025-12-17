@@ -140,8 +140,14 @@ pub struct DaemonConfig {
     /// How long to sleep between claim iterations
     pub claim_interval_ms: u64,
 
-    /// Maximum number of retry attempts before giving up
-    pub max_retries: u32,
+    /// Maximum number of retry attempts before giving up.
+    pub max_retries: Option<u32>,
+
+    /// Stop retrying this many milliseconds before the batch expires.
+    /// Positive values stop before the deadline (safety buffer).
+    /// Negative values allow retrying after the deadline.
+    /// If None, retries are not deadline-aware.
+    pub stop_before_deadline_ms: Option<i64>,
 
     /// Base backoff duration in milliseconds (will be exponentially increased)
     pub backoff_ms: u64,
@@ -223,7 +229,8 @@ impl Default for DaemonConfig {
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             priority_endpoints: default_priority_endpoints(),
             claim_interval_ms: 1000,
-            max_retries: 5,
+            max_retries: Some(1000),
+            stop_before_deadline_ms: Some(900_000),
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
@@ -877,7 +884,8 @@ mod tests {
             claim_interval_ms: 10, // Very fast for testing
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            max_retries: 3,
+            max_retries: Some(3),
+            stop_before_deadline_ms: None,
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
@@ -1039,7 +1047,8 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits,
-            max_retries: 3,
+            max_retries: Some(3),
+            stop_before_deadline_ms: None,
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
@@ -1259,7 +1268,8 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            max_retries: 5,
+            max_retries: Some(5),
+            stop_before_deadline_ms: None,
             backoff_ms: 10, // Very fast backoff for testing
             backoff_factor: 2,
             max_backoff_ms: 100,
@@ -1388,7 +1398,8 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
-            max_retries: 3,
+            max_retries: Some(3),
+            stop_before_deadline_ms: None,
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
@@ -1528,5 +1539,305 @@ mod tests {
 
         assert!(all_completed, "All 10 requests should have completed");
         assert_eq!(http_client.call_count(), 10);
+    }
+
+    #[sqlx::test]
+    async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
+        // Test that retries stop when approaching the deadline
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // All requests will fail
+        for _ in 0..20 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 500,
+                    body: r#"{"error":"server error"}"#.to_string(),
+                }),
+            );
+        }
+
+        // Use deadline-aware retry with a short completion window and short buffer
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            max_retries: Some(10_000),
+            stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
+            backoff_ms: 50,
+            backoff_factor: 2,
+            max_backoff_ms: 200,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
+
+        // Create a batch with a very short completion window (2 seconds)
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test deadline cutoff".to_string()),
+                vec![crate::RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "2s".to_string(), // Very short window
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let requests = manager
+            .get_batch_requests(batch.id)
+            .await
+            .expect("Failed to get batch requests");
+        let request_id = requests[0].id();
+
+        // Start the daemon
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for the deadline to pass
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Check the request state
+        let results = manager
+            .get_requests(vec![request_id])
+            .await
+            .expect("Failed to get request");
+
+        shutdown_token.cancel();
+
+        if let Some(Ok(crate::AnyRequest::Failed(failed))) = results.first() {
+            // Calculate expected retry attempts:
+            // - Completion window: 2000ms
+            // - Buffer: 500ms
+            // - Effective deadline: 1500ms
+            // - Backoff sequence: 50ms, 100ms, 200ms, 200ms, 200ms, 200ms, 200ms
+            // - Timeline:
+            //   - Initial attempt: t=0ms (attempt 0)
+            //   - Retry 1: t=50ms (attempt 1)
+            //   - Retry 2: t=150ms (attempt 2)
+            //   - Retry 3: t=350ms (attempt 3)
+            //   - Retry 4: t=550ms (attempt 4)
+            //   - Retry 5: t=750ms (attempt 5)
+            //   - Retry 6: t=950ms (attempt 6)
+            //   - Retry 7: t=1150ms (attempt 7)
+            //   - Retry 8: t=1350ms (attempt 8)
+            //   - Next would be t=1550ms - EXCEEDS 1500ms deadline
+            // Expected: 8 retry attempts (9 total including initial)
+
+            let retry_count = failed.state.retry_attempt;
+            let call_count = http_client.call_count();
+
+            // 1. Verify we stopped before too many retries (deadline constraint)
+            // Allow 7-9 attempts to account for timing variations in test execution
+            assert!(
+                retry_count >= 7 && retry_count <= 9,
+                "Expected 7-9 retry attempts based on deadline and backoff calculation, got {}",
+                retry_count
+            );
+
+            // 2. Verify HTTP call count matches retry attempts (1 initial + N retries)
+            assert_eq!(
+                call_count,
+                (retry_count + 1) as usize,
+                "Expected call count to match retry attempts + 1 initial attempt, got {} calls for {} retry attempts",
+                call_count,
+                retry_count
+            );
+
+            // 3. Verify the request actually has error details from the last attempt
+            assert!(
+                !failed.state.reason.to_error_message().is_empty(),
+                "Expected failed request to have failure reason"
+            );
+        } else {
+            panic!(
+                "Expected request to be in Failed state, got {:?}",
+                results.first()
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
+        // Test that when neither max_retries nor stop_before_deadline_ms is set,
+        // retries stop exactly at the deadline (no buffer)
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // All requests will fail
+        for _ in 0..20 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 500,
+                    body: r#"{"error":"server error"}"#.to_string(),
+                }),
+            );
+        }
+
+        // No max_retries, no stop_before_deadline_ms
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            max_retries: None,             // No retry limit
+            stop_before_deadline_ms: None, // No buffer - should retry until deadline
+            backoff_ms: 50,
+            backoff_factor: 2,
+            max_backoff_ms: 200,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
+
+        // Create a batch with a 2 second completion window
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test no limits retry".to_string()),
+                vec![crate::RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "2s".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let requests = manager
+            .get_batch_requests(batch.id)
+            .await
+            .expect("Failed to get batch requests");
+        let request_id = requests[0].id();
+
+        // Start the daemon
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for the deadline to pass
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Check the request state
+        let results = manager
+            .get_requests(vec![request_id])
+            .await
+            .expect("Failed to get request");
+
+        shutdown_token.cancel();
+
+        if let Some(Ok(crate::AnyRequest::Failed(failed))) = results.first() {
+            // Calculate expected retry attempts with NO buffer:
+            // - Completion window: 2000ms
+            // - Buffer: 0ms (none set)
+            // - Effective deadline: 2000ms
+            // - Backoff sequence: 50ms, 100ms, 200ms, 200ms, 200ms...
+            // - Timeline:
+            //   - Initial attempt: t=0ms (attempt 0)
+            //   - Retry 1: t=50ms (attempt 1)
+            //   - Retry 2: t=150ms (attempt 2)
+            //   - Retry 3: t=350ms (attempt 3)
+            //   - Retry 4: t=550ms (attempt 4)
+            //   - Retry 5: t=750ms (attempt 5)
+            //   - Retry 6: t=950ms (attempt 6)
+            //   - Retry 7: t=1150ms (attempt 7)
+            //   - Retry 8: t=1350ms (attempt 8)
+            //   - Retry 9: t=1550ms (attempt 9)
+            //   - Retry 10: t=1750ms (attempt 10)
+            //   - Retry 11: t=1950ms (attempt 11)
+            //   - Next would be t=2150ms - EXCEEDS 2000ms deadline
+            // Expected: ~11 retry attempts (12 total including initial)
+            // In reality, we will see <11 due to DB calls and CPU overhead in making requests
+
+            let retry_count = failed.state.retry_attempt;
+            let call_count = http_client.call_count();
+
+            // 1. Verify we retried more than the buffered case (which stopped at ~8)
+            //    but still stopped before too many attempts
+            // Allow 9-12 attempts to account for timing variations with CI slower CI CPUs
+            assert!(
+                retry_count >= 9 && retry_count < 12,
+                "Expected 9-12 retry attempts (should retry until deadline with no buffer), got {}",
+                retry_count
+            );
+
+            // 2. Verify HTTP call count matches retry attempts (1 initial + N retries)
+            assert_eq!(
+                call_count,
+                (retry_count + 1) as usize,
+                "Expected call count to match retry attempts + 1 initial attempt, got {} calls for {} retry attempts",
+                call_count,
+                retry_count
+            );
+
+            // 3. Verify the request has error details from the last attempt
+            assert!(
+                !failed.state.reason.to_error_message().is_empty(),
+                "Expected failed request to have failure reason"
+            );
+        } else {
+            panic!(
+                "Expected request to be in Failed state, got {:?}",
+                results.first()
+            );
+        }
     }
 }

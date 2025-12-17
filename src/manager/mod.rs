@@ -71,6 +71,16 @@ pub trait Storage: Send + Sync {
         offset: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>>;
 
+    /// Get aggregated statistics for request templates grouped by model.
+    /// This is optimized for cost estimation - it only fetches model names and body sizes,
+    /// avoiding the overhead of streaming full template data.
+    ///
+    /// Returns a vector of per-model statistics including request count and total body bytes.
+    async fn get_file_template_stats(
+        &self,
+        file_id: FileId,
+    ) -> Result<Vec<crate::batch::ModelTemplateStats>>;
+
     /// Delete a file (cascades to batches and executions).
     async fn delete_file(&self, file_id: FileId) -> Result<()>;
 
@@ -153,6 +163,24 @@ pub trait Storage: Send + Sync {
 
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
+
+    /// Retry failed requests by resetting them to pending state.
+    ///
+    /// This resets the specified failed requests to pending state with retry_attempt = 0,
+    /// allowing them to be picked up by the daemon for reprocessing.
+    ///
+    /// # Arguments
+    /// * `ids` - Request IDs to retry
+    ///
+    /// # Returns
+    /// A vector of results, one for each request ID. Each result indicates whether
+    /// the retry succeeded or failed.
+    ///
+    /// # Errors
+    /// Individual retry results may fail if:
+    /// - Request ID doesn't exist
+    /// - Request is not in failed state
+    async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>>;
 
     /// The following methods are defined specifically for requests - i.e. independent of the
     /// files/batches they belong to.
