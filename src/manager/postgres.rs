@@ -82,7 +82,7 @@ macro_rules! batch_from_row {
     ($row:expr) => {
         Batch {
             id: BatchId($row.id),
-            file_id: FileId($row.file_id),
+            file_id: $row.file_id.map(FileId),
             endpoint: $row.endpoint,
             completion_window: $row.completion_window,
             metadata: $row.metadata,
@@ -1891,7 +1891,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let row = sqlx::query!(
             r#"
             SELECT
-                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
                 b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                 b.expires_at, b.cancelling_at, b.errors,
                 b.total_requests,
@@ -1973,7 +1973,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         Ok(Batch {
             id: BatchId(row.id),
-            file_id: FileId(row.file_id),
+            file_id: row.file_id.map(FileId),
             created_at: row.created_at,
             metadata: row.metadata,
             completion_window: row.completion_window,
@@ -2003,8 +2003,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             r#"
             SELECT
                 b.id as batch_id,
-                b.file_id,
-                f.name as file_name,
+                b.file_id as "file_id?",
+                f.name as "file_name?",
                 b.total_requests,
                 b.requests_started_at as started_at,
                 b.created_at,
@@ -2014,7 +2014,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
                 COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
             FROM batches b
-            JOIN files f ON f.id = b.file_id
+            LEFT JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
@@ -2036,7 +2036,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         Ok(BatchStatus {
             batch_id: BatchId(row.batch_id),
-            file_id: FileId(row.file_id),
+            file_id: row.file_id.map(FileId),
             file_name: row.file_name,
             total_requests: row.total_requests,
             pending_requests: row.pending_requests,
@@ -2059,7 +2059,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 let row = sqlx::query!(
                     r#"
                     SELECT
-                        b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                        b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
                         b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                         b.expires_at, b.cancelling_at, b.errors,
                         b.total_requests,
@@ -2098,7 +2098,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 let row = sqlx::query!(
                     r#"
                     SELECT
-                        b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                        b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
                         b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                         b.expires_at, b.cancelling_at, b.errors,
                         b.total_requests,
@@ -2165,7 +2165,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let rows = sqlx::query!(
             r#"
             SELECT
-                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
                 b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                 b.expires_at, b.cancelling_at, b.errors,
                 b.total_requests,
@@ -2212,8 +2212,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             r#"
             SELECT
                 b.id as batch_id,
-                b.file_id,
-                f.name as file_name,
+                b.file_id as "file_id?",
+                f.name as "file_name?",
                 b.total_requests,
                 b.requests_started_at as started_at,
                 b.created_at,
@@ -2223,7 +2223,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
                 COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
             FROM batches b
-            JOIN files f ON f.id = b.file_id
+            LEFT JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
@@ -2247,7 +2247,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .into_iter()
             .map(|row| BatchStatus {
                 batch_id: BatchId(row.batch_id),
-                file_id: FileId(row.file_id),
+                file_id: row.file_id.map(FileId),
                 file_name: row.file_name,
                 total_requests: row.total_requests,
                 pending_requests: row.pending_requests,
@@ -3380,8 +3380,8 @@ mod tests {
             .expect("Failed to get batch status");
 
         assert_eq!(status.batch_id, batch.id);
-        assert_eq!(status.file_id, file_id);
-        assert_eq!(status.file_name, "batch-test");
+        assert_eq!(status.file_id, Some(file_id));
+        assert_eq!(status.file_name, Some("batch-test".to_string()));
         assert_eq!(status.total_requests, 3);
         assert_eq!(status.pending_requests, 3);
         assert_eq!(status.completed_requests, 0);
@@ -4762,7 +4762,7 @@ mod tests {
 
         // Verify all fields match
         assert_eq!(retrieved_batch.id, created_batch.id);
-        assert_eq!(retrieved_batch.file_id, file_id);
+        assert_eq!(retrieved_batch.file_id, Some(file_id));
         assert_eq!(retrieved_batch.endpoint, "/v1/chat/completions");
         assert_eq!(retrieved_batch.completion_window, "24h");
         assert_eq!(
