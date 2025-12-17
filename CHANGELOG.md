@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.8.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.7.0...fusillade-v0.8.0) (2025-12-15)
+
+
+### Features
+
+* Retry failed batch requests up to SLA and provide manual retry afterwards ([#28](https://github.com/doublewordai/fusillade/issues/28)) ([df7a2b4](https://github.com/doublewordai/fusillade/commit/df7a2b421c7db5cc9818b05b8020651b6b3ee48c))
+
+
+### Bug Fixes
+
+* retry tests ([#30](https://github.com/doublewordai/fusillade/issues/30)) ([9fdb5de](https://github.com/doublewordai/fusillade/commit/9fdb5de171b6813d5dfbe162c5723b56ae3d8379))
+
+## [0.7.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.6.0...fusillade-v0.7.0) (2025-12-10)
+
+
+### Features
+
+* get_file_template_stats ([#26](https://github.com/doublewordai/fusillade/issues/26)) ([cdd2487](https://github.com/doublewordai/fusillade/commit/cdd248727601b6ea3bcbf01e0cc432b31f214b44))
+
 ## [0.6.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.5.1...fusillade-v0.6.0) (2025-12-02)
 
 

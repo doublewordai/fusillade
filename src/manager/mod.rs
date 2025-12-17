@@ -10,7 +10,7 @@ use crate::batch::{
 use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::http::HttpClient;
-use crate::request::{AnyRequest, Claimed, DaemonId, Request, RequestId, RequestState};
+use crate::request::{AnyRequest, Claimed, DaemonId, Pending, Request, RequestId, RequestState};
 use async_trait::async_trait;
 use futures::stream::Stream;
 use std::pin::Pin;
@@ -68,6 +68,16 @@ pub trait Storage: Send + Sync {
         offset: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>>;
 
+    /// Get aggregated statistics for request templates grouped by model.
+    /// This is optimized for cost estimation - it only fetches model names and body sizes,
+    /// avoiding the overhead of streaming full template data.
+    ///
+    /// Returns a vector of per-model statistics including request count and total body bytes.
+    async fn get_file_template_stats(
+        &self,
+        file_id: FileId,
+    ) -> Result<Vec<crate::batch::ModelTemplateStats>>;
+
     /// Delete a file (cascades to batches and executions).
     async fn delete_file(&self, file_id: FileId) -> Result<()>;
 
@@ -105,8 +115,50 @@ pub trait Storage: Send + Sync {
     /// Get all requests for a batch.
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>>;
 
+    /// Find pending requests at risk of missing their batch's SLA deadline.
+    ///
+    /// Returns pending requests (stuck in queue) where the batch:
+    /// - `expires_at` is set
+    /// - `expires_at < NOW() + threshold_seconds`
+    /// - Not in terminal state (completed/failed/cancelled)
+    ///
+    /// Filters to only `pending` state requests - excludes claimed/processing requests
+    /// that are already being worked on.
+    ///
+    /// Ordered by urgency (soonest batch expiration first).
+    ///
+    /// # Arguments
+    /// - `threshold_seconds`: Time remaining threshold (e.g., 3600 for 1 hour)
+    ///
+    /// # Returns
+    /// Vector of `Request<Pending>` that are stuck in queue and at risk
+    ///
+    /// # Note
+    /// Currently only returns `pending` requests. Should we also include `claimed` or
+    /// `processing` requests that have been stuck for too long? For now, focusing on
+    /// requests stuck in the queue that need escalation/prioritization.
+    async fn find_at_risk_requests(&self, threshold_seconds: i64) -> Result<Vec<Request<Pending>>>;
+
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
+
+    /// Retry failed requests by resetting them to pending state.
+    ///
+    /// This resets the specified failed requests to pending state with retry_attempt = 0,
+    /// allowing them to be picked up by the daemon for reprocessing.
+    ///
+    /// # Arguments
+    /// * `ids` - Request IDs to retry
+    ///
+    /// # Returns
+    /// A vector of results, one for each request ID. Each result indicates whether
+    /// the retry succeeded or failed.
+    ///
+    /// # Errors
+    /// Individual retry results may fail if:
+    /// - Request ID doesn't exist
+    /// - Request is not in failed state
+    async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>>;
 
     /// The following methods are defined specifically for requests - i.e. independent of the
     /// files/batches they belong to.
