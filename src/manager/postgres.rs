@@ -760,7 +760,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 WHERE r.id = tc.id
                 RETURNING r.id, r.batch_id, r.template_id, r.retry_attempt,
                           r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,
-                          t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key
+                          t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
+                          b.expires_at as batch_expires_at
                 "#,
                 *daemon_id as Uuid,
                 model_limit as i64,
@@ -924,6 +925,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         completed_at = $6,
                         response_size = $7
                     WHERE id = $1
+                      AND superseded_at IS NULL
                     "#,
                     *req.data.id as Uuid,
                     req.state.response_status as i16,
@@ -939,7 +941,37 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 .rows_affected();
 
                 if rows_affected == 0 {
-                    return Err(FusilladeError::RequestNotFound(req.data.id));
+                    // Request was either not found OR already superseded
+                    // Check which case it is
+                    let exists = sqlx::query!(
+                        "SELECT superseded_at IS NOT NULL as \"was_superseded!\" FROM requests WHERE id = $1",
+                        *req.data.id as Uuid
+                    )
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to check request: {}", e)))?;
+
+                    match exists {
+                        Some(row) if row.was_superseded => {
+                            // Request was superseded by racing pair - this is OK, just log it
+                            tracing::debug!(
+                                request_id = %req.data.id,
+                                "Request completion skipped - already superseded by racing pair"
+                            );
+                            return Ok(());
+                        }
+                        Some(_) => {
+                            // Request exists but wasn't updated - shouldn't happen
+                            return Err(FusilladeError::Other(anyhow!(
+                                "Request {} exists but failed to update",
+                                req.data.id
+                            )));
+                        }
+                        None => {
+                            // Request doesn't exist
+                            return Err(FusilladeError::RequestNotFound(req.data.id));
+                        }
+                    }
                 }
 
                 // If this is part of a race (escalated or original), supersede the racing pair
@@ -965,6 +997,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         failed_at = $4,
                         response_size = $5
                     WHERE id = $1
+                      AND superseded_at IS NULL
                     "#,
                     *req.data.id as Uuid,
                     req.state.retry_attempt as i32,
@@ -978,7 +1011,37 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 .rows_affected();
 
                 if rows_affected == 0 {
-                    return Err(FusilladeError::RequestNotFound(req.data.id));
+                    // Request was either not found OR already superseded
+                    // Check which case it is
+                    let exists = sqlx::query!(
+                        "SELECT superseded_at IS NOT NULL as \"was_superseded!\" FROM requests WHERE id = $1",
+                        *req.data.id as Uuid
+                    )
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to check request: {}", e)))?;
+
+                    match exists {
+                        Some(row) if row.was_superseded => {
+                            // Request was superseded by racing pair - this is OK, just log it
+                            tracing::debug!(
+                                request_id = %req.data.id,
+                                "Request failure skipped - already superseded by racing pair"
+                            );
+                            return Ok(());
+                        }
+                        Some(_) => {
+                            // Request exists but wasn't updated - shouldn't happen
+                            return Err(FusilladeError::Other(anyhow!(
+                                "Request {} exists but failed to update",
+                                req.data.id
+                            )));
+                        }
+                        None => {
+                            // Request doesn't exist
+                            return Err(FusilladeError::RequestNotFound(req.data.id));
+                        }
+                    }
                 }
             }
             AnyRequest::Canceled(req) => {
@@ -1038,6 +1101,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
+                b.expires_at as batch_expires_at,
                 r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id
             FROM requests r
             JOIN request_templates t ON r.template_id = t.id
@@ -2596,7 +2660,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
-                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id
+                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,
+                b.expires_at as batch_expires_at
             FROM requests r
             JOIN request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id

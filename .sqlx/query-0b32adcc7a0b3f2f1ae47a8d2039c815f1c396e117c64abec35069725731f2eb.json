@@ -1,10 +1,6 @@
 {
   "db_name": "PostgreSQL",
-<<<<<<<< HEAD:.sqlx/query-02d187c714b1b02c3733f75568cfff586f0248c22a2acdb0a0bfc1261903a48e.json
-  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id, r.state,\n                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id\n            FROM requests r\n            JOIN request_templates t ON r.template_id = t.id\n            WHERE r.batch_id = $1\n            ORDER BY r.created_at ASC\n            ",
-========
-  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id, r.state,\n                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at\n            FROM requests r\n            JOIN request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.batch_id = $1\n            ORDER BY r.created_at ASC\n            ",
->>>>>>>> origin/main:.sqlx/query-3c36bb3f8924b61ddfb8816193a50f693fc373e0c7064bd673c3d247f94bb7ba.json
+  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id, r.state,\n                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at,\n                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id\n            FROM requests r\n            JOIN request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.id = ANY($1)\n            ",
   "describe": {
     "columns": [
       {
@@ -119,33 +115,33 @@
       },
       {
         "ordinal": 22,
-<<<<<<<< HEAD:.sqlx/query-02d187c714b1b02c3733f75568cfff586f0248c22a2acdb0a0bfc1261903a48e.json
+        "name": "batch_expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 23,
         "name": "escalated_from_request_id",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 23,
+        "ordinal": 24,
         "name": "is_escalated",
         "type_info": "Bool"
       },
       {
-        "ordinal": 24,
+        "ordinal": 25,
         "name": "superseded_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 25,
+        "ordinal": 26,
         "name": "superseded_by_request_id",
         "type_info": "Uuid"
-========
-        "name": "batch_expires_at",
-        "type_info": "Timestamptz"
->>>>>>>> origin/main:.sqlx/query-3c36bb3f8924b61ddfb8816193a50f693fc373e0c7064bd673c3d247f94bb7ba.json
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -171,18 +167,12 @@
       true,
       true,
       true,
-<<<<<<<< HEAD:.sqlx/query-02d187c714b1b02c3733f75568cfff586f0248c22a2acdb0a0bfc1261903a48e.json
+      false,
       true,
       false,
       true,
       true
     ]
   },
-  "hash": "02d187c714b1b02c3733f75568cfff586f0248c22a2acdb0a0bfc1261903a48e"
-========
-      false
-    ]
-  },
-  "hash": "3c36bb3f8924b61ddfb8816193a50f693fc373e0c7064bd673c3d247f94bb7ba"
->>>>>>>> origin/main:.sqlx/query-3c36bb3f8924b61ddfb8816193a50f693fc373e0c7064bd673c3d247f94bb7ba.json
+  "hash": "0b32adcc7a0b3f2f1ae47a8d2039c815f1c396e117c64abec35069725731f2eb"
 }
