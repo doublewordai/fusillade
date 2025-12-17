@@ -5,6 +5,7 @@
 
 use crate::request::AnyRequest;
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -33,7 +34,7 @@ use crate::error::{FusilladeError, Result};
 use crate::http::HttpClient;
 use crate::request::{
     Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, Pending, Processing, Request,
-    RequestData, RequestId, RequestState,
+    RequestData, RequestId, RequestState, RequestStateFilter,
 };
 
 use super::DaemonExecutor;
@@ -227,6 +228,59 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         }
 
         Ok(count)
+    }
+
+    /// Mark the racing pair as superseded when a request completes.
+    ///
+    /// When a request completes (either original or escalated), we need to find and
+    /// supersede its racing pair. This only applies if:
+    /// - The completed request is part of a race (has escalated_from_request_id or is_escalated=true)
+    /// - The racing pair is not already in a terminal state
+    ///
+    /// This is done in a single atomic UPDATE to avoid race conditions.
+    async fn supersede_racing_pair(
+        &self,
+        winner_id: RequestId,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let rows_affected: u64 = sqlx::query!(
+            r#"
+            UPDATE requests
+            SET
+                state = 'superseded',
+                superseded_at = $2,
+                superseded_by_request_id = $1
+            WHERE
+                -- Find the racing pair: if winner is escalated, find original; if winner is original, find escalated
+                id = (
+                    SELECT CASE
+                        WHEN w.is_escalated THEN w.escalated_from_request_id
+                        ELSE e.id
+                    END
+                    FROM requests w
+                    LEFT JOIN requests e ON e.escalated_from_request_id = w.id AND e.is_escalated = true
+                    WHERE w.id = $1
+                )
+                -- Only supersede if not already in a terminal state
+                AND state NOT IN ('completed', 'failed', 'canceled', 'superseded')
+            "#,
+            *winner_id as Uuid,
+            completed_at,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to supersede racing pair: {}", e)))?
+        .rows_affected();
+
+        if rows_affected > 0 {
+            tracing::info!(
+                winner_id = %winner_id,
+                superseded_count = rows_affected,
+                "Superseded racing request pair"
+            );
+        }
+
+        Ok(())
     }
 
     /// Check if a file should be expired and mark it as such.
@@ -845,6 +899,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 if rows_affected == 0 {
                     return Err(FusilladeError::RequestNotFound(req.data.id));
                 }
+
+                // If this is part of a race (escalated or original), supersede the racing pair
+                self.supersede_racing_pair(req.data.id, req.state.completed_at)
+                    .await?;
             }
             AnyRequest::Failed(req) => {
                 // Serialize FailureReason as JSON
@@ -1920,6 +1978,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
+                  AND is_escalated = false  -- Exclude escalated requests from batch accounting
+                  AND state != 'superseded'  -- Exclude superseded requests from batch accounting
             ) counts ON TRUE
             WHERE b.id = $1
             "#,
@@ -2029,6 +2089,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
+                  AND is_escalated = false  -- Exclude escalated requests from batch accounting
+                  AND state != 'superseded'  -- Exclude superseded requests from batch accounting
             ) counts ON TRUE
             WHERE b.id = $1
             "#,
@@ -2088,6 +2150,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             COUNT(*) FILTER (WHERE state = 'canceled') as canceled
                         FROM requests
                         WHERE batch_id = b.id
+                          AND is_escalated = false  -- Exclude escalated requests from batch accounting
+                          AND state != 'superseded'  -- Exclude superseded requests from batch accounting
                     ) counts ON TRUE
                     WHERE b.output_file_id = $1
                     "#,
@@ -2127,6 +2191,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             COUNT(*) FILTER (WHERE state = 'canceled') as canceled
                         FROM requests
                         WHERE batch_id = b.id
+                          AND is_escalated = false  -- Exclude escalated requests from batch accounting
+                          AND state != 'superseded'  -- Exclude superseded requests from batch accounting
                     ) counts ON TRUE
                     WHERE b.error_file_id = $1
                     "#,
@@ -2194,6 +2260,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
+                  AND is_escalated = false  -- Exclude escalated requests from batch accounting
+                  AND state != 'superseded'  -- Exclude superseded requests from batch accounting
             ) counts ON TRUE
             WHERE ($1::TEXT IS NULL OR b.created_by = $1)
               AND ($3::TIMESTAMPTZ IS NULL OR b.created_at < $3 OR (b.created_at = $3 AND b.id < $4))
@@ -2238,6 +2306,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
+                  AND is_escalated = false  -- Exclude escalated requests from batch accounting
+                  AND state != 'superseded'  -- Exclude superseded requests from batch accounting
             ) counts ON TRUE
             WHERE b.file_id = $1
             ORDER BY b.created_at DESC
@@ -2266,72 +2336,107 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .collect())
     }
 
-    async fn find_at_risk_requests(&self, threshold_seconds: i64) -> Result<Vec<Request<Pending>>> {
-        // Find pending requests from batches at risk of missing SLA
-        // Matches claim_requests pattern: request-level query with batch JOIN for prioritization
+    async fn get_at_risk_batches(
+        &self,
+        threshold_seconds: i64,
+        allowed_states: &[RequestStateFilter],
+    ) -> Result<HashMap<BatchId, usize>> {
         let rows = sqlx::query!(
             r#"
             SELECT
-                r.id,
                 r.batch_id,
-                r.template_id,
-                r.retry_attempt,
-                r.not_before,
-                r.escalated_from_request_id,
-                r.is_escalated,
-                r.superseded_at,
-                r.superseded_by_request_id,
-                t.custom_id,
-                t.endpoint,
-                t.method,
-                t.path,
-                t.body,
-                t.model,
-                t.api_key,
-                b.expires_at
+                COUNT(*) as count
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
-            JOIN request_templates t ON r.template_id = t.id
             WHERE b.expires_at < NOW() + make_interval(secs => $1)
               AND b.completed_at IS NULL
               AND b.failed_at IS NULL
               AND b.cancelled_at IS NULL
               AND b.cancelling_at IS NULL
-              AND r.state = 'pending'
-            ORDER BY b.expires_at ASC
+              AND r.state = ANY($2)
+            GROUP BY r.batch_id
             "#,
-            threshold_seconds as f64
+            threshold_seconds as f64,
+            allowed_states as &[RequestStateFilter],
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to find at-risk requests: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to get at-risk batches: {}", e)))?;
 
-        // Map rows to Request<Pending>
-        Ok(rows
-            .into_iter()
-            .map(|row| Request {
-                data: RequestData {
-                    id: RequestId(row.id),
-                    batch_id: BatchId(row.batch_id),
-                    template_id: TemplateId(row.template_id),
-                    custom_id: row.custom_id,
-                    endpoint: row.endpoint,
-                    method: row.method,
-                    path: row.path,
-                    body: row.body,
-                    model: row.model,
-                    api_key: row.api_key,
-                    escalated_from_request_id: row.escalated_from_request_id.map(RequestId),
-                    is_escalated: row.is_escalated,
-                    superseded_at: row.superseded_at,
-                    superseded_by_request_id: row.superseded_by_request_id.map(RequestId),
-                },
-                state: Pending {
-                    retry_attempt: row.retry_attempt as u32,
-                    not_before: row.not_before,
-                },
-            })
-            .collect())
+        let mut result = HashMap::new();
+        for row in rows {
+            result.insert(BatchId(row.batch_id), row.count.unwrap_or(0) as usize);
+        }
+
+        Ok(result)
+    }
+
+    /// Create escalated requests for at-risk requests in a single operation.
+    ///
+    /// This method performs a bulk INSERT to create escalated requests for all requests
+    /// matching the criteria. It automatically skips requests that already have escalations.
+    ///
+    /// # Arguments
+    /// * `model` - The model to filter requests by
+    /// * `threshold_seconds` - Seconds since batch creation to consider at-risk
+    /// * `allowed_states` - Request states to escalate (e.g., Pending, Claimed)
+    ///
+    /// # Returns
+    /// The number of escalated requests created
+    async fn create_escalated_requests(
+        &self,
+        model: &str,
+        threshold_seconds: i64,
+        allowed_states: &[RequestStateFilter],
+    ) -> Result<i64> {
+        let rows_affected = sqlx::query!(
+            r#"
+            INSERT INTO requests (
+                id, batch_id, template_id, state, custom_id, retry_attempt, model,
+                escalated_from_request_id, is_escalated, superseded_at, superseded_by_request_id
+            )
+            SELECT
+                gen_random_uuid(),
+                r.batch_id,
+                r.template_id,
+                'pending',
+                t.custom_id,
+                r.retry_attempt,
+                r.model,
+                r.id,        -- Link back to original request
+                true,        -- is_escalated = true
+                NULL,
+                NULL
+            FROM requests r
+            JOIN request_templates t ON r.template_id = t.id
+            JOIN batches b ON r.batch_id = b.id
+            WHERE r.model = $1
+              AND r.is_escalated = false
+              AND r.state = ANY($2)
+              AND b.completion_window IS NOT NULL
+              AND b.completed_at IS NULL
+              AND b.failed_at IS NULL
+              AND b.cancelled_at IS NULL
+              AND b.cancelling_at IS NULL
+              AND (NOW() - b.created_at) >= make_interval(secs => $3::float8)
+              AND b.created_at + CAST(b.completion_window AS INTERVAL) > NOW()
+              -- Only create escalation if one doesn't already exist in an active state
+              AND NOT EXISTS (
+                  SELECT 1 FROM requests esc
+                  WHERE esc.escalated_from_request_id = r.id
+                    AND esc.state IN ('pending', 'claimed', 'processing')
+              )
+            "#,
+            model,
+            allowed_states as &[RequestStateFilter],
+            threshold_seconds as f64,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create escalated requests: {}", e)))?
+        .rows_affected();
+
+        Ok(rows_affected as i64)
     }
 
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
@@ -6834,25 +6939,49 @@ mod tests {
     // - Edge cases (empty DB, no matches, zero threshold)
     // - Uses index: idx_requests_pending_sla
 
+    // =========================================================================
+    // GET_AT_RISK_BATCHES TESTS
+    // =========================================================================
+
     #[sqlx::test]
-    async fn test_find_at_risk_requests_threshold_filtering(pool: sqlx::PgPool) {
+    async fn test_get_at_risk_batches_threshold_and_state_filtering(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
-        // Batch 1: Expires in 30 minutes (within 1-hour threshold)
+        // Create batch 1: 3 pending requests, expires in 30 minutes
         let file1 = manager
             .create_file(
-                "batch-30min".to_string(),
+                "batch1".to_string(),
                 None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-30min".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":1}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":1}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":2}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req3".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":3}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
             )
             .await
             .unwrap();
@@ -6876,20 +7005,31 @@ mod tests {
         .await
         .unwrap();
 
-        // Batch 2: Expires in 2 hours (outside 1-hour threshold)
+        // Create batch 2: 2 pending requests, expires in 2 hours (outside 1-hour threshold)
         let file2 = manager
             .create_file(
-                "batch-2hours".to_string(),
+                "batch2".to_string(),
                 None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-2hours".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":2}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req4".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":4}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req5".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":5}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
             )
             .await
             .unwrap();
@@ -6913,86 +7053,80 @@ mod tests {
         .await
         .unwrap();
 
-        // Batch 3: No expiration (NULL expires_at)
-        let file3 = manager
-            .create_file(
-                "batch-no-expiry".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-no-expiry".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":3}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
+        // Test 1: Query with 1-hour threshold, pending requests only
+        let at_risk = manager
+            .get_at_risk_batches(3600, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(at_risk.len(), 1, "Only batch1 should be within threshold");
+        assert_eq!(
+            at_risk.get(&batch1.id),
+            Some(&3),
+            "Batch1 should have 3 pending requests"
+        );
+        assert!(
+            !at_risk.contains_key(&batch2.id),
+            "Batch2 outside threshold"
+        );
+
+        // Test 2: Query with 3-hour threshold
+        let at_risk_long = manager
+            .get_at_risk_batches(3600 * 3, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            at_risk_long.len(),
+            2,
+            "Both batches within 3-hour threshold"
+        );
+        assert_eq!(at_risk_long.get(&batch1.id), Some(&3));
+        assert_eq!(at_risk_long.get(&batch2.id), Some(&2));
+
+        // Test 3: Claim one request from batch1, test with claimed state
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        manager.claim_requests(1, daemon_id).await.unwrap();
+
+        let at_risk_claimed = manager
+            .get_at_risk_batches(3600, &[RequestStateFilter::Claimed])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            at_risk_claimed.get(&batch1.id),
+            Some(&1),
+            "Batch1 should have 1 claimed request"
+        );
+
+        // Test 4: Query with multiple states
+        let at_risk_multi = manager
+            .get_at_risk_batches(
+                3600,
+                &[RequestStateFilter::Pending, RequestStateFilter::Claimed],
             )
             .await
             .unwrap();
 
-        let batch3 = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file3,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-            })
-            .await
-            .unwrap();
-
-        // Query with 1-hour threshold (3600 seconds)
-        let at_risk = manager.find_at_risk_requests(3600).await.unwrap();
-
-        // Only batch1 (30 min) should have pending requests returned
         assert_eq!(
-            at_risk.len(),
-            1,
-            "Only requests from batch within threshold should be returned"
-        );
-        assert_eq!(
-            at_risk[0].data.batch_id, batch1.id,
-            "Should return request from the 30-minute batch"
-        );
-
-        // Query with 3-hour threshold
-        let at_risk_long = manager.find_at_risk_requests(3600 * 3).await.unwrap();
-
-        // Both batch1 and batch2 should have requests returned
-        assert_eq!(
-            at_risk_long.len(),
-            2,
-            "Requests from both batches within 3-hour threshold"
-        );
-        assert!(
-            at_risk_long.iter().any(|r| r.data.batch_id == batch1.id),
-            "Should include request from 30-minute batch"
-        );
-        assert!(
-            at_risk_long.iter().any(|r| r.data.batch_id == batch2.id),
-            "Should include request from 2-hour batch"
-        );
-
-        // Batch with NULL expiration should never have requests appear
-        assert!(
-            !at_risk_long.iter().any(|r| r.data.batch_id == batch3.id),
-            "Should NOT include requests from batch with NULL expiration"
+            at_risk_multi.get(&batch1.id),
+            Some(&3),
+            "Batch1 should have 2 pending + 1 claimed = 3 total"
         );
     }
 
     #[sqlx::test]
-    async fn test_find_at_risk_requests_terminal_state_exclusions(pool: sqlx::PgPool) {
+    async fn test_get_at_risk_batches_terminal_batch_exclusions(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
         // Batch 1: Completed (terminal)
         let file1 = manager
             .create_file(
-                "completed-batch".to_string(),
+                "completed".to_string(),
                 None,
                 vec![RequestTemplateInput {
-                    custom_id: Some("req-completed".to_string()),
+                    custom_id: Some("req1".to_string()),
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -7026,10 +7160,10 @@ mod tests {
         // Batch 2: Failed (terminal)
         let file2 = manager
             .create_file(
-                "failed-batch".to_string(),
+                "failed".to_string(),
                 None,
                 vec![RequestTemplateInput {
-                    custom_id: Some("req-failed".to_string()),
+                    custom_id: Some("req2".to_string()),
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -7063,10 +7197,10 @@ mod tests {
         // Batch 3: Cancelled (terminal)
         let file3 = manager
             .create_file(
-                "cancelled-batch".to_string(),
+                "cancelled".to_string(),
                 None,
                 vec![RequestTemplateInput {
-                    custom_id: Some("req-cancelled".to_string()),
+                    custom_id: Some("req3".to_string()),
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -7097,13 +7231,13 @@ mod tests {
         .await
         .unwrap();
 
-        // Batch 4: Cancelling (non-terminal, should be INCLUDED)
+        // Batch 4: Cancelling (should be excluded - query filters cancelling_at)
         let file4 = manager
             .create_file(
-                "cancelling-batch".to_string(),
+                "cancelling".to_string(),
                 None,
                 vec![RequestTemplateInput {
-                    custom_id: Some("req-cancelling".to_string()),
+                    custom_id: Some("req4".to_string()),
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -7134,13 +7268,13 @@ mod tests {
         .await
         .unwrap();
 
-        // Batch 5: Active (no terminal state, should be INCLUDED)
+        // Batch 5: Active (should be included)
         let file5 = manager
             .create_file(
-                "active-batch".to_string(),
+                "active".to_string(),
                 None,
                 vec![RequestTemplateInput {
-                    custom_id: Some("req-active".to_string()),
+                    custom_id: Some("req5".to_string()),
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -7171,49 +7305,39 @@ mod tests {
         .await
         .unwrap();
 
-        // Query with 1-hour threshold
-        let at_risk = manager.find_at_risk_requests(3600).await.unwrap();
+        // Only active batch should appear
+        let at_risk = manager
+            .get_at_risk_batches(3600, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
 
-        // Only active batches (non-terminal, not cancelling) should have requests returned
-        assert_eq!(
-            at_risk.len(),
-            1,
-            "Should only return pending requests from active batches"
-        );
-        assert!(
-            !at_risk.iter().any(|r| r.data.batch_id == batch1.id),
-            "Should NOT include requests from completed batch"
-        );
-        assert!(
-            !at_risk.iter().any(|r| r.data.batch_id == batch2.id),
-            "Should NOT include requests from failed batch"
-        );
-        assert!(
-            !at_risk.iter().any(|r| r.data.batch_id == batch3.id),
-            "Should NOT include requests from cancelled batch"
-        );
-        assert!(
-            !at_risk.iter().any(|r| r.data.batch_id == batch4.id),
-            "Should NOT include requests from cancelling batch (being cancelled)"
-        );
-        assert!(
-            at_risk.iter().any(|r| r.data.batch_id == batch5.id),
-            "Should include pending requests from active batch"
-        );
+        assert_eq!(at_risk.len(), 1, "Only active batch should be included");
+        assert_eq!(at_risk.get(&batch5.id), Some(&1));
+        assert!(!at_risk.contains_key(&batch1.id), "Exclude completed");
+        assert!(!at_risk.contains_key(&batch2.id), "Exclude failed");
+        assert!(!at_risk.contains_key(&batch3.id), "Exclude cancelled");
+        assert!(!at_risk.contains_key(&batch4.id), "Exclude cancelling");
     }
 
     #[sqlx::test]
-    async fn test_find_at_risk_requests_request_state_filtering(pool: sqlx::PgPool) {
+    async fn test_get_at_risk_batches_edge_cases(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
-        // Batch 1: Only completed requests (should NOT be returned)
-        let file1 = manager
+        // Test 1: Empty database
+        let empty = manager
+            .get_at_risk_batches(3600, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+        assert_eq!(empty.len(), 0, "Empty DB should return empty map");
+
+        // Test 2: Batch with no at-risk requests (outside threshold)
+        let file = manager
             .create_file(
-                "all-completed-batch".to_string(),
+                "far-future".to_string(),
                 None,
                 vec![RequestTemplateInput {
-                    custom_id: Some("req-completed".to_string()),
+                    custom_id: Some("req1".to_string()),
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -7225,596 +7349,9 @@ mod tests {
             .await
             .unwrap();
 
-        let batch1 = manager
+        let batch = manager
             .create_batch(crate::batch::BatchInput {
-                file_id: file1,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-            })
-            .await
-            .unwrap();
-
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
-            *batch1.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query!(
-            r#"
-            UPDATE requests
-            SET state = 'completed',
-                completed_at = NOW(),
-                response_status = 200,
-                response_body = '{"result":"ok"}',
-                response_size = 16
-            WHERE batch_id = $1
-            "#,
-            *batch1.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Batch 2: Has pending requests (should be returned)
-        let file2 = manager
-            .create_file(
-                "pending-batch".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-pending".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":2}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let batch2 = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file2,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-            })
-            .await
-            .unwrap();
-
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
-            *batch2.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Batch 3: Has claimed requests (should be returned)
-        let file3 = manager
-            .create_file(
-                "claimed-batch".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-claimed".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":3}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let batch3 = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file3,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-            })
-            .await
-            .unwrap();
-
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
-            *batch3.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let daemon_id = Uuid::new_v4();
-        sqlx::query!(
-            "UPDATE requests SET state = 'claimed', daemon_id = $2, claimed_at = NOW() WHERE batch_id = $1",
-            *batch3.id as Uuid,
-            daemon_id
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Batch 4: Has processing requests (should be returned)
-        let file4 = manager
-            .create_file(
-                "processing-batch".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-processing".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":4}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let batch4 = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file4,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-            })
-            .await
-            .unwrap();
-
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
-            *batch4.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query!(
-            r#"
-            UPDATE requests
-            SET state = 'processing',
-                daemon_id = $2,
-                claimed_at = NOW() - INTERVAL '1 second',
-                started_at = NOW()
-            WHERE batch_id = $1
-            "#,
-            *batch4.id as Uuid,
-            daemon_id
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Batch 5: Mixed states (some pending, some completed - should be returned)
-        let file5 = manager
-            .create_file(
-                "mixed-batch".to_string(),
-                None,
-                vec![
-                    RequestTemplateInput {
-                        custom_id: Some("req-mixed-1".to_string()),
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"test":5}"#.to_string(),
-                        model: "test".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: Some("req-mixed-2".to_string()),
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: r#"{"test":6}"#.to_string(),
-                        model: "test".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                ],
-            )
-            .await
-            .unwrap();
-
-        let batch5 = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file5,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-            })
-            .await
-            .unwrap();
-
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
-            *batch5.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Mark one request as completed, leave one pending
-        sqlx::query!(
-            r#"
-            UPDATE requests
-            SET state = 'completed',
-                completed_at = NOW(),
-                response_status = 200,
-                response_body = '{"result":"ok"}',
-                response_size = 16
-            WHERE batch_id = $1 AND custom_id = 'req-mixed-1'
-            "#,
-            *batch5.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Query with 1-hour threshold
-        let at_risk = manager.find_at_risk_requests(3600).await.unwrap();
-
-        // Should return only PENDING requests (batches 2 and 5)
-        // Claimed/processing requests are already being worked on, so not "at risk" in queue
-        assert_eq!(
-            at_risk.len(),
-            2,
-            "Should return only pending requests (not claimed/processing)"
-        );
-        assert!(
-            !at_risk.iter().any(|r| r.data.batch_id == batch1.id),
-            "Should NOT include batch with only completed requests"
-        );
-        assert!(
-            at_risk.iter().any(|r| r.data.batch_id == batch2.id),
-            "Should include pending request from batch2"
-        );
-        assert!(
-            !at_risk.iter().any(|r| r.data.batch_id == batch3.id),
-            "Should NOT include claimed requests (already being worked on)"
-        );
-        assert!(
-            !at_risk.iter().any(|r| r.data.batch_id == batch4.id),
-            "Should NOT include processing requests (already being worked on)"
-        );
-        assert!(
-            at_risk.iter().any(|r| r.data.batch_id == batch5.id),
-            "Should include pending request from batch5 (ignores completed one)"
-        );
-    }
-
-    #[sqlx::test]
-    async fn test_find_at_risk_requests_ordering(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
-
-        // Create batches in non-sorted order to test ordering
-        // Batch B: Expires in 50 minutes (middle priority)
-        let file_b = manager
-            .create_file(
-                "batch-50min".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-50min".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":"b"}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let batch_b = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_b,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-            })
-            .await
-            .unwrap();
-
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '50 minutes' WHERE id = $1",
-            *batch_b.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Small delay to ensure different created_at
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // Batch A: Expires in 10 minutes (highest priority)
-        let file_a = manager
-            .create_file(
-                "batch-10min".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-10min".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":"a"}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let batch_a = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_a,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-            })
-            .await
-            .unwrap();
-
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '10 minutes' WHERE id = $1",
-            *batch_a.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Small delay
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // Batch C: Expires in 30 minutes (lowest priority of the three)
-        let file_c = manager
-            .create_file(
-                "batch-30min".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-30min".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":"c"}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let batch_c = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_c,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-            })
-            .await
-            .unwrap();
-
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
-            *batch_c.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Query with 1-hour threshold (all three should be returned)
-        let at_risk = manager.find_at_risk_requests(3600).await.unwrap();
-
-        // Should return all 3 batches in expiration order (A, C, B)
-        assert_eq!(
-            at_risk.len(),
-            3,
-            "Should return all 3 batches within threshold"
-        );
-        assert_eq!(
-            at_risk[0].data.batch_id, batch_a.id,
-            "First should be request from batch expiring soonest (10 min)"
-        );
-        assert_eq!(
-            at_risk[1].data.batch_id, batch_c.id,
-            "Second should be request from batch expiring in middle (30 min)"
-        );
-        assert_eq!(
-            at_risk[2].data.batch_id, batch_b.id,
-            "Third should be request from batch expiring latest (50 min)"
-        );
-    }
-
-    #[sqlx::test]
-    async fn test_find_at_risk_requests_multiple_thresholds(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
-
-        // Create batches at different expiration times
-        // Batch 1: 15 minutes
-        let file1 = manager
-            .create_file(
-                "batch-15min".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-15min".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":1}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let batch1 = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file1,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-            })
-            .await
-            .unwrap();
-
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '15 minutes' WHERE id = $1",
-            *batch1.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Batch 2: 45 minutes
-        let file2 = manager
-            .create_file(
-                "batch-45min".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-45min".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":2}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let batch2 = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file2,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-            })
-            .await
-            .unwrap();
-
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '45 minutes' WHERE id = $1",
-            *batch2.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Batch 3: 90 minutes
-        let file3 = manager
-            .create_file(
-                "batch-90min".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-90min".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":3}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let batch3 = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file3,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-            })
-            .await
-            .unwrap();
-
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '90 minutes' WHERE id = $1",
-            *batch3.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Simulate SLA daemon querying with different thresholds
-        // Query 1: 30-minute threshold (critical)
-        let critical = manager.find_at_risk_requests(30 * 60).await.unwrap();
-        assert_eq!(critical.len(), 1, "30-min threshold: only 15-min batch");
-        assert_eq!(critical[0].data.batch_id, batch1.id);
-
-        // Query 2: 60-minute threshold (warning)
-        let warning = manager.find_at_risk_requests(60 * 60).await.unwrap();
-        assert_eq!(
-            warning.len(),
-            2,
-            "60-min threshold: 15-min and 45-min batches"
-        );
-        assert!(warning.iter().any(|r| r.data.batch_id == batch1.id));
-        assert!(warning.iter().any(|r| r.data.batch_id == batch2.id));
-
-        // Query 3: 120-minute threshold (info)
-        let info = manager.find_at_risk_requests(120 * 60).await.unwrap();
-        assert_eq!(info.len(), 3, "120-min threshold: all three batches");
-        assert!(info.iter().any(|r| r.data.batch_id == batch1.id));
-        assert!(info.iter().any(|r| r.data.batch_id == batch2.id));
-        assert!(info.iter().any(|r| r.data.batch_id == batch3.id));
-    }
-
-    #[sqlx::test]
-    async fn test_find_at_risk_requests_edge_cases(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
-
-        // Edge case 1: Empty database
-        let empty_result = manager.find_at_risk_requests(3600).await.unwrap();
-        assert_eq!(
-            empty_result.len(),
-            0,
-            "Empty database should return empty vec"
-        );
-
-        // Edge case 2: Create batch outside threshold
-        let file1 = manager
-            .create_file(
-                "far-future-batch".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("req-far".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: r#"{"test":1}"#.to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let batch1 = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file1,
+                file_id: file,
                 endpoint: "/v1/chat/completions".to_string(),
                 completion_window: "24h".to_string(),
                 metadata: None,
@@ -7825,26 +7362,36 @@ mod tests {
 
         sqlx::query!(
             "UPDATE batches SET expires_at = NOW() + INTERVAL '10 hours' WHERE id = $1",
-            *batch1.id as Uuid
+            *batch.id as Uuid
         )
         .execute(&pool)
         .await
         .unwrap();
 
-        let no_match = manager.find_at_risk_requests(3600).await.unwrap();
+        let no_match = manager
+            .get_at_risk_batches(3600, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+        assert_eq!(no_match.len(), 0, "No batches within threshold");
+
+        // Test 3: Zero threshold (nothing should match future expirations)
+        let zero_threshold = manager
+            .get_at_risk_batches(0, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
         assert_eq!(
-            no_match.len(),
+            zero_threshold.len(),
             0,
-            "Batch outside threshold should return empty vec"
+            "Zero threshold matches no future batches"
         );
 
-        // Edge case 3: Very small threshold (should still work)
+        // Test 4: Batch with all requests in wrong state
         let file2 = manager
             .create_file(
-                "immediate-batch".to_string(),
+                "all-completed".to_string(),
                 None,
                 vec![RequestTemplateInput {
-                    custom_id: Some("req-immediate".to_string()),
+                    custom_id: Some("req2".to_string()),
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -7868,23 +7415,1030 @@ mod tests {
             .unwrap();
 
         sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 seconds' WHERE id = $1",
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
             *batch2.id as Uuid
         )
         .execute(&pool)
         .await
         .unwrap();
 
-        let urgent = manager.find_at_risk_requests(60).await.unwrap();
-        assert_eq!(urgent.len(), 1, "Should find batch expiring in 30 seconds");
-        assert_eq!(urgent[0].data.batch_id, batch2.id);
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                completed_at = NOW(),
+                response_status = 200,
+                response_body = '{"ok":true}',
+                response_size = 11
+            WHERE batch_id = $1
+            "#,
+            *batch2.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        // Edge case 4: Zero threshold (only expired batches)
-        let expired = manager.find_at_risk_requests(0).await.unwrap();
-        assert_eq!(
-            expired.len(),
-            0,
-            "Zero threshold should not return future batches"
+        let no_pending = manager
+            .get_at_risk_batches(3600, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert!(
+            !no_pending.contains_key(&batch2.id),
+            "Batch with no pending requests should not appear"
         );
+    }
+
+    // =========================================================================
+    // CREATE_ESCALATED_REQUESTS TESTS
+    // =========================================================================
+
+    #[sqlx::test]
+    async fn test_create_escalated_requests_basic_functionality(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a batch with 2 requests for gpt-4
+        let file = manager
+            .create_file(
+                "test-file".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":1}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":2}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Set batch to be at-risk (created 30 minutes ago, expires in 30 minutes)
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET created_at = NOW() - INTERVAL '30 minutes',
+                expires_at = NOW() + INTERVAL '30 minutes'
+            WHERE id = $1
+            "#,
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Get original request IDs
+        let original_requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(original_requests.len(), 2);
+        let original_ids: Vec<_> = original_requests.iter().map(|r| r.id()).collect();
+
+        // Create escalated requests (threshold: 1800s = 30 min, so batch created 30min ago is at risk)
+        let count = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(count, 2, "Should create 2 escalated requests");
+
+        // Verify escalated requests were created
+        let all_requests: Vec<_> = sqlx::query!(
+            "SELECT id, escalated_from_request_id, is_escalated, model, state FROM requests WHERE batch_id = $1",
+            *batch.id as Uuid
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            all_requests.len(),
+            4,
+            "Should have 2 original + 2 escalated"
+        );
+
+        let escalated: Vec<_> = all_requests.iter().filter(|r| r.is_escalated).collect();
+        assert_eq!(escalated.len(), 2, "Should have 2 escalated requests");
+
+        // Verify escalated requests have correct properties
+        for esc in escalated {
+            assert_eq!(esc.model, "gpt-4");
+            assert_eq!(esc.state, "pending");
+            assert!(esc.escalated_from_request_id.is_some());
+            assert!(
+                original_ids.contains(&RequestId(esc.escalated_from_request_id.unwrap())),
+                "Escalated request should link to original"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_create_escalated_requests_model_filtering(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create batch with mixed models
+        let file = manager
+            .create_file(
+                "mixed-models".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("gpt4-req".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":1}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("gpt3-req".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":2}"#.to_string(),
+                        model: "gpt-3.5-turbo".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET created_at = NOW() - INTERVAL '30 minutes',
+                expires_at = NOW() + INTERVAL '30 minutes'
+            WHERE id = $1
+            "#,
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Escalate only gpt-4 requests
+        let count = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1, "Should only escalate gpt-4 request");
+
+        // Verify only gpt-4 was escalated
+        let escalated: Vec<_> = sqlx::query!(
+            "SELECT model FROM requests WHERE batch_id = $1 AND is_escalated = true",
+            *batch.id as Uuid
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(escalated.len(), 1);
+        assert_eq!(escalated[0].model, "gpt-4");
+    }
+
+    #[sqlx::test]
+    async fn test_create_escalated_requests_duplicate_prevention(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create batch with 1 request
+        let file = manager
+            .create_file(
+                "test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET created_at = NOW() - INTERVAL '30 minutes',
+                expires_at = NOW() + INTERVAL '30 minutes'
+            WHERE id = $1
+            "#,
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create escalation first time
+        let count1 = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(count1, 1, "Should create 1 escalation on first call");
+
+        // Try to create escalation again - should be blocked by NOT EXISTS
+        let count2 = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count2, 0,
+            "Should not create duplicate escalation - NOT EXISTS prevents it"
+        );
+
+        // Verify only 1 escalated request exists
+        let escalated_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*)::bigint FROM requests WHERE batch_id = $1 AND is_escalated = true",
+            *batch.id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(escalated_count, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_create_escalated_requests_allows_new_after_terminal(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create batch with 1 request
+        let file = manager
+            .create_file(
+                "test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET created_at = NOW() - INTERVAL '30 minutes',
+                expires_at = NOW() + INTERVAL '30 minutes'
+            WHERE id = $1
+            "#,
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create first escalation
+        let count1 = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(count1, 1);
+
+        // Mark the escalated request as completed (terminal state)
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                completed_at = NOW(),
+                response_status = 200,
+                response_body = '{"ok":true}',
+                response_size = 11
+            WHERE batch_id = $1 AND is_escalated = true
+            "#,
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Now try to create escalation again - should succeed because existing escalation is terminal
+        let count2 = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count2, 1,
+            "Should allow new escalation when existing one is in terminal state"
+        );
+
+        // Verify 2 escalated requests exist (one completed, one pending)
+        let escalated_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*)::bigint FROM requests WHERE batch_id = $1 AND is_escalated = true",
+            *batch.id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(escalated_count, 2);
+    }
+
+    #[sqlx::test]
+    async fn test_create_escalated_requests_state_filtering(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create batch with 3 requests
+        let file = manager
+            .create_file(
+                "test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":1}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":2}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req3".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":3}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET created_at = NOW() - INTERVAL '30 minutes',
+                expires_at = NOW() + INTERVAL '30 minutes'
+            WHERE id = $1
+            "#,
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Claim one request (moves to claimed state)
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        manager.claim_requests(1, daemon_id).await.unwrap();
+
+        // Mark one as completed
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                completed_at = NOW(),
+                response_status = 200,
+                response_body = '{"ok":true}',
+                response_size = 11
+            WHERE id = (
+                SELECT id FROM requests
+                WHERE batch_id = $1 AND state = 'pending'
+                LIMIT 1
+            )
+            "#,
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Now we have: 1 pending, 1 claimed, 1 completed
+
+        // Test 1: Escalate only pending
+        let pending_count = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(pending_count, 1, "Should only escalate 1 pending request");
+
+        // Test 2: Escalate only claimed
+        let claimed_count = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Claimed])
+            .await
+            .unwrap();
+
+        assert_eq!(claimed_count, 1, "Should only escalate 1 claimed request");
+
+        // Test 3: Escalate completed (semantically doesn't make sense, but query will match)
+        // The function doesn't filter out terminal request states, only terminal batch states
+        // So passing Completed in allowed_states WILL match completed requests
+        let completed_count = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Completed])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            completed_count, 1,
+            "Function matches completed requests if passed in allowed_states"
+        );
+
+        // Verify total escalated count: 1 pending + 1 claimed + 1 completed = 3
+        let total_escalated: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*)::bigint FROM requests WHERE batch_id = $1 AND is_escalated = true",
+            *batch.id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(total_escalated, 3, "Should have escalated all three");
+    }
+
+    #[sqlx::test]
+    async fn test_create_escalated_requests_terminal_batch_exclusions(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create 3 batches
+        let mut batch_ids = vec![];
+        for (name, terminal_field) in [
+            ("completed", "completed_at"),
+            ("failed", "failed_at"),
+            ("cancelled", "cancelled_at"),
+        ] {
+            let file = manager
+                .create_file(
+                    format!("{}-batch", name),
+                    None,
+                    vec![RequestTemplateInput {
+                        custom_id: Some(format!("{}-req", name)),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":1}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let batch = manager
+                .create_batch(crate::batch::BatchInput {
+                    file_id: file,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    created_by: None,
+                })
+                .await
+                .unwrap();
+
+            sqlx::query(&format!(
+                r#"
+                UPDATE batches
+                SET created_at = NOW() - INTERVAL '30 minutes',
+                    expires_at = NOW() + INTERVAL '30 minutes',
+                    {} = NOW()
+                WHERE id = $1
+                "#,
+                terminal_field
+            ))
+            .bind(*batch.id as Uuid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            batch_ids.push(batch.id);
+        }
+
+        // Try to escalate - should find 0 requests because all batches are terminal
+        let count = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count, 0,
+            "Should not escalate requests from terminal batches"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_create_escalated_requests_edge_cases(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Test 1: Empty database
+        let empty = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(empty, 0, "Empty database should return 0");
+
+        // Test 2: No matching model
+        let file = manager
+            .create_file(
+                "other-model".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "claude-3".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET created_at = NOW() - INTERVAL '30 minutes',
+                expires_at = NOW() + INTERVAL '30 minutes'
+            WHERE id = $1
+            "#,
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let no_model_match = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(no_model_match, 0, "No model match should return 0");
+
+        // Test 3: Batch created recently (not at risk yet)
+        let file2 = manager
+            .create_file(
+                "not-at-risk".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("req2".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":2}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch2 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file2,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET created_at = NOW() - INTERVAL '5 minutes',
+                expires_at = NOW() + INTERVAL '23 hours 55 minutes'
+            WHERE id = $1
+            "#,
+            *batch2.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let not_at_risk = manager
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .await
+            .unwrap();
+
+        assert_eq!(not_at_risk, 0, "Not at risk batch should return 0");
+    }
+
+    // =========================================================================
+    // SLA ESCALATION TESTS
+    // =========================================================================
+
+    #[sqlx::test]
+    async fn test_race_completion_original_wins(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a batch with one request
+        let file_id = manager
+            .create_file(
+                "race-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("original".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Get the original request
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let original_id = requests[0].id();
+
+        // Manually create an escalated request
+        let escalated_id = RequestId::from(Uuid::new_v4());
+        sqlx::query!(
+            r#"
+            INSERT INTO requests (
+                id, batch_id, template_id, state, custom_id, retry_attempt, model,
+                escalated_from_request_id, is_escalated
+            )
+            SELECT
+                $1, batch_id, template_id, 'pending', custom_id, retry_attempt, model,
+                id, true
+            FROM requests
+            WHERE id = $2
+            "#,
+            *escalated_id as Uuid,
+            *original_id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Claim and complete the original request
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let claimed = manager
+            .claim_requests(1, daemon_id)
+            .await
+            .expect("Failed to claim request");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].data.id, original_id);
+
+        // Complete the original request
+        let completed = Request {
+            data: claimed[0].data.clone(),
+            state: Completed {
+                response_status: 200,
+                response_body: r#"{"result":"success"}"#.to_string(),
+                claimed_at: claimed[0].state.claimed_at,
+                started_at: chrono::Utc::now(),
+                completed_at: chrono::Utc::now(),
+            },
+        };
+        manager.persist(&completed).await.unwrap();
+
+        // Verify the escalated request was superseded
+        let escalated_results = manager.get_requests(vec![escalated_id]).await.unwrap();
+        assert_eq!(escalated_results.len(), 1);
+        let escalated = escalated_results[0].as_ref().unwrap();
+
+        match escalated {
+            AnyRequest::Superseded(req) => {
+                assert_eq!(req.state.superseded_by_request_id, original_id);
+                assert!(req.state.was_escalated);
+            }
+            _ => panic!(
+                "Expected escalated request to be superseded, but was {:?}",
+                escalated.variant()
+            ),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_race_completion_escalated_wins(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a batch with one request
+        let file_id = manager
+            .create_file(
+                "race-test-2".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("original".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Get the original request
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let original_id = requests[0].id();
+
+        // Manually create an escalated request
+        let escalated_id = RequestId::from(Uuid::new_v4());
+        sqlx::query!(
+            r#"
+            INSERT INTO requests (
+                id, batch_id, template_id, state, custom_id, retry_attempt, model,
+                escalated_from_request_id, is_escalated
+            )
+            SELECT
+                $1, batch_id, template_id, 'pending', custom_id, retry_attempt, model,
+                id, true
+            FROM requests
+            WHERE id = $2
+            "#,
+            *escalated_id as Uuid,
+            *original_id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Claim and complete the escalated request (skipping the original)
+        // First update the escalated to claimed state
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'claimed', claimed_at = NOW(), daemon_id = $2
+            WHERE id = $1
+            "#,
+            *escalated_id as Uuid,
+            *DaemonId::from(Uuid::new_v4()) as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Get the escalated request
+        let escalated_results = manager.get_requests(vec![escalated_id]).await.unwrap();
+        let escalated_claimed = match &escalated_results[0].as_ref().unwrap() {
+            AnyRequest::Claimed(req) => req.clone(),
+            _ => panic!("Expected claimed request"),
+        };
+
+        // Complete the escalated request
+        let completed = Request {
+            data: escalated_claimed.data.clone(),
+            state: Completed {
+                response_status: 200,
+                response_body: r#"{"result":"success"}"#.to_string(),
+                claimed_at: escalated_claimed.state.claimed_at,
+                started_at: chrono::Utc::now(),
+                completed_at: chrono::Utc::now(),
+            },
+        };
+        manager.persist(&completed).await.unwrap();
+
+        // Verify the original request was superseded
+        let original_results = manager.get_requests(vec![original_id]).await.unwrap();
+        assert_eq!(original_results.len(), 1);
+        let original = original_results[0].as_ref().unwrap();
+
+        match original {
+            AnyRequest::Superseded(req) => {
+                assert_eq!(req.state.superseded_by_request_id, escalated_id);
+                assert!(!req.state.was_escalated);
+            }
+            _ => panic!(
+                "Expected original request to be superseded, but was {:?}",
+                original.variant()
+            ),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_race_completion_no_supersede_if_already_terminal(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a batch with one request
+        let file_id = manager
+            .create_file(
+                "race-test-3".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("original".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Get the original request
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let original_id = requests[0].id();
+
+        // Manually create an escalated request that's already completed
+        let escalated_id = RequestId::from(Uuid::new_v4());
+        let now = chrono::Utc::now();
+        sqlx::query!(
+            r#"
+            INSERT INTO requests (
+                id, batch_id, template_id, state, custom_id, retry_attempt, model,
+                escalated_from_request_id, is_escalated, response_status, response_body,
+                claimed_at, started_at, completed_at
+            )
+            SELECT
+                $1, batch_id, template_id, 'completed', custom_id, retry_attempt, model,
+                id, true, 200, '{"done":"first"}', $3, $3, $3
+            FROM requests
+            WHERE id = $2
+            "#,
+            *escalated_id as Uuid,
+            *original_id as Uuid,
+            now,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Now complete the original request
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let claimed = manager
+            .claim_requests(1, daemon_id)
+            .await
+            .expect("Failed to claim request");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].data.id, original_id);
+
+        let completed = Request {
+            data: claimed[0].data.clone(),
+            state: Completed {
+                response_status: 200,
+                response_body: r#"{"result":"success"}"#.to_string(),
+                claimed_at: claimed[0].state.claimed_at,
+                started_at: chrono::Utc::now(),
+                completed_at: chrono::Utc::now(),
+            },
+        };
+        manager.persist(&completed).await.unwrap();
+
+        // Verify the escalated request is still completed (not superseded)
+        let escalated_results = manager.get_requests(vec![escalated_id]).await.unwrap();
+        assert_eq!(escalated_results.len(), 1);
+        let escalated = escalated_results[0].as_ref().unwrap();
+
+        match escalated {
+            AnyRequest::Completed(_) => {
+                // This is correct - already terminal state should not be superseded
+            }
+            _ => panic!(
+                "Expected escalated request to remain completed, but was {:?}",
+                escalated.variant()
+            ),
+        }
     }
 }

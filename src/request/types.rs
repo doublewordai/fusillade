@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
@@ -14,6 +14,27 @@ use uuid::Uuid;
 use crate::batch::{BatchId, TemplateId};
 use crate::error::Result;
 use crate::http::HttpResponse;
+
+/// Database state for filtering and querying requests.
+///
+/// This enum represents the string values stored in the database's `state` column.
+/// It's used for filtering operations like SLA monitoring and escalation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "postgres", derive(sqlx::Type))]
+#[cfg_attr(
+    feature = "postgres",
+    sqlx(type_name = "text", rename_all = "lowercase")
+)]
+pub enum RequestStateFilter {
+    Pending,
+    Claimed,
+    Processing,
+    Completed,
+    Failed,
+    Canceled,
+    Superseded,
+}
 
 /// Marker trait for valid request states.
 ///

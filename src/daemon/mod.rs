@@ -106,6 +106,17 @@ pub struct SlaThreshold {
 
     /// Action to take when threshold is crossed
     pub action: SlaAction,
+
+    /// Request states to act on for this threshold.
+    /// Allows configuring different state filters for different thresholds
+    /// (e.g., escalate only pending at 1 hour, but escalate pending+claimed at 5 minutes).
+    /// Defaults to `[Pending]` if not specified.
+    #[serde(default = "default_sla_allowed_states")]
+    pub allowed_states: Vec<crate::request::RequestStateFilter>,
+}
+
+fn default_sla_allowed_states() -> Vec<crate::request::RequestStateFilter> {
+    vec![crate::request::RequestStateFilter::Pending]
 }
 
 /// Configuration for the daemon.
@@ -181,17 +192,21 @@ pub struct DaemonConfig {
     /// Example: Two thresholds (warning at 1 hour, critical at 15 minutes)
     /// ```
     /// use fusillade::daemon::{SlaThreshold, SlaAction, SlaLogLevel};
+    /// use fusillade::request::RequestStateFilter;
     ///
     /// vec![
     ///     SlaThreshold {
     ///         name: "warning".to_string(),
     ///         threshold_seconds: 3600,
     ///         action: SlaAction::Log { level: SlaLogLevel::Warn },
+    ///         allowed_states: vec![RequestStateFilter::Pending],
     ///     },
     ///     SlaThreshold {
     ///         name: "critical".to_string(),
     ///         threshold_seconds: 900,
     ///         action: SlaAction::Log { level: SlaLogLevel::Error },
+    ///         // Act on both pending and claimed requests for critical threshold
+    ///         allowed_states: vec![RequestStateFilter::Pending, RequestStateFilter::Claimed],
     ///     },
     /// ]
     /// # ;
@@ -510,6 +525,7 @@ where
             let shutdown_token = self.shutdown_token.clone();
             let sla_thresholds = self.config.sla_thresholds.clone();
             let sla_check_interval_seconds = self.config.sla_check_interval_seconds;
+            let priority_endpoints = self.config.priority_endpoints.clone();
 
             tokio::spawn(async move {
                 let mut interval =
@@ -520,55 +536,83 @@ where
                         _ = interval.tick() => {
                             // Query once per configured threshold
                             for threshold in &sla_thresholds {
-                                match storage.find_at_risk_requests(threshold.threshold_seconds).await {
-                                    Ok(requests) => {
-                                        // Group requests by batch for aggregated logging
-                                        let mut batch_counts: std::collections::HashMap<crate::batch::BatchId, usize> = std::collections::HashMap::new();
-                                        for request in &requests {
-                                            *batch_counts.entry(request.data.batch_id).or_insert(0) += 1;
-                                        }
+                                // Match on action type to determine what DB operation to perform
+                                match threshold.action {
+                                    SlaAction::Log { level } => {
+                                        // Get batch counts for logging
+                                        match storage.get_at_risk_batches(threshold.threshold_seconds, &threshold.allowed_states).await {
+                                            Ok(batch_counts) => {
+                                                if batch_counts.is_empty() {
+                                                    continue;
+                                                }
 
-                                        for (batch_id, pending_count) in batch_counts {
-                                            // Perform action based on threshold configuration
-                                            match threshold.action {
-                                                SlaAction::Log { level } => {
+                                                for (batch_id, at_risk_count) in batch_counts {
                                                     match level {
                                                         SlaLogLevel::Error => {
                                                             tracing::error!(
                                                                 batch_id = %batch_id,
-                                                                pending_count = pending_count,
+                                                                at_risk_count = at_risk_count,
                                                                 threshold_seconds = threshold.threshold_seconds,
                                                                 sla_name = %threshold.name,
-                                                                "Pending requests at risk of missing SLA"
+                                                                "Requests at risk of missing SLA"
                                                             );
                                                         }
                                                         SlaLogLevel::Warn => {
                                                             tracing::warn!(
                                                                 batch_id = %batch_id,
-                                                                pending_count = pending_count,
+                                                                at_risk_count = at_risk_count,
                                                                 threshold_seconds = threshold.threshold_seconds,
                                                                 sla_name = %threshold.name,
-                                                                "Pending requests at risk of missing SLA"
+                                                                "Requests at risk of missing SLA"
                                                             );
                                                         }
                                                     }
                                                 }
-                                                SlaAction::Escalate => {
-                                                    // TODO: Implement escalation logic in Phase 3
-                                                    tracing::warn!(
-                                                        batch_id = %batch_id,
-                                                        pending_count = pending_count,
-                                                        "Escalation not yet implemented"
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    error = %e,
+                                                    "Failed to get at-risk batches"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    SlaAction::Escalate => {
+                                        // Escalate for each configured model
+                                        for entry in priority_endpoints.iter() {
+                                            let model = entry.key();
+                                            let priority_config = entry.value();
+
+                                            // Create escalated requests
+                                            match storage
+                                                .create_escalated_requests(
+                                                    model,
+                                                    threshold.threshold_seconds,
+                                                    &threshold.allowed_states,
+                                                )
+                                                .await
+                                            {
+                                                Ok(escalated_count) => {
+                                                    if escalated_count > 0 {
+                                                        tracing::info!(
+                                                            model = %model,
+                                                            escalated_count = escalated_count,
+                                                            priority_endpoint = %priority_config.endpoint,
+                                                            threshold_seconds = threshold.threshold_seconds,
+                                                            sla_name = %threshold.name,
+                                                            "Successfully created escalated requests"
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        model = %model,
+                                                        error = %e,
+                                                        "Failed to escalate requests"
                                                     );
                                                 }
                                             }
                                         }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            error = %e,
-                                            "Failed to check SLA thresholds"
-                                        );
                                     }
                                 }
                             }
