@@ -39,6 +39,10 @@ jobs:
           components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Invalidate cache when migrations change since sqlx::migrate! embeds them at compile time
+          prefix-key: "v1"
+          shared-key: ${{ hashFiles('migrations/**/*.sql') }}
 
       - name: Install sqlx-cli and cargo-llvm-cov
         run: |
