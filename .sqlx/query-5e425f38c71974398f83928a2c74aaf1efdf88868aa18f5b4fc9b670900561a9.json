@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id,\n                r.batch_id,\n                r.template_id,\n                r.retry_attempt,\n                r.not_before,\n                t.custom_id,\n                t.endpoint,\n                t.method,\n                t.path,\n                t.body,\n                t.model,\n                t.api_key,\n                b.expires_at\n            FROM requests r\n            JOIN batches b ON r.batch_id = b.id\n            JOIN request_templates t ON r.template_id = t.id\n            WHERE b.expires_at < NOW() + make_interval(secs => $1)\n              AND b.completed_at IS NULL\n              AND b.failed_at IS NULL\n              AND b.cancelled_at IS NULL\n              AND b.cancelling_at IS NULL\n              AND r.state = 'pending'\n            ORDER BY b.expires_at ASC\n            ",
+  "query": "\n            SELECT\n                r.id,\n                r.batch_id,\n                r.template_id as \"template_id?\",\n                r.retry_attempt,\n                r.not_before,\n                t.custom_id as \"custom_id?\",\n                t.endpoint as \"endpoint?\",\n                t.method as \"method?\",\n                t.path as \"path?\",\n                t.body as \"body?\",\n                t.model as \"model?\",\n                t.api_key as \"api_key?\",\n                b.expires_at\n            FROM requests r\n            JOIN batches b ON r.batch_id = b.id\n            LEFT JOIN request_templates t ON r.template_id = t.id\n            WHERE b.expires_at < NOW() + make_interval(secs => $1)\n              AND b.completed_at IS NULL\n              AND b.failed_at IS NULL\n              AND b.cancelled_at IS NULL\n              AND b.cancelling_at IS NULL\n              AND r.state = 'pending'\n            ORDER BY b.expires_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -15,7 +15,7 @@
       },
       {
         "ordinal": 2,
-        "name": "template_id",
+        "name": "template_id?",
         "type_info": "Uuid"
       },
       {
@@ -30,37 +30,37 @@
       },
       {
         "ordinal": 5,
-        "name": "custom_id",
+        "name": "custom_id?",
         "type_info": "Text"
       },
       {
         "ordinal": 6,
-        "name": "endpoint",
+        "name": "endpoint?",
         "type_info": "Text"
       },
       {
         "ordinal": 7,
-        "name": "method",
+        "name": "method?",
         "type_info": "Text"
       },
       {
         "ordinal": 8,
-        "name": "path",
+        "name": "path?",
         "type_info": "Text"
       },
       {
         "ordinal": 9,
-        "name": "body",
+        "name": "body?",
         "type_info": "Text"
       },
       {
         "ordinal": 10,
-        "name": "model",
+        "name": "model?",
         "type_info": "Text"
       },
       {
         "ordinal": 11,
-        "name": "api_key",
+        "name": "api_key?",
         "type_info": "Text"
       },
       {
@@ -77,7 +77,7 @@
     "nullable": [
       false,
       false,
-      false,
+      true,
       false,
       true,
       true,
@@ -90,5 +90,5 @@
       false
     ]
   },
-  "hash": "913e556f7850f657f042953fc12516c8a2c7874089de71b49f7b692752582c60"
+  "hash": "5e425f38c71974398f83928a2c74aaf1efdf88868aa18f5b4fc9b670900561a9"
 }

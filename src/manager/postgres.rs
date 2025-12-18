@@ -82,7 +82,7 @@ macro_rules! batch_from_row {
     ($row:expr) => {
         Batch {
             id: BatchId($row.id),
-            file_id: FileId($row.file_id),
+            file_id: $row.file_id.map(FileId),
             endpoint: $row.endpoint,
             completion_window: $row.completion_window,
             metadata: $row.metadata,
@@ -648,6 +648,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     CROSS JOIN available_slots
                     WHERE r.state = 'pending'
                         AND r.model = $4
+                        AND r.template_id IS NOT NULL
                         AND (r.not_before IS NULL OR r.not_before <= $3)
                         AND b.cancelling_at IS NULL
                         AND available_slots.slots > 0
@@ -664,8 +665,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 JOIN request_templates t ON tc.template_id = t.id
                 JOIN batches b ON tc.batch_id = b.id
                 WHERE r.id = tc.id
-                RETURNING r.id, r.batch_id, r.template_id, r.retry_attempt,
-                          t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
+                RETURNING r.id, r.batch_id, r.template_id as "template_id!", r.retry_attempt,
+                          t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
+                          t.body as "body!", t.model as "model!", t.api_key as "api_key!",
                           b.expires_at as batch_expires_at
                 "#,
                 *daemon_id as Uuid,
@@ -910,13 +912,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let rows = sqlx::query!(
             r#"
             SELECT
-                r.id, r.batch_id, r.template_id, r.state,
-                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
+                r.id, r.batch_id, r.template_id as "template_id?", r.state,
+                t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
+                t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at
             FROM requests r
-            JOIN request_templates t ON r.template_id = t.id
+            LEFT JOIN request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
             WHERE r.id = ANY($1)
             "#,
@@ -932,17 +935,47 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         for row in rows {
             let request_id = RequestId(row.id);
-            let data = RequestData {
-                id: request_id,
-                batch_id: BatchId(row.batch_id),
-                template_id: TemplateId(row.template_id),
-                custom_id: row.custom_id,
-                endpoint: row.endpoint,
-                method: row.method,
-                path: row.path,
-                body: row.body,
-                model: row.model,
-                api_key: row.api_key,
+
+            // Check if template data exists (template may have been deleted)
+            let data = match (
+                row.template_id,
+                row.endpoint,
+                row.method,
+                row.path,
+                row.body,
+                row.model,
+                row.api_key,
+            ) {
+                (
+                    Some(template_id),
+                    Some(endpoint),
+                    Some(method),
+                    Some(path),
+                    Some(body),
+                    Some(model),
+                    Some(api_key),
+                ) => RequestData {
+                    id: request_id,
+                    batch_id: BatchId(row.batch_id),
+                    template_id: TemplateId(template_id),
+                    custom_id: row.custom_id,
+                    endpoint,
+                    method,
+                    path,
+                    body,
+                    model,
+                    api_key,
+                },
+                _ => {
+                    // Template was deleted - cannot reconstruct request
+                    request_map.insert(
+                        request_id,
+                        Err(FusilladeError::Other(anyhow!(
+                            "Request template has been deleted"
+                        ))),
+                    );
+                    continue;
+                }
             };
 
             let state = &row.state;
@@ -1741,6 +1774,33 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn delete_file(&self, file_id: FileId) -> Result<()> {
+        // Step 1: Cancel all in-progress batches associated with this file
+        // This will:
+        // - Prevent pending requests from being claimed (claim_requests filters by cancelling_at)
+        // - Count pending requests as canceled in batch status
+        // - Signal daemons to abort in-flight (claimed/processing) requests
+        // Only cancel batches that haven't reached a terminal state yet
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET cancelling_at = NOW(),
+                cancelled_at = NOW()
+            WHERE file_id = $1
+              AND cancelling_at IS NULL
+              AND completed_at IS NULL
+              AND failed_at IS NULL
+              AND cancelled_at IS NULL
+            "#,
+            *file_id as Uuid,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel batches: {}", e)))?;
+
+        // Step 2: Delete the file
+        // This cascades to delete request_templates (which makes template_id NULL on requests)
+        // Pending requests in cancelled batches remain 'pending' but are treated as canceled
+        // They can never be claimed because they have no template_id
         let rows_affected = sqlx::query!(
             r#"
             DELETE FROM files
@@ -1891,7 +1951,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let row = sqlx::query!(
             r#"
             SELECT
-                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
                 b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                 b.expires_at, b.cancelling_at, b.errors,
                 b.total_requests,
@@ -1973,7 +2033,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         Ok(Batch {
             id: BatchId(row.id),
-            file_id: FileId(row.file_id),
+            file_id: row.file_id.map(FileId),
             created_at: row.created_at,
             metadata: row.metadata,
             completion_window: row.completion_window,
@@ -2003,8 +2063,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             r#"
             SELECT
                 b.id as batch_id,
-                b.file_id,
-                f.name as file_name,
+                b.file_id as "file_id?",
+                f.name as "file_name?",
                 b.total_requests,
                 b.requests_started_at as started_at,
                 b.created_at,
@@ -2014,7 +2074,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
                 COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
             FROM batches b
-            JOIN files f ON f.id = b.file_id
+            LEFT JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
@@ -2036,7 +2096,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         Ok(BatchStatus {
             batch_id: BatchId(row.batch_id),
-            file_id: FileId(row.file_id),
+            file_id: row.file_id.map(FileId),
             file_name: row.file_name,
             total_requests: row.total_requests,
             pending_requests: row.pending_requests,
@@ -2059,7 +2119,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 let row = sqlx::query!(
                     r#"
                     SELECT
-                        b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                        b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
                         b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                         b.expires_at, b.cancelling_at, b.errors,
                         b.total_requests,
@@ -2098,7 +2158,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 let row = sqlx::query!(
                     r#"
                     SELECT
-                        b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                        b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
                         b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                         b.expires_at, b.cancelling_at, b.errors,
                         b.total_requests,
@@ -2165,7 +2225,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let rows = sqlx::query!(
             r#"
             SELECT
-                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
                 b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                 b.expires_at, b.cancelling_at, b.errors,
                 b.total_requests,
@@ -2212,8 +2272,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             r#"
             SELECT
                 b.id as batch_id,
-                b.file_id,
-                f.name as file_name,
+                b.file_id as "file_id?",
+                f.name as "file_name?",
                 b.total_requests,
                 b.requests_started_at as started_at,
                 b.created_at,
@@ -2223,7 +2283,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
                 COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
             FROM batches b
-            JOIN files f ON f.id = b.file_id
+            LEFT JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
@@ -2247,7 +2307,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .into_iter()
             .map(|row| BatchStatus {
                 batch_id: BatchId(row.batch_id),
-                file_id: FileId(row.file_id),
+                file_id: row.file_id.map(FileId),
                 file_name: row.file_name,
                 total_requests: row.total_requests,
                 pending_requests: row.pending_requests,
@@ -2269,20 +2329,20 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             SELECT
                 r.id,
                 r.batch_id,
-                r.template_id,
+                r.template_id as "template_id?",
                 r.retry_attempt,
                 r.not_before,
-                t.custom_id,
-                t.endpoint,
-                t.method,
-                t.path,
-                t.body,
-                t.model,
-                t.api_key,
+                t.custom_id as "custom_id?",
+                t.endpoint as "endpoint?",
+                t.method as "method?",
+                t.path as "path?",
+                t.body as "body?",
+                t.model as "model?",
+                t.api_key as "api_key?",
                 b.expires_at
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
-            JOIN request_templates t ON r.template_id = t.id
+            LEFT JOIN request_templates t ON r.template_id = t.id
             WHERE b.expires_at < NOW() + make_interval(secs => $1)
               AND b.completed_at IS NULL
               AND b.failed_at IS NULL
@@ -2300,24 +2360,36 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         // Map rows to Request<Pending>
         Ok(rows
             .into_iter()
-            .map(|row| Request {
-                data: RequestData {
-                    id: RequestId(row.id),
-                    batch_id: BatchId(row.batch_id),
-                    template_id: TemplateId(row.template_id),
-                    custom_id: row.custom_id,
-                    endpoint: row.endpoint,
-                    method: row.method,
-                    path: row.path,
-                    body: row.body,
-                    model: row.model,
-                    api_key: row.api_key,
-                },
-                state: Pending {
-                    retry_attempt: row.retry_attempt as u32,
-                    not_before: row.not_before,
-                    batch_expires_at: row.expires_at,
-                },
+            .filter_map(|row| {
+                // Skip requests with deleted templates
+                match (row.template_id, row.endpoint, row.method, row.path, row.body, row.model, row.api_key) {
+                    (Some(template_id), Some(endpoint), Some(method), Some(path), Some(body), Some(model), Some(api_key)) => {
+                        Some(Request {
+                            data: RequestData {
+                                id: RequestId(row.id),
+                                batch_id: BatchId(row.batch_id),
+                                template_id: TemplateId(template_id),
+                                custom_id: row.custom_id,
+                                endpoint,
+                                method,
+                                path,
+                                body,
+                                model,
+                                api_key,
+                            },
+                            state: Pending {
+                                retry_attempt: row.retry_attempt as u32,
+                                not_before: row.not_before,
+                                batch_expires_at: row.expires_at,
+                            },
+                        })
+                    }
+                    _ => {
+                        // Template was deleted - skip this request
+                        tracing::debug!(request_id = %row.id, "Skipping at-risk request with deleted template");
+                        None
+                    }
+                }
             })
             .collect())
     }
@@ -2350,11 +2422,50 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(())
     }
 
+    async fn delete_batch(&self, batch_id: BatchId) -> Result<()> {
+        // Delete the batch - this will cascade delete all associated requests
+        // due to ON DELETE CASCADE on requests.batch_id foreign key
+        let rows_affected = sqlx::query!(
+            r#"
+            DELETE FROM batches WHERE id = $1
+            "#,
+            *batch_id as Uuid,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete batch: {}", e)))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(FusilladeError::Other(anyhow!("Batch not found")));
+        }
+
+        Ok(())
+    }
+
     async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
         tracing::info!(count = ids.len(), "Retrying failed requests");
 
         // Get all requests in a single bulk query to avoid N+1 problem
         let get_results = self.get_requests(ids.clone()).await?;
+        let found_count = get_results.len();
+
+        // Check if any requests were not found (e.g., template was deleted)
+        if found_count != ids.len() {
+            // Some requests were not returned - likely because their template was deleted
+            // Find which ones are missing
+            let returned_ids: std::collections::HashSet<_> = get_results
+                .iter()
+                .filter_map(|r| r.as_ref().ok().map(|req| req.id()))
+                .collect();
+
+            let missing_ids: Vec<_> = ids.iter().filter(|id| !returned_ids.contains(id)).collect();
+
+            tracing::warn!(
+                missing_count = missing_ids.len(),
+                "Some requests not found, likely due to deleted templates"
+            );
+        }
 
         let mut results = Vec::new();
 
@@ -2385,6 +2496,13 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             results.push(result);
         }
 
+        // For any missing requests, add an error result
+        for _ in 0..(ids.len() - found_count) {
+            results.push(Err(FusilladeError::Other(anyhow!(
+                "Request not found - template may have been deleted"
+            ))));
+        }
+
         Ok(results)
     }
 
@@ -2392,13 +2510,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let rows = sqlx::query!(
             r#"
             SELECT
-                r.id, r.batch_id, r.template_id, r.state,
-                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
+                r.id, r.batch_id, r.template_id as "template_id?", r.state,
+                t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
+                t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at
             FROM requests r
-            JOIN request_templates t ON r.template_id = t.id
+            LEFT JOIN request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
             WHERE r.batch_id = $1
             ORDER BY r.created_at ASC
@@ -2412,17 +2531,43 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let mut results = Vec::new();
 
         for row in rows {
-            let data = RequestData {
-                id: RequestId(row.id),
-                batch_id: BatchId(row.batch_id),
-                template_id: TemplateId(row.template_id),
-                custom_id: row.custom_id,
-                endpoint: row.endpoint,
-                method: row.method,
-                path: row.path,
-                body: row.body,
-                model: row.model,
-                api_key: row.api_key,
+            let request_id = RequestId(row.id);
+
+            // Check if template data exists (template may have been deleted)
+            let data = match (
+                row.template_id,
+                row.endpoint,
+                row.method,
+                row.path,
+                row.body,
+                row.model,
+                row.api_key,
+            ) {
+                (
+                    Some(template_id),
+                    Some(endpoint),
+                    Some(method),
+                    Some(path),
+                    Some(body),
+                    Some(model),
+                    Some(api_key),
+                ) => RequestData {
+                    id: request_id,
+                    batch_id: BatchId(row.batch_id),
+                    template_id: TemplateId(template_id),
+                    custom_id: row.custom_id,
+                    endpoint,
+                    method,
+                    path,
+                    body,
+                    model,
+                    api_key,
+                },
+                _ => {
+                    // Template was deleted - skip this request
+                    tracing::debug!(request_id = %request_id, "Skipping batch request with deleted template");
+                    continue;
+                }
             };
 
             let state = &row.state;
@@ -3380,8 +3525,8 @@ mod tests {
             .expect("Failed to get batch status");
 
         assert_eq!(status.batch_id, batch.id);
-        assert_eq!(status.file_id, file_id);
-        assert_eq!(status.file_name, "batch-test");
+        assert_eq!(status.file_id, Some(file_id));
+        assert_eq!(status.file_name, Some("batch-test".to_string()));
         assert_eq!(status.total_requests, 3);
         assert_eq!(status.pending_requests, 3);
         assert_eq!(status.completed_requests, 0);
@@ -3526,6 +3671,80 @@ mod tests {
         for request in requests {
             assert!(matches!(request, AnyRequest::Pending(_)));
         }
+    }
+
+    #[sqlx::test]
+    async fn test_delete_batch(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file with templates
+        let file_id = manager
+            .create_file(
+                "delete-batch-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":1}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":2}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Create a batch
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Verify batch exists
+        let batch_before = manager.get_batch(batch.id).await;
+        assert!(batch_before.is_ok());
+
+        // Verify requests exist
+        let requests_before = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests_before.len(), 2);
+
+        // Delete the batch
+        manager.delete_batch(batch.id).await.unwrap();
+
+        // Verify batch is gone
+        let batch_after = manager.get_batch(batch.id).await;
+        assert!(batch_after.is_err());
+
+        // Verify requests are gone (cascade deleted)
+        let requests_after = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests_after.len(), 0);
+
+        // Verify file still exists (should NOT be cascade deleted)
+        let file_after = manager.get_file(file_id).await;
+        assert!(file_after.is_ok());
+
+        // Verify deleting non-existent batch returns error
+        let delete_result = manager.delete_batch(batch.id).await;
+        assert!(delete_result.is_err());
     }
 
     #[sqlx::test]
@@ -3758,9 +3977,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify the batch exists
-        let status_before = manager.get_batch_status(batch.id).await;
-        assert!(status_before.is_ok());
+        // Verify the batch exists with file_id set
+        let batch_before = manager.get_batch(batch.id).await.unwrap();
+        assert_eq!(batch_before.file_id, Some(file_id));
+        assert!(batch_before.cancelling_at.is_none());
+        assert!(batch_before.cancelled_at.is_none());
+        assert_eq!(batch_before.pending_requests, 2);
+
+        // Verify we have pending requests with template_id
+        let requests_before = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests_before.len(), 2);
 
         // Delete the file
         manager.delete_file(file_id).await.unwrap();
@@ -3769,9 +3995,16 @@ mod tests {
         let file_result = manager.get_file(file_id).await;
         assert!(file_result.is_err());
 
-        // Verify batch is gone (cascade delete)
-        let status_after = manager.get_batch_status(batch.id).await;
-        assert!(status_after.is_err());
+        // Verify batch still exists but file_id is NULL and batch is cancelled
+        let batch_after = manager.get_batch(batch.id).await.unwrap();
+        assert_eq!(batch_after.file_id, None);
+        assert!(batch_after.cancelling_at.is_some());
+        assert!(batch_after.cancelled_at.is_some());
+        assert_eq!(batch_after.canceled_requests, 2); // Both requests should be counted as canceled
+
+        // Verify requests still exist but are skipped when template is deleted
+        let requests_after = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests_after.len(), 0); // Requests with deleted templates are skipped
     }
 
     // =========================================================================
@@ -4762,7 +4995,7 @@ mod tests {
 
         // Verify all fields match
         assert_eq!(retrieved_batch.id, created_batch.id);
-        assert_eq!(retrieved_batch.file_id, file_id);
+        assert_eq!(retrieved_batch.file_id, Some(file_id));
         assert_eq!(retrieved_batch.endpoint, "/v1/chat/completions");
         assert_eq!(retrieved_batch.completion_window, "24h");
         assert_eq!(

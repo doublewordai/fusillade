@@ -343,7 +343,7 @@ pub struct BatchInput {
 #[derive(Debug, Clone, Serialize)]
 pub struct Batch {
     pub id: BatchId,
-    pub file_id: FileId,
+    pub file_id: Option<FileId>,
     pub created_at: DateTime<Utc>,
     /// Metadata key-value pairs (OpenAI allows up to 16 pairs)
     pub metadata: Option<serde_json::Value>,
@@ -385,8 +385,8 @@ pub struct Batch {
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchStatus {
     pub batch_id: BatchId,
-    pub file_id: FileId,
-    pub file_name: String,
+    pub file_id: Option<FileId>,
+    pub file_name: Option<String>,
     pub total_requests: i64,
     pub pending_requests: i64,
     pub in_progress_requests: i64,
