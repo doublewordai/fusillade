@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                    SELECT\n                        b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,\n                        b.output_file_id, b.error_file_id, b.created_by, b.created_at,\n                        b.expires_at, b.cancelling_at, b.errors,\n                        b.total_requests,\n                        b.requests_started_at,\n                        b.finalizing_at,\n                        b.completed_at,\n                        b.failed_at,\n                        b.cancelled_at,\n                        COALESCE(counts.pending, 0)::BIGINT as \"pending_requests!\",\n                        COALESCE(counts.in_progress, 0)::BIGINT as \"in_progress_requests!\",\n                        COALESCE(counts.completed, 0)::BIGINT as \"completed_requests!\",\n                        COALESCE(counts.failed, 0)::BIGINT as \"failed_requests!\",\n                        COALESCE(counts.canceled, 0)::BIGINT as \"canceled_requests!\"\n                    FROM batches b\n                    LEFT JOIN LATERAL (\n                        SELECT\n                            COUNT(*) FILTER (WHERE state = 'pending') as pending,\n                            COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,\n                            COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,\n                            COUNT(*) FILTER (WHERE state = 'failed') as failed,\n                            COUNT(*) FILTER (WHERE state = 'canceled') as canceled\n                        FROM requests\n                        WHERE batch_id = b.id\n                          AND is_escalated = false  -- Exclude escalated requests from batch accounting\n                    ) counts ON TRUE\n                    WHERE b.error_file_id = $1\n                    ",
+  "query": "\n                    SELECT\n                        b.id, b.file_id as \"file_id?\", b.endpoint, b.completion_window, b.metadata,\n                        b.output_file_id, b.error_file_id, b.created_by, b.created_at,\n                        b.expires_at, b.cancelling_at, b.errors,\n                        b.total_requests,\n                        b.requests_started_at,\n                        b.finalizing_at,\n                        b.completed_at,\n                        b.failed_at,\n                        b.cancelled_at,\n                        COALESCE(counts.pending, 0)::BIGINT as \"pending_requests!\",\n                        COALESCE(counts.in_progress, 0)::BIGINT as \"in_progress_requests!\",\n                        COALESCE(counts.completed, 0)::BIGINT as \"completed_requests!\",\n                        COALESCE(counts.failed, 0)::BIGINT as \"failed_requests!\",\n                        COALESCE(counts.canceled, 0)::BIGINT as \"canceled_requests!\"\n                    FROM batches b\n                    LEFT JOIN LATERAL (\n                        SELECT\n                            COUNT(*) FILTER (WHERE state = 'pending') as pending,\n                            COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,\n                            COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,\n                            COUNT(*) FILTER (WHERE state = 'failed') as failed,\n                            COUNT(*) FILTER (WHERE state = 'canceled') as canceled\n                        FROM requests\n                        WHERE batch_id = b.id\n                          AND is_escalated = false  -- Exclude escalated requests from batch accounting\n                    ) counts ON TRUE\n                    WHERE b.output_file_id = $1\n                    ",
   "describe": {
     "columns": [
       {
@@ -10,7 +10,7 @@
       },
       {
         "ordinal": 1,
-        "name": "file_id",
+        "name": "file_id?",
         "type_info": "Uuid"
       },
       {
@@ -126,7 +126,7 @@
     },
     "nullable": [
       false,
-      false,
+      true,
       false,
       false,
       true,
@@ -150,5 +150,5 @@
       null
     ]
   },
-  "hash": "3b7541368fad792cac1faec85521132121967aa621d96b3b8ef1ea796ce0ce0c"
+  "hash": "d5ac76f875d189015be4b4579e1680d63b8a009f3d8c50e3260536f486584fbc"
 }

@@ -164,6 +164,10 @@ pub trait Storage: Send + Sync {
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
 
+    /// Delete a batch and all its associated requests.
+    /// This is a destructive operation that removes the batch and all request data.
+    async fn delete_batch(&self, batch_id: BatchId) -> Result<()>;
+
     /// Retry failed requests by resetting them to pending state.
     ///
     /// This resets the specified failed requests to pending state with retry_attempt = 0,
