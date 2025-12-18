@@ -2422,6 +2422,27 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(())
     }
 
+    async fn delete_batch(&self, batch_id: BatchId) -> Result<()> {
+        // Delete the batch - this will cascade delete all associated requests
+        // due to ON DELETE CASCADE on requests.batch_id foreign key
+        let rows_affected = sqlx::query!(
+            r#"
+            DELETE FROM batches WHERE id = $1
+            "#,
+            *batch_id as Uuid,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete batch: {}", e)))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(FusilladeError::Other(anyhow!("Batch not found")));
+        }
+
+        Ok(())
+    }
+
     async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
         tracing::info!(count = ids.len(), "Retrying failed requests");
 
@@ -3650,6 +3671,80 @@ mod tests {
         for request in requests {
             assert!(matches!(request, AnyRequest::Pending(_)));
         }
+    }
+
+    #[sqlx::test]
+    async fn test_delete_batch(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file with templates
+        let file_id = manager
+            .create_file(
+                "delete-batch-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":1}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":2}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Create a batch
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Verify batch exists
+        let batch_before = manager.get_batch(batch.id).await;
+        assert!(batch_before.is_ok());
+
+        // Verify requests exist
+        let requests_before = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests_before.len(), 2);
+
+        // Delete the batch
+        manager.delete_batch(batch.id).await.unwrap();
+
+        // Verify batch is gone
+        let batch_after = manager.get_batch(batch.id).await;
+        assert!(batch_after.is_err());
+
+        // Verify requests are gone (cascade deleted)
+        let requests_after = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests_after.len(), 0);
+
+        // Verify file still exists (should NOT be cascade deleted)
+        let file_after = manager.get_file(file_id).await;
+        assert!(file_after.is_ok());
+
+        // Verify deleting non-existent batch returns error
+        let delete_result = manager.delete_batch(batch.id).await;
+        assert!(delete_result.is_err());
     }
 
     #[sqlx::test]
