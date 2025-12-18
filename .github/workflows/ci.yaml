@@ -51,16 +51,7 @@ jobs:
         run: |
           PGPASSWORD=postgres createdb -h localhost -U postgres fusillade
           echo "DATABASE_URL=postgres://postgres:postgres@localhost:5432/fusillade" > .env
-          echo "=== Listing migration files ==="
-          ls -1 migrations/*.up.sql | wc -l
-          echo "=== Checking for duplicate version numbers ==="
-          ls -1 migrations/*.up.sql | cut -d'_' -f1 | cut -d'/' -f2 | sort | uniq -d
-          echo "=== All migration versions ==="
-          ls -1 migrations/*.up.sql | cut -d'_' -f1 | cut -d'/' -f2 | sort
-          echo "=== sqlx migrate info before running ==="
-          sqlx migrate info || echo "Failed"
-          echo "=== Running migrations with verbose output ==="
-          RUST_LOG=sqlx=debug sqlx migrate run
+          sqlx migrate run
 
       - name: Run tests
         env:
