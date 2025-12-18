@@ -140,10 +140,10 @@ pub trait Storage: Send + Sync {
     /// Automatically skips requests that already have escalations.
     ///
     /// Escalated requests:
-    /// - Have the same template/body/model as the original
-    /// - Point to priority endpoints (configured separately per model)
+    /// - Have the same template/body/model as the original (from request_templates)
     /// - Are marked with `is_escalated = true` (invisible to batch accounting)
     /// - Link back to original via `escalated_from_request_id`
+    /// - Priority endpoint routing is handled by the daemon at request processing time
     ///
     /// Both requests race through normal queue processing. First to complete wins.
     ///
@@ -253,7 +253,12 @@ pub trait Storage: Send + Sync {
     ) -> Result<Vec<Request<Claimed>>>;
 
     /// Update an existing request's state in storage.
-    async fn persist<T: RequestState + Clone>(&self, request: &Request<T>) -> Result<()>
+    ///
+    /// Returns `Some(request_id)` if a racing pair was superseded (for cancellation purposes).
+    async fn persist<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<RequestId>>
     where
         AnyRequest: From<Request<T>>;
 }

@@ -109,46 +109,6 @@ macro_rules! batch_from_row {
     };
 }
 
-/// Macro to construct a `Batch` from a database row.
-///
-/// This eliminates the duplication of mapping database row fields to Batch objects
-/// across multiple query methods.
-///
-/// # Example
-/// ```ignore
-/// let row = sqlx::query!(...).fetch_one(&pool).await?;
-/// let batch = batch_from_row!(row);
-/// ```
-macro_rules! batch_from_row {
-    ($row:expr) => {
-        Batch {
-            id: BatchId($row.id),
-            file_id: FileId($row.file_id),
-            endpoint: $row.endpoint,
-            completion_window: $row.completion_window,
-            metadata: $row.metadata,
-            output_file_id: $row.output_file_id.map(FileId),
-            error_file_id: $row.error_file_id.map(FileId),
-            created_by: $row.created_by,
-            created_at: $row.created_at,
-            expires_at: $row.expires_at,
-            cancelling_at: $row.cancelling_at,
-            errors: $row.errors,
-            total_requests: $row.total_requests,
-            requests_started_at: $row.requests_started_at,
-            finalizing_at: $row.finalizing_at,
-            completed_at: $row.completed_at,
-            failed_at: $row.failed_at,
-            cancelled_at: $row.cancelled_at,
-            pending_requests: $row.pending_requests,
-            in_progress_requests: $row.in_progress_requests,
-            completed_requests: $row.completed_requests,
-            failed_requests: $row.failed_requests,
-            canceled_requests: $row.canceled_requests,
-        }
-    };
-}
-
 impl PostgresRequestManager<crate::http::ReqwestHttpClient> {
     /// Create a new PostgreSQL request manager with default settings.
     ///
@@ -282,8 +242,8 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         &self,
         winner_id: RequestId,
         completed_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
-        let rows_affected: u64 = sqlx::query!(
+    ) -> Result<Option<RequestId>> {
+        let result = sqlx::query!(
             r#"
             UPDATE requests
             SET
@@ -303,24 +263,31 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 )
                 -- Only supersede if not already in a terminal state
                 AND state NOT IN ('completed', 'failed', 'canceled', 'superseded')
+            RETURNING id
             "#,
             *winner_id as Uuid,
             completed_at,
         )
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to supersede racing pair: {}", e)))?
-        .rows_affected();
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to supersede racing pair: {}", e)))?;
 
-        if rows_affected > 0 {
+        let superseded_id = result.map(|row| RequestId(row.id));
+
+        if superseded_id.is_some() {
             tracing::info!(
                 winner_id = %winner_id,
-                superseded_count = rows_affected,
+                superseded_id = ?superseded_id,
                 "Superseded racing request pair"
+            );
+        } else {
+            tracing::warn!(
+                winner_id = %winner_id,
+                "supersede_racing_pair UPDATE matched 0 rows - racing pair may not exist or already in terminal state"
             );
         }
 
-        Ok(())
+        Ok(superseded_id)
     }
 
     /// Check if a file should be expired and mark it as such.
@@ -825,7 +792,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(all_claimed)
     }
 
-    async fn persist<T: RequestState + Clone>(&self, request: &Request<T>) -> Result<()>
+    async fn persist<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<RequestId>>
     where
         AnyRequest: From<Request<T>>,
     {
@@ -893,6 +863,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         claimed_at = $4,
                         started_at = $5
                     WHERE id = $1
+                      AND superseded_at IS NULL
                     "#,
                     *req.data.id as Uuid,
                     req.state.retry_attempt as i32,
@@ -906,7 +877,28 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 .rows_affected();
 
                 if rows_affected == 0 {
-                    return Err(FusilladeError::RequestNotFound(req.data.id));
+                    // Check if request was superseded
+                    let exists = sqlx::query!(
+                        "SELECT superseded_at IS NOT NULL as \"was_superseded!\" FROM requests WHERE id = $1",
+                        *req.data.id as Uuid
+                    )
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to check request: {}", e)))?;
+
+                    match exists {
+                        Some(row) if row.was_superseded => {
+                            // Request was superseded - this is OK, task was cancelled
+                            tracing::debug!(
+                                request_id = %req.data.id,
+                                "Processing state update skipped - request was superseded"
+                            );
+                            return Ok(None);
+                        }
+                        _ => {
+                            return Err(FusilladeError::RequestNotFound(req.data.id));
+                        }
+                    }
                 }
             }
             AnyRequest::Completed(req) => {
@@ -958,7 +950,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                 request_id = %req.data.id,
                                 "Request completion skipped - already superseded by racing pair"
                             );
-                            return Ok(());
+                            return Ok(None);
                         }
                         Some(_) => {
                             // Request exists but wasn't updated - shouldn't happen
@@ -975,8 +967,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 }
 
                 // If this is part of a race (escalated or original), supersede the racing pair
-                self.supersede_racing_pair(req.data.id, req.state.completed_at)
+                let superseded_id = self
+                    .supersede_racing_pair(req.data.id, req.state.completed_at)
                     .await?;
+                return Ok(superseded_id);
             }
             AnyRequest::Failed(req) => {
                 // Serialize FailureReason as JSON
@@ -1028,7 +1022,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                 request_id = %req.data.id,
                                 "Request failure skipped - already superseded by racing pair"
                             );
-                            return Ok(());
+                            return Ok(None);
                         }
                         Some(_) => {
                             // Request exists but wasn't updated - shouldn't happen
@@ -1088,7 +1082,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 
     async fn get_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<AnyRequest>>> {
@@ -1773,10 +1767,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             )
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE r.state = 'completed') as completed,
-                    COUNT(*) FILTER (WHERE r.state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE r.state = 'canceled') as canceled,
-                    COUNT(*) FILTER (WHERE r.state IN ('claimed', 'processing')) as in_progress
+                    COUNT(*) FILTER (WHERE r.state IN ('completed', 'superseded') AND r.is_escalated = false) as completed,
+                    COUNT(*) FILTER (WHERE r.state = 'failed' AND r.is_escalated = false) as failed,
+                    COUNT(*) FILTER (WHERE r.state = 'canceled' AND r.is_escalated = false) as canceled,
+                    COUNT(*) FILTER (WHERE r.state IN ('claimed', 'processing') AND r.is_escalated = false) as in_progress
                 FROM requests r
                 WHERE r.batch_id = b.id
             ) counts ON (f.purpose IN ('batch_output', 'batch_error'))
@@ -2120,13 +2114,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
-                    COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                    COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
                   AND is_escalated = false  -- Exclude escalated requests from batch accounting
-                  AND state != 'superseded'  -- Exclude superseded requests from batch accounting
             ) counts ON TRUE
             WHERE b.id = $1
             "#,
@@ -2231,13 +2224,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
-                    COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                    COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
                   AND is_escalated = false  -- Exclude escalated requests from batch accounting
-                  AND state != 'superseded'  -- Exclude superseded requests from batch accounting
             ) counts ON TRUE
             WHERE b.id = $1
             "#,
@@ -2292,13 +2284,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         SELECT
                             COUNT(*) FILTER (WHERE state = 'pending') as pending,
                             COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
-                            COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                            COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                             COUNT(*) FILTER (WHERE state = 'failed') as failed,
                             COUNT(*) FILTER (WHERE state = 'canceled') as canceled
                         FROM requests
                         WHERE batch_id = b.id
                           AND is_escalated = false  -- Exclude escalated requests from batch accounting
-                          AND state != 'superseded'  -- Exclude superseded requests from batch accounting
                     ) counts ON TRUE
                     WHERE b.output_file_id = $1
                     "#,
@@ -2333,13 +2324,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         SELECT
                             COUNT(*) FILTER (WHERE state = 'pending') as pending,
                             COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
-                            COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                            COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                             COUNT(*) FILTER (WHERE state = 'failed') as failed,
                             COUNT(*) FILTER (WHERE state = 'canceled') as canceled
                         FROM requests
                         WHERE batch_id = b.id
                           AND is_escalated = false  -- Exclude escalated requests from batch accounting
-                          AND state != 'superseded'  -- Exclude superseded requests from batch accounting
                     ) counts ON TRUE
                     WHERE b.error_file_id = $1
                     "#,
@@ -2402,13 +2392,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
-                    COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                    COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
                   AND is_escalated = false  -- Exclude escalated requests from batch accounting
-                  AND state != 'superseded'  -- Exclude superseded requests from batch accounting
             ) counts ON TRUE
             WHERE ($1::TEXT IS NULL OR b.created_by = $1)
               AND ($3::TIMESTAMPTZ IS NULL OR b.created_at < $3 OR (b.created_at = $3 AND b.id < $4))
@@ -2448,13 +2437,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
-                    COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                    COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
                   AND is_escalated = false  -- Exclude escalated requests from batch accounting
-                  AND state != 'superseded'  -- Exclude superseded requests from batch accounting
             ) counts ON TRUE
             WHERE b.file_id = $1
             ORDER BY b.created_at DESC
@@ -2816,6 +2804,24 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                 "Missing canceled_at for canceled execution"
                             ))
                         })?,
+                    },
+                    data,
+                }),
+                "superseded" => AnyRequest::Superseded(Request {
+                    state: crate::request::types::Superseded {
+                        superseded_at: row.superseded_at.ok_or_else(|| {
+                            FusilladeError::Other(anyhow!(
+                                "Missing superseded_at for superseded execution"
+                            ))
+                        })?,
+                        superseded_by_request_id: RequestId(
+                            row.superseded_by_request_id.ok_or_else(|| {
+                                FusilladeError::Other(anyhow!(
+                                    "Missing superseded_by_request_id for superseded execution"
+                                ))
+                            })?,
+                        ),
+                        was_escalated: row.is_escalated,
                     },
                     data,
                 }),

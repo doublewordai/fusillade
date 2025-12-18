@@ -397,6 +397,19 @@ impl AnyRequest {
         }
     }
 
+    /// Get the request data regardless of state.
+    pub fn data(&self) -> &RequestData {
+        match self {
+            AnyRequest::Pending(r) => &r.data,
+            AnyRequest::Claimed(r) => &r.data,
+            AnyRequest::Processing(r) => &r.data,
+            AnyRequest::Completed(r) => &r.data,
+            AnyRequest::Failed(r) => &r.data,
+            AnyRequest::Canceled(r) => &r.data,
+            AnyRequest::Superseded(r) => &r.data,
+        }
+    }
+
     /// Check if this request is in the Pending state.
     pub fn is_pending(&self) -> bool {
         matches!(self, AnyRequest::Pending(_))
