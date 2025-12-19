@@ -41,6 +41,24 @@ use super::utils::{
     calculate_error_message_size, calculate_response_body_size, estimate_error_file_size,
     estimate_output_file_size,
 };
+
+/// Batch table fields to include as headers in individual requests.
+///
+/// These field values will be fetched from the batches table and sent as
+/// headers in the format `x-fusillade-batch-COLUMN-NAME` with each request.
+///
+/// To customize which batch fields are included:
+/// 1. Add/remove field names from this array (use actual batch table column names)
+/// 2. Update the match statement in claim_requests to handle the new field
+///
+/// The query already fetches all batch fields, so you don't need to modify it.
+///
+/// Example: If this array contains ["created_by", "endpoint"], then requests
+/// will include headers like:
+/// - `x-fusillade-batch-created-by: user@example.com`
+/// - `x-fusillade-batch-endpoint: https://api.example.com`
+const BATCH_METADATA_FIELDS: &[&str] = &["id", "created_by", "endpoint", "completion_window"];
+
 /// PostgreSQL implementation of the Storage and DaemonExecutor traits.
 ///
 /// This manager uses PostgreSQL for persistent storage and runs a daemon for processing requests.
@@ -642,7 +660,20 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     SELECT GREATEST(0, $2::BIGINT - (SELECT count FROM in_progress_count)) as slots
                 ),
                 to_claim AS (
-                    SELECT r.id, r.template_id, r.batch_id
+                    SELECT r.id, r.template_id, r.batch_id,
+                           b.id::TEXT as batch_id_str,
+                           b.file_id::TEXT as batch_file_id,
+                           b.endpoint as batch_endpoint,
+                           b.completion_window as batch_completion_window,
+                           b.metadata::TEXT as batch_metadata,
+                           b.output_file_id::TEXT as batch_output_file_id,
+                           b.error_file_id::TEXT as batch_error_file_id,
+                           COALESCE(b.created_by, '') as batch_created_by,
+                           b.created_at::TEXT as batch_created_at,
+                           b.expires_at::TEXT as batch_expires_at,
+                           b.cancelling_at::TEXT as batch_cancelling_at,
+                           b.errors::TEXT as batch_errors,
+                           b.total_requests::TEXT as batch_total_requests
                     FROM requests r
                     JOIN batches b ON r.batch_id = b.id
                     CROSS JOIN available_slots
@@ -668,7 +699,20 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 RETURNING r.id, r.batch_id, r.template_id as "template_id!", r.retry_attempt,
                           t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
                           t.body as "body!", t.model as "model!", t.api_key as "api_key!",
-                          b.expires_at as batch_expires_at
+                          b.expires_at as batch_expires_at,
+                          tc.batch_id_str as "batch_id_str!",
+                          tc.batch_file_id as "batch_file_id!",
+                          tc.batch_endpoint as "batch_endpoint!",
+                          tc.batch_completion_window as "batch_completion_window!",
+                          tc.batch_metadata as "batch_metadata",
+                          tc.batch_output_file_id as "batch_output_file_id",
+                          tc.batch_error_file_id as "batch_error_file_id",
+                          tc.batch_created_by as "batch_created_by!",
+                          tc.batch_created_at as "batch_created_at!",
+                          tc.batch_expires_at as "batch_expires_at",
+                          tc.batch_cancelling_at as "batch_cancelling_at",
+                          tc.batch_errors as "batch_errors",
+                          tc.batch_total_requests as "batch_total_requests!"
                 "#,
                 *daemon_id as Uuid,
                 model_limit as i64,
@@ -697,25 +741,52 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
                 remaining_limit -= claimed_count;
 
-                all_claimed.extend(rows.into_iter().map(|row| Request {
-                    state: Claimed {
-                        daemon_id,
-                        claimed_at: now,
-                        retry_attempt: row.retry_attempt as u32,
-                        batch_expires_at: row.batch_expires_at,
-                    },
-                    data: RequestData {
-                        id: RequestId(row.id),
-                        batch_id: BatchId(row.batch_id),
-                        template_id: TemplateId(row.template_id),
-                        custom_id: row.custom_id,
-                        endpoint: row.endpoint,
-                        method: row.method,
-                        path: row.path,
-                        body: row.body,
-                        model: row.model,
-                        api_key: row.api_key,
-                    },
+                all_claimed.extend(rows.into_iter().map(|row| {
+                    // Build batch metadata HashMap from specified fields
+                    let mut batch_metadata = std::collections::HashMap::new();
+                    for field_name in BATCH_METADATA_FIELDS {
+                        let value: Option<&str> = match *field_name {
+                            "id" => Some(&row.batch_id_str),
+                            "file_id" => Some(&row.batch_file_id),
+                            "endpoint" => Some(&row.batch_endpoint),
+                            "completion_window" => Some(&row.batch_completion_window),
+                            "metadata" => row.batch_metadata.as_deref(),
+                            "output_file_id" => row.batch_output_file_id.as_deref(),
+                            "error_file_id" => row.batch_error_file_id.as_deref(),
+                            "created_by" => Some(&row.batch_created_by),
+                            "created_at" => Some(&row.batch_created_at),
+                            "expires_at" => row.batch_expires_at.as_deref(),
+                            "cancelling_at" => row.batch_cancelling_at.as_deref(),
+                            "errors" => row.batch_errors.as_deref(),
+                            "total_requests" => Some(&row.batch_total_requests),
+                            _ => None,
+                        };
+                        if let Some(v) = value {
+                            batch_metadata.insert(field_name.to_string(), v.to_string());
+                        }
+                    }
+
+                    Request {
+                        state: Claimed {
+                            daemon_id,
+                            claimed_at: now,
+                            retry_attempt: row.retry_attempt as u32,
+                            batch_expires_at: row.batch_expires_at
+                        },
+                        data: RequestData {
+                            id: RequestId(row.id),
+                            batch_id: BatchId(row.batch_id),
+                            template_id: TemplateId(row.template_id),
+                            custom_id: row.custom_id,
+                            endpoint: row.endpoint,
+                            method: row.method,
+                            path: row.path,
+                            body: row.body,
+                            model: row.model,
+                            api_key: row.api_key,
+                            batch_metadata,
+                        },
+                    }
                 }));
             }
         }
@@ -965,6 +1036,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     body,
                     model,
                     api_key,
+                    batch_metadata: std::collections::HashMap::new(),
                 },
                 _ => {
                     // Template was deleted - cannot reconstruct request
@@ -2376,6 +2448,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                 body,
                                 model,
                                 api_key,
+                                batch_metadata: std::collections::HashMap::new(),
                             },
                             state: Pending {
                                 retry_attempt: row.retry_attempt as u32,
@@ -2562,6 +2635,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     body,
                     model,
                     api_key,
+                    batch_metadata: std::collections::HashMap::new()
                 },
                 _ => {
                     // Template was deleted - skip this request
