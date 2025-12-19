@@ -416,6 +416,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            batch_metadata: std::collections::HashMap::new(),
         };
 
         let response = mock.execute(&request, "test-key", 5000).await.unwrap();
@@ -459,6 +460,7 @@ mod tests {
             body: "".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            batch_metadata: std::collections::HashMap::new(),
         };
 
         let response1 = mock.execute(&request, "key", 5000).await.unwrap();
@@ -485,6 +487,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            batch_metadata: std::collections::HashMap::new(),
         };
 
         let result = mock.execute(&request, "key", 5000).await;
@@ -514,6 +517,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            batch_metadata: std::collections::HashMap::new(),
         };
 
         // Spawn the request execution (it will block waiting for trigger)

@@ -692,7 +692,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                           tc.batch_error_file_id as "batch_error_file_id",
                           tc.batch_created_by as "batch_created_by!",
                           tc.batch_created_at as "batch_created_at!",
-                          tc.batch_expires_at as "batch_expires_at",
+                          tc.batch_expires_at as "batch_expires_at_str",
                           tc.batch_cancelling_at as "batch_cancelling_at",
                           tc.batch_errors as "batch_errors",
                           tc.batch_total_requests as "batch_total_requests!"
@@ -738,7 +738,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             "error_file_id" => row.batch_error_file_id.as_deref(),
                             "created_by" => Some(&row.batch_created_by),
                             "created_at" => Some(&row.batch_created_at),
-                            "expires_at" => row.batch_expires_at.as_deref(),
+                            "expires_at" => row.batch_expires_at_str.as_deref(),
                             "cancelling_at" => row.batch_cancelling_at.as_deref(),
                             "errors" => row.batch_errors.as_deref(),
                             "total_requests" => Some(&row.batch_total_requests),
@@ -2930,12 +2930,12 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                         last_completed_at = row.completed_at;
                         last_id = row.id;
 
-                        let response_body: serde_json::Value = match row.response_body {
-                            Some(body) => match serde_json::from_str(&body) {
+                        let response_body: serde_json::Value = match &row.response_body {
+                            Some(body) => match serde_json::from_str(body) {
                                 Ok(json) => json,
                                 Err(e) => {
                                     tracing::warn!("Failed to parse response body as JSON: {}", e);
-                                    serde_json::Value::String(body)
+                                    serde_json::Value::String(body.to_string())
                                 }
                             },
                             None => serde_json::Value::Null,
@@ -6187,6 +6187,7 @@ mod tests {
             cancellation_poll_interval_ms: 100, // Fast polling for tests
             sla_check_interval_seconds: 60,
             sla_thresholds: vec![], // Disable SLA monitoring in tests
+            batch_metadata_fields: vec![],
         };
 
         let daemon = Arc::new(crate::daemon::Daemon::new(
