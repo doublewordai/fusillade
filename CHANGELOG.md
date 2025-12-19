@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.9.0...fusillade-v0.10.0) (2025-12-19)
+
+
+### Features
+
+* file and batch search ([#39](https://github.com/doublewordai/fusillade/issues/39)) ([8564fac](https://github.com/doublewordai/fusillade/commit/8564facaa483a64dfeac88f3d91c630fa970ca9f))
+
 ## [0.9.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.8.2...fusillade-v0.9.0) (2025-12-18)
 
 
