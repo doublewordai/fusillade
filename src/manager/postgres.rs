@@ -1642,6 +1642,17 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             query_builder.push_bind(purpose);
         }
 
+        if let Some(search) = &filter.search {
+            let search_pattern = format!("%{}%", search.to_lowercase());
+            if has_where {
+                query_builder.push(" AND LOWER(f.name) LIKE ");
+            } else {
+                query_builder.push(" WHERE LOWER(f.name) LIKE ");
+                has_where = true;
+            }
+            query_builder.push_bind(search_pattern);
+        }
+
         // Add cursor-based pagination
         if let (Some(after_id), Some(after_ts)) = (&filter.after, after_created_at) {
             let comparison = if filter.ascending { ">" } else { "<" };
@@ -2199,6 +2210,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     async fn list_batches(
         &self,
         created_by: Option<String>,
+        search: Option<String>,
         after: Option<BatchId>,
         limit: i64,
     ) -> Result<Vec<Batch>> {
@@ -2222,6 +2234,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         };
 
         // Use a single query with optional cursor filtering and on-demand counting
+        // Join with files table to enable searching by input filename
+        let search_pattern = search.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
         let rows = sqlx::query!(
             r#"
             SELECT
@@ -2240,6 +2254,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
                 COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
             FROM batches b
+            LEFT JOIN files f ON b.file_id = f.id
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
@@ -2252,6 +2267,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             ) counts ON TRUE
             WHERE ($1::TEXT IS NULL OR b.created_by = $1)
               AND ($3::TIMESTAMPTZ IS NULL OR b.created_at < $3 OR (b.created_at = $3 AND b.id < $4))
+              AND ($5::TEXT IS NULL OR LOWER(b.metadata::text) LIKE $5 OR LOWER(f.name) LIKE $5)
             ORDER BY b.created_at DESC, b.id DESC
             LIMIT $2
             "#,
@@ -2259,6 +2275,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             limit,
             after_created_at,
             after_id,
+            search_pattern,
         )
         .fetch_all(&self.pool)
         .await
