@@ -100,6 +100,7 @@ pub trait Storage: Send + Sync {
     async fn list_batches(
         &self,
         created_by: Option<String>,
+        search: Option<String>,
         after: Option<BatchId>,
         limit: i64,
     ) -> Result<Vec<Batch>>;
