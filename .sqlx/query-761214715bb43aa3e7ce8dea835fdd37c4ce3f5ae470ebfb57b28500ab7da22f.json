@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id as \"template_id?\", r.state,\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", t.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at\n            FROM requests r\n            LEFT JOIN request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.id = ANY($1)\n            ",
+  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id as \"template_id?\", r.state,\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", t.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at,\n                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id\n            FROM requests r\n            LEFT JOIN request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.id = ANY($1)\n            ",
   "describe": {
     "columns": [
       {
@@ -117,6 +117,26 @@
         "ordinal": 22,
         "name": "batch_expires_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 23,
+        "name": "escalated_from_request_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 24,
+        "name": "is_escalated",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 25,
+        "name": "superseded_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 26,
+        "name": "superseded_by_request_id",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
@@ -147,8 +167,12 @@
       true,
       true,
       true,
-      false
+      false,
+      true,
+      false,
+      true,
+      true
     ]
   },
-  "hash": "a42fcc45f85ed383f9a27c9248d1e0a6ad9fb3b4fcf4613ffd7dab1ee85a4d8d"
+  "hash": "761214715bb43aa3e7ce8dea835fdd37c4ce3f5ae470ebfb57b28500ab7da22f"
 }

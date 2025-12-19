@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
@@ -14,6 +14,27 @@ use uuid::Uuid;
 use crate::batch::{BatchId, TemplateId};
 use crate::error::Result;
 use crate::http::HttpResponse;
+
+/// Database state for filtering and querying requests.
+///
+/// This enum represents the string values stored in the database's `state` column.
+/// It's used for filtering operations like SLA monitoring and escalation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "postgres", derive(sqlx::Type))]
+#[cfg_attr(
+    feature = "postgres",
+    sqlx(type_name = "text", rename_all = "lowercase")
+)]
+pub enum RequestStateFilter {
+    Pending,
+    Claimed,
+    Processing,
+    Completed,
+    Failed,
+    Canceled,
+    Superseded,
+}
 
 /// Marker trait for valid request states.
 ///
@@ -84,6 +105,21 @@ pub struct RequestData {
     /// Batch metadata fields to be sent as headers (x-fusillade-COLUMN-NAME)
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub batch_metadata: std::collections::HashMap<String, String>,
+
+    // Escalation tracking fields for SLA race-based priority routing
+    /// If this is an escalated request, references the original request that was escalated
+    pub escalated_from_request_id: Option<RequestId>,
+
+    /// True if this request was created as an SLA escalation to a priority endpoint
+    /// Escalated requests are infrastructure and not counted in batch progress
+    pub is_escalated: bool,
+
+    /// When this request was superseded by its racing pair completing first
+    /// Superseded requests are terminal and do not count toward batch completion
+    pub superseded_at: Option<DateTime<Utc>>,
+
+    /// Which request (original or escalated) completed first and superseded this one
+    pub superseded_by_request_id: Option<RequestId>,
 }
 
 // ============================================================================
@@ -235,6 +271,25 @@ pub struct Canceled {
 
 impl RequestState for Canceled {}
 
+/// Request was superseded by its racing pair completing first.
+///
+/// This is a terminal state for requests involved in SLA escalation races.
+/// When a request is escalated, both the original and escalated request race
+/// to completion. The first to complete marks the other as superseded.
+#[derive(Debug, Clone, Serialize)]
+pub struct Superseded {
+    /// When this request was superseded
+    pub superseded_at: DateTime<Utc>,
+
+    /// Which request (original or escalated) won the race
+    pub superseded_by_request_id: RequestId,
+
+    /// True if this request was the escalated one, false if it was the original
+    pub was_escalated: bool,
+}
+
+impl RequestState for Superseded {}
+
 /// Unique identifier for a request in the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -316,6 +371,7 @@ pub enum AnyRequest {
     Completed(Request<Completed>),
     Failed(Request<Failed>),
     Canceled(Request<Canceled>),
+    Superseded(Request<Superseded>),
 }
 
 impl AnyRequest {
@@ -328,6 +384,7 @@ impl AnyRequest {
             AnyRequest::Completed(r) => r.data.id,
             AnyRequest::Failed(r) => r.data.id,
             AnyRequest::Canceled(r) => r.data.id,
+            AnyRequest::Superseded(r) => r.data.id,
         }
     }
 
@@ -340,6 +397,20 @@ impl AnyRequest {
             AnyRequest::Completed(_) => "Completed",
             AnyRequest::Failed(_) => "Failed",
             AnyRequest::Canceled(_) => "Canceled",
+            AnyRequest::Superseded(_) => "Superseded",
+        }
+    }
+
+    /// Get the request data regardless of state.
+    pub fn data(&self) -> &RequestData {
+        match self {
+            AnyRequest::Pending(r) => &r.data,
+            AnyRequest::Claimed(r) => &r.data,
+            AnyRequest::Processing(r) => &r.data,
+            AnyRequest::Completed(r) => &r.data,
+            AnyRequest::Failed(r) => &r.data,
+            AnyRequest::Canceled(r) => &r.data,
+            AnyRequest::Superseded(r) => &r.data,
         }
     }
 
@@ -348,11 +419,14 @@ impl AnyRequest {
         matches!(self, AnyRequest::Pending(_))
     }
 
-    /// Check if this request is in a terminal state (Completed, Failed, or Canceled).
+    /// Check if this request is in a terminal state (Completed, Failed, Canceled, or Superseded).
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            AnyRequest::Completed(_) | AnyRequest::Failed(_) | AnyRequest::Canceled(_)
+            AnyRequest::Completed(_)
+                | AnyRequest::Failed(_)
+                | AnyRequest::Canceled(_)
+                | AnyRequest::Superseded(_)
         )
     }
 
@@ -408,5 +482,11 @@ impl From<Request<Failed>> for AnyRequest {
 impl From<Request<Canceled>> for AnyRequest {
     fn from(r: Request<Canceled>) -> Self {
         AnyRequest::Canceled(r)
+    }
+}
+
+impl From<Request<Superseded>> for AnyRequest {
+    fn from(r: Request<Superseded>) -> Self {
+        AnyRequest::Superseded(r)
     }
 }
