@@ -118,6 +118,7 @@ impl HttpClient for ReqwestHttpClient {
         // Add fusillade request ID header for analytics correlation in dwctl
         // Use the full UUID (request.id.0) instead of the Display impl which only shows 8 chars
         req = req.header("X-Fusillade-Request-Id", request.id.0.to_string());
+<<<<<<< Updated upstream
 
         // Add batch metadata as headers (x-fusillade-batch-COLUMN-NAME)
         // This includes id, created_by, endpoint, completion_window, etc.
@@ -126,6 +127,14 @@ impl HttpClient for ReqwestHttpClient {
             let header_name = format!("x-fusillade-batch-{}", key.replace('_', "-"));
             req = req.header(&header_name, value);
         }
+=======
+        // Add custom_id header if present for analytics correlation
+        if let Some(custom_id) = &request.custom_id {
+            req = req.header("X-Fusillade-Custom-Id", custom_id.clone());
+            tracing::trace!(request_id = %request.id, custom_id = %custom_id, "Added X-Fusillade-Custom-Id header");
+        }
+        tracing::trace!(request_id = %request.id, batch_id = %request.batch_id, "Added X-Fusillade-Batch-Id and X-Fusillade-Request-Id headers");
+>>>>>>> Stashed changes
 
         // Only add body and Content-Type for methods that support a body
         let method_upper = request.method.to_uppercase();
