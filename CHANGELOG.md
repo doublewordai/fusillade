@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.10.0...fusillade-v0.11.0) (2025-12-19)
+
+
+### Features
+
+* pass in fields to forward as headers ([#38](https://github.com/doublewordai/fusillade/issues/38)) ([3d1e309](https://github.com/doublewordai/fusillade/commit/3d1e309a986b4c32245bb92f1fcaeefc3fa9311c))
+* Sla escalation ([#34](https://github.com/doublewordai/fusillade/issues/34)) ([6c6b802](https://github.com/doublewordai/fusillade/commit/6c6b802285caa417cc2f169be3e464610be6fa77))
+
 ## [0.10.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.9.0...fusillade-v0.10.0) (2025-12-19)
 
 
