@@ -1052,6 +1052,7 @@ mod tests {
             claim_interval_ms: 10, // Very fast for testing
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            priority_endpoints: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -1217,6 +1218,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits,
+            priority_endpoints: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -1440,6 +1442,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            priority_endpoints: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(5),
             stop_before_deadline_ms: None,
             backoff_ms: 10, // Very fast backoff for testing
@@ -1572,6 +1575,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
+            priority_endpoints: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -1739,6 +1743,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            priority_endpoints: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(10_000),
             stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
             backoff_ms: 50,
@@ -1890,6 +1895,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            priority_endpoints: Arc::new(dashmap::DashMap::new()),
             max_retries: None,             // No retry limit
             stop_before_deadline_ms: None, // No buffer - should retry until deadline
             backoff_ms: 50,
@@ -2041,6 +2047,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            priority_endpoints: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,

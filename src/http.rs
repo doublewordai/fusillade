@@ -590,6 +590,10 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             batch_metadata: batch_metadata.clone(),
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
         };
 
         let response = mock.execute(&request, "test-key", 5000).await.unwrap();
@@ -702,6 +706,10 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-api-key".to_string(),
             batch_metadata,
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
         };
 
         // Use real HTTP client
