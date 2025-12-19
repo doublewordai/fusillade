@@ -80,6 +80,10 @@ pub struct RequestData {
 
     /// API key for authentication (sent in Authorization: Bearer header)
     pub api_key: String,
+
+    /// Batch metadata fields to be sent as headers (x-fusillade-COLUMN-NAME)
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub batch_metadata: std::collections::HashMap<String, String>,
 }
 
 // ============================================================================
