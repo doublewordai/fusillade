@@ -42,23 +42,6 @@ use super::utils::{
     estimate_output_file_size,
 };
 
-/// Batch table fields to include as headers in individual requests.
-///
-/// These field values will be fetched from the batches table and sent as
-/// headers in the format `x-fusillade-batch-COLUMN-NAME` with each request.
-///
-/// To customize which batch fields are included:
-/// 1. Add/remove field names from this array (use actual batch table column names)
-/// 2. Update the match statement in claim_requests to handle the new field
-///
-/// The query already fetches all batch fields, so you don't need to modify it.
-///
-/// Example: If this array contains ["created_by", "endpoint"], then requests
-/// will include headers like:
-/// - `x-fusillade-batch-created-by: user@example.com`
-/// - `x-fusillade-batch-endpoint: https://api.example.com`
-const BATCH_METADATA_FIELDS: &[&str] = &["id", "created_by", "endpoint", "completion_window"];
-
 /// PostgreSQL implementation of the Storage and DaemonExecutor traits.
 ///
 /// This manager uses PostgreSQL for persistent storage and runs a daemon for processing requests.
@@ -742,10 +725,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 remaining_limit -= claimed_count;
 
                 all_claimed.extend(rows.into_iter().map(|row| {
-                    // Build batch metadata HashMap from specified fields
+                    // Build batch metadata HashMap from configured fields
                     let mut batch_metadata = std::collections::HashMap::new();
-                    for field_name in BATCH_METADATA_FIELDS {
-                        let value: Option<&str> = match *field_name {
+                    for field_name in &self.config.batch_metadata_fields {
+                        let value: Option<&str> = match field_name.as_str() {
                             "id" => Some(&row.batch_id_str),
                             "file_id" => Some(&row.batch_file_id),
                             "endpoint" => Some(&row.batch_endpoint),
@@ -762,7 +745,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             _ => None,
                         };
                         if let Some(v) = value {
-                            batch_metadata.insert(field_name.to_string(), v.to_string());
+                            batch_metadata.insert(field_name.clone(), v.to_string());
                         }
                     }
 

@@ -173,6 +173,24 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default)]
     pub sla_thresholds: Vec<SlaThreshold>,
+
+    /// Batch table column names to include as request headers.
+    /// These values are sent as `x-fusillade-batch-{column}` headers with each request.
+    /// Example: ["id", "created_by", "endpoint"] produces headers like:
+    ///   - x-fusillade-batch-id
+    ///   - x-fusillade-batch-created-by
+    ///   - x-fusillade-batch-endpoint
+    #[serde(default = "default_batch_metadata_fields")]
+    pub batch_metadata_fields: Vec<String>,
+}
+
+fn default_batch_metadata_fields() -> Vec<String> {
+    vec![
+        "id".to_string(),
+        "endpoint".to_string(),
+        "created_at".to_string(),
+        "completion_window".to_string(),
+    ]
 }
 
 impl Default for DaemonConfig {
@@ -211,6 +229,7 @@ impl Default for DaemonConfig {
                     },
                 },
             ],
+            batch_metadata_fields: default_batch_metadata_fields(),
         }
     }
 }
