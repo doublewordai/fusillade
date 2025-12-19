@@ -15,7 +15,7 @@ pub mod request;
 
 // Re-export commonly used types
 pub use batch::*;
-pub use daemon::{Daemon, DaemonConfig};
+pub use daemon::{Daemon, DaemonConfig, PriorityEndpointConfig, SlaThreshold};
 pub use error::{FusilladeError, Result};
 pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient};
 pub use manager::postgres::PostgresRequestManager;

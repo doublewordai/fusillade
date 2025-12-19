@@ -10,9 +10,12 @@ use crate::batch::{
 use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::http::HttpClient;
-use crate::request::{AnyRequest, Claimed, DaemonId, Pending, Request, RequestId, RequestState};
+use crate::request::{
+    AnyRequest, Claimed, DaemonId, Request, RequestId, RequestState, RequestStateFilter,
+};
 use async_trait::async_trait;
 use futures::stream::Stream;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -106,7 +109,6 @@ pub trait Storage: Send + Sync {
     ) -> Result<Vec<Batch>>;
 
     /// Get a batch by its output or error file ID.
-    /// Uses indexed lookup on output_file_id or error_file_id.
     async fn get_batch_by_output_file_id(
         &self,
         file_id: FileId,
@@ -116,29 +118,52 @@ pub trait Storage: Send + Sync {
     /// Get all requests for a batch.
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>>;
 
-    /// Find pending requests at risk of missing their batch's SLA deadline.
+    /// Get batches at risk of missing their SLA deadline.
     ///
-    /// Returns pending requests (stuck in queue) where the batch:
-    /// - `expires_at` is set
-    /// - `expires_at < NOW() + threshold_seconds`
-    /// - Not in terminal state (completed/failed/cancelled)
-    ///
-    /// Filters to only `pending` state requests - excludes claimed/processing requests
-    /// that are already being worked on.
-    ///
-    /// Ordered by urgency (soonest batch expiration first).
+    /// Returns a map of batch IDs to the count of requests in that batch
+    /// that are at risk of missing the SLA. Useful for logging SLA violations.
     ///
     /// # Arguments
     /// - `threshold_seconds`: Time remaining threshold (e.g., 3600 for 1 hour)
+    /// - `allowed_states`: List of request states to count
     ///
     /// # Returns
-    /// Vector of `Request<Pending>` that are stuck in queue and at risk
+    /// HashMap mapping BatchId to the count of at-risk requests
+    async fn get_at_risk_batches(
+        &self,
+        threshold_seconds: i64,
+        allowed_states: &[RequestStateFilter],
+    ) -> Result<HashMap<BatchId, usize>>;
+
+    /// Create escalated requests for at-risk requests in a single operation.
     ///
-    /// # Note
-    /// Currently only returns `pending` requests. Should we also include `claimed` or
-    /// `processing` requests that have been stuck for too long? For now, focusing on
-    /// requests stuck in the queue that need escalation/prioritization.
-    async fn find_at_risk_requests(&self, threshold_seconds: i64) -> Result<Vec<Request<Pending>>>;
+    /// Creates escalated copies of all requests matching the criteria.
+    /// Automatically skips requests that already have escalations.
+    ///
+    /// Escalated requests:
+    /// - Have the same template/body as the original (from request_templates)
+    /// - Use the overridden model if provided, otherwise same model as original
+    /// - Are marked with `is_escalated = true` (invisible to batch accounting)
+    /// - Link back to original via `escalated_from_request_id`
+    /// - Priority endpoint routing is handled by the daemon at request processing time
+    ///
+    /// Both requests race through normal queue processing. First to complete wins.
+    ///
+    /// # Arguments
+    /// - `model`: The model to filter requests by (e.g., "gpt-4")
+    /// - `threshold_seconds`: Seconds since batch creation to consider at-risk
+    /// - `allowed_states`: List of request states to escalate
+    /// - `model_override`: Optional model name to use for escalated requests (e.g., "gpt-4-priority")
+    ///
+    /// # Returns
+    /// The number of escalated requests created
+    async fn create_escalated_requests(
+        &self,
+        model: &str,
+        threshold_seconds: i64,
+        allowed_states: &[RequestStateFilter],
+        model_override: Option<&str>,
+    ) -> Result<i64>;
 
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
@@ -204,13 +229,14 @@ pub trait Storage: Send + Sync {
                         req.cancel(self).await?;
                         Ok(())
                     }
-                    AnyRequest::Completed(_) | AnyRequest::Failed(_) | AnyRequest::Canceled(_) => {
-                        Err(crate::error::FusilladeError::InvalidState(
-                            id,
-                            "terminal state".to_string(),
-                            "cancellable state".to_string(),
-                        ))
-                    }
+                    AnyRequest::Completed(_)
+                    | AnyRequest::Failed(_)
+                    | AnyRequest::Canceled(_)
+                    | AnyRequest::Superseded(_) => Err(crate::error::FusilladeError::InvalidState(
+                        id,
+                        "terminal state".to_string(),
+                        "cancellable state".to_string(),
+                    )),
                 },
                 Err(e) => Err(e),
             };
@@ -235,7 +261,12 @@ pub trait Storage: Send + Sync {
     ) -> Result<Vec<Request<Claimed>>>;
 
     /// Update an existing request's state in storage.
-    async fn persist<T: RequestState + Clone>(&self, request: &Request<T>) -> Result<()>
+    ///
+    /// Returns `Some(request_id)` if a racing pair was superseded (for cancellation purposes).
+    async fn persist<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<RequestId>>
     where
         AnyRequest: From<Request<T>>;
 }

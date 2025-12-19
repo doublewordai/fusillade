@@ -122,8 +122,9 @@ impl HttpClient for ReqwestHttpClient {
 
         // Add batch metadata as headers (x-fusillade-batch-COLUMN-NAME)
         // This includes id, created_by, endpoint, completion_window, etc.
+        // Convert underscores to hyphens for standard HTTP header naming
         for (key, value) in &request.batch_metadata {
-            let header_name = format!("x-fusillade-batch-{}", key);
+            let header_name = format!("x-fusillade-batch-{}", key.replace('_', "-"));
             req = req.header(&header_name, value);
             tracing::trace!(request_id = %request.id, header = %header_name, "Added batch metadata header");
         }
@@ -223,6 +224,7 @@ pub struct MockCall {
     pub body: String,
     pub api_key: String,
     pub timeout_ms: u64,
+    pub batch_metadata: std::collections::HashMap<String, String>,
 }
 
 impl MockHttpClient {
@@ -332,6 +334,7 @@ impl HttpClient for MockHttpClient {
             body: request.body.clone(),
             api_key: api_key.to_string(),
             timeout_ms,
+            batch_metadata: request.batch_metadata.clone(),
         });
 
         // Look up the response
@@ -416,6 +419,10 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -460,6 +467,10 @@ mod tests {
             body: "".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -487,6 +498,10 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -517,6 +532,10 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -537,5 +556,170 @@ mod tests {
         let response = handle.await.unwrap().unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, "triggered");
+    }
+
+    #[tokio::test]
+    async fn test_mock_client_records_batch_metadata() {
+        let mock = MockHttpClient::new();
+        mock.add_response(
+            "POST /test",
+            Ok(HttpResponse {
+                status: 200,
+                body: "success".to_string(),
+            }),
+        );
+
+        let mut batch_metadata = std::collections::HashMap::new();
+        batch_metadata.insert("id".to_string(), "batch-123".to_string());
+        batch_metadata.insert(
+            "endpoint".to_string(),
+            "https://api.example.com".to_string(),
+        );
+        batch_metadata.insert("created_at".to_string(), "2025-12-19T12:00:00Z".to_string());
+        batch_metadata.insert("completion_window".to_string(), "2s".to_string());
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            body: r#"{"key":"value"}"#.to_string(),
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            batch_metadata: batch_metadata.clone(),
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
+        };
+
+        let response = mock.execute(&request, "test-key", 5000).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "success");
+
+        // Verify batch metadata was recorded
+        let calls = mock.get_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].batch_metadata.len(), 4);
+        assert_eq!(
+            calls[0].batch_metadata.get("id"),
+            Some(&"batch-123".to_string())
+        );
+        assert_eq!(
+            calls[0].batch_metadata.get("endpoint"),
+            Some(&"https://api.example.com".to_string())
+        );
+        assert_eq!(
+            calls[0].batch_metadata.get("created_at"),
+            Some(&"2025-12-19T12:00:00Z".to_string())
+        );
+        assert_eq!(
+            calls[0].batch_metadata.get("completion_window"),
+            Some(&"2s".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reqwest_client_sets_batch_metadata_headers() {
+        use axum::{Router, extract::Request, http::StatusCode, routing::post};
+
+        // Create a test server that captures headers
+        let app = Router::new().route(
+            "/test",
+            post(|request: Request| async move {
+                let headers = request.headers();
+
+                // Verify batch metadata headers are present and correct
+                assert_eq!(
+                    headers
+                        .get("x-fusillade-batch-id")
+                        .and_then(|h| h.to_str().ok()),
+                    Some("batch-456"),
+                    "Missing or incorrect x-fusillade-batch-id header"
+                );
+                assert_eq!(
+                    headers
+                        .get("x-fusillade-batch-endpoint")
+                        .and_then(|h| h.to_str().ok()),
+                    Some("/v1/completions"),
+                    "Missing or incorrect x-fusillade-batch-endpoint header"
+                );
+                assert_eq!(
+                    headers
+                        .get("x-fusillade-batch-created-at")
+                        .and_then(|h| h.to_str().ok()),
+                    Some("2025-12-19T13:00:00Z"),
+                    "Missing or incorrect x-fusillade-batch-created-at header"
+                );
+                assert_eq!(
+                    headers
+                        .get("x-fusillade-batch-completion-window")
+                        .and_then(|h| h.to_str().ok()),
+                    Some("24h"),
+                    "Missing or incorrect x-fusillade-batch-completion-window header"
+                );
+
+                // Also verify standard headers
+                assert_eq!(
+                    headers.get("authorization").and_then(|h| h.to_str().ok()),
+                    Some("Bearer test-api-key"),
+                    "Missing or incorrect authorization header"
+                );
+                assert!(
+                    headers.get("x-fusillade-request-id").is_some(),
+                    "Missing x-fusillade-request-id header"
+                );
+
+                (StatusCode::OK, r#"{"result":"ok"}"#)
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Give server time to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Create request with batch metadata
+        let mut batch_metadata = std::collections::HashMap::new();
+        batch_metadata.insert("id".to_string(), "batch-456".to_string());
+        batch_metadata.insert("endpoint".to_string(), "/v1/completions".to_string());
+        batch_metadata.insert("created_at".to_string(), "2025-12-19T13:00:00Z".to_string());
+        batch_metadata.insert("completion_window".to_string(), "24h".to_string());
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: format!("http://{}", addr),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            body: r#"{"prompt":"test"}"#.to_string(),
+            model: "test-model".to_string(),
+            api_key: "test-api-key".to_string(),
+            batch_metadata,
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
+        };
+
+        // Use real HTTP client
+        let client = ReqwestHttpClient::new();
+        let response = client
+            .execute(&request, "test-api-key", 5000)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, r#"{"result":"ok"}"#);
     }
 }
