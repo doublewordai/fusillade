@@ -754,7 +754,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             daemon_id,
                             claimed_at: now,
                             retry_attempt: row.retry_attempt as u32,
-                            batch_expires_at: row.batch_expires_at
+                            batch_expires_at: row.batch_expires_at,
                         },
                         data: RequestData {
                             id: RequestId(row.id),
@@ -2618,7 +2618,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     body,
                     model,
                     api_key,
-                    batch_metadata: std::collections::HashMap::new()
+                    batch_metadata: std::collections::HashMap::new(),
                 },
                 _ => {
                     // Template was deleted - skip this request
