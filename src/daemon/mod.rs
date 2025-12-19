@@ -790,6 +790,37 @@ where
                                             modified_data.api_key = api_key_override.clone();
                                         }
 
+                                        // Apply model override to request body if specified
+                                        if let Some(model_override) = &priority_config.model_override {
+                                            match serde_json::from_str::<serde_json::Value>(&modified_data.body) {
+                                                Ok(mut body_json) => {
+                                                    if let Some(obj) = body_json.as_object_mut() {
+                                                        obj.insert("model".to_string(), serde_json::Value::String(model_override.clone()));
+                                                        modified_data.body = serde_json::to_string(&body_json)
+                                                            .unwrap_or_else(|_| modified_data.body.clone());
+                                                        tracing::debug!(
+                                                            request_id = %request_id,
+                                                            original_model = %model_clone,
+                                                            override_model = %model_override,
+                                                            "Applied model override to request body"
+                                                        );
+                                                    } else {
+                                                        tracing::warn!(
+                                                            request_id = %request_id,
+                                                            "Request body is not a JSON object, cannot apply model override"
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        request_id = %request_id,
+                                                        error = %e,
+                                                        "Failed to parse request body as JSON, cannot apply model override"
+                                                    );
+                                                }
+                                            }
+                                        }
+
                                         tracing::info!(
                                             request_id = %request_id,
                                             original_endpoint = %request.data.endpoint,

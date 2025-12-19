@@ -2426,12 +2426,15 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
         "Original should have gpt-4 model"
     );
 
-    // Verify: Escalated has overridden model
+    // Verify: Escalated keeps original model in DB (override applied at runtime)
     assert_eq!(
         escalated.data().model,
-        "gpt-4-priority",
-        "Escalated should have gpt-4-priority model from override"
+        "gpt-4",
+        "Escalated should keep original model in DB (override applied at runtime)"
     );
+
+    // Wait a bit for both requests to be processed
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     shutdown_token.cancel();
 
@@ -2441,4 +2444,49 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
         .await
         .expect("Failed to get batch status");
     assert_eq!(batch_status.total_requests, 1);
+
+    // CRITICAL: Verify the actual HTTP requests sent to mock client
+    let calls = http_client.get_calls();
+    println!("\n=== HTTP CALLS MADE ===");
+    for (i, call) in calls.iter().enumerate() {
+        println!(
+            "Call {}: {} {} - Body: {}",
+            i, call.method, call.path, call.body
+        );
+    }
+    println!("======================\n");
+
+    // Find calls to each endpoint
+    let original_calls: Vec<_> = calls.iter().filter(|c| c.path == "/v1/test").collect();
+    let escalated_calls: Vec<_> = calls
+        .iter()
+        .filter(|c| c.path == "/priority/test")
+        .collect();
+
+    assert_eq!(
+        original_calls.len(),
+        1,
+        "Should have 1 call to original endpoint"
+    );
+    assert_eq!(
+        escalated_calls.len(),
+        1,
+        "Should have 1 call to escalated endpoint"
+    );
+
+    // Verify the original request body has gpt-4
+    assert!(
+        original_calls[0].body.contains(r#""model":"gpt-4""#),
+        "Original request should contain model gpt-4 in body: {}",
+        original_calls[0].body
+    );
+
+    // Verify the escalated request body has gpt-4-priority (model override applied)
+    assert!(
+        escalated_calls[0]
+            .body
+            .contains(r#""model":"gpt-4-priority""#),
+        "Escalated request should contain model override gpt-4-priority in body: {}",
+        escalated_calls[0].body
+    );
 }

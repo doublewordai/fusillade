@@ -2583,7 +2583,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         model: &str,
         threshold_seconds: i64,
         allowed_states: &[RequestStateFilter],
-        model_override: Option<&str>,
+        _model_override: Option<&str>,
     ) -> Result<i64> {
         let rows_affected = sqlx::query!(
             r#"
@@ -2598,7 +2598,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 'pending',
                 t.custom_id,
                 r.retry_attempt,
-                CASE WHEN $4::text IS NOT NULL THEN $4::text ELSE r.model END,
+                r.model,     -- Keep original model for hashmap lookup at runtime
                 r.id,        -- Link back to original request
                 true,        -- is_escalated = true
                 NULL,
@@ -2626,7 +2626,6 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             model,
             allowed_states as &[RequestStateFilter],
             threshold_seconds as f64,
-            model_override,
         )
         .execute(&self.pool)
         .await
@@ -8618,11 +8617,181 @@ mod tests {
             .find(|r| r.data().is_escalated)
             .expect("Should find escalated request");
 
-        // Verify model was overridden
+        // Verify model was NOT overridden in DB (keeps original for hashmap lookup)
         assert_eq!(
             escalated.data().model,
-            "gpt-4-priority",
-            "Escalated request should have overridden model"
+            "gpt-4",
+            "Escalated request should keep original model in DB (override applied at runtime)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_create_escalated_requests_with_null_template_id(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a batch with a request template
+        let file_id = manager
+            .create_file(
+                "null-template-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("test".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Get the request and its template_id
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let request_id = requests[0].id();
+
+        // Delete the request template to simulate template deletion
+        // This should set template_id to NULL due to ON DELETE SET NULL
+        sqlx::query!(
+            "DELETE FROM request_templates WHERE id = (SELECT template_id FROM requests WHERE id = $1)",
+            *request_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Verify template_id is now NULL
+        let template_id: Option<Uuid> = sqlx::query_scalar!(
+            "SELECT template_id FROM requests WHERE id = $1",
+            *request_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            template_id.is_none(),
+            "template_id should be NULL after template deletion"
+        );
+
+        // Backdate batch to make it at-risk
+        sqlx::query!(
+            r#"UPDATE batches SET created_at = NOW() - INTERVAL '2 hours', expires_at = NOW() + INTERVAL '22 hours' WHERE id = $1"#,
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Try to create escalated requests
+        let count = manager
+            .create_escalated_requests("gpt-4", 3600, &[RequestStateFilter::Pending], None)
+            .await
+            .unwrap();
+
+        // The request with NULL template_id should be excluded from escalation
+        // because of the INNER JOIN with request_templates
+        assert_eq!(
+            count, 0,
+            "Should NOT create escalated requests for requests with NULL template_id"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_model_override_should_not_persist_in_db(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a batch with one request
+        let file_id = manager
+            .create_file(
+                "model-persist-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("test".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Backdate batch to make it at-risk
+        sqlx::query!(
+            r#"UPDATE batches SET created_at = NOW() - INTERVAL '2 hours', expires_at = NOW() + INTERVAL '22 hours' WHERE id = $1"#,
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create escalated requests WITH model override
+        let count = manager
+            .create_escalated_requests(
+                "gpt-4",
+                3600,
+                &[RequestStateFilter::Pending],
+                Some("gpt-4-priority"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1, "Should create 1 escalated request");
+
+        // Get all requests
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "Should have 2 requests (original + escalated)"
+        );
+
+        // Find the escalated request
+        let escalated = requests
+            .iter()
+            .find(|r| r.data().is_escalated)
+            .expect("Should find escalated request");
+
+        // The model should NOT be overridden in the database
+        // It should keep the original model name for hashmap lookup at runtime
+        assert_eq!(
+            escalated.data().model,
+            "gpt-4",
+            "Escalated request should keep original model in DB, not the override"
+        );
+
+        // Verify it still links to the original request
+        assert!(
+            escalated.data().escalated_from_request_id.is_some(),
+            "Should link to original request"
         );
     }
 
