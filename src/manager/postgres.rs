@@ -665,7 +665,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         // Randomize model order to prevent starvation when hitting global limit
         {
             use rand::seq::SliceRandom;
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             models.shuffle(&mut rng);
         } // Drop rng before async operations
 
