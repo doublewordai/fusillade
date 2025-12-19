@@ -42,6 +42,7 @@ use super::utils::{
     calculate_error_message_size, calculate_response_body_size, estimate_error_file_size,
     estimate_output_file_size,
 };
+
 /// PostgreSQL implementation of the Storage and DaemonExecutor traits.
 ///
 /// This manager uses PostgreSQL for persistent storage and runs a daemon for processing requests.
@@ -703,7 +704,20 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     SELECT GREATEST(0, $2::BIGINT - (SELECT count FROM in_progress_count)) as slots
                 ),
                 to_claim AS (
-                    SELECT r.id, r.template_id, r.batch_id
+                    SELECT r.id, r.template_id, r.batch_id,
+                           b.id::TEXT as batch_id_str,
+                           b.file_id::TEXT as batch_file_id,
+                           b.endpoint as batch_endpoint,
+                           b.completion_window as batch_completion_window,
+                           b.metadata::TEXT as batch_metadata,
+                           b.output_file_id::TEXT as batch_output_file_id,
+                           b.error_file_id::TEXT as batch_error_file_id,
+                           COALESCE(b.created_by, '') as batch_created_by,
+                           b.created_at::TEXT as batch_created_at,
+                           b.expires_at::TEXT as batch_expires_at,
+                           b.cancelling_at::TEXT as batch_cancelling_at,
+                           b.errors::TEXT as batch_errors,
+                           b.total_requests::TEXT as batch_total_requests
                     FROM requests r
                     JOIN batches b ON r.batch_id = b.id
                     CROSS JOIN available_slots
@@ -730,7 +744,20 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                           t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
                           r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,
                           t.body as "body!", t.model as "model!", t.api_key as "api_key!",
-                          b.expires_at as batch_expires_at
+                          b.expires_at as batch_expires_at,
+                          tc.batch_id_str as "batch_id_str!",
+                          tc.batch_file_id as "batch_file_id!",
+                          tc.batch_endpoint as "batch_endpoint!",
+                          tc.batch_completion_window as "batch_completion_window!",
+                          tc.batch_metadata as "batch_metadata",
+                          tc.batch_output_file_id as "batch_output_file_id",
+                          tc.batch_error_file_id as "batch_error_file_id",
+                          tc.batch_created_by as "batch_created_by!",
+                          tc.batch_created_at as "batch_created_at!",
+                          tc.batch_expires_at as "batch_expires_at_str",
+                          tc.batch_cancelling_at as "batch_cancelling_at",
+                          tc.batch_errors as "batch_errors",
+                          tc.batch_total_requests as "batch_total_requests!"
                 "#,
                 *daemon_id as Uuid,
                 model_limit as i64,
@@ -759,29 +786,56 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
                 remaining_limit -= claimed_count;
 
-                all_claimed.extend(rows.into_iter().map(|row| Request {
-                    state: Claimed {
-                        daemon_id,
-                        claimed_at: now,
-                        retry_attempt: row.retry_attempt as u32,
-                        batch_expires_at: row.batch_expires_at,
-                    },
-                    data: RequestData {
-                        id: RequestId(row.id),
-                        batch_id: BatchId(row.batch_id),
-                        template_id: TemplateId(row.template_id),
-                        custom_id: row.custom_id,
-                        endpoint: row.endpoint,
-                        method: row.method,
-                        path: row.path,
-                        body: row.body,
-                        model: row.model,
-                        api_key: row.api_key,
-                        escalated_from_request_id: row.escalated_from_request_id.map(RequestId),
-                        is_escalated: row.is_escalated,
-                        superseded_at: row.superseded_at,
-                        superseded_by_request_id: row.superseded_by_request_id.map(RequestId),
-                    },
+                all_claimed.extend(rows.into_iter().map(|row| {
+                    // Build batch metadata HashMap from configured fields
+                    let mut batch_metadata = std::collections::HashMap::new();
+                    for field_name in &self.config.batch_metadata_fields {
+                        let value: Option<&str> = match field_name.as_str() {
+                            "id" => Some(&row.batch_id_str),
+                            "file_id" => Some(&row.batch_file_id),
+                            "endpoint" => Some(&row.batch_endpoint),
+                            "completion_window" => Some(&row.batch_completion_window),
+                            "metadata" => row.batch_metadata.as_deref(),
+                            "output_file_id" => row.batch_output_file_id.as_deref(),
+                            "error_file_id" => row.batch_error_file_id.as_deref(),
+                            "created_by" => Some(&row.batch_created_by),
+                            "created_at" => Some(&row.batch_created_at),
+                            "expires_at" => row.batch_expires_at_str.as_deref(),
+                            "cancelling_at" => row.batch_cancelling_at.as_deref(),
+                            "errors" => row.batch_errors.as_deref(),
+                            "total_requests" => Some(&row.batch_total_requests),
+                            _ => None,
+                        };
+                        if let Some(v) = value {
+                            batch_metadata.insert(field_name.clone(), v.to_string());
+                        }
+                    }
+
+                    Request {
+                        state: Claimed {
+                            daemon_id,
+                            claimed_at: now,
+                            retry_attempt: row.retry_attempt as u32,
+                            batch_expires_at: row.batch_expires_at,
+                        },
+                        data: RequestData {
+                            id: RequestId(row.id),
+                            batch_id: BatchId(row.batch_id),
+                            template_id: TemplateId(row.template_id),
+                            custom_id: row.custom_id,
+                            endpoint: row.endpoint,
+                            method: row.method,
+                            path: row.path,
+                            body: row.body,
+                            model: row.model,
+                            api_key: row.api_key,
+                            batch_metadata,
+                            escalated_from_request_id: row.escalated_from_request_id.map(RequestId),
+                            is_escalated: row.is_escalated,
+                            superseded_at: row.superseded_at,
+                            superseded_by_request_id: row.superseded_by_request_id.map(RequestId),
+                        },
+                    }
                 }));
             }
         }
@@ -1147,6 +1201,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     body,
                     model,
                     api_key,
+                    batch_metadata: std::collections::HashMap::new(),
                     escalated_from_request_id: row.escalated_from_request_id.map(RequestId),
                     is_escalated: row.is_escalated,
                     superseded_at: row.superseded_at,
@@ -1846,6 +1901,17 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             query_builder.push_bind(purpose);
         }
 
+        if let Some(search) = &filter.search {
+            let search_pattern = format!("%{}%", search.to_lowercase());
+            if has_where {
+                query_builder.push(" AND LOWER(f.name) LIKE ");
+            } else {
+                query_builder.push(" WHERE LOWER(f.name) LIKE ");
+                has_where = true;
+            }
+            query_builder.push_bind(search_pattern);
+        }
+
         // Add cursor-based pagination
         if let (Some(after_id), Some(after_ts)) = (&filter.after, after_created_at) {
             let comparison = if filter.ascending { ">" } else { "<" };
@@ -2407,6 +2473,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     async fn list_batches(
         &self,
         created_by: Option<String>,
+        search: Option<String>,
         after: Option<BatchId>,
         limit: i64,
     ) -> Result<Vec<Batch>> {
@@ -2430,6 +2497,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         };
 
         // Use a single query with optional cursor filtering and on-demand counting
+        // Join with files table to enable searching by input filename
+        let search_pattern = search.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
         let rows = sqlx::query!(
             r#"
             SELECT
@@ -2448,6 +2517,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
                 COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
             FROM batches b
+            LEFT JOIN files f ON b.file_id = f.id
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
@@ -2461,6 +2531,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             ) counts ON TRUE
             WHERE ($1::TEXT IS NULL OR b.created_by = $1)
               AND ($3::TIMESTAMPTZ IS NULL OR b.created_at < $3 OR (b.created_at = $3 AND b.id < $4))
+              AND ($5::TEXT IS NULL OR LOWER(b.metadata::text) LIKE $5 OR LOWER(f.name) LIKE $5)
             ORDER BY b.created_at DESC, b.id DESC
             LIMIT $2
             "#,
@@ -2468,6 +2539,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             limit,
             after_created_at,
             after_id,
+            search_pattern,
         )
         .fetch_all(&self.pool)
         .await
@@ -2804,6 +2876,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     body,
                     model,
                     api_key,
+                    batch_metadata: std::collections::HashMap::new(),
                     escalated_from_request_id: row.escalated_from_request_id.map(RequestId),
                     is_escalated: row.is_escalated,
                     superseded_at: row.superseded_at,
@@ -3137,12 +3210,12 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                         last_completed_at = row.completed_at;
                         last_id = row.id;
 
-                        let response_body: serde_json::Value = match row.response_body {
-                            Some(body) => match serde_json::from_str(&body) {
+                        let response_body: serde_json::Value = match &row.response_body {
+                            Some(body) => match serde_json::from_str(body) {
                                 Ok(json) => json,
                                 Err(e) => {
                                     tracing::warn!("Failed to parse response body as JSON: {}", e);
-                                    serde_json::Value::String(body)
+                                    serde_json::Value::String(body.to_string())
                                 }
                             },
                             None => serde_json::Value::Null,

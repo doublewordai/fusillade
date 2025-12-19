@@ -305,6 +305,8 @@ pub struct FileFilter {
     pub status: Option<String>,
     /// Filter by purpose
     pub purpose: Option<String>,
+    /// Search query for filename (case-insensitive substring match)
+    pub search: Option<String>,
     /// Cursor for pagination (file ID to start after)
     pub after: Option<FileId>,
     /// Maximum number of results to return

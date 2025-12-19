@@ -102,6 +102,10 @@ pub struct RequestData {
     /// API key for authentication (sent in Authorization: Bearer header)
     pub api_key: String,
 
+    /// Batch metadata fields to be sent as headers (x-fusillade-COLUMN-NAME)
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub batch_metadata: std::collections::HashMap<String, String>,
+
     // Escalation tracking fields for SLA race-based priority routing
     /// If this is an escalated request, references the original request that was escalated
     pub escalated_from_request_id: Option<RequestId>,
