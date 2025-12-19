@@ -262,12 +262,11 @@ impl Request<Failed> {
     /// The retry logic considers:
     /// - max_retries: Hard cap on total retry attempts
     /// - stop_before_deadline_ms: Deadline-aware retry (stops before batch expiration)
-    pub async fn retry<S: Storage + ?Sized>(
+    pub fn can_retry(
         self,
         retry_attempt: u32,
         config: RetryConfig,
-        storage: &S,
-    ) -> Result<Option<Request<Pending>>> {
+    ) -> std::result::Result<Request<Pending>, Self> {
         // Calculate exponential backoff: backoff_ms * (backoff_factor ^ retry_attempt)
         let backoff_duration = {
             let exponential = config
@@ -288,7 +287,7 @@ impl Request<Failed> {
                 max_retries,
                 "No retries remaining (reached max_retries), request remains failed"
             );
-            return Ok(None);
+            return Err(self);
         }
 
         // Determine the effective deadline (with or without buffer)
@@ -312,7 +311,7 @@ impl Request<Failed> {
                 stop_before_deadline_ms = config.stop_before_deadline_ms,
                 "No retries remaining (would exceed batch deadline), request remains failed"
             );
-            return Ok(None);
+            return Err(self);
         }
 
         let time_until_deadline = effective_deadline - now;
@@ -342,8 +341,7 @@ impl Request<Failed> {
             },
         };
 
-        storage.persist(&request).await?;
-        Ok(Some(request))
+        Ok(request)
     }
 }
 
@@ -434,7 +432,6 @@ impl Request<Processing> {
                         data: self.data,
                         state: failed_state,
                     };
-                    storage.persist(&request).await?;
                     Ok(RequestCompletionResult::Failed(request))
                 } else if is_error {
                     // Non-retriable error (e.g., 4xx client errors)
