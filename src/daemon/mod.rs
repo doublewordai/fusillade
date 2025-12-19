@@ -728,7 +728,7 @@ where
                                                 }
                                                 Err(failed) => {
                                                     // No retries left - persist as Failed (terminal)
-                                                    storage.persist(&failed).await?;
+                                                    storage.persist(&*failed).await?;
                                                     requests_failed.fetch_add(1, Ordering::Relaxed);
                                                     tracing::warn!(
                                                         request_id = %request_id,

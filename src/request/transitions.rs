@@ -266,7 +266,7 @@ impl Request<Failed> {
         self,
         retry_attempt: u32,
         config: RetryConfig,
-    ) -> std::result::Result<Request<Pending>, Self> {
+    ) -> std::result::Result<Request<Pending>, Box<Self>> {
         // Calculate exponential backoff: backoff_ms * (backoff_factor ^ retry_attempt)
         let backoff_duration = {
             let exponential = config
@@ -287,7 +287,7 @@ impl Request<Failed> {
                 max_retries,
                 "No retries remaining (reached max_retries), request remains failed"
             );
-            return Err(self);
+            return Err(Box::new(self));
         }
 
         // Determine the effective deadline (with or without buffer)
@@ -311,7 +311,7 @@ impl Request<Failed> {
                 stop_before_deadline_ms = config.stop_before_deadline_ms,
                 "No retries remaining (would exceed batch deadline), request remains failed"
             );
-            return Err(self);
+            return Err(Box::new(self));
         }
 
         let time_until_deadline = effective_deadline - now;
