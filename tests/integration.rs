@@ -1064,6 +1064,7 @@ mod sla {
             }],
             priority_endpoints,
             stop_before_deadline_ms: None,
+            batch_metadata_fields: vec![],
         };
 
         let manager = Arc::new(
@@ -1378,6 +1379,7 @@ mod sla {
             }],
             priority_endpoints,
             stop_before_deadline_ms: None,
+            batch_metadata_fields: vec![],
         };
 
         let manager = Arc::new(
@@ -1543,6 +1545,7 @@ mod sla {
             }],
             priority_endpoints,
             stop_before_deadline_ms: None,
+            batch_metadata_fields: vec![],
         };
 
         let manager = Arc::new(
@@ -1732,6 +1735,7 @@ mod sla {
             }],
             priority_endpoints,
             stop_before_deadline_ms: None,
+            batch_metadata_fields: vec![],
         };
 
         let manager = Arc::new(
@@ -1901,6 +1905,7 @@ mod sla {
             }],
             priority_endpoints,
             stop_before_deadline_ms: None,
+            batch_metadata_fields: vec![],
         };
 
         let manager = Arc::new(
@@ -2142,6 +2147,7 @@ mod sla {
             }],
             priority_endpoints,
             stop_before_deadline_ms: None,
+            batch_metadata_fields: vec![],
         };
 
         let manager = Arc::new(
@@ -2348,6 +2354,7 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
         }],
         priority_endpoints,
         stop_before_deadline_ms: None,
+        batch_metadata_fields: vec![],
     };
 
     let manager = Arc::new(
