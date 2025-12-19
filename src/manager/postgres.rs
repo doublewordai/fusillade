@@ -4809,7 +4809,7 @@ mod tests {
         .expect("Failed to mark request as failed");
 
         // Stream the output file - should contain 2 completed requests
-        let output_stream = manager.get_file_content_stream(output_file_id, 0);
+        let output_stream = manager.get_file_content_stream(output_file_id, 0, None);
         let output_items: Vec<_> = output_stream.collect().await;
 
         assert_eq!(output_items.len(), 2, "Should have 2 output items");
@@ -4843,7 +4843,7 @@ mod tests {
         );
 
         // Stream the error file - should contain 1 failed request
-        let error_stream = manager.get_file_content_stream(error_file_id, 0);
+        let error_stream = manager.get_file_content_stream(error_file_id, 0, None);
         let error_items: Vec<_> = error_stream.collect().await;
 
         assert_eq!(error_items.len(), 1, "Should have 1 error item");
@@ -4863,7 +4863,7 @@ mod tests {
         }
 
         // Verify that streaming a regular input file still works
-        let input_stream = manager.get_file_content_stream(file_id, 0);
+        let input_stream = manager.get_file_content_stream(file_id, 0, None);
         let input_items: Vec<_> = input_stream.collect().await;
 
         assert_eq!(input_items.len(), 3, "Input file should have 3 templates");
