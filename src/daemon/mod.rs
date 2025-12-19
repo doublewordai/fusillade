@@ -74,6 +74,11 @@ pub struct PriorityEndpointConfig {
 
     /// Optional override for path (if None, uses original request's path)
     pub path_override: Option<String>,
+
+    /// Optional override for model name (if None, uses original request's model)
+    /// This allows routing to different model tiers for priority endpoints
+    /// (e.g., "gpt-4" -> "gpt-4-priority")
+    pub model_override: Option<String>,
 }
 
 /// Action to take when a batch crosses an SLA threshold.
@@ -617,6 +622,7 @@ where
                                                         model,
                                                         threshold.threshold_seconds,
                                                         &threshold.allowed_states,
+                                                        priority_config.model_override.as_deref(),
                                                     )
                                                     .await
                                                 {

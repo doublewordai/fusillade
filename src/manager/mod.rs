@@ -140,7 +140,8 @@ pub trait Storage: Send + Sync {
     /// Automatically skips requests that already have escalations.
     ///
     /// Escalated requests:
-    /// - Have the same template/body/model as the original (from request_templates)
+    /// - Have the same template/body as the original (from request_templates)
+    /// - Use the overridden model if provided, otherwise same model as original
     /// - Are marked with `is_escalated = true` (invisible to batch accounting)
     /// - Link back to original via `escalated_from_request_id`
     /// - Priority endpoint routing is handled by the daemon at request processing time
@@ -151,6 +152,7 @@ pub trait Storage: Send + Sync {
     /// - `model`: The model to filter requests by (e.g., "gpt-4")
     /// - `threshold_seconds`: Seconds since batch creation to consider at-risk
     /// - `allowed_states`: List of request states to escalate
+    /// - `model_override`: Optional model name to use for escalated requests (e.g., "gpt-4-priority")
     ///
     /// # Returns
     /// The number of escalated requests created
@@ -159,6 +161,7 @@ pub trait Storage: Send + Sync {
         model: &str,
         threshold_seconds: i64,
         allowed_states: &[RequestStateFilter],
+        model_override: Option<&str>,
     ) -> Result<i64>;
 
     /// Cancel all pending/in-progress requests for a batch.

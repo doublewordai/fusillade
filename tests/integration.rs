@@ -1035,6 +1035,7 @@ mod sla {
                 endpoint: "https://priority.openai.com".to_string(),
                 api_key: None, // Use original API key
                 path_override: Some("/priority/test".to_string()),
+                model_override: None,
             },
         );
 
@@ -1513,6 +1514,7 @@ mod sla {
                 endpoint: "https://priority.openai.com".to_string(),
                 api_key: None,
                 path_override: Some("/priority/test".to_string()),
+                model_override: None,
             },
         );
 
@@ -1701,6 +1703,7 @@ mod sla {
                 endpoint: "https://priority.openai.com".to_string(),
                 api_key: None,
                 path_override: Some("/priority/test".to_string()),
+                model_override: None,
             },
         );
 
@@ -1869,6 +1872,7 @@ mod sla {
                 endpoint: "https://priority.openai.com".to_string(),
                 api_key: None,
                 path_override: Some("/priority/test".to_string()),
+                model_override: None,
             },
         );
 
@@ -2109,6 +2113,7 @@ mod sla {
                 endpoint: "https://priority.openai.com".to_string(),
                 api_key: None,
                 path_override: Some("/priority/test".to_string()),
+                model_override: None,
             },
         );
 
@@ -2281,4 +2286,159 @@ mod sla {
             "Should have 3 superseded (losers of each race)"
         );
     }
+}
+
+#[sqlx::test]
+async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
+    // Test: Model override changes the escalated request's model
+    // Expected: Escalated request has the overridden model name
+    let http_client = Arc::new(MockHttpClient::new());
+
+    // Response for original model
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"result":"success"}"#.to_string(),
+        }),
+    );
+
+    // Response for priority model with different model name
+    http_client.add_response(
+        "POST /priority/test",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"result":"priority_success"}"#.to_string(),
+        }),
+    );
+
+    let priority_endpoints = Arc::new(dashmap::DashMap::new());
+    priority_endpoints.insert(
+        "gpt-4".to_string(),
+        PriorityEndpointConfig {
+            endpoint: "https://priority.openai.com".to_string(),
+            api_key: None,
+            path_override: Some("/priority/test".to_string()),
+            model_override: Some("gpt-4-priority".to_string()), // Override to different model
+        },
+    );
+
+    let config = DaemonConfig {
+        claim_batch_size: 10,
+        claim_interval_ms: 10,
+        default_model_concurrency: 10,
+        model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+        max_retries: Some(3),
+        backoff_ms: 100,
+        backoff_factor: 2,
+        max_backoff_ms: 1000,
+        timeout_ms: 5000,
+        status_log_interval_ms: None,
+        heartbeat_interval_ms: 10000,
+        should_retry: Arc::new(default_should_retry),
+        claim_timeout_ms: 1000,
+        processing_timeout_ms: 5000,
+        cancellation_poll_interval_ms: 100,
+        sla_check_interval_seconds: 1,
+        sla_thresholds: vec![SlaThreshold {
+            name: "test-escalation".to_string(),
+            threshold_seconds: 3600,
+            action: SlaAction::Escalate,
+            allowed_states: vec![RequestStateFilter::Pending],
+        }],
+        priority_endpoints,
+        stop_before_deadline_ms: None,
+    };
+
+    let manager = Arc::new(
+        PostgresRequestManager::with_client(pool.clone(), http_client.clone()).with_config(config),
+    );
+
+    let file_id = manager
+        .create_file(
+            "model-override-test".to_string(),
+            None,
+            vec![RequestTemplateInput {
+                custom_id: Some("original".to_string()),
+                endpoint: "https://api.openai.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"model":"gpt-4","prompt":"test"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                api_key: "test-key".to_string(),
+            }],
+        )
+        .await
+        .expect("Failed to create file");
+
+    let batch = manager
+        .create_batch(BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "2h".to_string(),
+            metadata: None,
+            created_by: None,
+        })
+        .await
+        .expect("Failed to create batch");
+
+    // Backdate batch to make it at-risk
+    sqlx::query!(
+            r#"UPDATE batches SET created_at = NOW() - INTERVAL '90 minutes', expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1"#,
+            *batch.id as sqlx::types::Uuid
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to backdate batch");
+
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
+    manager
+        .clone()
+        .run(shutdown_token.clone())
+        .expect("Failed to start daemon");
+
+    // Wait for SLA checker to run and create escalation
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+
+    let all_requests = manager
+        .get_batch_requests(batch.id)
+        .await
+        .expect("Failed to get requests");
+
+    // Should have 2 requests: original + escalated
+    assert_eq!(all_requests.len(), 2, "Should have original + escalated");
+
+    // Find the escalated request
+    let escalated = all_requests
+        .iter()
+        .find(|r| r.data().is_escalated)
+        .expect("Should find escalated request");
+
+    let original = all_requests
+        .iter()
+        .find(|r| !r.data().is_escalated)
+        .expect("Should find original request");
+
+    // Verify: Original has original model
+    assert_eq!(
+        original.data().model,
+        "gpt-4",
+        "Original should have gpt-4 model"
+    );
+
+    // Verify: Escalated has overridden model
+    assert_eq!(
+        escalated.data().model,
+        "gpt-4-priority",
+        "Escalated should have gpt-4-priority model from override"
+    );
+
+    shutdown_token.cancel();
+
+    // Verify batch status
+    let batch_status = manager
+        .get_batch_status(batch.id)
+        .await
+        .expect("Failed to get batch status");
+    assert_eq!(batch_status.total_requests, 1);
 }

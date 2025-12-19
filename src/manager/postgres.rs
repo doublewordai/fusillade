@@ -2583,6 +2583,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         model: &str,
         threshold_seconds: i64,
         allowed_states: &[RequestStateFilter],
+        model_override: Option<&str>,
     ) -> Result<i64> {
         let rows_affected = sqlx::query!(
             r#"
@@ -2597,7 +2598,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 'pending',
                 t.custom_id,
                 r.retry_attempt,
-                r.model,
+                CASE WHEN $4::text IS NOT NULL THEN $4::text ELSE r.model END,
                 r.id,        -- Link back to original request
                 true,        -- is_escalated = true
                 NULL,
@@ -2625,6 +2626,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             model,
             allowed_states as &[RequestStateFilter],
             threshold_seconds as f64,
+            model_override,
         )
         .execute(&self.pool)
         .await
@@ -2752,7 +2754,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             SELECT
                 r.id, r.batch_id, r.template_id as "template_id?", r.state,
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
-                t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
+                t.path as "path?", t.body as "body?", r.model as "model?", t.api_key as "api_key?",
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,
@@ -7938,7 +7940,7 @@ mod tests {
 
         // Create escalated requests (threshold: 1800s = 30 min, so batch created 30min ago is at risk)
         let count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
@@ -8034,7 +8036,7 @@ mod tests {
 
         // Escalate only gpt-4 requests
         let count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
@@ -8102,7 +8104,7 @@ mod tests {
 
         // Create escalation first time
         let count1 = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
@@ -8110,7 +8112,7 @@ mod tests {
 
         // Try to create escalation again - should be blocked by NOT EXISTS
         let count2 = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
@@ -8181,7 +8183,7 @@ mod tests {
 
         // Create first escalation
         let count1 = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
@@ -8206,7 +8208,7 @@ mod tests {
 
         // Now try to create escalation again - should succeed because existing escalation is terminal
         let count2 = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
@@ -8324,7 +8326,7 @@ mod tests {
 
         // Test 1: Escalate only pending
         let pending_count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
@@ -8332,7 +8334,7 @@ mod tests {
 
         // Test 2: Escalate only claimed
         let claimed_count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Claimed])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Claimed], None)
             .await
             .unwrap();
 
@@ -8342,7 +8344,7 @@ mod tests {
         // The function doesn't filter out terminal request states, only terminal batch states
         // So passing Completed in allowed_states WILL match completed requests
         let completed_count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Completed])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Completed], None)
             .await
             .unwrap();
 
@@ -8424,7 +8426,7 @@ mod tests {
 
         // Try to escalate - should find 0 requests because all batches are terminal
         let count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
@@ -8441,7 +8443,7 @@ mod tests {
 
         // Test 1: Empty database
         let empty = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
@@ -8490,7 +8492,7 @@ mod tests {
         .unwrap();
 
         let no_model_match = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
@@ -8539,7 +8541,7 @@ mod tests {
         .unwrap();
 
         let not_at_risk = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending])
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
@@ -8549,6 +8551,80 @@ mod tests {
     // =========================================================================
     // SLA ESCALATION TESTS
     // =========================================================================
+
+    #[sqlx::test]
+    async fn test_model_override_direct(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a batch with one request
+        let file_id = manager
+            .create_file(
+                "model-override-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("test".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"test":1}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Backdate batch to make it at-risk
+        sqlx::query!(
+            r#"UPDATE batches SET created_at = NOW() - INTERVAL '2 hours', expires_at = NOW() + INTERVAL '22 hours' WHERE id = $1"#,
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Test with model override
+        let count = manager
+            .create_escalated_requests(
+                "gpt-4",
+                3600,
+                &[RequestStateFilter::Pending],
+                Some("gpt-4-priority"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1, "Should create 1 escalated request");
+
+        // Get all requests
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests.len(), 2, "Should have 2 requests");
+
+        // Find the escalated request
+        let escalated = requests
+            .iter()
+            .find(|r| r.data().is_escalated)
+            .expect("Should find escalated request");
+
+        // Verify model was overridden
+        assert_eq!(
+            escalated.data().model,
+            "gpt-4-priority",
+            "Escalated request should have overridden model"
+        );
+    }
 
     #[sqlx::test]
     async fn test_race_completion_original_wins(pool: sqlx::PgPool) {
