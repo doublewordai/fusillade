@@ -482,7 +482,6 @@ impl Request<Processing> {
                     data: self.data,
                     state: failed_state,
                 };
-                storage.persist(&request).await?;
                 Ok(RequestCompletionResult::Failed(request))
             }
             None => {
