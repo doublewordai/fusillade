@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.1](https://github.com/doublewordai/fusillade/compare/fusillade-v0.11.0...fusillade-v0.11.1) (2025-12-20)
+
+
+### Bug Fixes
+
+* single persistence to failed for retryable errrors ([#44](https://github.com/doublewordai/fusillade/issues/44)) ([cd1005a](https://github.com/doublewordai/fusillade/commit/cd1005a5ba705a5c161a8438c775ed062f422e52))
+* use dashes not underscores for headers ([#42](https://github.com/doublewordai/fusillade/issues/42)) ([d941f22](https://github.com/doublewordai/fusillade/commit/d941f226e6479a29607dc07a5cbdc18bef04cb54))
+
 ## [0.11.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.10.0...fusillade-v0.11.0) (2025-12-19)
 
 
