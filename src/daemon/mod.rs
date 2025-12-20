@@ -944,15 +944,19 @@ where
                                             );
 
                                             // Attempt to retry
-                                            match failed.retry(retry_attempt, retry_config, storage.as_ref()).await? {
-                                                Some(_pending) => {
+                                            match failed.can_retry(retry_attempt, retry_config) {
+                                                Ok(pending) => {
+                                                    // Can retry - persist as Pending
+                                                    storage.persist(&pending).await?;
                                                     tracing::info!(
                                                         request_id = %request_id,
                                                         retry_attempt = retry_attempt + 1,
                                                         "Request queued for retry"
                                                     );
                                                 }
-                                                None => {
+                                                Err(failed) => {
+                                                    // No retries left - persist as Failed (terminal)
+                                                    storage.persist(&*failed).await?;
                                                     requests_failed.fetch_add(1, Ordering::Relaxed);
                                                     tracing::warn!(
                                                         request_id = %request_id,
