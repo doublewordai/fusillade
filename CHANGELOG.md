@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.11.1...fusillade-v0.12.0) (2025-12-22)
+
+
+### Features
+
+* custom ID header ([#46](https://github.com/doublewordai/fusillade/issues/46)) ([1a6a5d2](https://github.com/doublewordai/fusillade/commit/1a6a5d25d048e5ffbfa68b641e6abb3166837640))
+
 ## [0.11.1](https://github.com/doublewordai/fusillade/compare/fusillade-v0.11.0...fusillade-v0.11.1) (2025-12-20)
 
 
