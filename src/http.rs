@@ -127,6 +127,12 @@ impl HttpClient for ReqwestHttpClient {
             req = req.header(&header_name, value);
         }
 
+        // Add custom_id header if present for analytics correlation
+        if let Some(custom_id) = &request.custom_id {
+            req = req.header("X-Fusillade-Custom-Id", custom_id.clone());
+            tracing::trace!(request_id = %request.id, custom_id = %custom_id, "Added X-Fusillade-Custom-Id header");
+        }
+
         // Only add body and Content-Type for methods that support a body
         let method_upper = request.method.to_uppercase();
         if method_upper != "GET"

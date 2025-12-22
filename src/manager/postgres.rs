@@ -1719,7 +1719,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     }
 
     async fn get_file_content(&self, file_id: FileId) -> Result<Vec<FileContentItem>> {
-        let mut stream = self.get_file_content_stream(file_id, 0);
+        let mut stream = self.get_file_content_stream(file_id, 0, None);
         let mut items = Vec::new();
 
         while let Some(result) = stream.next().await {
@@ -1763,11 +1763,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .collect())
     }
 
-    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    #[tracing::instrument(skip(self), fields(file_id = %file_id, search = ?search))]
     fn get_file_content_stream(
         &self,
         file_id: FileId,
         offset: usize,
+        search: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
         let pool = self.pool.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
@@ -1802,14 +1803,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             // Route to appropriate streaming logic based on purpose
             match purpose.as_deref() {
                 Some("batch_output") => {
-                    Self::stream_batch_output(pool, file_id, offset, tx).await;
+                    Self::stream_batch_output(pool, file_id, offset, search, tx).await;
                 }
                 Some("batch_error") => {
-                    Self::stream_batch_error(pool, file_id, offset, tx).await;
+                    Self::stream_batch_error(pool, file_id, offset, search, tx).await;
                 }
                 _ => {
                     // Regular file or purpose='batch': stream request templates
-                    Self::stream_request_templates(pool, file_id, offset, tx).await;
+                    Self::stream_request_templates(pool, file_id, offset, search, tx).await;
                 }
             }
         });
@@ -3051,11 +3052,13 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         pool: sqlx::PgPool,
         file_id: FileId,
         offset: i64,
+        search: Option<String>,
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) {
         const BATCH_SIZE: i64 = 1000;
         let mut last_line_number: i32 = -1;
         let mut is_first_batch = true;
+        let search_pattern = search.map(|s| format!("%{}%", s.to_lowercase()));
 
         loop {
             // Use OFFSET only on first batch, then use cursor pagination
@@ -3071,6 +3074,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 SELECT custom_id, endpoint, method, path, body, model, api_key, line_number
                 FROM request_templates
                 WHERE file_id = $1 AND ($2 = -1 OR line_number > $2)
+                  AND ($5::text IS NULL OR LOWER(custom_id) LIKE $5)
                 ORDER BY line_number ASC
                 OFFSET $3
                 LIMIT $4
@@ -3079,6 +3083,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 line_filter,
                 offset_val,
                 BATCH_SIZE,
+                search_pattern.as_deref(),
             )
             .fetch_all(&pool)
             .await;
@@ -3135,6 +3140,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         pool: sqlx::PgPool,
         file_id: FileId,
         offset: i64,
+        search: Option<String>,
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) {
         // First, find the batch that owns this output file
@@ -3168,6 +3174,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         let mut last_completed_at: Option<chrono::DateTime<chrono::Utc>> = None;
         let mut last_id: Uuid = Uuid::nil();
         let mut is_first_batch = true;
+        let search_pattern = search.map(|s| format!("%{}%", s.to_lowercase()));
 
         loop {
             // Use OFFSET only on first batch, then use cursor pagination
@@ -3185,6 +3192,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 WHERE batch_id = $1
                   AND state = 'completed'
                   AND ($2::TIMESTAMPTZ IS NULL OR completed_at > $2 OR (completed_at = $2 AND id > $3))
+                  AND ($6::text IS NULL OR LOWER(custom_id) LIKE $6)
                 ORDER BY completed_at ASC, id ASC
                 OFFSET $4
                 LIMIT $5
@@ -3194,6 +3202,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 cursor_id,
                 offset_val,
                 BATCH_SIZE,
+                search_pattern.as_deref(),
             )
             .fetch_all(&pool)
             .await;
@@ -3259,6 +3268,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         pool: sqlx::PgPool,
         file_id: FileId,
         offset: i64,
+        search: Option<String>,
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) {
         // First, find the batch that owns this error file
@@ -3292,6 +3302,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         let mut last_failed_at: Option<chrono::DateTime<chrono::Utc>> = None;
         let mut last_id: Uuid = Uuid::nil();
         let mut is_first_batch = true;
+        let search_pattern = search.map(|s| format!("%{}%", s.to_lowercase()));
 
         loop {
             // Use OFFSET only on first batch, then use cursor pagination
@@ -3309,6 +3320,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 WHERE batch_id = $1
                   AND state = 'failed'
                   AND ($2::TIMESTAMPTZ IS NULL OR failed_at > $2 OR (failed_at = $2 AND id > $3))
+                  AND ($6::text IS NULL OR LOWER(custom_id) LIKE $6)
                 ORDER BY failed_at ASC, id ASC
                 OFFSET $4
                 LIMIT $5
@@ -3318,6 +3330,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 cursor_id,
                 offset_val,
                 BATCH_SIZE,
+                search_pattern.as_deref(),
             )
             .fetch_all(&pool)
             .await;
@@ -4796,7 +4809,7 @@ mod tests {
         .expect("Failed to mark request as failed");
 
         // Stream the output file - should contain 2 completed requests
-        let output_stream = manager.get_file_content_stream(output_file_id, 0);
+        let output_stream = manager.get_file_content_stream(output_file_id, 0, None);
         let output_items: Vec<_> = output_stream.collect().await;
 
         assert_eq!(output_items.len(), 2, "Should have 2 output items");
@@ -4830,7 +4843,7 @@ mod tests {
         );
 
         // Stream the error file - should contain 1 failed request
-        let error_stream = manager.get_file_content_stream(error_file_id, 0);
+        let error_stream = manager.get_file_content_stream(error_file_id, 0, None);
         let error_items: Vec<_> = error_stream.collect().await;
 
         assert_eq!(error_items.len(), 1, "Should have 1 error item");
@@ -4850,7 +4863,7 @@ mod tests {
         }
 
         // Verify that streaming a regular input file still works
-        let input_stream = manager.get_file_content_stream(file_id, 0);
+        let input_stream = manager.get_file_content_stream(file_id, 0, None);
         let input_items: Vec<_> = input_stream.collect().await;
 
         assert_eq!(input_items.len(), 3, "Input file should have 3 templates");

@@ -65,10 +65,12 @@ pub trait Storage: Send + Sync {
     /// - Batch error files (purpose='batch_error'): BatchErrorItem
     ///
     /// The offset parameter allows skipping the first N lines (0-indexed).
+    /// The search parameter filters results by custom_id (case-insensitive substring match).
     fn get_file_content_stream(
         &self,
         file_id: FileId,
         offset: usize,
+        search: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>>;
 
     /// Get aggregated statistics for request templates grouped by model.
