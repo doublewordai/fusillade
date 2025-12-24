@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/doublewordai/fusillade/compare/fusillade-v0.12.0...fusillade-v0.12.1) (2025-12-24)
+
+
+### Bug Fixes
+
+* sla query to only focus on expiry time in order to pick all at risk requests ([#48](https://github.com/doublewordai/fusillade/issues/48)) ([e691424](https://github.com/doublewordai/fusillade/commit/e6914246aaeb8fe58084fba38ac805b28fa49986))
+
 ## [0.12.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.11.1...fusillade-v0.12.0) (2025-12-22)
 
 
