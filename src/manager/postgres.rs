@@ -2682,13 +2682,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             WHERE r.model = $1
               AND r.is_escalated = false
               AND r.state = ANY($2)
-              AND b.completion_window IS NOT NULL
+              AND b.expires_at IS NOT NULL
               AND b.completed_at IS NULL
               AND b.failed_at IS NULL
               AND b.cancelled_at IS NULL
               AND b.cancelling_at IS NULL
-              AND (NOW() - b.created_at) >= make_interval(secs => $3::float8)
-              AND b.created_at + CAST(b.completion_window AS INTERVAL) > NOW()
+              AND (b.expires_at - NOW()) <= make_interval(secs => $3::float8)
               -- Only create escalation if one doesn't already exist in an active state
               AND NOT EXISTS (
                   SELECT 1 FROM requests esc
@@ -2704,6 +2703,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to create escalated requests: {}", e)))?
         .rows_affected();
+
+        tracing::debug!(rows_affected, "Created escalated requests");
 
         Ok(rows_affected as i64)
     }
@@ -8671,16 +8672,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Backdate batch to make it at-risk
+        // Backdate batch to make it at-risk (expires in 30 minutes, which is < 1 hour threshold)
         sqlx::query!(
-            r#"UPDATE batches SET created_at = NOW() - INTERVAL '2 hours', expires_at = NOW() + INTERVAL '22 hours' WHERE id = $1"#,
+            r#"UPDATE batches SET created_at = NOW() - INTERVAL '23 hours 30 minutes', expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1"#,
             *batch.id as Uuid
         )
         .execute(&pool)
         .await
         .unwrap();
 
-        // Test with model override
+        // Test with model override (threshold: 3600s = 1 hour, batch expires in 30 min = at risk)
         let count = manager
             .create_escalated_requests(
                 "gpt-4",
@@ -8830,16 +8831,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Backdate batch to make it at-risk
+        // Backdate batch to make it at-risk (expires in 30 minutes, which is < 1 hour threshold)
         sqlx::query!(
-            r#"UPDATE batches SET created_at = NOW() - INTERVAL '2 hours', expires_at = NOW() + INTERVAL '22 hours' WHERE id = $1"#,
+            r#"UPDATE batches SET created_at = NOW() - INTERVAL '23 hours 30 minutes', expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1"#,
             *batch.id as Uuid
         )
         .execute(&pool)
         .await
         .unwrap();
 
-        // Create escalated requests WITH model override
+        // Create escalated requests WITH model override (threshold: 3600s = 1 hour, batch expires in 30 min = at risk)
         let count = manager
             .create_escalated_requests(
                 "gpt-4",

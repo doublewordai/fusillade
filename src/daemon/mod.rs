@@ -573,6 +573,17 @@ where
                 );
             }
 
+            tracing::info!("Starting SLA monitoring task");
+            tracing::debug!("SLA check interval: {} seconds", sla_check_interval_seconds);
+            tracing::debug!("Configured SLA thresholds: {:?}", sla_thresholds);
+            tracing::debug!(
+                "Configured priority endpoints for models: {:?}",
+                priority_endpoints
+                    .iter()
+                    .map(|entry| entry.key().clone())
+                    .collect::<Vec<_>>()
+            );
+
             tokio::spawn(async move {
                 let mut interval =
                     tokio::time::interval(Duration::from_secs(sla_check_interval_seconds));
@@ -580,8 +591,10 @@ where
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
+                            tracing::trace!("SLA Tick");
                             // Query once per configured threshold
                             for threshold in &sla_thresholds {
+                                tracing::trace!("Threshold: {}", threshold.name);
                                 // Match on action type to determine what DB operation to perform
                                 match threshold.action {
                                     SlaAction::Log { level } => {
@@ -634,6 +647,11 @@ where
                                             for entry in priority_endpoints.iter() {
                                                 let model = entry.key();
                                                 let priority_config = entry.value();
+                                                tracing::trace!(
+                                                    model = %model,
+                                                    priority_endpoint = %priority_config.endpoint,
+                                                    "Checking for requests to escalate"
+                                                );
 
                                                 // Create escalated requests
                                                 match storage
@@ -647,7 +665,7 @@ where
                                                 {
                                                     Ok(escalated_count) => {
                                                         if escalated_count > 0 {
-                                                            tracing::info!(
+                                                            tracing::debug!(
                                                                 model = %model,
                                                                 escalated_count = escalated_count,
                                                                 priority_endpoint = %priority_config.endpoint,
@@ -1134,20 +1152,20 @@ mod tests {
                 .await
                 .expect("Failed to get request");
 
-            if let Some(Ok(any_request)) = results.first() {
-                if any_request.is_terminal() {
-                    if let crate::AnyRequest::Completed(req) = any_request {
-                        // Verify the request was completed successfully
-                        assert_eq!(req.state.response_status, 200);
-                        assert_eq!(req.state.response_body, r#"{"result":"success"}"#);
-                        completed = true;
-                        break;
-                    } else {
-                        panic!(
-                            "Request reached terminal state but was not completed: {:?}",
-                            any_request
-                        );
-                    }
+            if let Some(Ok(any_request)) = results.first()
+                && any_request.is_terminal()
+            {
+                if let crate::AnyRequest::Completed(req) = any_request {
+                    // Verify the request was completed successfully
+                    assert_eq!(req.state.response_status, 200);
+                    assert_eq!(req.state.response_body, r#"{"result":"success"}"#);
+                    completed = true;
+                    break;
+                } else {
+                    panic!(
+                        "Request reached terminal state but was not completed: {:?}",
+                        any_request
+                    );
                 }
             }
 
@@ -1523,17 +1541,17 @@ mod tests {
                 .await
                 .expect("Failed to get request");
 
-            if let Some(Ok(any_request)) = results.first() {
-                if let crate::AnyRequest::Completed(req) = any_request {
-                    // Verify the request eventually completed successfully
-                    assert_eq!(req.state.response_status, 200);
-                    assert_eq!(
-                        req.state.response_body,
-                        r#"{"result":"success after retries"}"#
-                    );
-                    completed = true;
-                    break;
-                }
+            if let Some(Ok(any_request)) = results.first()
+                && let crate::AnyRequest::Completed(req) = any_request
+            {
+                // Verify the request eventually completed successfully
+                assert_eq!(req.state.response_status, 200);
+                assert_eq!(
+                    req.state.response_body,
+                    r#"{"result":"success after retries"}"#
+                );
+                completed = true;
+                break;
             }
 
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1849,7 +1867,7 @@ mod tests {
             // Allow 4-9 attempts to account for timing variations in test execution,
             // parallel test execution overhead, and query overhead from batch metadata fields
             assert!(
-                retry_count >= 4 && retry_count <= 9,
+                (4..=9).contains(&retry_count),
                 "Expected 4-9 retry attempts based on deadline and backoff calculation, got {}",
                 retry_count
             );
@@ -2006,7 +2024,7 @@ mod tests {
             // Allow 6-12 attempts to account for timing variations with CI slower CI CPUs,
             // parallel test execution overhead, and query overhead from batch metadata fields
             assert!(
-                retry_count >= 6 && retry_count < 12,
+                (6..12).contains(&retry_count),
                 "Expected 6-12 retry attempts (should retry until deadline with no buffer), got {}",
                 retry_count
             );
