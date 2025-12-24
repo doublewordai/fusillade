@@ -573,7 +573,7 @@ where
                 );
             }
 
-            tracing::debug!("Starting SLA monitoring task");
+            tracing::info!("Starting SLA monitoring task");
             tracing::debug!("SLA check interval: {} seconds", sla_check_interval_seconds);
             tracing::debug!("Configured SLA thresholds: {:?}", sla_thresholds);
             tracing::debug!(
@@ -594,7 +594,7 @@ where
                             tracing::trace!("SLA Tick");
                             // Query once per configured threshold
                             for threshold in &sla_thresholds {
-                                tracing::info!("Threshold: {}", threshold.name);
+                                tracing::trace!("Threshold: {}", threshold.name);
                                 // Match on action type to determine what DB operation to perform
                                 match threshold.action {
                                     SlaAction::Log { level } => {
@@ -665,7 +665,7 @@ where
                                                 {
                                                     Ok(escalated_count) => {
                                                         if escalated_count > 0 {
-                                                            tracing::info!(
+                                                            tracing::debug!(
                                                                 model = %model,
                                                                 escalated_count = escalated_count,
                                                                 priority_endpoint = %priority_config.endpoint,
