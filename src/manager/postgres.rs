@@ -3044,6 +3044,28 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         Ok(results)
     }
+
+    async fn find_pending_escalation(
+        &self,
+        original_request_id: RequestId,
+    ) -> Result<Option<RequestId>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id
+            FROM requests
+            WHERE escalated_from_request_id = $1
+              AND is_escalated = true
+              AND state IN ('pending', 'claimed', 'processing')
+            LIMIT 1
+            "#,
+            *original_request_id as Uuid,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to find pending escalation: {}", e)))?;
+
+        Ok(row.map(|r| RequestId(r.id)))
+    }
 }
 
 // Helper methods for file streaming and virtual file creation

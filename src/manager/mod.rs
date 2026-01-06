@@ -120,6 +120,23 @@ pub trait Storage: Send + Sync {
     /// Get all requests for a batch.
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>>;
 
+    /// Find a pending escalated request for a given original request.
+    ///
+    /// When a request is escalated, both the original and escalated request race.
+    /// This method finds the escalated request (if any) that was created from
+    /// the given original request ID and is still in a pending/claimed/processing state.
+    ///
+    /// This is much more efficient than `get_batch_requests` for finding a single
+    /// escalated request, as it uses a targeted query instead of fetching all
+    /// requests in the batch.
+    ///
+    /// # Returns
+    /// The request ID of the pending escalated request, or None if not found.
+    async fn find_pending_escalation(
+        &self,
+        original_request_id: RequestId,
+    ) -> Result<Option<RequestId>>;
+
     /// Get batches at risk of missing their SLA deadline.
     ///
     /// Returns a map of batch IDs to the count of requests in that batch

@@ -917,26 +917,8 @@ where
                                             completed.data.escalated_from_request_id
                                         } else {
                                             // This is an original - check if there's an escalated request to supersede
-                                            // Query DB to find any escalated request with escalated_from_request_id = this ID
-                                            match storage.get_batch_requests(batch_id).await {
-                                                Ok(requests) => {
-                                                    requests.iter().find_map(|req| {
-                                                        match req {
-                                                            crate::AnyRequest::Processing(r) if r.data.is_escalated && r.data.escalated_from_request_id == Some(request_id) => {
-                                                                Some(r.data.id)
-                                                            }
-                                                            crate::AnyRequest::Pending(r) if r.data.is_escalated && r.data.escalated_from_request_id == Some(request_id) => {
-                                                                Some(r.data.id)
-                                                            }
-                                                            crate::AnyRequest::Claimed(r) if r.data.is_escalated && r.data.escalated_from_request_id == Some(request_id) => {
-                                                                Some(r.data.id)
-                                                            }
-                                                            _ => None
-                                                        }
-                                                    })
-                                                }
-                                                Err(_) => None
-                                            }
+                                            // Use targeted query instead of fetching all batch requests
+                                            storage.find_pending_escalation(request_id).await.unwrap_or(None)
                                         };
 
                                         if let Some(sid) = superseded_id_opt
