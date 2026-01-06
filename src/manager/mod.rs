@@ -132,7 +132,10 @@ pub trait Storage: Send + Sync {
     ///
     /// # Returns
     /// The request ID of the pending escalated request, or None if not found.
-    async fn find_pending_escalation(&self, original_request_id: RequestId) -> Result<Option<RequestId>>;
+    async fn find_pending_escalation(
+        &self,
+        original_request_id: RequestId,
+    ) -> Result<Option<RequestId>>;
 
     /// Get batches at risk of missing their SLA deadline.
     ///

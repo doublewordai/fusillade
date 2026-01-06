@@ -3045,7 +3045,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(results)
     }
 
-    async fn find_pending_escalation(&self, original_request_id: RequestId) -> Result<Option<RequestId>> {
+    async fn find_pending_escalation(
+        &self,
+        original_request_id: RequestId,
+    ) -> Result<Option<RequestId>> {
         let row = sqlx::query!(
             r#"
             SELECT id
