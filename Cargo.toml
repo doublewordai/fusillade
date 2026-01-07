@@ -12,7 +12,7 @@ path = "src/lib.rs"
 [features]
 default = ["postgres"]
 postgres = ["sqlx"]
-metrics = ["prometheus"]
+metrics = ["dep:metrics"]
 
 [dependencies]
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -37,8 +37,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 test-log = "0.2.18"
 rand = "0.9"
 
-# Prometheus metrics (optional, enabled via 'metrics' feature)
-prometheus = { version = "0.14", optional = true }
+# Metrics facade (optional, enabled via 'metrics' feature)
+metrics = { version = "0.24", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

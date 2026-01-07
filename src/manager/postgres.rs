@@ -3751,29 +3751,14 @@ impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
     fn run(
         self: Arc<Self>,
         shutdown_token: tokio_util::sync::CancellationToken,
-        #[cfg(feature = "metrics")] registry: Option<std::sync::Arc<prometheus::Registry>>,
     ) -> Result<JoinHandle<Result<()>>> {
         tracing::info!("Starting PostgreSQL request manager daemon");
-
-        // Create metrics from registry if provided
-        #[cfg(feature = "metrics")]
-        let metrics = registry.and_then(|reg| {
-            match crate::metrics::FusilladeMetrics::new((*reg).clone()) {
-                Ok(m) => Some(Arc::new(m)),
-                Err(e) => {
-                    tracing::error!("Failed to create Fusillade metrics: {}", e);
-                    None
-                }
-            }
-        });
 
         let daemon = Arc::new(Daemon::new(
             self.clone(),
             self.http_client.clone(),
             self.config.clone(),
             shutdown_token,
-            #[cfg(feature = "metrics")]
-            metrics,
         ));
 
         let handle = tokio::spawn(async move {
@@ -6540,8 +6525,6 @@ mod tests {
             http_client.clone(),
             config,
             shutdown_token.clone(),
-            #[cfg(feature = "metrics")]
-            None,
         ));
 
         // Run daemon (it will poll for cancelled batches)

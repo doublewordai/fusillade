@@ -22,8 +22,6 @@ pub use error::{FusilladeError, Result};
 pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient};
 pub use manager::postgres::PostgresRequestManager;
 pub use manager::{DaemonExecutor, Storage};
-#[cfg(feature = "metrics")]
-pub use metrics::FusilladeMetrics;
 pub use request::*;
 
 /// Get the fusillade database migrator

@@ -360,7 +360,6 @@ pub trait DaemonExecutor<H: HttpClient>: Storage + Send + Sync {
     fn run(
         self: Arc<Self>,
         shutdown_token: tokio_util::sync::CancellationToken,
-        #[cfg(feature = "metrics")] registry: Option<std::sync::Arc<prometheus::Registry>>,
     ) -> Result<JoinHandle<Result<()>>>;
 
     // File and Batch Management methods are inherited from the Storage trait
