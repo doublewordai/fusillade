@@ -253,6 +253,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 superseded_by_request_id = $1
             WHERE
                 -- Find the racing pair: if winner is escalated, find original; if winner is original, find escalated
+                -- LIMIT 1 handles edge case where multiple escalated requests exist for the same original
                 id = (
                     SELECT CASE
                         WHEN w.is_escalated THEN w.escalated_from_request_id
@@ -261,6 +262,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                     FROM requests w
                     LEFT JOIN requests e ON e.escalated_from_request_id = w.id AND e.is_escalated = true
                     WHERE w.id = $1
+                    LIMIT 1
                 )
                 -- Only supersede if not already in a terminal state
                 AND state NOT IN ('completed', 'failed', 'canceled', 'superseded')
