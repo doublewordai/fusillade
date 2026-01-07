@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use metrics::{counter, gauge, histogram};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
 
@@ -736,6 +737,9 @@ where
                 .claim_requests(self.config.claim_batch_size, self.daemon_id)
                 .await?;
 
+            // Record claim metrics
+            counter!("fusillade_claims_total").increment(claimed.len() as u64);
+
             tracing::debug!(
                 claimed_count = claimed.len(),
                 "Claimed requests from storage"
@@ -801,16 +805,23 @@ where
                             request_cancellation_tokens
                                 .insert(request_id, request_cancellation_token.clone());
 
-                            // Increment in-flight counter
+                            // Increment in-flight counter and gauge
                             requests_in_flight.fetch_add(1, Ordering::Relaxed);
+                            gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
+                                .increment(1.0);
 
                             join_set.spawn(async move {
                                 // Permit is held for the duration of this task
                                 let _permit = permit;
 
+                                // Track processing start time for duration metrics
+                                let processing_start = std::time::Instant::now();
+
                                 // Ensure we decrement the counter when this task completes
-                                let _guard = scopeguard::guard((), |_| {
+                                let model_for_guard = model_clone.clone();
+                                let _guard = scopeguard::guard((), move |_| {
                                     requests_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
                                 });
 
                                 tracing::info!(request_id = %request_id, "Processing request");
@@ -909,6 +920,9 @@ where
                                 }, cancellation).await {
                                     Ok(RequestCompletionResult::Completed(completed)) => {
                                         requests_processed.fetch_add(1, Ordering::Relaxed);
+                                        counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
+                                        histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
+                                            .record(processing_start.elapsed().as_secs_f64());
                                         tracing::info!(request_id = %request_id, "Request completed successfully");
 
                                         // If this request is part of a race, cancel the superseded racing pair's token
@@ -948,6 +962,7 @@ where
                                                 Ok(pending) => {
                                                     // Can retry - persist as Pending
                                                     storage.persist(&pending).await?;
+                                                    counter!("fusillade_requests_retried_total", "model" => model_clone.clone()).increment(1);
                                                     tracing::info!(
                                                         request_id = %request_id,
                                                         retry_attempt = retry_attempt + 1,
@@ -958,6 +973,9 @@ where
                                                     // No retries left - persist as Failed (terminal)
                                                     storage.persist(&*failed).await?;
                                                     requests_failed.fetch_add(1, Ordering::Relaxed);
+                                                    counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                                    histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
+                                                        .record(processing_start.elapsed().as_secs_f64());
                                                     tracing::warn!(
                                                         request_id = %request_id,
                                                         retry_attempt,
@@ -967,6 +985,9 @@ where
                                             }
                                         } else {
                                             requests_failed.fetch_add(1, Ordering::Relaxed);
+                                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                            histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
+                                                .record(processing_start.elapsed().as_secs_f64());
                                             tracing::warn!(
                                                 request_id = %request_id,
                                                 error = %failed.state.reason.to_error_message(),
@@ -975,6 +996,7 @@ where
                                         }
                                     }
                                     Ok(RequestCompletionResult::Canceled(_canceled)) => {
+                                        counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled").increment(1);
                                         tracing::debug!(request_id = %request_id, "Request canceled by user");
                                     }
                                     Err(FusilladeError::Shutdown) => {
