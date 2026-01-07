@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.3](https://github.com/doublewordai/fusillade/compare/fusillade-v0.12.2...fusillade-v0.12.3) (2026-01-07)
+
+
+### Bug Fixes
+
+* handle multiple escalated requests in supersede_racing_pair query ([#54](https://github.com/doublewordai/fusillade/issues/54)) ([0ac1068](https://github.com/doublewordai/fusillade/commit/0ac1068808b9eba52d90008a0bc80cec76b16b79))
+
 ## [0.12.2](https://github.com/doublewordai/fusillade/compare/fusillade-v0.12.1...fusillade-v0.12.2) (2026-01-06)
 
 
