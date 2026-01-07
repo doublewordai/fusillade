@@ -137,6 +137,24 @@ pub trait Storage: Send + Sync {
         allowed_states: &[RequestStateFilter],
     ) -> Result<HashMap<BatchId, usize>>;
 
+    /// Get at-risk requests grouped by model and endpoint.
+    ///
+    /// Similar to `get_at_risk_batches` but provides model-level granularity
+    /// for metrics and monitoring. Returns count of at-risk requests per
+    /// (model, endpoint) combination.
+    ///
+    /// # Arguments
+    /// - `threshold_seconds`: Time remaining threshold (e.g., 3600 for 1 hour)
+    /// - `allowed_states`: List of request states to count
+    ///
+    /// # Returns
+    /// HashMap mapping (model, endpoint) to the count of at-risk requests
+    async fn get_at_risk_requests_by_model(
+        &self,
+        threshold_seconds: i64,
+        allowed_states: &[RequestStateFilter],
+    ) -> Result<HashMap<(String, String), usize>>;
+
     /// Create escalated requests for at-risk requests in a single operation.
     ///
     /// Creates escalated copies of all requests matching the criteria.
@@ -342,6 +360,7 @@ pub trait DaemonExecutor<H: HttpClient>: Storage + Send + Sync {
     fn run(
         self: Arc<Self>,
         shutdown_token: tokio_util::sync::CancellationToken,
+        #[cfg(feature = "metrics")] registry: Option<std::sync::Arc<prometheus::Registry>>,
     ) -> Result<JoinHandle<Result<()>>>;
 
     // File and Batch Management methods are inherited from the Storage trait

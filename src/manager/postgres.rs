@@ -2639,6 +2639,43 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(result)
     }
 
+    async fn get_at_risk_requests_by_model(
+        &self,
+        threshold_seconds: i64,
+        allowed_states: &[RequestStateFilter],
+    ) -> Result<HashMap<(String, String), usize>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                r.model,
+                b.endpoint,
+                COUNT(*) as "count!"
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            WHERE b.expires_at < NOW() + make_interval(secs => $1)
+              AND b.completed_at IS NULL
+              AND b.failed_at IS NULL
+              AND b.cancelled_at IS NULL
+              AND b.cancelling_at IS NULL
+              AND r.state = ANY($2)
+              AND r.is_escalated = false
+            GROUP BY r.model, b.endpoint
+            "#,
+            threshold_seconds as f64,
+            allowed_states as &[RequestStateFilter],
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to get at-risk requests by model: {}", e))
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| ((row.model, row.endpoint), row.count as usize))
+            .collect())
+    }
+
     /// Create escalated requests for at-risk requests in a single operation.
     ///
     /// This method performs a bulk INSERT to create escalated requests for all requests
@@ -3714,14 +3751,29 @@ impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
     fn run(
         self: Arc<Self>,
         shutdown_token: tokio_util::sync::CancellationToken,
+        #[cfg(feature = "metrics")] registry: Option<std::sync::Arc<prometheus::Registry>>,
     ) -> Result<JoinHandle<Result<()>>> {
         tracing::info!("Starting PostgreSQL request manager daemon");
+
+        // Create metrics from registry if provided
+        #[cfg(feature = "metrics")]
+        let metrics = registry.and_then(|reg| {
+            match crate::metrics::FusilladeMetrics::new((*reg).clone()) {
+                Ok(m) => Some(Arc::new(m)),
+                Err(e) => {
+                    tracing::error!("Failed to create Fusillade metrics: {}", e);
+                    None
+                }
+            }
+        });
 
         let daemon = Arc::new(Daemon::new(
             self.clone(),
             self.http_client.clone(),
             self.config.clone(),
             shutdown_token,
+            #[cfg(feature = "metrics")]
+            metrics,
         ));
 
         let handle = tokio::spawn(async move {
@@ -6488,6 +6540,8 @@ mod tests {
             http_client.clone(),
             config,
             shutdown_token.clone(),
+            #[cfg(feature = "metrics")]
+            None,
         ));
 
         // Run daemon (it will poll for cancelled batches)

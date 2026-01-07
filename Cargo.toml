@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [features]
 default = ["postgres"]
 postgres = ["sqlx"]
+metrics = ["prometheus"]
 
 [dependencies]
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -36,11 +37,12 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 test-log = "0.2.18"
 rand = "0.9"
 
+# Prometheus metrics (optional, enabled via 'metrics' feature)
+prometheus = { version = "0.14", optional = true }
+
 [dev-dependencies]
 tokio-test = "0.4"
-axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing-subscriber = "0.3"
 rstest = "0.26"
 clap = { version = "4", features = ["derive"] }

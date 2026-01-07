@@ -296,6 +296,9 @@ where
     /// Used to abort in-flight HTTP requests when their racing pair completes first (supersession)
     request_cancellation_tokens:
         Arc<dashmap::DashMap<RequestId, tokio_util::sync::CancellationToken>>,
+    /// Prometheus metrics (optional, requires 'metrics' feature)
+    #[cfg(feature = "metrics")]
+    metrics: Option<Arc<crate::metrics::FusilladeMetrics>>,
 }
 
 impl<S, H> Daemon<S, H>
@@ -309,6 +312,7 @@ where
         http_client: Arc<H>,
         config: DaemonConfig,
         shutdown_token: tokio_util::sync::CancellationToken,
+        #[cfg(feature = "metrics")] metrics: Option<Arc<crate::metrics::FusilladeMetrics>>,
     ) -> Self {
         Self {
             daemon_id: DaemonId::from(uuid::Uuid::new_v4()),
@@ -322,6 +326,8 @@ where
             shutdown_token,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
             request_cancellation_tokens: Arc::new(dashmap::DashMap::new()),
+            #[cfg(feature = "metrics")]
+            metrics,
         }
     }
 
@@ -562,6 +568,8 @@ where
             let sla_thresholds = self.config.sla_thresholds.clone();
             let sla_check_interval_seconds = self.config.sla_check_interval_seconds;
             let priority_endpoints = self.config.priority_endpoints.clone();
+            #[cfg(feature = "metrics")]
+            let metrics = self.metrics.clone();
 
             // Warn about configuration mismatches
             let has_escalate_threshold = sla_thresholds
@@ -627,6 +635,41 @@ where
                                                         }
                                                     }
                                                 }
+
+                                                // Record model-level SLA metrics
+                                                #[cfg(feature = "metrics")]
+                                                if let Some(metrics) = &metrics {
+                                                    match storage.get_at_risk_requests_by_model(
+                                                        threshold.threshold_seconds,
+                                                        &threshold.allowed_states
+                                                    ).await {
+                                                        Ok(model_counts) => {
+                                                            for ((model, endpoint), count) in model_counts {
+                                                                metrics.record_sla_at_risk(
+                                                                    &model,
+                                                                    &endpoint,
+                                                                    &threshold.name,
+                                                                    count
+                                                                );
+
+                                                                // Log for correlation
+                                                                tracing::warn!(
+                                                                    target: "metrics_correlation",
+                                                                    metric = "fusillade_sla_at_risk_requests",
+                                                                    model = %model,
+                                                                    endpoint = %endpoint,
+                                                                    sla_name = %threshold.name,
+                                                                    count = count,
+                                                                    threshold_seconds = threshold.threshold_seconds,
+                                                                    "SLA at risk"
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::error!("Failed to get model-level SLA metrics: {}", e);
+                                                        }
+                                                    }
+                                                }
                                             }
                                             Err(e) => {
                                                 tracing::error!(
@@ -665,6 +708,29 @@ where
                                                 {
                                                     Ok(escalated_count) => {
                                                         if escalated_count > 0 {
+                                                            // Record escalation metrics
+                                                            #[cfg(feature = "metrics")]
+                                                            if let Some(metrics) = &metrics {
+                                                                for _ in 0..escalated_count {
+                                                                    metrics.record_sla_escalation(
+                                                                        model,
+                                                                        &priority_config.endpoint,
+                                                                        &threshold.name
+                                                                    );
+                                                                }
+
+                                                                // Log for correlation
+                                                                tracing::info!(
+                                                                    target: "metrics_correlation",
+                                                                    metric = "fusillade_sla_escalations_total",
+                                                                    model = %model,
+                                                                    endpoint = %priority_config.endpoint,
+                                                                    sla_name = %threshold.name,
+                                                                    escalated_count = escalated_count,
+                                                                    "SLA escalation created"
+                                                                );
+                                                            }
+
                                                             tracing::debug!(
                                                                 model = %model,
                                                                 escalated_count = escalated_count,
