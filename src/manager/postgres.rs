@@ -715,9 +715,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                            b.output_file_id::TEXT as batch_output_file_id,
                            b.error_file_id::TEXT as batch_error_file_id,
                            COALESCE(b.created_by, '') as batch_created_by,
-                           b.created_at::TEXT as batch_created_at,
-                           b.expires_at::TEXT as batch_expires_at,
-                           b.cancelling_at::TEXT as batch_cancelling_at,
+                           to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as batch_created_at,
+                           to_char(b.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as batch_expires_at,
+                           to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as batch_cancelling_at,
                            b.errors::TEXT as batch_errors,
                            b.total_requests::TEXT as batch_total_requests
                     FROM requests r
