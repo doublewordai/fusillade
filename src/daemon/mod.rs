@@ -13,7 +13,7 @@ use crate::batch::BatchId;
 use crate::error::Result;
 use crate::http::{HttpClient, HttpResponse};
 use crate::manager::{DaemonStorage, Storage};
-use crate::request::{DaemonId, RequestCompletionResult, RequestId};
+use crate::request::{DaemonId, RequestCompletionResult, RequestId, RequestStateFilter};
 
 pub mod transitions;
 pub mod types;
@@ -607,6 +607,13 @@ where
                                                 }
 
                                                 for (batch_id, at_risk_count) in batch_counts {
+                                                    // Record metric for SLA near-miss
+                                                    counter!(
+                                                        "fusillade_sla_near_miss_total",
+                                                        "sla_name" => threshold.name.clone(),
+                                                        "batch_id" => batch_id.to_string()
+                                                    ).increment(at_risk_count as u64);
+
                                                     match level {
                                                         SlaLogLevel::Error => {
                                                             tracing::error!(
@@ -687,6 +694,39 @@ where
                                             }
                                         }
                                     }
+                                }
+                            }
+
+                            // Check for batches that have already missed their SLA deadline
+                            // This runs regardless of configured thresholds to catch any missed SLAs
+                            let all_states = vec![
+                                RequestStateFilter::Pending,
+                                RequestStateFilter::Claimed,
+                                RequestStateFilter::Processing,
+                            ];
+                            match storage.get_missed_sla_batches(&all_states).await {
+                                Ok(missed_batch_counts) => {
+                                    if !missed_batch_counts.is_empty() {
+                                        for (batch_id, missed_count) in missed_batch_counts {
+                                            // Record metric for SLA miss
+                                            counter!(
+                                                "fusillade_sla_missed_total",
+                                                "batch_id" => batch_id.to_string()
+                                            ).increment(missed_count as u64);
+
+                                            tracing::error!(
+                                                batch_id = %batch_id,
+                                                missed_count = missed_count,
+                                                "Requests have missed their SLA deadline"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "Failed to get missed SLA batches"
+                                    );
                                 }
                             }
                         }
