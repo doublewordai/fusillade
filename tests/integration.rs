@@ -303,12 +303,22 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
         http_client.in_flight_count()
     );
 
-    // Verify exactly 2 are in-flight (not more)
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Verify exactly 2 are in-flight (not more) by polling for a bit
+    let start = tokio::time::Instant::now();
+    let stable_duration = Duration::from_millis(100);
+    while start.elapsed() < stable_duration {
+        let in_flight = http_client.in_flight_count();
+        assert!(
+            in_flight <= 2,
+            "Concurrency limit violated: {} requests in-flight (expected max 2)",
+            in_flight
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(
         http_client.in_flight_count(),
         2,
-        "Concurrency limit violated: more than 2 requests in-flight"
+        "Expected exactly 2 requests in-flight after stability check"
     );
 
     // Trigger completion of first request
@@ -620,14 +630,10 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
     // Increase the limit to 5
     model_concurrency_limits.insert("gpt-4".to_string(), 5);
 
-    // Wait a bit for the daemon to pick up the new limit
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     // Complete one request to free up a permit and trigger daemon to check limits
     triggers.remove(0).send(()).unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Now we should see up to 5 requests in flight
+    // Now we should see up to 5 requests in flight (daemon picks up new limit)
     let start = tokio::time::Instant::now();
     let timeout = Duration::from_secs(2);
     let mut reached_new_limit = false;
@@ -764,16 +770,30 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
-    // Wait for the deadline to pass
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Poll until request reaches Failed state (due to deadline)
+    let start = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(5);
+    let mut results = None;
 
-    // Check the request state
-    let results = manager
-        .get_requests(vec![request_id])
-        .await
-        .expect("Failed to get request");
+    while start.elapsed() < timeout {
+        let res = manager
+            .get_requests(vec![request_id])
+            .await
+            .expect("Failed to get request");
+
+        if let Some(Ok(req)) = res.first() {
+            if req.is_terminal() {
+                results = Some(res);
+                break;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     shutdown_token.cancel();
+
+    let results = results.expect("Request should have reached terminal state within timeout");
 
     if let Some(Ok(fusillade::AnyRequest::Failed(failed))) = results.first() {
         // Calculate expected retry attempts:
@@ -911,16 +931,30 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
-    // Wait for the deadline to pass
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Poll until request reaches Failed state (due to deadline)
+    let start = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(5);
+    let mut results = None;
 
-    // Check the request state
-    let results = manager
-        .get_requests(vec![request_id])
-        .await
-        .expect("Failed to get request");
+    while start.elapsed() < timeout {
+        let res = manager
+            .get_requests(vec![request_id])
+            .await
+            .expect("Failed to get request");
+
+        if let Some(Ok(req)) = res.first() {
+            if req.is_terminal() {
+                results = Some(res);
+                break;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     shutdown_token.cancel();
+
+    let results = results.expect("Request should have reached terminal state within timeout");
 
     if let Some(Ok(fusillade::AnyRequest::Failed(failed))) = results.first() {
         // Calculate expected retry attempts with NO buffer:
@@ -1131,14 +1165,24 @@ mod sla {
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
-        // Wait for escalation to be created (SLA check runs every 1 second)
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Poll for escalation to be created
+        let start = tokio::time::Instant::now();
+        let all_requests = loop {
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("Timeout waiting for escalation to be created");
+            }
 
-        // Verify: Escalated request was created
-        let all_requests = manager
-            .get_batch_requests(batch.id)
-            .await
-            .expect("Failed to get requests");
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+
+            if requests.len() == 2 {
+                break requests;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
 
         // Should have 2 requests now: original + escalated
         assert_eq!(
@@ -1430,8 +1474,24 @@ mod sla {
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
-        // Wait for SLA checker to run (it should NOT create escalations)
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Poll to verify no escalations are created (SLA checker runs but creates nothing)
+        let start = tokio::time::Instant::now();
+        let check_duration = Duration::from_millis(1500);
+
+        while start.elapsed() < check_duration {
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+
+            assert_eq!(
+                requests.len(),
+                1,
+                "Should not create escalations when no priority endpoint is configured"
+            );
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         let all_requests = manager
             .get_batch_requests(batch.id)
@@ -1601,12 +1661,25 @@ mod sla {
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Poll for escalation to be created
+        let start = tokio::time::Instant::now();
+        let all_requests = loop {
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("Timeout waiting for escalation to be created");
+            }
 
-        let all_requests = manager
-            .get_batch_requests(batch.id)
-            .await
-            .expect("Failed to get requests");
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+
+            if requests.len() == 2 {
+                break requests;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
         assert_eq!(all_requests.len(), 2, "Should have original + escalated");
 
         let escalated_id = all_requests
@@ -1791,12 +1864,25 @@ mod sla {
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Poll for escalation to be created
+        let start = tokio::time::Instant::now();
+        let all_requests = loop {
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("Timeout waiting for escalation to be created");
+            }
 
-        let all_requests = manager
-            .get_batch_requests(batch.id)
-            .await
-            .expect("Failed to get requests");
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+
+            if requests.len() == 2 {
+                break requests;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
         let escalated_id = all_requests
             .iter()
             .find(|r| r.data().is_escalated)
@@ -1980,22 +2066,34 @@ mod sla {
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
-        // Wait for SLA checker to run and create escalations
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Poll until escalation is created in batch1
+        let start = tokio::time::Instant::now();
+        let (batch1_requests, batch2_requests, batch3_requests) = loop {
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("Timeout waiting for escalation to be created in batch1");
+            }
 
-        // Count escalated requests across all batches
-        let batch1_requests = manager
-            .get_batch_requests(batch1.id)
-            .await
-            .expect("Failed to get batch1 requests");
-        let batch2_requests = manager
-            .get_batch_requests(batch2.id)
-            .await
-            .expect("Failed to get batch2 requests");
-        let batch3_requests = manager
-            .get_batch_requests(batch3.id)
-            .await
-            .expect("Failed to get batch3 requests");
+            let b1 = manager
+                .get_batch_requests(batch1.id)
+                .await
+                .expect("Failed to get batch1 requests");
+            let b2 = manager
+                .get_batch_requests(batch2.id)
+                .await
+                .expect("Failed to get batch2 requests");
+            let b3 = manager
+                .get_batch_requests(batch3.id)
+                .await
+                .expect("Failed to get batch3 requests");
+
+            let b1_escalated = b1.iter().filter(|r| r.data().is_escalated).count();
+
+            if b1_escalated > 0 {
+                break (b1, b2, b3);
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
 
         let escalated_count = batch1_requests
             .iter()
@@ -2219,13 +2317,24 @@ mod sla {
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
-        // Wait for SLA checker to run and create escalations
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Poll until all 3 escalations are created (3 original + 3 escalated = 6 total)
+        let start = tokio::time::Instant::now();
+        let all_requests = loop {
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("Timeout waiting for escalations to be created");
+            }
 
-        let all_requests = manager
-            .get_batch_requests(batch.id)
-            .await
-            .expect("Failed to get requests");
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+
+            if requests.len() == 6 {
+                break requests;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
 
         // Verify: 3 original + 3 escalated = 6 total
         assert_eq!(
@@ -2404,13 +2513,24 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
-    // Wait for SLA checker to run and create escalation
-    tokio::time::sleep(Duration::from_millis(1050)).await;
+    // Poll for escalation to be created
+    let start = tokio::time::Instant::now();
+    let all_requests = loop {
+        if start.elapsed() > Duration::from_secs(5) {
+            panic!("Timeout waiting for escalation to be created");
+        }
 
-    let all_requests = manager
-        .get_batch_requests(batch.id)
-        .await
-        .expect("Failed to get requests");
+        let requests = manager
+            .get_batch_requests(batch.id)
+            .await
+            .expect("Failed to get requests");
+
+        if requests.len() == 2 {
+            break requests;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
 
     // Should have 2 requests: original + escalated
     assert_eq!(all_requests.len(), 2, "Should have original + escalated");
@@ -2440,8 +2560,24 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
         "Escalated should keep original model in DB (override applied at runtime)"
     );
 
-    // Wait a bit for both requests to be processed
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Poll until one request completes (batch shows completion)
+    let start = tokio::time::Instant::now();
+    loop {
+        if start.elapsed() > Duration::from_secs(3) {
+            panic!("Timeout waiting for batch to show completed requests");
+        }
+
+        let status = manager
+            .get_batch_status(batch.id)
+            .await
+            .expect("Failed to get batch status");
+
+        if status.completed_requests > 0 {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     shutdown_token.cancel();
 
@@ -2495,5 +2631,214 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
             .contains(r#""model":"gpt-4-priority""#),
         "Escalated request should contain model override gpt-4-priority in body: {}",
         escalated_calls[0].body
+    );
+}
+
+#[sqlx::test]
+async fn test_sla_escalation_uses_priority_api_key(pool: sqlx::PgPool) {
+    // Test: Verify escalated requests use priority endpoint's API key when configured
+    // Expected: Original uses "original-api-key", escalated uses "priority-api-key"
+    let http_client = Arc::new(MockHttpClient::new());
+
+    // Mock responses for both endpoints
+    http_client.add_response(
+        "POST /priority/test",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"result":"priority_success"}"#.to_string(),
+        }),
+    );
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"result":"regular_success"}"#.to_string(),
+        }),
+    );
+
+    // Configure priority endpoint with custom API key
+    let priority_endpoints = Arc::new(dashmap::DashMap::new());
+    priority_endpoints.insert(
+        "gpt-4".to_string(),
+        PriorityEndpointConfig {
+            endpoint: "https://priority.openai.com".to_string(),
+            api_key: Some("priority-api-key".to_string()), // Different API key for priority endpoint
+            path_override: Some("/priority/test".to_string()),
+            model_override: None,
+        },
+    );
+
+    let config = DaemonConfig {
+        claim_batch_size: 10,
+        claim_interval_ms: 10,
+        default_model_concurrency: 10,
+        model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+        max_retries: Some(0),
+        backoff_ms: 100,
+        backoff_factor: 2,
+        max_backoff_ms: 1000,
+        timeout_ms: 5000,
+        status_log_interval_ms: None,
+        heartbeat_interval_ms: 100,
+        should_retry: Arc::new(default_should_retry),
+        claim_timeout_ms: 1000,
+        processing_timeout_ms: 5000,
+        cancellation_poll_interval_ms: 10,
+        sla_check_interval_seconds: 1,
+        sla_thresholds: vec![SlaThreshold {
+            name: "test-api-key".to_string(),
+            threshold_seconds: 3600,
+            action: SlaAction::Escalate,
+            allowed_states: vec![RequestStateFilter::Pending],
+        }],
+        priority_endpoints,
+        stop_before_deadline_ms: None,
+        batch_metadata_fields: vec![],
+    };
+
+    let manager = Arc::new(
+        PostgresRequestManager::with_client(pool.clone(), http_client.clone()).with_config(config),
+    );
+
+    // Create batch with original API key
+    let file_id = manager
+        .create_file(
+            "api-key-test".to_string(),
+            None,
+            vec![RequestTemplateInput {
+                custom_id: Some("original".to_string()),
+                endpoint: "https://api.openai.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"model":"gpt-4","prompt":"test"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                api_key: "original-api-key".to_string(), // Original API key
+            }],
+        )
+        .await
+        .expect("Failed to create file");
+
+    let batch = manager
+        .create_batch(BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "2h".to_string(),
+            metadata: None,
+            created_by: None,
+        })
+        .await
+        .expect("Failed to create batch");
+
+    // Make batch at-risk
+    sqlx::query!(
+        r#"UPDATE batches SET created_at = NOW() - INTERVAL '90 minutes', expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1"#,
+        *batch.id as sqlx::types::Uuid
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to backdate batch");
+
+    let requests = manager
+        .get_batch_requests(batch.id)
+        .await
+        .expect("Failed to get requests");
+    let original_id = requests[0].id();
+
+    // Start daemon
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
+    manager
+        .clone()
+        .run(shutdown_token.clone())
+        .expect("Failed to start daemon");
+
+    // Poll for escalation to be created
+    let start = tokio::time::Instant::now();
+    let all_requests = loop {
+        if start.elapsed() > Duration::from_secs(5) {
+            panic!("Timeout waiting for escalation to be created");
+        }
+
+        let requests = manager
+            .get_batch_requests(batch.id)
+            .await
+            .expect("Failed to get requests");
+
+        if requests.len() == 2 {
+            break requests;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert_eq!(all_requests.len(), 2, "Should have original + escalated");
+
+    let escalated_id = all_requests
+        .iter()
+        .find(|r| {
+            let data = match r {
+                AnyRequest::Pending(req) => &req.data,
+                AnyRequest::Claimed(req) => &req.data,
+                AnyRequest::Processing(req) => &req.data,
+                AnyRequest::Completed(req) => &req.data,
+                AnyRequest::Failed(req) => &req.data,
+                AnyRequest::Superseded(req) => &req.data,
+                AnyRequest::Canceled(req) => &req.data,
+            };
+            data.is_escalated
+        })
+        .map(|r| r.id())
+        .expect("Should have escalated request");
+
+    // Wait for both requests to complete
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let results = manager
+            .get_requests(vec![original_id, escalated_id])
+            .await
+            .expect("Failed to get requests");
+        if results.iter().any(|r| r.as_ref().unwrap().is_terminal()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    shutdown_token.cancel();
+
+    // Verify API keys used in HTTP calls
+    let calls = http_client.get_calls();
+
+    // At least one call should have been made
+    assert!(
+        !calls.is_empty(),
+        "Expected at least one HTTP call to have been made"
+    );
+
+    // Find calls by path to identify which is which
+    let original_calls: Vec<_> = calls.iter().filter(|c| c.path == "/v1/test").collect();
+    let escalated_calls: Vec<_> = calls
+        .iter()
+        .filter(|c| c.path == "/priority/test")
+        .collect();
+
+    // Verify escalated request used priority API key
+    if !escalated_calls.is_empty() {
+        assert_eq!(
+            escalated_calls[0].api_key, "priority-api-key",
+            "Escalated request should use priority endpoint's API key"
+        );
+    }
+
+    // Verify original request used original API key (if it was called)
+    if !original_calls.is_empty() {
+        assert_eq!(
+            original_calls[0].api_key, "original-api-key",
+            "Original request should use original API key"
+        );
+    }
+
+    // At minimum, verify the escalated request was made with the correct API key
+    assert!(
+        !escalated_calls.is_empty(),
+        "Expected escalated request to have been processed"
     );
 }

@@ -265,7 +265,8 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                     LIMIT 1
                 )
                 -- Only supersede if not already in a terminal state
-                AND state NOT IN ('completed', 'failed', 'canceled', 'superseded')
+                -- Allow superseding 'failed' requests since that's the point of escalation
+                AND state NOT IN ('completed', 'canceled', 'superseded')
             RETURNING id
             "#,
             *winner_id as Uuid,
@@ -2719,15 +2720,15 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
               AND r.state = ANY($2)
               AND b.expires_at IS NOT NULL
               AND b.completed_at IS NULL
-              AND b.failed_at IS NULL
+              -- Don't exclude failed batches - allow escalation as last resort
               AND b.cancelled_at IS NULL
               AND b.cancelling_at IS NULL
               AND (b.expires_at - NOW()) <= make_interval(secs => $3::float8)
-              -- Only create escalation if one doesn't already exist in an active state
+              -- Only create escalation if one doesn't already exist (in any state)
+              -- This prevents creating duplicate escalations if the first one failed
               AND NOT EXISTS (
                   SELECT 1 FROM requests esc
                   WHERE esc.escalated_from_request_id = r.id
-                    AND esc.state IN ('pending', 'claimed', 'processing')
               )
             "#,
             model,
@@ -8349,18 +8350,19 @@ mod tests {
         .await
         .unwrap();
 
-        // Now try to create escalation again - should succeed because existing escalation is terminal
+        // Now try to create escalation again - should NOT create a new one because one already exists
+        // (even though it's in a terminal state, we don't create duplicate escalations)
         let count2 = manager
             .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
         assert_eq!(
-            count2, 1,
-            "Should allow new escalation when existing one is in terminal state"
+            count2, 0,
+            "Should not allow new escalation when one already exists (even if terminal)"
         );
 
-        // Verify 2 escalated requests exist (one completed, one pending)
+        // Verify only 1 escalated request exists (the completed one)
         let escalated_count: i64 = sqlx::query_scalar!(
             "SELECT COUNT(*)::bigint FROM requests WHERE batch_id = $1 AND is_escalated = true",
             *batch.id as Uuid
@@ -8370,7 +8372,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(escalated_count, 2);
+        assert_eq!(escalated_count, 1);
     }
 
     #[sqlx::test]
@@ -8567,15 +8569,34 @@ mod tests {
             batch_ids.push(batch.id);
         }
 
-        // Try to escalate - should find 0 requests because all batches are terminal
+        // Try to escalate - should find 1 request from the failed batch
+        // (failed batches are NOT excluded, as they may need escalation as a last resort)
         let count = manager
             .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
             .await
             .unwrap();
 
         assert_eq!(
-            count, 0,
-            "Should not escalate requests from terminal batches"
+            count, 1,
+            "Should escalate requests from failed batches (last resort), but not completed or cancelled batches"
+        );
+
+        // Verify the escalation came from the failed batch
+        let escalated = sqlx::query!(
+            r#"
+            SELECT r.batch_id, b.failed_at
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            WHERE r.is_escalated = true
+            "#
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            escalated.failed_at.is_some(),
+            "Escalated request should be from the failed batch"
         );
     }
 
