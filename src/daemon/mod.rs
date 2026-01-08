@@ -637,12 +637,12 @@ where
                                                 ).await {
                                                     Ok(model_counts) => {
                                                         for ((model, endpoint), count) in model_counts {
-                                                            crate::metrics::record_sla_at_risk(
-                                                                &model,
-                                                                &endpoint,
-                                                                &threshold.name,
-                                                                count
-                                                            );
+                                                            gauge!(
+                                                                "fusillade_sla_at_risk_requests",
+                                                                "model" => model.clone(),
+                                                                "endpoint" => endpoint.clone(),
+                                                                "sla_name" => threshold.name.clone()
+                                                            ).set(count as f64);
 
                                                             // Log for correlation
                                                             tracing::warn!(
@@ -700,27 +700,23 @@ where
                                                     Ok(escalated_count) => {
                                                         if escalated_count > 0 {
                                                             // Record escalation metrics
-                                                            #[cfg(feature = "metrics")]
-                                                            {
-                                                                for _ in 0..escalated_count {
-                                                                    crate::metrics::record_sla_escalation(
-                                                                        model,
-                                                                        &priority_config.endpoint,
-                                                                        &threshold.name
-                                                                    );
-                                                                }
+                                                            counter!(
+                                                                "fusillade_sla_escalations_total",
+                                                                "model" => model.to_string(),
+                                                                "endpoint" => priority_config.endpoint.clone(),
+                                                                "sla_name" => threshold.name.clone()
+                                                            ).increment(escalated_count as u64);
 
-                                                                // Log for correlation
-                                                                tracing::info!(
-                                                                    target: "metrics_correlation",
-                                                                    metric = "fusillade_sla_escalations_total",
-                                                                    model = %model,
-                                                                    endpoint = %priority_config.endpoint,
-                                                                    sla_name = %threshold.name,
-                                                                    escalated_count = escalated_count,
-                                                                    "SLA escalation created"
-                                                                );
-                                                            }
+                                                            // Log for correlation
+                                                            tracing::info!(
+                                                                target: "metrics_correlation",
+                                                                metric = "fusillade_sla_escalations_total",
+                                                                model = %model,
+                                                                endpoint = %priority_config.endpoint,
+                                                                sla_name = %threshold.name,
+                                                                escalated_count = escalated_count,
+                                                                "SLA escalation created"
+                                                            );
 
                                                             tracing::debug!(
                                                                 model = %model,
