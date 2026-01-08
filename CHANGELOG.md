@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.13.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.12.4...fusillade-v0.13.0) (2026-01-07)
+
+
+### Features
+
+* add prometheus metrics for daemon operations ([#58](https://github.com/doublewordai/fusillade/issues/58)) ([b86d526](https://github.com/doublewordai/fusillade/commit/b86d526c2c7f765b800d977d3bee018c4a252666))
+
+## [0.12.4](https://github.com/doublewordai/fusillade/compare/fusillade-v0.12.3...fusillade-v0.12.4) (2026-01-07)
+
+
+### Bug Fixes
+
+* use ISO 8601 format for batch timestamp headers ([#56](https://github.com/doublewordai/fusillade/issues/56)) ([61306b8](https://github.com/doublewordai/fusillade/commit/61306b8eee506cd01ccb1da285d1e0b920787b4d))
+
+## [0.12.3](https://github.com/doublewordai/fusillade/compare/fusillade-v0.12.2...fusillade-v0.12.3) (2026-01-07)
+
+
+### Bug Fixes
+
+* handle multiple escalated requests in supersede_racing_pair query ([#54](https://github.com/doublewordai/fusillade/issues/54)) ([0ac1068](https://github.com/doublewordai/fusillade/commit/0ac1068808b9eba52d90008a0bc80cec76b16b79))
+
+## [0.12.2](https://github.com/doublewordai/fusillade/compare/fusillade-v0.12.1...fusillade-v0.12.2) (2026-01-06)
+
+
+### Bug Fixes
+
+* use targeted query for escalation lookup ([#52](https://github.com/doublewordai/fusillade/issues/52)) ([6e84c39](https://github.com/doublewordai/fusillade/commit/6e84c39e72d46f94e544674578bce6fac3564bfd))
+
 ## [0.12.1](https://github.com/doublewordai/fusillade/compare/fusillade-v0.12.0...fusillade-v0.12.1) (2025-12-24)
 
 

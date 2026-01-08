@@ -253,6 +253,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 superseded_by_request_id = $1
             WHERE
                 -- Find the racing pair: if winner is escalated, find original; if winner is original, find escalated
+                -- LIMIT 1 handles edge case where multiple escalated requests exist for the same original
                 id = (
                     SELECT CASE
                         WHEN w.is_escalated THEN w.escalated_from_request_id
@@ -261,6 +262,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                     FROM requests w
                     LEFT JOIN requests e ON e.escalated_from_request_id = w.id AND e.is_escalated = true
                     WHERE w.id = $1
+                    LIMIT 1
                 )
                 -- Only supersede if not already in a terminal state
                 AND state NOT IN ('completed', 'failed', 'canceled', 'superseded')
@@ -713,9 +715,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                            b.output_file_id::TEXT as batch_output_file_id,
                            b.error_file_id::TEXT as batch_error_file_id,
                            COALESCE(b.created_by, '') as batch_created_by,
-                           b.created_at::TEXT as batch_created_at,
-                           b.expires_at::TEXT as batch_expires_at,
-                           b.cancelling_at::TEXT as batch_cancelling_at,
+                           to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as batch_created_at,
+                           to_char(b.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as batch_expires_at,
+                           to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as batch_cancelling_at,
                            b.errors::TEXT as batch_errors,
                            b.total_requests::TEXT as batch_total_requests
                     FROM requests r
@@ -3080,6 +3082,28 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         }
 
         Ok(results)
+    }
+
+    async fn find_pending_escalation(
+        &self,
+        original_request_id: RequestId,
+    ) -> Result<Option<RequestId>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id
+            FROM requests
+            WHERE escalated_from_request_id = $1
+              AND is_escalated = true
+              AND state IN ('pending', 'claimed', 'processing')
+            LIMIT 1
+            "#,
+            *original_request_id as Uuid,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to find pending escalation: {}", e)))?;
+
+        Ok(row.map(|r| RequestId(r.id)))
     }
 }
 

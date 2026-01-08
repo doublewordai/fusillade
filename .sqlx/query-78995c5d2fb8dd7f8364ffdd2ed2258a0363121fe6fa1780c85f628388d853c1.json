@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests\n            SET\n                state = 'superseded',\n                superseded_at = $2,\n                superseded_by_request_id = $1\n            WHERE\n                -- Find the racing pair: if winner is escalated, find original; if winner is original, find escalated\n                -- LIMIT 1 handles edge case where multiple escalated requests exist for the same original\n                id = (\n                    SELECT CASE\n                        WHEN w.is_escalated THEN w.escalated_from_request_id\n                        ELSE e.id\n                    END\n                    FROM requests w\n                    LEFT JOIN requests e ON e.escalated_from_request_id = w.id AND e.is_escalated = true\n                    WHERE w.id = $1\n                    LIMIT 1\n                )\n                -- Only supersede if not already in a terminal state\n                AND state NOT IN ('completed', 'failed', 'canceled', 'superseded')\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "78995c5d2fb8dd7f8364ffdd2ed2258a0363121fe6fa1780c85f628388d853c1"
+}
