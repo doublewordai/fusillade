@@ -282,6 +282,40 @@ pub enum FileContentItem {
     Error(BatchErrorItem),
 }
 
+/// Status of a batch result item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchResultStatus {
+    /// Request is pending execution
+    Pending,
+    /// Request is currently being processed (claimed or processing)
+    InProgress,
+    /// Request completed successfully
+    Completed,
+    /// Request failed with an error
+    Failed,
+}
+
+/// Merged batch result item combining input, output, and status.
+/// Used for the Results view to show input/output pairs in a single row.
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchResultItem {
+    /// Fusillade request ID (unique identifier)
+    pub id: String,
+    /// User-provided identifier (NOT unique - may be duplicated)
+    pub custom_id: Option<String>,
+    /// Model used for this request
+    pub model: String,
+    /// Original request body from the input template
+    pub input_body: serde_json::Value,
+    /// Full response object (choices, usage, etc.) for completed requests
+    pub response_body: Option<serde_json::Value>,
+    /// Error message for failed requests
+    pub error: Option<String>,
+    /// Current status of the request
+    pub status: BatchResultStatus,
+}
+
 /// Metadata for creating a file from a stream
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct FileMetadata {

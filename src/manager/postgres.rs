@@ -3081,6 +3081,24 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(results)
     }
 
+    #[tracing::instrument(skip(self), fields(batch_id = %batch_id, search = ?search))]
+    fn get_batch_results_stream(
+        &self,
+        batch_id: BatchId,
+        offset: usize,
+        search: Option<String>,
+    ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>> {
+        let pool = self.pool.clone();
+        let (tx, rx) = mpsc::channel(self.download_buffer_size);
+        let offset = offset as i64;
+
+        tokio::spawn(async move {
+            Self::stream_batch_results(pool, batch_id, offset, search, tx).await;
+        });
+
+        Box::pin(ReceiverStream::new(rx))
+    }
+
     async fn find_pending_escalation(
         &self,
         original_request_id: RequestId,
@@ -3429,6 +3447,117 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                     let _ = tx
                         .send(Err(FusilladeError::Other(anyhow!(
                             "Failed to fetch failed requests: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Stream batch results with merged input/output data for the Results view.
+    /// This joins requests with their templates to provide input body alongside response/error.
+    async fn stream_batch_results(
+        pool: sqlx::PgPool,
+        batch_id: BatchId,
+        offset: i64,
+        search: Option<String>,
+        tx: mpsc::Sender<Result<crate::batch::BatchResultItem>>,
+    ) {
+        use crate::batch::{BatchResultItem, BatchResultStatus};
+
+        const BATCH_SIZE: i64 = 1000;
+        let mut last_created_at: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut last_id: Uuid = Uuid::nil();
+        let mut is_first_batch = true;
+        let search_pattern = search.map(|s| format!("%{}%", s.to_lowercase()));
+
+        loop {
+            // Use OFFSET only on first batch, then use cursor pagination
+            let (cursor_time, cursor_id, offset_val) = if is_first_batch {
+                (None, Uuid::nil(), offset)
+            } else {
+                (last_created_at, last_id, 0i64)
+            };
+            is_first_batch = false;
+
+            let request_batch = sqlx::query!(
+                r#"
+                SELECT r.id, r.custom_id, r.model, r.state,
+                       t.body as input_body,
+                       r.response_body, r.error, r.created_at
+                FROM requests r
+                JOIN request_templates t ON r.template_id = t.id
+                WHERE r.batch_id = $1
+                  AND r.superseded_at IS NULL
+                  AND ($2::TIMESTAMPTZ IS NULL OR r.created_at > $2 OR (r.created_at = $2 AND r.id > $3))
+                  AND ($6::text IS NULL OR LOWER(r.custom_id) LIKE $6)
+                ORDER BY r.created_at ASC, r.id ASC
+                OFFSET $4
+                LIMIT $5
+                "#,
+                *batch_id as Uuid,
+                cursor_time,
+                cursor_id,
+                offset_val,
+                BATCH_SIZE,
+                search_pattern.as_deref(),
+            )
+            .fetch_all(&pool)
+            .await;
+
+            match request_batch {
+                Ok(requests) => {
+                    if requests.is_empty() {
+                        break;
+                    }
+
+                    tracing::debug!("Fetched batch of {} results", requests.len());
+
+                    for row in requests {
+                        last_created_at = Some(row.created_at);
+                        last_id = row.id;
+
+                        // Parse input body as JSON
+                        let input_body: serde_json::Value = serde_json::from_str(&row.input_body)
+                            .unwrap_or_else(|_| serde_json::Value::String(row.input_body.clone()));
+
+                        // Parse response body as JSON if present
+                        let response_body: Option<serde_json::Value> =
+                            row.response_body.as_ref().map(|body| {
+                                serde_json::from_str(body)
+                                    .unwrap_or_else(|_| serde_json::Value::String(body.clone()))
+                            });
+
+                        // Map state to BatchResultStatus
+                        let status = match row.state.as_str() {
+                            "completed" => BatchResultStatus::Completed,
+                            "failed" => BatchResultStatus::Failed,
+                            "pending" => BatchResultStatus::Pending,
+                            "claimed" | "processing" => BatchResultStatus::InProgress,
+                            _ => BatchResultStatus::Pending, // Default for unknown states
+                        };
+
+                        let result_item = BatchResultItem {
+                            id: row.id.to_string(),
+                            custom_id: row.custom_id,
+                            model: row.model,
+                            input_body,
+                            response_body,
+                            error: row.error,
+                            status,
+                        };
+
+                        if tx.send(Ok(result_item)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Failed to fetch batch results: {}",
                             e
                         ))))
                         .await;
