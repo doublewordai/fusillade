@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                r.model,\n                b.endpoint,\n                COUNT(*) as \"count!\"\n            FROM requests r\n            JOIN batches b ON r.batch_id = b.id\n            WHERE b.expires_at < NOW() + make_interval(secs => $1)\n              AND b.completed_at IS NULL\n              AND b.failed_at IS NULL\n              AND b.cancelled_at IS NULL\n              AND b.cancelling_at IS NULL\n              AND r.state = ANY($2)\n              AND r.is_escalated = false\n            GROUP BY r.model, b.endpoint\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Float8",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "8a6432b0da7c21bb482b007f4bbeb03465e6dfa7bd47de4b655d66d7099c708e"
+}
