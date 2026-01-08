@@ -154,6 +154,21 @@ pub trait Storage: Send + Sync {
         allowed_states: &[RequestStateFilter],
     ) -> Result<HashMap<BatchId, usize>>;
 
+    /// Get batches with requests that have already missed their SLA deadline.
+    ///
+    /// Returns a count of requests per batch where the deadline has passed.
+    /// Only considers batches that are not completed, failed, or cancelled.
+    ///
+    /// # Arguments
+    /// - `allowed_states`: List of request states to count
+    ///
+    /// # Returns
+    /// HashMap mapping BatchId to the count of requests that missed SLA
+    async fn get_missed_sla_batches(
+        &self,
+        allowed_states: &[RequestStateFilter],
+    ) -> Result<HashMap<BatchId, usize>>;
+
     /// Create escalated requests for at-risk requests in a single operation.
     ///
     /// Creates escalated copies of all requests matching the criteria.

@@ -2641,6 +2641,39 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(result)
     }
 
+    async fn get_missed_sla_batches(
+        &self,
+        allowed_states: &[RequestStateFilter],
+    ) -> Result<HashMap<BatchId, usize>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                r.batch_id,
+                COUNT(*) as count
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            WHERE b.expires_at < NOW()
+              AND b.completed_at IS NULL
+              AND b.failed_at IS NULL
+              AND b.cancelled_at IS NULL
+              AND b.cancelling_at IS NULL
+              AND r.state = ANY($1)
+            GROUP BY r.batch_id
+            "#,
+            allowed_states as &[RequestStateFilter],
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to get missed SLA batches: {}", e)))?;
+
+        let mut result = HashMap::new();
+        for row in rows {
+            result.insert(BatchId(row.batch_id), row.count.unwrap_or(0) as usize);
+        }
+
+        Ok(result)
+    }
+
     /// Create escalated requests for at-risk requests in a single operation.
     ///
     /// This method performs a bulk INSERT to create escalated requests for all requests
