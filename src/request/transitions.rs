@@ -193,7 +193,13 @@ impl Request<Claimed> {
         storage: &S,
     ) -> Result<Request<Processing>> {
         let request_data = self.data.clone();
-        let api_key = request_data.api_key.clone();
+
+        // Use escalated_api_key if present, otherwise fall back to original api_key
+        let api_key = request_data
+            .escalated_api_key
+            .as_ref()
+            .unwrap_or(&request_data.api_key)
+            .clone();
 
         // Create a channel for the HTTP result
         let (tx, rx) = tokio::sync::mpsc::channel(1);

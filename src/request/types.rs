@@ -114,6 +114,15 @@ pub struct RequestData {
     /// Escalated requests are infrastructure and not counted in batch progress
     pub is_escalated: bool,
 
+    /// When set, the actual model to send the request to (overrides model field)
+    /// Used for SLA escalation to more powerful models while keeping the original model visible to the user
+    /// The 'model' field remains as the user-requested model
+    pub escalated_model: Option<String>,
+
+    /// When set, the API key to use for the escalated request (overrides api_key field)
+    /// Used together with escalated_model to allow escalation to models requiring different credentials
+    pub escalated_api_key: Option<String>,
+
     /// When this request was superseded by its racing pair completing first
     /// Superseded requests are terminal and do not count toward batch completion
     pub superseded_at: Option<DateTime<Utc>>,

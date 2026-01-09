@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id as \"template_id?\", r.state,\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", r.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,\n                b.expires_at as batch_expires_at\n            FROM requests r\n            LEFT JOIN request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.batch_id = $1\n            ORDER BY r.created_at ASC\n            ",
+  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id as \"template_id?\", r.state,\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", t.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at,\n                r.escalated_from_request_id, r.is_escalated, r.escalated_model, r.escalated_api_key, r.superseded_at, r.superseded_by_request_id\n            FROM requests r\n            LEFT JOIN request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.id = ANY($1)\n            ",
   "describe": {
     "columns": [
       {
@@ -115,33 +115,43 @@
       },
       {
         "ordinal": 22,
+        "name": "batch_expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 23,
         "name": "escalated_from_request_id",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 23,
+        "ordinal": 24,
         "name": "is_escalated",
         "type_info": "Bool"
       },
       {
-        "ordinal": 24,
+        "ordinal": 25,
+        "name": "escalated_model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 26,
+        "name": "escalated_api_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 27,
         "name": "superseded_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 25,
+        "ordinal": 28,
         "name": "superseded_by_request_id",
         "type_info": "Uuid"
-      },
-      {
-        "ordinal": 26,
-        "name": "batch_expires_at",
-        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -167,12 +177,14 @@
       true,
       true,
       true,
+      false,
       true,
       false,
       true,
       true,
-      false
+      true,
+      true
     ]
   },
-  "hash": "3bbbfa21957e02efece2cc2c7d4986d94c389e047e4897c9080eebfd9fc855ce"
+  "hash": "744b9d75595d7d3dda2c59dd5c90d3e7f99d76eb336186b7f098e720e95b9b7b"
 }

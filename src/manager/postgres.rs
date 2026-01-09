@@ -745,7 +745,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 WHERE r.id = tc.id
                 RETURNING r.id, r.batch_id, r.template_id as "template_id!", r.retry_attempt,
                           t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
-                          r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,
+                          r.escalated_from_request_id, r.is_escalated, r.escalated_model, r.escalated_api_key, r.superseded_at, r.superseded_by_request_id,
                           t.body as "body!", t.model as "model!", t.api_key as "api_key!",
                           b.expires_at as batch_expires_at,
                           tc.batch_id_str as "batch_id_str!",
@@ -835,6 +835,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             batch_metadata,
                             escalated_from_request_id: row.escalated_from_request_id.map(RequestId),
                             is_escalated: row.is_escalated,
+                            escalated_model: row.escalated_model.clone(),
+                            escalated_api_key: row.escalated_api_key,
                             superseded_at: row.superseded_at,
                             superseded_by_request_id: row.superseded_by_request_id.map(RequestId),
                         },
@@ -1156,7 +1158,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at,
-                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id
+                r.escalated_from_request_id, r.is_escalated, r.escalated_model, r.escalated_api_key, r.superseded_at, r.superseded_by_request_id
             FROM requests r
             LEFT JOIN request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
@@ -1207,6 +1209,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     batch_metadata: std::collections::HashMap::new(),
                     escalated_from_request_id: row.escalated_from_request_id.map(RequestId),
                     is_escalated: row.is_escalated,
+                    escalated_model: row.escalated_model.clone(),
+                    escalated_api_key: row.escalated_api_key,
                     superseded_at: row.superseded_at,
                     superseded_by_request_id: row.superseded_by_request_id.map(RequestId),
                 },
@@ -2692,13 +2696,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         model: &str,
         threshold_seconds: i64,
         allowed_states: &[RequestStateFilter],
-        _model_override: Option<&str>,
+        escalated_model: Option<&str>,
+        escalated_api_key: Option<&str>,
     ) -> Result<i64> {
         let rows_affected = sqlx::query!(
             r#"
             INSERT INTO requests (
                 id, batch_id, template_id, state, custom_id, retry_attempt, model,
-                escalated_from_request_id, is_escalated, superseded_at, superseded_by_request_id
+                escalated_from_request_id, is_escalated, escalated_model, escalated_api_key, superseded_at, superseded_by_request_id
             )
             SELECT
                 gen_random_uuid(),
@@ -2707,9 +2712,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 'pending',
                 t.custom_id,
                 r.retry_attempt,
-                r.model,     -- Keep original model for hashmap lookup at runtime
+                r.model,     -- Keep original model (what user requested)
                 r.id,        -- Link back to original request
                 true,        -- is_escalated = true
+                $4,          -- escalated_model (actual model to route to, or NULL)
+                $5,          -- escalated_api_key (API key for escalated model, or NULL to use original)
                 NULL,
                 NULL
             FROM requests r
@@ -2734,6 +2741,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             model,
             allowed_states as &[RequestStateFilter],
             threshold_seconds as f64,
+            escalated_model,
+            escalated_api_key,
         )
         .execute(&self.pool)
         .await
@@ -2866,7 +2875,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 t.path as "path?", t.body as "body?", r.model as "model?", t.api_key as "api_key?",
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
-                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,
+                r.escalated_from_request_id, r.is_escalated, r.escalated_model, r.escalated_api_key, r.superseded_at, r.superseded_by_request_id,
                 b.expires_at as batch_expires_at
             FROM requests r
             LEFT JOIN request_templates t ON r.template_id = t.id
@@ -2917,6 +2926,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     batch_metadata: std::collections::HashMap::new(),
                     escalated_from_request_id: row.escalated_from_request_id.map(RequestId),
                     is_escalated: row.is_escalated,
+                    escalated_model: row.escalated_model.clone(),
+                    escalated_api_key: row.escalated_api_key,
                     superseded_at: row.superseded_at,
                     superseded_by_request_id: row.superseded_by_request_id.map(RequestId),
                 },
@@ -8084,7 +8095,7 @@ mod tests {
 
         // Create escalated requests (threshold: 1800s = 30 min, so batch created 30min ago is at risk)
         let count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8180,7 +8191,7 @@ mod tests {
 
         // Escalate only gpt-4 requests
         let count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8248,7 +8259,7 @@ mod tests {
 
         // Create escalation first time
         let count1 = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8256,7 +8267,7 @@ mod tests {
 
         // Try to create escalation again - should be blocked by NOT EXISTS
         let count2 = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8327,7 +8338,7 @@ mod tests {
 
         // Create first escalation
         let count1 = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8353,7 +8364,7 @@ mod tests {
         // Now try to create escalation again - should NOT create a new one because one already exists
         // (even though it's in a terminal state, we don't create duplicate escalations)
         let count2 = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8471,7 +8482,7 @@ mod tests {
 
         // Test 1: Escalate only pending
         let pending_count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8479,7 +8490,7 @@ mod tests {
 
         // Test 2: Escalate only claimed
         let claimed_count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Claimed], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Claimed], None, None)
             .await
             .unwrap();
 
@@ -8489,7 +8500,7 @@ mod tests {
         // The function doesn't filter out terminal request states, only terminal batch states
         // So passing Completed in allowed_states WILL match completed requests
         let completed_count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Completed], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Completed], None, None)
             .await
             .unwrap();
 
@@ -8572,7 +8583,7 @@ mod tests {
         // Try to escalate - should find 1 request from the failed batch
         // (failed batches are NOT excluded, as they may need escalation as a last resort)
         let count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8607,7 +8618,7 @@ mod tests {
 
         // Test 1: Empty database
         let empty = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8656,7 +8667,7 @@ mod tests {
         .unwrap();
 
         let no_model_match = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8705,7 +8716,7 @@ mod tests {
         .unwrap();
 
         let not_at_risk = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8766,6 +8777,7 @@ mod tests {
                 3600,
                 &[RequestStateFilter::Pending],
                 Some("gpt-4-priority"),
+                None,
             )
             .await
             .unwrap();
@@ -8863,7 +8875,7 @@ mod tests {
 
         // Try to create escalated requests
         let count = manager
-            .create_escalated_requests("gpt-4", 3600, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 3600, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8925,6 +8937,7 @@ mod tests {
                 3600,
                 &[RequestStateFilter::Pending],
                 Some("gpt-4-priority"),
+                None,
             )
             .await
             .unwrap();
