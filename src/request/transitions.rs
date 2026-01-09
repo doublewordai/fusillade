@@ -103,6 +103,8 @@
 //! ```
 
 use std::sync::Arc;
+
+use metrics::counter;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -283,6 +285,12 @@ impl Request<Failed> {
         if let Some(max_retries) = config.max_retries
             && retry_attempt >= max_retries
         {
+            counter!(
+                "fusillade_retry_denied_total",
+                "model" => self.data.model.clone(),
+                "reason" => "max_retries"
+            )
+            .increment(1);
             tracing::debug!(
                 request_id = %self.data.id,
                 retry_attempt,
@@ -304,6 +312,12 @@ impl Request<Failed> {
 
         // Check if the next retry would start before the effective deadline
         if not_before >= effective_deadline {
+            counter!(
+                "fusillade_retry_denied_total",
+                "model" => self.data.model.clone(),
+                "reason" => "deadline"
+            )
+            .increment(1);
             let time_until_deadline = self.state.batch_expires_at - now;
             tracing::warn!(
                 request_id = %self.data.id,
@@ -427,6 +441,14 @@ impl Request<Processing> {
 
                 // Check if this response should be retried
                 if should_retry(&http_response) {
+                    // Record retriable HTTP status for observability
+                    counter!(
+                        "fusillade_http_status_retriable_total",
+                        "model" => self.data.model.clone(),
+                        "status" => http_response.status.to_string()
+                    )
+                    .increment(1);
+
                     // Treat as failure for retry purposes
                     let failed_state = Failed {
                         reason: FailureReason::RetriableHttpStatus {
