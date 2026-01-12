@@ -135,11 +135,13 @@ pub trait Storage: Send + Sync {
     /// - `batch_id`: The batch to get results for
     /// - `offset`: Number of results to skip (for pagination)
     /// - `search`: Optional custom_id filter (case-insensitive substring match)
+    /// - `status`: Optional status filter (completed, failed, pending, in_progress)
     fn get_batch_results_stream(
         &self,
         batch_id: BatchId,
         offset: usize,
         search: Option<String>,
+        status: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>>;
 
     /// Find a pending escalated request for a given original request.

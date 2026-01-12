@@ -3081,19 +3081,20 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(results)
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id, search = ?search))]
+    #[tracing::instrument(skip(self), fields(batch_id = %batch_id, search = ?search, status = ?status))]
     fn get_batch_results_stream(
         &self,
         batch_id: BatchId,
         offset: usize,
         search: Option<String>,
+        status: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>> {
         let pool = self.pool.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
         tokio::spawn(async move {
-            Self::stream_batch_results(pool, batch_id, offset, search, tx).await;
+            Self::stream_batch_results(pool, batch_id, offset, search, status, tx).await;
         });
 
         Box::pin(ReceiverStream::new(rx))
@@ -3463,6 +3464,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         batch_id: BatchId,
         offset: i64,
         search: Option<String>,
+        status: Option<String>,
         tx: mpsc::Sender<Result<crate::batch::BatchResultItem>>,
     ) {
         use crate::batch::{BatchResultItem, BatchResultStatus};
@@ -3472,6 +3474,13 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         let mut last_id: Uuid = Uuid::nil();
         let mut is_first_batch = true;
         let search_pattern = search.map(|s| format!("%{}%", s.to_lowercase()));
+
+        // Convert status filter to database state values
+        // in_progress maps to both 'claimed' and 'processing' states
+        let state_filter: Option<Vec<String>> = status.map(|s| match s.as_str() {
+            "in_progress" => vec!["claimed".to_string(), "processing".to_string()],
+            other => vec![other.to_string()],
+        });
 
         loop {
             // Use OFFSET only on first batch, then use cursor pagination
@@ -3493,6 +3502,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                   AND r.superseded_at IS NULL
                   AND ($2::TIMESTAMPTZ IS NULL OR r.created_at > $2 OR (r.created_at = $2 AND r.id > $3))
                   AND ($6::text IS NULL OR LOWER(r.custom_id) LIKE $6)
+                  AND ($7::text[] IS NULL OR r.state = ANY($7))
                 ORDER BY r.created_at ASC, r.id ASC
                 OFFSET $4
                 LIMIT $5
@@ -3503,6 +3513,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 offset_val,
                 BATCH_SIZE,
                 search_pattern.as_deref(),
+                state_filter.as_deref(),
             )
             .fetch_all(&pool)
             .await;
