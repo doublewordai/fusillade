@@ -67,11 +67,11 @@ pub enum SlaLogLevel {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelEscalationConfig {
     /// The model to escalate to (e.g., "o1-preview" for requests using "gpt-4")
-    /// This model is set in the escalated_model field and used for routing by the HTTP client
+    /// Escalated requests are created with a new template using this model
     pub escalation_model: String,
 
     /// Optional API key to use for the escalated model
-    /// If not provided, the original request's API key will be used
+    /// If provided, escalated requests will use this API key instead of the original
     pub escalation_api_key: Option<String>,
 }
 
@@ -575,7 +575,11 @@ where
                     "Configured model escalations for models: {:?}",
                     model_escalations
                         .iter()
-                        .map(|entry| format!("{} -> {}", entry.key(), entry.value().escalation_model))
+                        .map(|entry| format!(
+                            "{} -> {}",
+                            entry.key(),
+                            entry.value().escalation_model
+                        ))
                         .collect::<Vec<_>>()
                 );
             }
@@ -785,17 +789,12 @@ where
                 "Claimed requests from storage"
             );
 
-            // Group requests by effective model for better concurrency control visibility
-            // Use escalated_model if set, otherwise use the original model
+            // Group requests by model for better concurrency control visibility
+            // Escalated requests have their own template with the escalated model
             let mut by_model: HashMap<String, Vec<_>> = HashMap::new();
             for request in claimed {
-                let effective_model = request
-                    .data
-                    .escalated_model
-                    .as_ref()
-                    .unwrap_or(&request.data.model)
-                    .clone();
-                by_model.entry(effective_model).or_default().push(request);
+                let model = request.data.model.clone();
+                by_model.entry(model).or_default().push(request);
             }
 
             tracing::debug!(

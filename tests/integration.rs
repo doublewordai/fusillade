@@ -782,10 +782,11 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
             .expect("Failed to get request");
 
         if let Some(Ok(req)) = res.first()
-            && req.is_terminal() {
-                results = Some(res);
-                break;
-            }
+            && req.is_terminal()
+        {
+            results = Some(res);
+            break;
+        }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -942,10 +943,11 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
             .expect("Failed to get request");
 
         if let Some(Ok(req)) = res.first()
-            && req.is_terminal() {
-                results = Some(res);
-                break;
-            }
+            && req.is_terminal()
+        {
+            results = Some(res);
+            break;
+        }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1196,11 +1198,11 @@ mod sla {
             Some(original_id),
             "Escalated should link to original"
         );
-        assert_eq!(escalated_data.model, "gpt-4");
+        // With the new approach, escalated requests have their own template
+        // with the escalated model, so model field contains the escalated model
         assert_eq!(
-            escalated_data.escalated_model,
-            Some("gpt-4-turbo".to_string()),
-            "Escalated request should have escalated_model set"
+            escalated_data.model, "gpt-4-turbo",
+            "Escalated request should have model set to escalated model"
         );
 
         // Wait for one request to complete
@@ -2460,16 +2462,11 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
         "Original should have gpt-4 model"
     );
 
-    // Verify: Escalated keeps original model in DB (escalated_model indicates routing target)
+    // Verify: Escalated has its own template with the escalated model
     assert_eq!(
         escalated.data().model,
-        "gpt-4",
-        "Escalated should keep original model in DB"
-    );
-    assert_eq!(
-        escalated.data().escalated_model,
-        Some("gpt-4-priority".to_string()),
-        "Escalated should have escalated_model set to indicate routing target"
+        "gpt-4-priority",
+        "Escalated should have escalated model from its template"
     );
 
     // Poll until one request completes (batch shows completion)
@@ -2512,7 +2509,6 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
     println!("======================\n");
 
     // Both original and escalated requests use the same endpoint/path
-    // They differ by API key (escalated_api_key) and are grouped separately for concurrency
     let test_calls: Vec<_> = calls.iter().filter(|c| c.path == "/v1/test").collect();
 
     assert_eq!(
@@ -2521,19 +2517,26 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
         "Should have 2 calls to /v1/test (original + escalated racing)"
     );
 
-    // Both requests have gpt-4 in the body (escalated_model is metadata for concurrency/routing)
-    // Both requests send the same body to the same endpoint
-    for call in test_calls.iter() {
-        assert!(
-            call.body.contains(r#""model":"gpt-4""#),
-            "Request should contain model gpt-4 in body: {}",
-            call.body
-        );
-    }
+    // With the template-based approach:
+    // - Original request body contains: "model":"gpt-4"
+    // - Escalated request body contains: "model": "gpt-4-priority" (note: space after colon)
+    // Order is non-deterministic, so we check that we have one of each
+    let original_call = test_calls
+        .iter()
+        .find(|c| c.body.contains(r#""model":"gpt-4""#) && !c.body.contains("priority"))
+        .expect("Should find call with original model gpt-4");
 
-    // The test verified above that escalated.data().escalated_model is set to "gpt-4-priority"
-    // This metadata is used for concurrency grouping - escalated requests count toward
-    // the escalated model's concurrency limit, not the original model's limit
+    let escalated_call = test_calls
+        .iter()
+        .find(|c| c.body.contains("gpt-4-priority"))
+        .expect("Should find call with escalated model gpt-4-priority");
+
+    // Verify we found both (sanity check)
+    assert_eq!(
+        test_calls.len(),
+        2,
+        "Should have exactly one original and one escalated call"
+    );
 }
 
 #[sqlx::test]
@@ -2724,18 +2727,9 @@ async fn test_sla_escalation_uses_priority_api_key(pool: sqlx::PgPool) {
     );
 
     // Both calls should go to the same path
-    assert_eq!(calls[0].path, "/v1/test", "First call should be to /v1/test");
-    assert_eq!(calls[1].path, "/v1/test", "Second call should be to /v1/test");
-
-    // Both calls should have the same body (model stays as user-requested)
-    assert!(
-        calls[0].body.contains(r#""model":"gpt-4""#),
-        "First call should have gpt-4 in body"
-    );
-    assert!(
-        calls[1].body.contains(r#""model":"gpt-4""#),
-        "Second call should have gpt-4 in body"
-    );
+    for call in calls.iter() {
+        assert_eq!(call.path, "/v1/test", "All calls should be to /v1/test");
+    }
 
     // Find which call is original and which is escalated by API key
     let original_call = calls
@@ -2746,6 +2740,20 @@ async fn test_sla_escalation_uses_priority_api_key(pool: sqlx::PgPool) {
         .iter()
         .find(|c| c.api_key == "escalated-api-key")
         .expect("Should have a call with escalated-api-key");
+
+    // With the template-based approach:
+    // - Original request body contains: "model":"gpt-4"
+    // - Escalated request body contains: "model": "gpt-4-turbo" (note: space after colon)
+    assert!(
+        original_call.body.contains(r#""model":"gpt-4""#) && !original_call.body.contains("turbo"),
+        "Original call should have gpt-4 in body: {}",
+        original_call.body
+    );
+    assert!(
+        escalated_call.body.contains("gpt-4-turbo"),
+        "Escalated call should have gpt-4-turbo in body: {}",
+        escalated_call.body
+    );
 
     // Verify: Original uses original API key
     assert_eq!(
@@ -2775,39 +2783,19 @@ async fn test_sla_escalation_uses_priority_api_key(pool: sqlx::PgPool) {
         .find(|r| !r.data().is_escalated)
         .expect("Should have original request");
 
-    // Verify: Escalated request has escalated_model and escalated_api_key set in DB
-    assert_eq!(
-        escalated.data().escalated_model,
-        Some("gpt-4-turbo".to_string()),
-        "Escalated request should have escalated_model set to gpt-4-turbo"
-    );
-    assert_eq!(
-        escalated.data().escalated_api_key,
-        Some("escalated-api-key".to_string()),
-        "Escalated request should have escalated_api_key set"
-    );
+    // Verify: Escalated request has its own template with escalated model and API key
     assert_eq!(
         escalated.data().model,
-        "gpt-4",
-        "Escalated request should keep original model gpt-4"
+        "gpt-4-turbo",
+        "Escalated request should have escalated model from its template"
     );
     assert_eq!(
         escalated.data().api_key,
-        "original-api-key",
-        "Escalated request stores original api_key in DB (escalated_api_key overrides it)"
+        "escalated-api-key",
+        "Escalated request should have escalated API key from its template"
     );
 
-    // Verify: Original request has no escalation fields
-    assert_eq!(
-        original.data().escalated_model,
-        None,
-        "Original request should not have escalated_model set"
-    );
-    assert_eq!(
-        original.data().escalated_api_key,
-        None,
-        "Original request should not have escalated_api_key set"
-    );
+    // Verify: Original request has original model and API key
     assert_eq!(
         original.data().model,
         "gpt-4",

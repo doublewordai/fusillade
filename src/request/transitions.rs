@@ -194,20 +194,13 @@ impl Request<Claimed> {
     ) -> Result<Request<Processing>> {
         let request_data = self.data.clone();
 
-        // Use escalated_api_key if present, otherwise fall back to original api_key
-        let api_key = request_data
-            .escalated_api_key
-            .as_ref()
-            .unwrap_or(&request_data.api_key)
-            .clone();
-
         // Create a channel for the HTTP result
         let (tx, rx) = tokio::sync::mpsc::channel(1);
 
         // Spawn the HTTP request as an async task
         let task_handle = tokio::spawn(async move {
             let result = http_client
-                .execute(&request_data, &api_key, timeout_ms)
+                .execute(&request_data, &request_data.api_key, timeout_ms)
                 .await;
             let _ = tx.send(result).await; // Ignore send errors (receiver dropped)
         });
