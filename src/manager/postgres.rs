@@ -2709,11 +2709,23 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         // - No special handling needed in request processing
         // - The original request's model is preserved for user visibility
 
+        //   The query does 3 things:
+
+        // 1. Finds at-risk requests (at_risk_requests CTE):
+        //     - Say we find 3 requests that need escalation
+        // 2. Creates 3 NEW templates (new_templates_ordered CTE):
+        //     - Each with the escalated model (e.g., "gpt-4-priority") and escalated API key
+        //     - This INSERT RETURNING gives us back the new template IDs
+        // 3. Creates 3 escalated REQUESTS (final INSERT):
+        //     - Each escalated request needs a template_id field
+        //     - We need to know WHICH new template ID belongs to WHICH at-risk request
+
         let rows_affected = sqlx::query!(
             r#"
             WITH at_risk_requests AS (
                 -- Find requests that need escalation
                 SELECT
+                    ROW_NUMBER() OVER (ORDER BY r.id) as row_num,
                     r.id as original_request_id,
                     r.batch_id,
                     r.retry_attempt,
@@ -2757,7 +2769,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 LIMIT 1
                 RETURNING id
             ),
-            new_templates AS (
+            new_templates_ordered AS (
                 -- Create new templates with escalated model and API key in the escalation file
                 INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key)
                 SELECT
@@ -2771,7 +2783,19 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     COALESCE($4, arr.original_model),  -- Use escalated model if provided, else original
                     COALESCE($5, arr.original_api_key) -- Use escalated API key if provided, else original
                 FROM at_risk_requests arr
-                RETURNING id, (SELECT id FROM escalation_file) as file_id, custom_id, model, api_key
+                ORDER BY arr.row_num  -- Maintain consistent ordering
+                RETURNING id as template_id, custom_id, model, api_key
+            ),
+            new_templates AS (
+                -- Add row numbers to maintain 1:1 mapping with at_risk_requests
+                -- This ensures correct pairing even when multiple batches have the same custom_id
+                SELECT
+                    ROW_NUMBER() OVER (ORDER BY template_id) as row_num,
+                    template_id,
+                    custom_id,
+                    model,
+                    api_key
+                FROM new_templates_ordered
             )
             INSERT INTO requests (
                 id, batch_id, template_id, state, custom_id, retry_attempt, model,
@@ -2780,7 +2804,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             SELECT
                 gen_random_uuid(),
                 arr.batch_id,
-                nt.id,           -- Point to the new template
+                nt.template_id,  -- Point to the new template
                 'pending',
                 arr.custom_id,
                 arr.retry_attempt,
@@ -2790,7 +2814,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 NULL,
                 NULL
             FROM at_risk_requests arr
-            JOIN new_templates nt ON arr.custom_id = nt.custom_id
+            JOIN new_templates nt ON arr.row_num = nt.row_num
             "#,
             model,
             allowed_states as &[RequestStateFilter],
@@ -9339,5 +9363,180 @@ mod tests {
                 escalated.variant()
             ),
         }
+    }
+
+    #[sqlx::test]
+    async fn test_escalation_with_duplicate_custom_ids_across_batches(pool: sqlx::PgPool) {
+        // Test that when multiple batches have requests with the same custom_id,
+        // escalated requests are correctly paired with their original batch.
+        // This verifies the ROW_NUMBER() fix that ensures 1:1 mapping.
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create two files, each with a request that has custom_id "request-1"
+        let file1_id = manager
+            .create_file(
+                "batch1-file".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("request-1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"model":"gpt-4","prompt":"batch1"}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key1".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let file2_id = manager
+            .create_file(
+                "batch2-file".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("request-1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"model":"gpt-4","prompt":"batch2"}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key2".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Create two batches
+        let batch1 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file1_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "2h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let batch2 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file2_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "2h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Backdate both batches to make them at-risk
+        let now = chrono::Utc::now();
+        sqlx::query!(
+            r#"UPDATE batches SET created_at = $1, expires_at = $2 WHERE id = ANY($3)"#,
+            now - chrono::Duration::minutes(90),
+            now + chrono::Duration::minutes(30),
+            &[*batch1.id, *batch2.id] as &[Uuid]
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Get original requests
+        let batch1_requests = manager.get_batch_requests(batch1.id).await.unwrap();
+        let batch2_requests = manager.get_batch_requests(batch2.id).await.unwrap();
+        assert_eq!(batch1_requests.len(), 1);
+        assert_eq!(batch2_requests.len(), 1);
+        let batch1_orig_id = batch1_requests[0].id();
+        let batch2_orig_id = batch2_requests[0].id();
+
+        // Verify both have the same custom_id
+        assert_eq!(
+            batch1_requests[0].data().custom_id,
+            Some("request-1".to_string())
+        );
+        assert_eq!(
+            batch2_requests[0].data().custom_id,
+            Some("request-1".to_string())
+        );
+
+        // Create escalated requests for both at-risk batches
+        let count = manager
+            .create_escalated_requests(
+                "gpt-4",
+                3600,
+                &[RequestStateFilter::Pending],
+                Some("gpt-4-priority"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(count, 2, "Should create 2 escalated requests (one per batch)");
+
+        // Get all requests for both batches
+        let batch1_all = manager.get_batch_requests(batch1.id).await.unwrap();
+        let batch2_all = manager.get_batch_requests(batch2.id).await.unwrap();
+
+        // Each batch should now have 2 requests: original + escalated
+        assert_eq!(
+            batch1_all.len(),
+            2,
+            "Batch 1 should have original + escalated"
+        );
+        assert_eq!(
+            batch2_all.len(),
+            2,
+            "Batch 2 should have original + escalated"
+        );
+
+        // Find escalated requests
+        let batch1_escalated = batch1_all
+            .iter()
+            .find(|r| r.data().is_escalated)
+            .expect("Batch 1 should have escalated request");
+        let batch2_escalated = batch2_all
+            .iter()
+            .find(|r| r.data().is_escalated)
+            .expect("Batch 2 should have escalated request");
+
+        // Verify: Each escalated request links back to the correct original request
+        assert_eq!(
+            batch1_escalated.data().escalated_from_request_id,
+            Some(batch1_orig_id),
+            "Batch 1 escalated should link to batch 1 original"
+        );
+        assert_eq!(
+            batch2_escalated.data().escalated_from_request_id,
+            Some(batch2_orig_id),
+            "Batch 2 escalated should link to batch 2 original"
+        );
+
+        // Verify: Each escalated request is in the correct batch
+        assert_eq!(
+            batch1_escalated.data().batch_id,
+            batch1.id,
+            "Batch 1 escalated should be in batch 1"
+        );
+        assert_eq!(
+            batch2_escalated.data().batch_id,
+            batch2.id,
+            "Batch 2 escalated should be in batch 2"
+        );
+
+        // Verify: Both have the same custom_id (this is expected and OK)
+        assert_eq!(
+            batch1_escalated.data().custom_id,
+            Some("request-1".to_string())
+        );
+        assert_eq!(
+            batch2_escalated.data().custom_id,
+            Some("request-1".to_string())
+        );
+
+        // Verify: They have the escalated model
+        assert_eq!(batch1_escalated.data().model, "gpt-4-priority");
+        assert_eq!(batch2_escalated.data().model, "gpt-4-priority");
     }
 }
