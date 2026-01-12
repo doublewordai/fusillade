@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                SELECT r.id, r.custom_id, r.model, r.state,\n                       t.body as input_body,\n                       r.response_body, r.error, r.created_at\n                FROM requests r\n                JOIN request_templates t ON r.template_id = t.id\n                WHERE r.batch_id = $1\n                  AND r.superseded_at IS NULL\n                  AND ($2::TIMESTAMPTZ IS NULL OR r.created_at > $2 OR (r.created_at = $2 AND r.id > $3))\n                  AND ($6::text IS NULL OR LOWER(r.custom_id) LIKE $6)\n                ORDER BY r.created_at ASC, r.id ASC\n                OFFSET $4\n                LIMIT $5\n                ",
+  "query": "\n                SELECT r.id, r.custom_id, r.model, r.state,\n                       t.body as input_body,\n                       r.response_body, r.error, r.created_at\n                FROM requests r\n                JOIN request_templates t ON r.template_id = t.id\n                WHERE r.batch_id = $1\n                  AND r.superseded_at IS NULL\n                  AND ($2::TIMESTAMPTZ IS NULL OR r.created_at > $2 OR (r.created_at = $2 AND r.id > $3))\n                  AND ($6::text IS NULL OR LOWER(r.custom_id) LIKE $6)\n                  AND ($7::text[] IS NULL OR r.state = ANY($7))\n                ORDER BY r.created_at ASC, r.id ASC\n                OFFSET $4\n                LIMIT $5\n                ",
   "describe": {
     "columns": [
       {
@@ -51,7 +51,8 @@
         "Uuid",
         "Int8",
         "Int8",
-        "Text"
+        "Text",
+        "TextArray"
       ]
     },
     "nullable": [
@@ -65,5 +66,5 @@
       false
     ]
   },
-  "hash": "55d64ee97f118861024b3349724e61f71fbfa7e48b6b82e35acd1d19ca0a2d39"
+  "hash": "ea05f36ff30285e7bf3618e979159b4fa7a20227dc3e5cabf2baf3b65860e2b0"
 }
