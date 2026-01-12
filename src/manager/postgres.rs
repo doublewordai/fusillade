@@ -9473,7 +9473,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(count, 2, "Should create 2 escalated requests (one per batch)");
+        assert_eq!(
+            count, 2,
+            "Should create 2 escalated requests (one per batch)"
+        );
 
         // Get all requests for both batches
         let batch1_all = manager.get_batch_requests(batch1.id).await.unwrap();
