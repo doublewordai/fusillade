@@ -3081,6 +3081,25 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(results)
     }
 
+    #[tracing::instrument(skip(self), fields(batch_id = %batch_id, search = ?search, status = ?status))]
+    fn get_batch_results_stream(
+        &self,
+        batch_id: BatchId,
+        offset: usize,
+        search: Option<String>,
+        status: Option<String>,
+    ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>> {
+        let pool = self.pool.clone();
+        let (tx, rx) = mpsc::channel(self.download_buffer_size);
+        let offset = offset as i64;
+
+        tokio::spawn(async move {
+            Self::stream_batch_results(pool, batch_id, offset, search, status, tx).await;
+        });
+
+        Box::pin(ReceiverStream::new(rx))
+    }
+
     async fn find_pending_escalation(
         &self,
         original_request_id: RequestId,
@@ -3429,6 +3448,169 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                     let _ = tx
                         .send(Err(FusilladeError::Other(anyhow!(
                             "Failed to fetch failed requests: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Stream batch results with merged input/output data for the Results view.
+    /// This joins requests with their templates to provide input body alongside response/error.
+    async fn stream_batch_results(
+        pool: sqlx::PgPool,
+        batch_id: BatchId,
+        offset: i64,
+        search: Option<String>,
+        status: Option<String>,
+        tx: mpsc::Sender<Result<crate::batch::BatchResultItem>>,
+    ) {
+        use crate::batch::{BatchResultItem, BatchResultStatus};
+
+        // First, get the file_id from the batch
+        // This allows us to query by file_id to avoid duplicates from SLA escalation
+        let file_id = match sqlx::query_scalar!(
+            r#"SELECT file_id FROM batches WHERE id = $1"#,
+            *batch_id as Uuid,
+        )
+        .fetch_optional(&pool)
+        .await
+        {
+            Ok(Some(Some(fid))) => fid,
+            Ok(Some(None)) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!(
+                        "Batch has no associated file_id"
+                    ))))
+                    .await;
+                return;
+            }
+            Ok(None) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!("Batch not found"))))
+                    .await;
+                return;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!(
+                        "Failed to fetch batch: {}",
+                        e
+                    ))))
+                    .await;
+                return;
+            }
+        };
+
+        const BATCH_SIZE: i64 = 1000;
+        let mut last_line_number: i32 = -1;
+        let mut is_first_batch = true;
+        let search_pattern = search.map(|s| format!("%{}%", s.to_lowercase()));
+
+        // Convert status filter to database state values
+        // in_progress maps to both 'claimed' and 'processing' states
+        let state_filter: Option<Vec<String>> = status.map(|s| match s.as_str() {
+            "in_progress" => vec!["claimed".to_string(), "processing".to_string()],
+            other => vec![other.to_string()],
+        });
+
+        loop {
+            // Use OFFSET only on first batch, then use cursor pagination by line_number
+            let (line_filter, offset_val) = if is_first_batch {
+                (-1i32, offset)
+            } else {
+                (last_line_number, 0i64)
+            };
+            is_first_batch = false;
+
+            // Query from request_templates joined to requests.
+            // For each template, we find the matching request for this batch.
+            // If the request was superseded, we use the superseding request's data instead.
+            let request_batch = sqlx::query!(
+                r#"
+                SELECT
+                    COALESCE(successor.id, r.id) as "id!",
+                    COALESCE(successor.custom_id, r.custom_id) as "custom_id?",
+                    COALESCE(successor.model, r.model) as "model!",
+                    COALESCE(successor.state, r.state) as "state!",
+                    t.body as input_body,
+                    COALESCE(successor.response_body, r.response_body) as "response_body?",
+                    COALESCE(successor.error, r.error) as "error?",
+                    t.line_number as "line_number!"
+                FROM request_templates t
+                JOIN requests r ON r.template_id = t.id AND r.batch_id = $1 AND r.is_escalated = false
+                LEFT JOIN requests successor ON successor.id = r.superseded_by_request_id
+                WHERE t.file_id = $2
+                  AND ($3 = -1 OR t.line_number > $3)
+                  AND ($6::text IS NULL OR LOWER(COALESCE(successor.custom_id, r.custom_id)) LIKE $6)
+                  AND ($7::text[] IS NULL OR COALESCE(successor.state, r.state) = ANY($7))
+                ORDER BY t.line_number ASC
+                OFFSET $4
+                LIMIT $5
+                "#,
+                *batch_id as Uuid,
+                file_id,
+                line_filter,
+                offset_val,
+                BATCH_SIZE,
+                search_pattern.as_deref(),
+                state_filter.as_deref(),
+            )
+            .fetch_all(&pool)
+            .await;
+
+            match request_batch {
+                Ok(requests) => {
+                    if requests.is_empty() {
+                        break;
+                    }
+
+                    tracing::debug!("Fetched batch of {} results", requests.len());
+
+                    for row in requests {
+                        last_line_number = row.line_number;
+
+                        // Parse input body as JSON
+                        let input_body: serde_json::Value = serde_json::from_str(&row.input_body)
+                            .unwrap_or_else(|_| serde_json::Value::String(row.input_body.clone()));
+
+                        // Parse response body as JSON if present
+                        let response_body: Option<serde_json::Value> =
+                            row.response_body.as_ref().map(|body| {
+                                serde_json::from_str(body)
+                                    .unwrap_or_else(|_| serde_json::Value::String(body.clone()))
+                            });
+
+                        // Map state to BatchResultStatus
+                        let status = match row.state.as_str() {
+                            "completed" => BatchResultStatus::Completed,
+                            "failed" => BatchResultStatus::Failed,
+                            "pending" => BatchResultStatus::Pending,
+                            "claimed" | "processing" => BatchResultStatus::InProgress,
+                            _ => BatchResultStatus::Pending, // Default for unknown states
+                        };
+
+                        let result_item = BatchResultItem {
+                            id: row.id.to_string(),
+                            custom_id: row.custom_id,
+                            model: row.model,
+                            input_body,
+                            response_body,
+                            error: row.error,
+                            status,
+                        };
+
+                        if tx.send(Ok(result_item)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Failed to fetch batch results: {}",
                             e
                         ))))
                         .await;
