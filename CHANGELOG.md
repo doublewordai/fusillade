@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.15.0...fusillade-v0.16.0) (2026-01-12)
+
+
+### Features
+
+* stream_batch_results in postgres manager ([#66](https://github.com/doublewordai/fusillade/issues/66)) ([05a96d5](https://github.com/doublewordai/fusillade/commit/05a96d59463dac3c12d7463e584d60b0f7088f14))
+
 ## [0.15.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.14.0...fusillade-v0.15.0) (2026-01-09)
 
 

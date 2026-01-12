@@ -2807,3 +2807,1057 @@ async fn test_sla_escalation_uses_priority_api_key(pool: sqlx::PgPool) {
         "Original request should use original-api-key"
     );
 }
+
+/// Tests for `get_batch_results_stream` and `stream_batch_results`.
+///
+/// These tests verify that batch results correctly handle SLA escalation scenarios,
+/// returning one result per template with the "winning" request's data.
+mod batch_results_stream {
+    use super::*;
+    use futures::StreamExt;
+
+    /// Helper to collect all results from a batch results stream
+    async fn collect_batch_results(
+        manager: &PostgresRequestManager<MockHttpClient>,
+        batch_id: fusillade::batch::BatchId,
+    ) -> Vec<fusillade::batch::BatchResultItem> {
+        let stream = manager.get_batch_results_stream(batch_id, 0, None, None);
+        stream
+            .filter_map(|r| async { r.ok() })
+            .collect::<Vec<_>>()
+            .await
+    }
+
+    #[sqlx::test]
+    async fn test_batch_results_no_escalation(pool: sqlx::PgPool) {
+        // Test: Basic batch with no escalation returns all results
+        let http_client = Arc::new(MockHttpClient::new());
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success1"}"#.to_string(),
+            }),
+        );
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success2"}"#.to_string(),
+            }),
+        );
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
+
+        // Create file with 2 templates
+        let file_id = manager
+            .create_file(
+                "test-results".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req-1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"test1"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"test2"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        // Run daemon to complete requests
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for requests to complete
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+            if requests.iter().all(|r| r.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown_token.cancel();
+
+        // Get batch results stream
+        let results = collect_batch_results(&manager, batch.id).await;
+
+        // Should have exactly 2 results (one per template)
+        assert_eq!(results.len(), 2, "Should have 2 results");
+
+        // Verify custom IDs
+        let custom_ids: Vec<_> = results
+            .iter()
+            .filter_map(|r| r.custom_id.as_ref())
+            .collect();
+        assert!(custom_ids.contains(&&"req-1".to_string()));
+        assert!(custom_ids.contains(&&"req-2".to_string()));
+
+        // All should be completed
+        for result in &results {
+            assert_eq!(
+                result.status,
+                fusillade::batch::BatchResultStatus::Completed
+            );
+            assert!(result.response_body.is_some());
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_batch_results_escalated_wins(pool: sqlx::PgPool) {
+        // Test: When escalated request wins, batch results show escalated request's data
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Escalated completes quickly with different response
+        let escalated_trigger = http_client.add_response_with_trigger(
+            "POST /priority/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"escalated_success"}"#.to_string(),
+            }),
+        );
+
+        // Original is slower
+        let original_trigger = http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"original_success"}"#.to_string(),
+            }),
+        );
+
+        // Escalated completes at 50ms, original at 300ms
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = escalated_trigger.send(());
+        });
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = original_trigger.send(());
+        });
+
+        let priority_endpoints = Arc::new(dashmap::DashMap::new());
+        priority_endpoints.insert(
+            "gpt-4".to_string(),
+            PriorityEndpointConfig {
+                endpoint: "https://priority.example.com".to_string(),
+                path_override: Some("/priority/test".to_string()),
+                api_key: None,
+                model_override: None,
+            },
+        );
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            priority_endpoints,
+            sla_check_interval_seconds: 1,
+            sla_thresholds: vec![SlaThreshold {
+                name: "test-escalation".to_string(),
+                threshold_seconds: 3600,
+                action: SlaAction::Escalate,
+                allowed_states: vec![RequestStateFilter::Pending],
+            }],
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
+
+        let file_id = manager
+            .create_file(
+                "escalated-wins-results".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("test-req".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        // Make batch at-risk by backdating expires_at
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch.id as uuid::Uuid
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to update batch");
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for escalation and completion
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+
+            // Need 2 requests (original + escalated) with at least one terminal
+            if requests.len() >= 2 && requests.iter().any(|r| r.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Wait a bit more for supersession to complete
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        shutdown_token.cancel();
+
+        // Get batch results stream
+        let results = collect_batch_results(&manager, batch.id).await;
+
+        // Should have exactly 1 result (one per template, not per request)
+        assert_eq!(
+            results.len(),
+            1,
+            "Should have 1 result per template, not duplicates from escalation"
+        );
+
+        // Result should be from the escalated request (which won)
+        let result = &results[0];
+        assert_eq!(result.custom_id, Some("test-req".to_string()));
+        assert_eq!(
+            result.status,
+            fusillade::batch::BatchResultStatus::Completed
+        );
+
+        // Verify it's the escalated response
+        let response_body = result.response_body.as_ref().expect("Should have response");
+        assert!(
+            response_body
+                .as_object()
+                .and_then(|o| o.get("result"))
+                .and_then(|v| v.as_str())
+                == Some("escalated_success"),
+            "Should contain escalated request's response, got: {:?}",
+            response_body
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_batch_results_original_wins(pool: sqlx::PgPool) {
+        // Test: When original request wins, batch results show original request's data
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Original completes quickly
+        let original_trigger = http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"original_success"}"#.to_string(),
+            }),
+        );
+
+        // Escalated is slower
+        let escalated_trigger = http_client.add_response_with_trigger(
+            "POST /priority/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"escalated_success"}"#.to_string(),
+            }),
+        );
+
+        // Original completes at 50ms, escalated at 300ms
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = original_trigger.send(());
+        });
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = escalated_trigger.send(());
+        });
+
+        let priority_endpoints = Arc::new(dashmap::DashMap::new());
+        priority_endpoints.insert(
+            "gpt-4".to_string(),
+            PriorityEndpointConfig {
+                endpoint: "https://priority.example.com".to_string(),
+                path_override: Some("/priority/test".to_string()),
+                api_key: None,
+                model_override: None,
+            },
+        );
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            priority_endpoints,
+            sla_check_interval_seconds: 1,
+            sla_thresholds: vec![SlaThreshold {
+                name: "test-escalation".to_string(),
+                threshold_seconds: 3600,
+                action: SlaAction::Escalate,
+                allowed_states: vec![RequestStateFilter::Pending],
+            }],
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
+
+        let file_id = manager
+            .create_file(
+                "original-wins-results".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("test-req".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        // Make batch at-risk
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch.id as uuid::Uuid
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to update batch");
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for completion
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+
+            if requests.len() >= 2 && requests.iter().any(|r| r.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        shutdown_token.cancel();
+
+        let results = collect_batch_results(&manager, batch.id).await;
+
+        assert_eq!(results.len(), 1, "Should have 1 result per template");
+
+        let result = &results[0];
+
+        // Original won, so result should NOT have superseded_by set
+        // and should contain original's response
+        assert_eq!(
+            result.status,
+            fusillade::batch::BatchResultStatus::Completed
+        );
+
+        let response_body = result.response_body.as_ref().expect("Should have response");
+        assert!(
+            response_body
+                .as_object()
+                .and_then(|o| o.get("result"))
+                .and_then(|v| v.as_str())
+                == Some("original_success"),
+            "Should contain original request's response, got: {:?}",
+            response_body
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_batch_results_multiple_templates_with_escalation(pool: sqlx::PgPool) {
+        // Test: 2 templates with same model, both get escalated
+        // Expected: 2 results total (one per template), each showing the winning request's data
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Use triggers for all requests to control timing precisely
+        // Template 1: original wins (completes at 50ms), escalated slower (300ms)
+        let original1_trigger = http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"req1_original"}"#.to_string(),
+            }),
+        );
+        let escalated1_trigger = http_client.add_response_with_trigger(
+            "POST /priority/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"req1_escalated"}"#.to_string(),
+            }),
+        );
+
+        // Template 2: escalated wins (completes at 50ms), original slower (300ms)
+        let original2_trigger = http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"req2_original"}"#.to_string(),
+            }),
+        );
+        let escalated2_trigger = http_client.add_response_with_trigger(
+            "POST /priority/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"req2_escalated"}"#.to_string(),
+            }),
+        );
+
+        // Template 1: original wins
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = original1_trigger.send(());
+        });
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = escalated1_trigger.send(());
+        });
+
+        // Template 2: escalated wins
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = original2_trigger.send(());
+        });
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = escalated2_trigger.send(());
+        });
+
+        let priority_endpoints = Arc::new(dashmap::DashMap::new());
+        priority_endpoints.insert(
+            "gpt-4".to_string(),
+            PriorityEndpointConfig {
+                endpoint: "https://priority.example.com".to_string(),
+                path_override: Some("/priority/test".to_string()),
+                api_key: None,
+                model_override: None,
+            },
+        );
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            priority_endpoints,
+            sla_check_interval_seconds: 1,
+            sla_thresholds: vec![SlaThreshold {
+                name: "test-escalation".to_string(),
+                threshold_seconds: 3600,
+                action: SlaAction::Escalate,
+                allowed_states: vec![RequestStateFilter::Pending],
+            }],
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
+
+        let file_id = manager
+            .create_file(
+                "multi-escalation".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req-1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"test1"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"test2"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        // Make batch at-risk for escalation
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch.id as uuid::Uuid
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to update batch");
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for escalations to be created and races to complete
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+
+            // 2 originals + 2 escalated = 4 requests
+            // Need at least 2 terminal (the winners)
+            let terminal_count = requests.iter().filter(|r| r.is_terminal()).count();
+            if requests.len() >= 4 && terminal_count >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Wait for supersession to complete
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        shutdown_token.cancel();
+
+        let results = collect_batch_results(&manager, batch.id).await;
+
+        // Should have exactly 2 results (one per template, not 4 for all requests)
+        assert_eq!(
+            results.len(),
+            2,
+            "Should have 2 results (one per template), got: {:?}",
+            results.iter().map(|r| &r.custom_id).collect::<Vec<_>>()
+        );
+
+        // Verify both custom IDs are present
+        let custom_ids: Vec<_> = results
+            .iter()
+            .filter_map(|r| r.custom_id.as_ref())
+            .collect();
+        assert!(custom_ids.contains(&&"req-1".to_string()));
+        assert!(custom_ids.contains(&&"req-2".to_string()));
+
+        // Both should be completed
+        for result in &results {
+            assert_eq!(
+                result.status,
+                fusillade::batch::BatchResultStatus::Completed,
+                "Result {:?} should be completed",
+                result.custom_id
+            );
+            assert!(
+                result.response_body.is_some(),
+                "Result {:?} should have response body",
+                result.custom_id
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_batch_results_deleted_file_returns_error(pool: sqlx::PgPool) {
+        // Test: When batch's file is deleted, stream returns error
+        let http_client = Arc::new(MockHttpClient::new());
+
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            pool.clone(),
+            http_client,
+        ));
+
+        let file_id = manager
+            .create_file(
+                "to-delete".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("test".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        // Delete the file (set file_id to NULL on batch)
+        sqlx::query!(
+            "UPDATE batches SET file_id = NULL WHERE id = $1",
+            *batch.id as uuid::Uuid
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to clear file_id");
+
+        // Try to get results - should get an error
+        let stream = manager.get_batch_results_stream(batch.id, 0, None, None);
+        let results: Vec<_> = stream.collect().await;
+
+        // Should have one error result
+        assert_eq!(results.len(), 1, "Should have one result (the error)");
+        assert!(
+            results[0].is_err(),
+            "Result should be an error when file_id is NULL"
+        );
+
+        let err = results[0].as_ref().unwrap_err();
+        assert!(
+            err.to_string().contains("file_id"),
+            "Error should mention file_id: {}",
+            err
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_batch_results_pagination(pool: sqlx::PgPool) {
+        // Test: Pagination works correctly with offset
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Add responses for 5 requests
+        for i in 0..5 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!(r#"{{"result":"success{}"}}"#, i),
+                }),
+            );
+        }
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
+
+        // Create file with 5 templates
+        let templates: Vec<_> = (0..5)
+            .map(|i| RequestTemplateInput {
+                custom_id: Some(format!("req-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: format!(r#"{{"prompt":"test{}"}}"#, i),
+                model: "gpt-4".to_string(),
+                api_key: "test-key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file("pagination-test".to_string(), None, templates)
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        // Run daemon
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for completion
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+            if requests.iter().all(|r| r.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown_token.cancel();
+
+        // Get all results
+        let all_results = collect_batch_results(&manager, batch.id).await;
+        assert_eq!(all_results.len(), 5, "Should have 5 results");
+
+        // Get with offset 2
+        let stream = manager.get_batch_results_stream(batch.id, 2, None, None);
+        let offset_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
+
+        assert_eq!(
+            offset_results.len(),
+            3,
+            "Should have 3 results with offset 2"
+        );
+
+        // Verify the offset results are the last 3
+        let offset_ids: Vec<_> = offset_results
+            .iter()
+            .filter_map(|r| r.custom_id.as_ref())
+            .collect();
+        assert!(offset_ids.contains(&&"req-2".to_string()));
+        assert!(offset_ids.contains(&&"req-3".to_string()));
+        assert!(offset_ids.contains(&&"req-4".to_string()));
+    }
+
+    #[sqlx::test]
+    async fn test_batch_results_status_filter(pool: sqlx::PgPool) {
+        // Test: Status filter works correctly
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // First 2 succeed, third fails
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success1"}"#.to_string(),
+            }),
+        );
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success2"}"#.to_string(),
+            }),
+        );
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 500,
+                body: r#"{"error":"server error"}"#.to_string(),
+            }),
+        );
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            max_retries: Some(0), // No retries so it fails immediately
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
+
+        let templates: Vec<_> = (0..3)
+            .map(|i| RequestTemplateInput {
+                custom_id: Some(format!("req-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: format!(r#"{{"prompt":"test{}"}}"#, i),
+                model: "gpt-4".to_string(),
+                api_key: "test-key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file("filter-test".to_string(), None, templates)
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for completion
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+            if requests.iter().all(|r| r.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown_token.cancel();
+
+        // Filter by completed
+        let stream =
+            manager.get_batch_results_stream(batch.id, 0, None, Some("completed".to_string()));
+        let completed_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
+
+        assert_eq!(
+            completed_results.len(),
+            2,
+            "Should have 2 completed results"
+        );
+        for r in &completed_results {
+            assert_eq!(r.status, fusillade::batch::BatchResultStatus::Completed);
+        }
+
+        // Filter by failed
+        let stream =
+            manager.get_batch_results_stream(batch.id, 0, None, Some("failed".to_string()));
+        let failed_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
+
+        assert_eq!(failed_results.len(), 1, "Should have 1 failed result");
+        assert_eq!(
+            failed_results[0].status,
+            fusillade::batch::BatchResultStatus::Failed
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_batch_results_search_filter(pool: sqlx::PgPool) {
+        // Test: Search filter works correctly (case-insensitive)
+        let http_client = Arc::new(MockHttpClient::new());
+
+        for _ in 0..3 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 200,
+                    body: r#"{"result":"success"}"#.to_string(),
+                }),
+            );
+        }
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
+
+        let file_id = manager
+            .create_file(
+                "search-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("Alpha-Request".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"test"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("Beta-Request".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"test"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("Gamma-Item".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"test"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for completion
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+            if requests.iter().all(|r| r.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown_token.cancel();
+
+        // Search for "request" (case-insensitive)
+        let stream =
+            manager.get_batch_results_stream(batch.id, 0, Some("request".to_string()), None);
+        let search_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
+
+        assert_eq!(
+            search_results.len(),
+            2,
+            "Should find 2 results containing 'request'"
+        );
+
+        let custom_ids: Vec<_> = search_results
+            .iter()
+            .filter_map(|r| r.custom_id.as_ref())
+            .collect();
+        assert!(custom_ids.contains(&&"Alpha-Request".to_string()));
+        assert!(custom_ids.contains(&&"Beta-Request".to_string()));
+
+        // Search for "ALPHA" (case-insensitive)
+        let stream = manager.get_batch_results_stream(batch.id, 0, Some("ALPHA".to_string()), None);
+        let alpha_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
+
+        assert_eq!(alpha_results.len(), 1, "Should find 1 result for 'ALPHA'");
+        assert_eq!(
+            alpha_results[0].custom_id,
+            Some("Alpha-Request".to_string())
+        );
+    }
+}
