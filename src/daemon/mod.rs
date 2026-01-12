@@ -673,6 +673,11 @@ where
                                                 {
                                                     Ok(escalated_count) => {
                                                         if escalated_count > 0 {
+                                                            counter!(
+                                                                "fusillade_escalations_created_total",
+                                                                "model" => model.to_string(),
+                                                                "sla_name" => threshold.name.clone()
+                                                            ).increment(escalated_count as u64);
                                                             tracing::debug!(
                                                                 model = %model,
                                                                 escalated_count = escalated_count,
@@ -909,7 +914,7 @@ where
                                             }
                                         }
 
-                                        tracing::info!(
+                                        tracing::debug!(
                                             request_id = %request_id,
                                             original_endpoint = %request.data.endpoint,
                                             priority_endpoint = %modified_data.endpoint,
@@ -939,6 +944,9 @@ where
                                     storage.as_ref()
                                 ).await?;
 
+                                // Capture retry attempt count before completion (not preserved in Completed state)
+                                let retry_attempt_at_completion = processing.state.retry_attempt;
+
                                 let cancellation = async {
                                     tokio::select! {
                                         _ = batch_cancellation_token.cancelled() => {
@@ -963,7 +971,10 @@ where
                                         counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
                                         histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
                                             .record(processing_start.elapsed().as_secs_f64());
-                                        tracing::info!(request_id = %request_id, "Request completed successfully");
+                                        // Record how many retries it took to succeed (0 = first attempt succeeded)
+                                        histogram!("fusillade_retry_attempts_on_success", "model" => model_clone.clone())
+                                            .record(retry_attempt_at_completion as f64);
+                                        tracing::info!(request_id = %request_id, retry_attempts = retry_attempt_at_completion, "Request completed successfully");
 
                                         // If this request is part of a race, cancel the superseded racing pair's token
                                         let superseded_id_opt = if completed.data.is_escalated {
@@ -977,10 +988,17 @@ where
 
                                         if let Some(sid) = superseded_id_opt
                                             && let Some((_, token)) = request_cancellation_tokens.remove(&sid) {
+                                                let winner = if completed.data.is_escalated { "escalated" } else { "original" };
+                                                counter!(
+                                                    "fusillade_escalation_winner_total",
+                                                    "model" => model_clone.clone(),
+                                                    "winner" => winner
+                                                ).increment(1);
                                                 token.cancel();
-                                                tracing::info!(
+                                                tracing::debug!(
                                                     winner_id = %request_id,
                                                     superseded_id = %sid,
+                                                    winner = winner,
                                                     "Cancelled superseded request's in-flight HTTP task"
                                                 );
                                             }
@@ -1002,7 +1020,11 @@ where
                                                 Ok(pending) => {
                                                     // Can retry - persist as Pending
                                                     storage.persist(&pending).await?;
-                                                    counter!("fusillade_requests_retried_total", "model" => model_clone.clone()).increment(1);
+                                                    counter!(
+                                                        "fusillade_requests_retried_total",
+                                                        "model" => model_clone.clone(),
+                                                        "attempt" => (retry_attempt + 1).to_string()
+                                                    ).increment(1);
                                                     tracing::info!(
                                                         request_id = %request_id,
                                                         retry_attempt = retry_attempt + 1,
