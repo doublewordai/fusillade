@@ -2519,7 +2519,7 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
 
     // With the template-based approach:
     // - Original request body contains: "model":"gpt-4"
-    // - Escalated request body contains: "model": "gpt-4-priority" (note: space after colon)
+    // - Escalated request body contains: "model": "gpt-4-priority"
     // Order is non-deterministic, so we check that we have one of each
     let original_call = test_calls
         .iter()
