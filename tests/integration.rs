@@ -2743,7 +2743,7 @@ async fn test_sla_escalation_uses_priority_api_key(pool: sqlx::PgPool) {
 
     // With the template-based approach:
     // - Original request body contains: "model":"gpt-4"
-    // - Escalated request body contains: "model": "gpt-4-turbo" (note: space after colon)
+    // - Escalated request body contains the model "gpt-4-turbo"
     assert!(
         original_call.body.contains(r#""model":"gpt-4""#) && !original_call.body.contains("turbo"),
         "Original call should have gpt-4 in body: {}",
