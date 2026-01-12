@@ -3469,9 +3469,43 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     ) {
         use crate::batch::{BatchResultItem, BatchResultStatus};
 
+        // First, get the file_id from the batch
+        // This allows us to query by file_id to avoid duplicates from SLA escalation
+        let file_id = match sqlx::query_scalar!(
+            r#"SELECT file_id FROM batches WHERE id = $1"#,
+            *batch_id as Uuid,
+        )
+        .fetch_optional(&pool)
+        .await
+        {
+            Ok(Some(Some(fid))) => fid,
+            Ok(Some(None)) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!(
+                        "Batch has no associated file_id"
+                    ))))
+                    .await;
+                return;
+            }
+            Ok(None) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!("Batch not found"))))
+                    .await;
+                return;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!(
+                        "Failed to fetch batch: {}",
+                        e
+                    ))))
+                    .await;
+                return;
+            }
+        };
+
         const BATCH_SIZE: i64 = 1000;
-        let mut last_created_at: Option<chrono::DateTime<chrono::Utc>> = None;
-        let mut last_id: Uuid = Uuid::nil();
+        let mut last_line_number: i32 = -1;
         let mut is_first_batch = true;
         let search_pattern = search.map(|s| format!("%{}%", s.to_lowercase()));
 
@@ -3483,33 +3517,42 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         });
 
         loop {
-            // Use OFFSET only on first batch, then use cursor pagination
-            let (cursor_time, cursor_id, offset_val) = if is_first_batch {
-                (None, Uuid::nil(), offset)
+            // Use OFFSET only on first batch, then use cursor pagination by line_number
+            let (line_filter, offset_val) = if is_first_batch {
+                (-1i32, offset)
             } else {
-                (last_created_at, last_id, 0i64)
+                (last_line_number, 0i64)
             };
             is_first_batch = false;
 
+            // Query from request_templates joined to requests.
+            // For each template, we find the matching request for this batch.
+            // If the request was superseded, we use the superseding request's data instead.
             let request_batch = sqlx::query!(
                 r#"
-                SELECT r.id, r.custom_id, r.model, r.state,
-                       t.body as input_body,
-                       r.response_body, r.error, r.created_at
-                FROM requests r
-                JOIN request_templates t ON r.template_id = t.id
-                WHERE r.batch_id = $1
-                  AND r.superseded_at IS NULL
-                  AND ($2::TIMESTAMPTZ IS NULL OR r.created_at > $2 OR (r.created_at = $2 AND r.id > $3))
-                  AND ($6::text IS NULL OR LOWER(r.custom_id) LIKE $6)
-                  AND ($7::text[] IS NULL OR r.state = ANY($7))
-                ORDER BY r.created_at ASC, r.id ASC
+                SELECT
+                    COALESCE(successor.id, r.id) as "id!",
+                    COALESCE(successor.custom_id, r.custom_id) as "custom_id?",
+                    COALESCE(successor.model, r.model) as "model!",
+                    COALESCE(successor.state, r.state) as "state!",
+                    t.body as input_body,
+                    COALESCE(successor.response_body, r.response_body) as "response_body?",
+                    COALESCE(successor.error, r.error) as "error?",
+                    t.line_number as "line_number!"
+                FROM request_templates t
+                JOIN requests r ON r.template_id = t.id AND r.batch_id = $1 AND r.is_escalated = false
+                LEFT JOIN requests successor ON successor.id = r.superseded_by_request_id
+                WHERE t.file_id = $2
+                  AND ($3 = -1 OR t.line_number > $3)
+                  AND ($6::text IS NULL OR LOWER(COALESCE(successor.custom_id, r.custom_id)) LIKE $6)
+                  AND ($7::text[] IS NULL OR COALESCE(successor.state, r.state) = ANY($7))
+                ORDER BY t.line_number ASC
                 OFFSET $4
                 LIMIT $5
                 "#,
                 *batch_id as Uuid,
-                cursor_time,
-                cursor_id,
+                file_id,
+                line_filter,
                 offset_val,
                 BATCH_SIZE,
                 search_pattern.as_deref(),
@@ -3527,8 +3570,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                     tracing::debug!("Fetched batch of {} results", requests.len());
 
                     for row in requests {
-                        last_created_at = Some(row.created_at);
-                        last_id = row.id;
+                        last_line_number = row.line_number;
 
                         // Parse input body as JSON
                         let input_body: serde_json::Value = serde_json::from_str(&row.input_body)
