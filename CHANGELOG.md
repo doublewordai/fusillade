@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.16.0...fusillade-v1.0.0) (2026-01-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* sla escalation through control layer ([#67](https://github.com/doublewordai/fusillade/issues/67))
+
+### Bug Fixes
+
+* sla escalation through control layer ([#67](https://github.com/doublewordai/fusillade/issues/67)) ([b0ada75](https://github.com/doublewordai/fusillade/commit/b0ada75f6ed51337ff121007fa9150f50d5c8210))
+
 ## [0.16.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.15.0...fusillade-v0.16.0) (2026-01-12)
 
 
