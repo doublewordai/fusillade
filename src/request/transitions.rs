@@ -193,7 +193,6 @@ impl Request<Claimed> {
         storage: &S,
     ) -> Result<Request<Processing>> {
         let request_data = self.data.clone();
-        let api_key = request_data.api_key.clone();
 
         // Create a channel for the HTTP result
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -201,7 +200,7 @@ impl Request<Claimed> {
         // Spawn the HTTP request as an async task
         let task_handle = tokio::spawn(async move {
             let result = http_client
-                .execute(&request_data, &api_key, timeout_ms)
+                .execute(&request_data, &request_data.api_key, timeout_ms)
                 .await;
             let _ = tx.send(result).await; // Ignore send errors (receiver dropped)
         });
