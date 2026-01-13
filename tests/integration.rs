@@ -2951,8 +2951,9 @@ mod batch_results_stream {
         let http_client = Arc::new(MockHttpClient::new());
 
         // Escalated completes quickly with different response
+        // Both use the same path since escalated requests no longer use separate endpoints
         let escalated_trigger = http_client.add_response_with_trigger(
-            "POST /priority/test",
+            "POST /v1/test",
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"escalated_success"}"#.to_string(),
@@ -2978,14 +2979,12 @@ mod batch_results_stream {
             let _ = original_trigger.send(());
         });
 
-        let priority_endpoints = Arc::new(dashmap::DashMap::new());
-        priority_endpoints.insert(
+        let model_escalations = Arc::new(dashmap::DashMap::new());
+        model_escalations.insert(
             "gpt-4".to_string(),
-            PriorityEndpointConfig {
-                endpoint: "https://priority.example.com".to_string(),
-                path_override: Some("/priority/test".to_string()),
-                api_key: None,
-                model_override: None,
+            ModelEscalationConfig {
+                escalation_model: "gpt-4-turbo".to_string(),
+                escalation_api_key: None,
             },
         );
 
@@ -2993,7 +2992,7 @@ mod batch_results_stream {
             claim_batch_size: 10,
             claim_interval_ms: 10,
             default_model_concurrency: 10,
-            priority_endpoints,
+            model_escalations,
             sla_check_interval_seconds: 1,
             sla_thresholds: vec![SlaThreshold {
                 name: "test-escalation".to_string(),
@@ -3118,8 +3117,9 @@ mod batch_results_stream {
         );
 
         // Escalated is slower
+        // Both use the same path since escalated requests no longer use separate endpoints
         let escalated_trigger = http_client.add_response_with_trigger(
-            "POST /priority/test",
+            "POST /v1/test",
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"escalated_success"}"#.to_string(),
@@ -3136,14 +3136,12 @@ mod batch_results_stream {
             let _ = escalated_trigger.send(());
         });
 
-        let priority_endpoints = Arc::new(dashmap::DashMap::new());
-        priority_endpoints.insert(
+        let model_escalations = Arc::new(dashmap::DashMap::new());
+        model_escalations.insert(
             "gpt-4".to_string(),
-            PriorityEndpointConfig {
-                endpoint: "https://priority.example.com".to_string(),
-                path_override: Some("/priority/test".to_string()),
-                api_key: None,
-                model_override: None,
+            ModelEscalationConfig {
+                escalation_model: "gpt-4-turbo".to_string(),
+                escalation_api_key: None,
             },
         );
 
@@ -3151,7 +3149,7 @@ mod batch_results_stream {
             claim_batch_size: 10,
             claim_interval_ms: 10,
             default_model_concurrency: 10,
-            priority_endpoints,
+            model_escalations,
             sla_check_interval_seconds: 1,
             sla_thresholds: vec![SlaThreshold {
                 name: "test-escalation".to_string(),
@@ -3259,6 +3257,7 @@ mod batch_results_stream {
         let http_client = Arc::new(MockHttpClient::new());
 
         // Use triggers for all requests to control timing precisely
+        // Both original and escalated use same path since escalated requests no longer use separate endpoints
         // Template 1: original wins (completes at 50ms), escalated slower (300ms)
         let original1_trigger = http_client.add_response_with_trigger(
             "POST /v1/test",
@@ -3268,7 +3267,7 @@ mod batch_results_stream {
             }),
         );
         let escalated1_trigger = http_client.add_response_with_trigger(
-            "POST /priority/test",
+            "POST /v1/test",
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"req1_escalated"}"#.to_string(),
@@ -3284,7 +3283,7 @@ mod batch_results_stream {
             }),
         );
         let escalated2_trigger = http_client.add_response_with_trigger(
-            "POST /priority/test",
+            "POST /v1/test",
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"req2_escalated"}"#.to_string(),
@@ -3311,14 +3310,12 @@ mod batch_results_stream {
             let _ = escalated2_trigger.send(());
         });
 
-        let priority_endpoints = Arc::new(dashmap::DashMap::new());
-        priority_endpoints.insert(
+        let model_escalations = Arc::new(dashmap::DashMap::new());
+        model_escalations.insert(
             "gpt-4".to_string(),
-            PriorityEndpointConfig {
-                endpoint: "https://priority.example.com".to_string(),
-                path_override: Some("/priority/test".to_string()),
-                api_key: None,
-                model_override: None,
+            ModelEscalationConfig {
+                escalation_model: "gpt-4-turbo".to_string(),
+                escalation_api_key: None,
             },
         );
 
@@ -3326,7 +3323,7 @@ mod batch_results_stream {
             claim_batch_size: 10,
             claim_interval_ms: 10,
             default_model_concurrency: 10,
-            priority_endpoints,
+            model_escalations,
             sla_check_interval_seconds: 1,
             sla_thresholds: vec![SlaThreshold {
                 name: "test-escalation".to_string(),
