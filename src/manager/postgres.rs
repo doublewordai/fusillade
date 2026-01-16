@@ -1434,7 +1434,6 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let mut file_id: Option<Uuid> = None;
         let mut template_count = 0;
 
-
         while let Some(item) = stream.next().await {
             match item {
                 FileStreamItem::Metadata(meta) => {
@@ -1460,7 +1459,6 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     if meta.uploaded_by.is_some() {
                         metadata.uploaded_by = meta.uploaded_by;
                     }
-
                 }
                 FileStreamItem::Error(error_message) => {
                     // Rollback transaction and return validation error
@@ -1549,9 +1547,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             )
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to create file: {}", e))
-            })?
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create file: {}", e)))?
         };
 
         // Now update the file with all the final metadata
