@@ -46,8 +46,8 @@ fn default_sla_check_interval_seconds() -> u64 {
     60
 }
 
-/// Default priority endpoints (empty map)
-fn default_priority_endpoints() -> Arc<dashmap::DashMap<String, PriorityEndpointConfig>> {
+/// Default model escalations (empty map)
+fn default_model_escalations() -> Arc<dashmap::DashMap<String, ModelEscalationConfig>> {
     Arc::new(dashmap::DashMap::new())
 }
 
@@ -61,25 +61,18 @@ pub enum SlaLogLevel {
     Error,
 }
 
-/// Configuration for a priority endpoint used in SLA escalation.
-///
-/// When a request is escalated, it's cloned and sent to the priority endpoint
-/// specified in this configuration, while the original continues processing.
+/// Model-based escalation configuration for SLA escalation.
+/// When configured, escalated requests are routed to a different model in the control layer
+/// while keeping the original model visible to the user.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PriorityEndpointConfig {
-    /// Priority endpoint URL (e.g., "https://priority-api.openai.com")
-    pub endpoint: String,
+pub struct ModelEscalationConfig {
+    /// The model to escalate to (e.g., "o1-preview" for requests using "gpt-4")
+    /// Escalated requests are created with a new template using this model
+    pub escalation_model: String,
 
-    /// Optional override for API key (if None, uses original request's API key)
-    pub api_key: Option<String>,
-
-    /// Optional override for path (if None, uses original request's path)
-    pub path_override: Option<String>,
-
-    /// Optional override for model name (if None, uses original request's model)
-    /// This allows routing to different model tiers for priority endpoints
-    /// (e.g., "gpt-4" -> "gpt-4-priority")
-    pub model_override: Option<String>,
+    /// Optional API key to use for the escalated model
+    /// If provided, escalated requests will use this API key instead of the original
+    pub escalation_api_key: Option<String>,
 }
 
 /// Action to take when a batch crosses an SLA threshold.
@@ -137,11 +130,11 @@ pub struct DaemonConfig {
     /// Per-model concurrency overrides (shared, can be updated dynamically)
     pub model_concurrency_limits: Arc<dashmap::DashMap<String, usize>>,
 
-    /// Per-model priority endpoint configurations for SLA escalation
-    /// Maps model name -> priority endpoint config
-    /// When a request is escalated, it's cloned and sent to the priority endpoint for that model
-    #[serde(skip, default = "default_priority_endpoints")]
-    pub priority_endpoints: Arc<dashmap::DashMap<String, PriorityEndpointConfig>>,
+    /// Per-model escalation configurations for SLA-based model switching
+    /// Maps model name -> escalation config (e.g., "gpt-4" -> "o1-preview")
+    /// When a request is escalated, it's routed to the escalation_model by the control layer
+    #[serde(skip, default = "default_model_escalations")]
+    pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
 
     /// How long to sleep between claim iterations
     pub claim_interval_ms: u64,
@@ -251,7 +244,7 @@ impl Default for DaemonConfig {
             claim_batch_size: 100,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            priority_endpoints: default_priority_endpoints(),
+            model_escalations: default_model_escalations(),
             claim_interval_ms: 1000,
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(900_000),
@@ -562,28 +555,34 @@ where
             let shutdown_token = self.shutdown_token.clone();
             let sla_thresholds = self.config.sla_thresholds.clone();
             let sla_check_interval_seconds = self.config.sla_check_interval_seconds;
-            let priority_endpoints = self.config.priority_endpoints.clone();
+            let model_escalations = self.config.model_escalations.clone();
 
             // Warn about configuration mismatches
             let has_escalate_threshold = sla_thresholds
                 .iter()
                 .any(|t| matches!(t.action, SlaAction::Escalate));
-            if !priority_endpoints.is_empty() && !has_escalate_threshold {
+            if !model_escalations.is_empty() && !has_escalate_threshold {
                 tracing::warn!(
-                    "Priority endpoints are configured but no SLA thresholds with Escalate action are set. Priority endpoints will not be used."
+                    "Model escalations are configured but no SLA thresholds with Escalate action are set. Model escalations will not be used."
                 );
             }
 
             tracing::info!("Starting SLA monitoring task");
             tracing::debug!("SLA check interval: {} seconds", sla_check_interval_seconds);
             tracing::debug!("Configured SLA thresholds: {:?}", sla_thresholds);
-            tracing::debug!(
-                "Configured priority endpoints for models: {:?}",
-                priority_endpoints
-                    .iter()
-                    .map(|entry| entry.key().clone())
-                    .collect::<Vec<_>>()
-            );
+            if !model_escalations.is_empty() {
+                tracing::debug!(
+                    "Configured model escalations for models: {:?}",
+                    model_escalations
+                        .iter()
+                        .map(|entry| format!(
+                            "{} -> {}",
+                            entry.key(),
+                            entry.value().escalation_model
+                        ))
+                        .collect::<Vec<_>>()
+                );
+            }
 
             tokio::spawn(async move {
                 let mut interval =
@@ -645,38 +644,43 @@ where
                                         }
                                     }
                                     SlaAction::Escalate => {
-                                        if priority_endpoints.is_empty() {
+                                        if model_escalations.is_empty() {
                                             tracing::warn!(
                                                 sla_name = %threshold.name,
-                                                "SLA threshold configured with Escalate action but no priority endpoints are set. No escalations will be created."
+                                                "SLA threshold configured with Escalate action but no model_escalations are set. No escalations will be created."
                                             );
                                         } else {
                                             // Escalate for each configured model
-                                            for entry in priority_endpoints.iter() {
+                                            for entry in model_escalations.iter() {
                                                 let model = entry.key();
-                                                let priority_config = entry.value();
+                                                let escalation_config = entry.value();
                                                 tracing::trace!(
                                                     model = %model,
-                                                    priority_endpoint = %priority_config.endpoint,
+                                                    escalation_model = %escalation_config.escalation_model,
                                                     "Checking for requests to escalate"
                                                 );
 
-                                                // Create escalated requests
                                                 match storage
                                                     .create_escalated_requests(
                                                         model,
                                                         threshold.threshold_seconds,
                                                         &threshold.allowed_states,
-                                                        priority_config.model_override.as_deref(),
+                                                        Some(&escalation_config.escalation_model),
+                                                        escalation_config.escalation_api_key.as_deref(),
                                                     )
                                                     .await
                                                 {
                                                     Ok(escalated_count) => {
                                                         if escalated_count > 0 {
+                                                            counter!(
+                                                                "fusillade_escalations_created_total",
+                                                                "model" => model.to_string(),
+                                                                "sla_name" => threshold.name.clone()
+                                                            ).increment(escalated_count as u64);
                                                             tracing::debug!(
                                                                 model = %model,
                                                                 escalated_count = escalated_count,
-                                                                priority_endpoint = %priority_config.endpoint,
+                                                                escalation_model = %escalation_config.escalation_model,
                                                                 threshold_seconds = threshold.threshold_seconds,
                                                                 sla_name = %threshold.name,
                                                                 "Successfully created escalated requests"
@@ -786,12 +790,11 @@ where
             );
 
             // Group requests by model for better concurrency control visibility
+            // Escalated requests have their own template with the escalated model
             let mut by_model: HashMap<String, Vec<_>> = HashMap::new();
             for request in claimed {
-                by_model
-                    .entry(request.data.model.clone())
-                    .or_default()
-                    .push(request);
+                let model = request.data.model.clone();
+                by_model.entry(model).or_default().push(request);
             }
 
             tracing::debug!(
@@ -832,7 +835,6 @@ where
                             let cancellation_tokens = self.cancellation_tokens.clone();
                             let request_cancellation_tokens =
                                 self.request_cancellation_tokens.clone();
-                            let priority_endpoints = self.config.priority_endpoints.clone();
 
                             // Get or create a cancellation token for this batch
                             // All requests in a batch share the same token
@@ -866,78 +868,15 @@ where
 
                                 tracing::info!(request_id = %request_id, "Processing request");
 
-                                // If this is an escalated request, modify endpoint/path/api_key based on priority config
-                                let request_to_process = if request.data.is_escalated {
-                                    if let Some(priority_config) = priority_endpoints.get(&model_clone) {
-                                        let mut modified_data = request.data.clone();
-                                        modified_data.endpoint = priority_config.endpoint.clone();
-                                        if let Some(path_override) = &priority_config.path_override {
-                                            modified_data.path = path_override.clone();
-                                        }
-                                        if let Some(api_key_override) = &priority_config.api_key {
-                                            modified_data.api_key = api_key_override.clone();
-                                        }
-
-                                        // Apply model override to request body if specified
-                                        if let Some(model_override) = &priority_config.model_override {
-                                            match serde_json::from_str::<serde_json::Value>(&modified_data.body) {
-                                                Ok(mut body_json) => {
-                                                    if let Some(obj) = body_json.as_object_mut() {
-                                                        obj.insert("model".to_string(), serde_json::Value::String(model_override.clone()));
-                                                        modified_data.body = serde_json::to_string(&body_json)
-                                                            .unwrap_or_else(|_| modified_data.body.clone());
-                                                        tracing::debug!(
-                                                            request_id = %request_id,
-                                                            original_model = %model_clone,
-                                                            override_model = %model_override,
-                                                            "Applied model override to request body"
-                                                        );
-                                                    } else {
-                                                        tracing::warn!(
-                                                            request_id = %request_id,
-                                                            "Request body is not a JSON object, cannot apply model override"
-                                                        );
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        request_id = %request_id,
-                                                        error = %e,
-                                                        "Failed to parse request body as JSON, cannot apply model override"
-                                                    );
-                                                }
-                                            }
-                                        }
-
-                                        tracing::info!(
-                                            request_id = %request_id,
-                                            original_endpoint = %request.data.endpoint,
-                                            priority_endpoint = %modified_data.endpoint,
-                                            "Routing escalated request to priority endpoint"
-                                        );
-
-                                        crate::request::Request {
-                                            data: modified_data,
-                                            state: request.state.clone(),
-                                        }
-                                    } else {
-                                        tracing::warn!(
-                                            request_id = %request_id,
-                                            model = %model_clone,
-                                            "Escalated request but no priority endpoint configured for model"
-                                        );
-                                        request
-                                    }
-                                } else {
-                                    request
-                                };
-
                                 // Launch request processing (this goes on a background thread)
-                                let processing = request_to_process.process(
+                                let processing = request.process(
                                     http_client,
                                     timeout_ms,
                                     storage.as_ref()
                                 ).await?;
+
+                                // Capture retry attempt count before completion (not preserved in Completed state)
+                                let retry_attempt_at_completion = processing.state.retry_attempt;
 
                                 let cancellation = async {
                                     tokio::select! {
@@ -963,7 +902,10 @@ where
                                         counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
                                         histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
                                             .record(processing_start.elapsed().as_secs_f64());
-                                        tracing::info!(request_id = %request_id, "Request completed successfully");
+                                        // Record how many retries it took to succeed (0 = first attempt succeeded)
+                                        histogram!("fusillade_retry_attempts_on_success", "model" => model_clone.clone())
+                                            .record(retry_attempt_at_completion as f64);
+                                        tracing::info!(request_id = %request_id, retry_attempts = retry_attempt_at_completion, "Request completed successfully");
 
                                         // If this request is part of a race, cancel the superseded racing pair's token
                                         let superseded_id_opt = if completed.data.is_escalated {
@@ -977,10 +919,17 @@ where
 
                                         if let Some(sid) = superseded_id_opt
                                             && let Some((_, token)) = request_cancellation_tokens.remove(&sid) {
+                                                let winner = if completed.data.is_escalated { "escalated" } else { "original" };
+                                                counter!(
+                                                    "fusillade_escalation_winner_total",
+                                                    "model" => model_clone.clone(),
+                                                    "winner" => winner
+                                                ).increment(1);
                                                 token.cancel();
-                                                tracing::info!(
+                                                tracing::debug!(
                                                     winner_id = %request_id,
                                                     superseded_id = %sid,
+                                                    winner = winner,
                                                     "Cancelled superseded request's in-flight HTTP task"
                                                 );
                                             }
@@ -1002,7 +951,11 @@ where
                                                 Ok(pending) => {
                                                     // Can retry - persist as Pending
                                                     storage.persist(&pending).await?;
-                                                    counter!("fusillade_requests_retried_total", "model" => model_clone.clone()).increment(1);
+                                                    counter!(
+                                                        "fusillade_requests_retried_total",
+                                                        "model" => model_clone.clone(),
+                                                        "attempt" => (retry_attempt + 1).to_string()
+                                                    ).increment(1);
                                                     tracing::info!(
                                                         request_id = %request_id,
                                                         retry_attempt = retry_attempt + 1,
@@ -1118,7 +1071,7 @@ mod tests {
             claim_interval_ms: 10, // Very fast for testing
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            priority_endpoints: Arc::new(dashmap::DashMap::new()),
+            model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -1284,7 +1237,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits,
-            priority_endpoints: Arc::new(dashmap::DashMap::new()),
+            model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -1508,7 +1461,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            priority_endpoints: Arc::new(dashmap::DashMap::new()),
+            model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(5),
             stop_before_deadline_ms: None,
             backoff_ms: 10, // Very fast backoff for testing
@@ -1641,7 +1594,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
-            priority_endpoints: Arc::new(dashmap::DashMap::new()),
+            model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -1809,7 +1762,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            priority_endpoints: Arc::new(dashmap::DashMap::new()),
+            model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(10_000),
             stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
             backoff_ms: 50,
@@ -1961,7 +1914,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            priority_endpoints: Arc::new(dashmap::DashMap::new()),
+            model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: None,             // No retry limit
             stop_before_deadline_ms: None, // No buffer - should retry until deadline
             backoff_ms: 50,
@@ -2113,7 +2066,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            priority_endpoints: Arc::new(dashmap::DashMap::new()),
+            model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,

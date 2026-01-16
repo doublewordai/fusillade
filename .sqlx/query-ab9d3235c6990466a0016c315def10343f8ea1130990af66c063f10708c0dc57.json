@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id as \"template_id?\", r.state,\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", r.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,\n                b.expires_at as batch_expires_at\n            FROM requests r\n            LEFT JOIN request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.batch_id = $1\n            ORDER BY r.created_at ASC\n            ",
+  "query": "\n            SELECT\n                r.id, r.batch_id, r.template_id as \"template_id?\", r.state,\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", t.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,\n                b.expires_at as batch_expires_at\n            FROM requests r\n            LEFT JOIN request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.batch_id = $1\n            ORDER BY r.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -174,5 +174,5 @@
       false
     ]
   },
-  "hash": "3bbbfa21957e02efece2cc2c7d4986d94c389e047e4897c9080eebfd9fc855ce"
+  "hash": "ab9d3235c6990466a0016c315def10343f8ea1130990af66c063f10708c0dc57"
 }

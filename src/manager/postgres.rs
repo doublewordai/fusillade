@@ -265,7 +265,8 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                     LIMIT 1
                 )
                 -- Only supersede if not already in a terminal state
-                AND state NOT IN ('completed', 'failed', 'canceled', 'superseded')
+                -- Allow superseding 'failed' requests since that's the point of escalation
+                AND state NOT IN ('completed', 'canceled', 'superseded')
             RETURNING id
             "#,
             *winner_id as Uuid,
@@ -549,7 +550,10 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
             r#"
             SELECT COALESCE(SUM(response_size), 0)::BIGINT as "sum!"
             FROM requests
-            WHERE batch_id = $1 AND state = $2
+            WHERE batch_id = $1
+              AND state = $2
+              AND superseded_at IS NULL
+              AND (state != 'failed' OR is_escalated = false)  -- For failed: only originals; for completed: include all winners
             "#,
             *batch.id as Uuid,
             state_filter,
@@ -645,12 +649,13 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         let now = Utc::now();
 
-        // Get all models with pending requests (using denormalized model column)
+        // Get all models with pending requests
         // Exclude requests from cancelled batches
         let mut models = sqlx::query_scalar!(
             r#"
-            SELECT DISTINCT r.model
+            SELECT DISTINCT t.model
             FROM requests r
+            JOIN request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
             WHERE r.state = 'pending'
                 AND (r.not_before IS NULL OR r.not_before <= $1)
@@ -698,9 +703,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 r#"
                 WITH in_progress_count AS (
                     SELECT COUNT(*)::BIGINT as count
-                    FROM requests
-                    WHERE model = $4
-                        AND state IN ('claimed', 'processing')
+                    FROM requests r
+                    JOIN request_templates t ON r.template_id = t.id
+                    WHERE t.model = $4
+                        AND r.state IN ('claimed', 'processing')
                 ),
                 available_slots AS (
                     SELECT GREATEST(0, $2::BIGINT - (SELECT count FROM in_progress_count)) as slots
@@ -721,10 +727,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                            b.errors::TEXT as batch_errors,
                            b.total_requests::TEXT as batch_total_requests
                     FROM requests r
+                    JOIN request_templates tc_template ON r.template_id = tc_template.id
                     JOIN batches b ON r.batch_id = b.id
                     CROSS JOIN available_slots
                     WHERE r.state = 'pending'
-                        AND r.model = $4
+                        AND tc_template.model = $4
                         AND r.template_id IS NOT NULL
                         AND (r.not_before IS NULL OR r.not_before <= $3)
                         AND b.cancelling_at IS NULL
@@ -2593,55 +2600,139 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         model: &str,
         threshold_seconds: i64,
         allowed_states: &[RequestStateFilter],
-        _model_override: Option<&str>,
+        escalated_model: Option<&str>,
+        escalated_api_key: Option<&str>,
     ) -> Result<i64> {
+        // Step 1: Create new templates for escalated requests with escalated model and API key
+        // Step 2: Insert escalated requests pointing to these new templates
+        //
+        // This approach is cleaner than using override fields because:
+        // - The escalated request naturally has different model/api_key in its template
+        // - No special handling needed in request processing
+        // - The original request's model is preserved for user visibility
+
+        //   The query does 3 things:
+
+        // 1. Finds at-risk requests (at_risk_requests CTE):
+        //     - Say we find 3 requests that need escalation
+        // 2. Creates 3 NEW templates (new_templates_ordered CTE):
+        //     - Each with the escalated model (e.g., "gpt-4-priority") and escalated API key
+        //     - This INSERT RETURNING gives us back the new template IDs
+        // 3. Creates 3 escalated REQUESTS (final INSERT):
+        //     - Each escalated request needs a template_id field
+        //     - We need to know WHICH new template ID belongs to WHICH at-risk request
+
         let rows_affected = sqlx::query!(
             r#"
+            WITH at_risk_requests AS (
+                -- Find requests that need escalation
+                SELECT
+                    ROW_NUMBER() OVER (ORDER BY r.id) as row_num,
+                    r.id as original_request_id,
+                    r.batch_id,
+                    r.retry_attempt,
+                    t.file_id,
+                    t.custom_id,
+                    t.endpoint,
+                    t.method,
+                    t.path,
+                    t.body,
+                    t.model as original_model,
+                    t.api_key as original_api_key,
+                    b.created_by as batch_created_by
+                FROM requests r
+                JOIN request_templates t ON r.template_id = t.id
+                JOIN batches b ON r.batch_id = b.id
+                WHERE t.model = $1
+                  AND r.is_escalated = false
+                  AND r.state = ANY($2)
+                  AND b.expires_at IS NOT NULL
+                  AND b.completed_at IS NULL
+                  AND b.cancelled_at IS NULL
+                  AND b.cancelling_at IS NULL
+                  AND (b.expires_at - NOW()) <= make_interval(secs => $3::float8)
+                  -- Only create escalation if one doesn't already exist
+                  AND NOT EXISTS (
+                      SELECT 1 FROM requests esc
+                      WHERE esc.escalated_from_request_id = r.id
+                  )
+            ),
+            escalation_file AS (
+                -- Create a virtual file to hold escalation templates (not the batch input file)
+                -- This prevents escalation templates from being picked up when creating requests from the batch
+                INSERT INTO files (name, purpose, size_bytes, size_finalized, uploaded_by)
+                SELECT
+                    'escalation-templates-' || gen_random_uuid()::text || '.jsonl',
+                    'escalation_templates',
+                    0,
+                    true,
+                    arr.batch_created_by
+                FROM at_risk_requests arr
+                LIMIT 1
+                RETURNING id
+            ),
+            new_templates_ordered AS (
+                -- Create new templates with escalated model and API key in the escalation file
+                INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key)
+                SELECT
+                    (SELECT id FROM escalation_file),  -- Use the escalation file, NOT the original file
+                    arr.custom_id,
+                    arr.endpoint,
+                    arr.method,
+                    arr.path,
+                    -- Update the model field in the body JSON to match the escalated model
+                    jsonb_set(arr.body::jsonb, '{model}', to_jsonb(COALESCE($4, arr.original_model)))::text,
+                    COALESCE($4, arr.original_model),  -- Use escalated model if provided, else original
+                    COALESCE($5, arr.original_api_key) -- Use escalated API key if provided, else original
+                FROM at_risk_requests arr
+                ORDER BY arr.row_num  -- Maintain consistent ordering
+                RETURNING id as template_id, custom_id, model, api_key
+            ),
+            new_templates AS (
+                -- Add row numbers to maintain 1:1 mapping with at_risk_requests
+                -- This ensures correct pairing even when multiple batches have the same custom_id
+                SELECT
+                    ROW_NUMBER() OVER (ORDER BY template_id) as row_num,
+                    template_id,
+                    custom_id,
+                    model,
+                    api_key
+                FROM new_templates_ordered
+            )
             INSERT INTO requests (
                 id, batch_id, template_id, state, custom_id, retry_attempt, model,
                 escalated_from_request_id, is_escalated, superseded_at, superseded_by_request_id
             )
             SELECT
                 gen_random_uuid(),
-                r.batch_id,
-                r.template_id,
+                arr.batch_id,
+                nt.template_id,  -- Point to the new template
                 'pending',
-                t.custom_id,
-                r.retry_attempt,
-                r.model,     -- Keep original model for hashmap lookup at runtime
-                r.id,        -- Link back to original request
-                true,        -- is_escalated = true
+                arr.custom_id,
+                arr.retry_attempt,
+                nt.model,        -- Denormalized model from the new template
+                arr.original_request_id,  -- Link back to original request
+                true,            -- is_escalated = true
                 NULL,
                 NULL
-            FROM requests r
-            JOIN request_templates t ON r.template_id = t.id
-            JOIN batches b ON r.batch_id = b.id
-            WHERE r.model = $1
-              AND r.is_escalated = false
-              AND r.state = ANY($2)
-              AND b.expires_at IS NOT NULL
-              AND b.completed_at IS NULL
-              AND b.failed_at IS NULL
-              AND b.cancelled_at IS NULL
-              AND b.cancelling_at IS NULL
-              AND (b.expires_at - NOW()) <= make_interval(secs => $3::float8)
-              -- Only create escalation if one doesn't already exist in an active state
-              AND NOT EXISTS (
-                  SELECT 1 FROM requests esc
-                  WHERE esc.escalated_from_request_id = r.id
-                    AND esc.state IN ('pending', 'claimed', 'processing')
-              )
+            FROM at_risk_requests arr
+            JOIN new_templates nt ON arr.row_num = nt.row_num
             "#,
             model,
             allowed_states as &[RequestStateFilter],
             threshold_seconds as f64,
+            escalated_model,
+            escalated_api_key,
         )
         .execute(&self.pool)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to create escalated requests: {}", e)))?
         .rows_affected();
 
-        tracing::debug!(rows_affected, "Created escalated requests");
+        tracing::debug!(
+            rows_affected,
+            "Created escalated requests with new templates"
+        );
 
         Ok(rows_affected as i64)
     }
@@ -2764,7 +2855,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             SELECT
                 r.id, r.batch_id, r.template_id as "template_id?", r.state,
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
-                t.path as "path?", t.body as "body?", r.model as "model?", t.api_key as "api_key?",
+                t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,
@@ -2982,6 +3073,25 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(results)
     }
 
+    #[tracing::instrument(skip(self), fields(batch_id = %batch_id, search = ?search, status = ?status))]
+    fn get_batch_results_stream(
+        &self,
+        batch_id: BatchId,
+        offset: usize,
+        search: Option<String>,
+        status: Option<String>,
+    ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>> {
+        let pool = self.pool.clone();
+        let (tx, rx) = mpsc::channel(self.download_buffer_size);
+        let offset = offset as i64;
+
+        tokio::spawn(async move {
+            Self::stream_batch_results(pool, batch_id, offset, search, status, tx).await;
+        });
+
+        Box::pin(ReceiverStream::new(rx))
+    }
+
     async fn find_pending_escalation(
         &self,
         original_request_id: RequestId,
@@ -3151,6 +3261,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 FROM requests
                 WHERE batch_id = $1
                   AND state = 'completed'
+                  AND superseded_at IS NULL  -- Only include race winners (original or escalated)
                   AND ($2::TIMESTAMPTZ IS NULL OR completed_at > $2 OR (completed_at = $2 AND id > $3))
                   AND ($6::text IS NULL OR LOWER(custom_id) LIKE $6)
                 ORDER BY completed_at ASC, id ASC
@@ -3279,6 +3390,8 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                 FROM requests
                 WHERE batch_id = $1
                   AND state = 'failed'
+                  AND is_escalated = false  -- Only include original requests, not escalated racing pairs
+                  AND superseded_at IS NULL  -- Exclude requests superseded by winning escalations
                   AND ($2::TIMESTAMPTZ IS NULL OR failed_at > $2 OR (failed_at = $2 AND id > $3))
                   AND ($6::text IS NULL OR LOWER(custom_id) LIKE $6)
                 ORDER BY failed_at ASC, id ASC
@@ -3330,6 +3443,169 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                     let _ = tx
                         .send(Err(FusilladeError::Other(anyhow!(
                             "Failed to fetch failed requests: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Stream batch results with merged input/output data for the Results view.
+    /// This joins requests with their templates to provide input body alongside response/error.
+    async fn stream_batch_results(
+        pool: sqlx::PgPool,
+        batch_id: BatchId,
+        offset: i64,
+        search: Option<String>,
+        status: Option<String>,
+        tx: mpsc::Sender<Result<crate::batch::BatchResultItem>>,
+    ) {
+        use crate::batch::{BatchResultItem, BatchResultStatus};
+
+        // First, get the file_id from the batch
+        // This allows us to query by file_id to avoid duplicates from SLA escalation
+        let file_id = match sqlx::query_scalar!(
+            r#"SELECT file_id FROM batches WHERE id = $1"#,
+            *batch_id as Uuid,
+        )
+        .fetch_optional(&pool)
+        .await
+        {
+            Ok(Some(Some(fid))) => fid,
+            Ok(Some(None)) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!(
+                        "Batch has no associated file_id"
+                    ))))
+                    .await;
+                return;
+            }
+            Ok(None) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!("Batch not found"))))
+                    .await;
+                return;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!(
+                        "Failed to fetch batch: {}",
+                        e
+                    ))))
+                    .await;
+                return;
+            }
+        };
+
+        const BATCH_SIZE: i64 = 1000;
+        let mut last_line_number: i32 = -1;
+        let mut is_first_batch = true;
+        let search_pattern = search.map(|s| format!("%{}%", s.to_lowercase()));
+
+        // Convert status filter to database state values
+        // in_progress maps to both 'claimed' and 'processing' states
+        let state_filter: Option<Vec<String>> = status.map(|s| match s.as_str() {
+            "in_progress" => vec!["claimed".to_string(), "processing".to_string()],
+            other => vec![other.to_string()],
+        });
+
+        loop {
+            // Use OFFSET only on first batch, then use cursor pagination by line_number
+            let (line_filter, offset_val) = if is_first_batch {
+                (-1i32, offset)
+            } else {
+                (last_line_number, 0i64)
+            };
+            is_first_batch = false;
+
+            // Query from request_templates joined to requests.
+            // For each template, we find the matching request for this batch.
+            // If the request was superseded, we use the superseding request's data instead.
+            let request_batch = sqlx::query!(
+                r#"
+                SELECT
+                    COALESCE(successor.id, r.id) as "id!",
+                    COALESCE(successor.custom_id, r.custom_id) as "custom_id?",
+                    COALESCE(successor.model, r.model) as "model!",
+                    COALESCE(successor.state, r.state) as "state!",
+                    t.body as input_body,
+                    COALESCE(successor.response_body, r.response_body) as "response_body?",
+                    COALESCE(successor.error, r.error) as "error?",
+                    t.line_number as "line_number!"
+                FROM request_templates t
+                JOIN requests r ON r.template_id = t.id AND r.batch_id = $1 AND r.is_escalated = false
+                LEFT JOIN requests successor ON successor.id = r.superseded_by_request_id
+                WHERE t.file_id = $2
+                  AND ($3 = -1 OR t.line_number > $3)
+                  AND ($6::text IS NULL OR LOWER(COALESCE(successor.custom_id, r.custom_id)) LIKE $6)
+                  AND ($7::text[] IS NULL OR COALESCE(successor.state, r.state) = ANY($7))
+                ORDER BY t.line_number ASC
+                OFFSET $4
+                LIMIT $5
+                "#,
+                *batch_id as Uuid,
+                file_id,
+                line_filter,
+                offset_val,
+                BATCH_SIZE,
+                search_pattern.as_deref(),
+                state_filter.as_deref(),
+            )
+            .fetch_all(&pool)
+            .await;
+
+            match request_batch {
+                Ok(requests) => {
+                    if requests.is_empty() {
+                        break;
+                    }
+
+                    tracing::debug!("Fetched batch of {} results", requests.len());
+
+                    for row in requests {
+                        last_line_number = row.line_number;
+
+                        // Parse input body as JSON
+                        let input_body: serde_json::Value = serde_json::from_str(&row.input_body)
+                            .unwrap_or_else(|_| serde_json::Value::String(row.input_body.clone()));
+
+                        // Parse response body as JSON if present
+                        let response_body: Option<serde_json::Value> =
+                            row.response_body.as_ref().map(|body| {
+                                serde_json::from_str(body)
+                                    .unwrap_or_else(|_| serde_json::Value::String(body.clone()))
+                            });
+
+                        // Map state to BatchResultStatus
+                        let status = match row.state.as_str() {
+                            "completed" => BatchResultStatus::Completed,
+                            "failed" => BatchResultStatus::Failed,
+                            "pending" => BatchResultStatus::Pending,
+                            "claimed" | "processing" => BatchResultStatus::InProgress,
+                            _ => BatchResultStatus::Pending, // Default for unknown states
+                        };
+
+                        let result_item = BatchResultItem {
+                            id: row.id.to_string(),
+                            custom_id: row.custom_id,
+                            model: row.model,
+                            input_body,
+                            response_body,
+                            error: row.error,
+                            status,
+                        };
+
+                        if tx.send(Ok(result_item)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Failed to fetch batch results: {}",
                             e
                         ))))
                         .await;
@@ -7527,7 +7803,7 @@ mod tests {
 
         // Create escalated requests (threshold: 1800s = 30 min, so batch created 30min ago is at risk)
         let count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -7623,7 +7899,7 @@ mod tests {
 
         // Escalate only gpt-4 requests
         let count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -7691,7 +7967,7 @@ mod tests {
 
         // Create escalation first time
         let count1 = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -7699,7 +7975,7 @@ mod tests {
 
         // Try to create escalation again - should be blocked by NOT EXISTS
         let count2 = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -7770,7 +8046,7 @@ mod tests {
 
         // Create first escalation
         let count1 = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -7793,18 +8069,19 @@ mod tests {
         .await
         .unwrap();
 
-        // Now try to create escalation again - should succeed because existing escalation is terminal
+        // Now try to create escalation again - should NOT create a new one because one already exists
+        // (even though it's in a terminal state, we don't create duplicate escalations)
         let count2 = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
         assert_eq!(
-            count2, 1,
-            "Should allow new escalation when existing one is in terminal state"
+            count2, 0,
+            "Should not allow new escalation when one already exists (even if terminal)"
         );
 
-        // Verify 2 escalated requests exist (one completed, one pending)
+        // Verify only 1 escalated request exists (the completed one)
         let escalated_count: i64 = sqlx::query_scalar!(
             "SELECT COUNT(*)::bigint FROM requests WHERE batch_id = $1 AND is_escalated = true",
             *batch.id as Uuid
@@ -7814,7 +8091,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(escalated_count, 2);
+        assert_eq!(escalated_count, 1);
     }
 
     #[sqlx::test]
@@ -7913,7 +8190,7 @@ mod tests {
 
         // Test 1: Escalate only pending
         let pending_count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -7921,7 +8198,7 @@ mod tests {
 
         // Test 2: Escalate only claimed
         let claimed_count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Claimed], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Claimed], None, None)
             .await
             .unwrap();
 
@@ -7931,7 +8208,7 @@ mod tests {
         // The function doesn't filter out terminal request states, only terminal batch states
         // So passing Completed in allowed_states WILL match completed requests
         let completed_count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Completed], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Completed], None, None)
             .await
             .unwrap();
 
@@ -8011,15 +8288,34 @@ mod tests {
             batch_ids.push(batch.id);
         }
 
-        // Try to escalate - should find 0 requests because all batches are terminal
+        // Try to escalate - should find 1 request from the failed batch
+        // (failed batches are NOT excluded, as they may need escalation as a last resort)
         let count = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
         assert_eq!(
-            count, 0,
-            "Should not escalate requests from terminal batches"
+            count, 1,
+            "Should escalate requests from failed batches (last resort), but not completed or cancelled batches"
+        );
+
+        // Verify the escalation came from the failed batch
+        let escalated = sqlx::query!(
+            r#"
+            SELECT r.batch_id, b.failed_at
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            WHERE r.is_escalated = true
+            "#
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            escalated.failed_at.is_some(),
+            "Escalated request should be from the failed batch"
         );
     }
 
@@ -8030,7 +8326,7 @@ mod tests {
 
         // Test 1: Empty database
         let empty = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8079,7 +8375,7 @@ mod tests {
         .unwrap();
 
         let no_model_match = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8128,7 +8424,7 @@ mod tests {
         .unwrap();
 
         let not_at_risk = manager
-            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 1800, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8189,6 +8485,7 @@ mod tests {
                 3600,
                 &[RequestStateFilter::Pending],
                 Some("gpt-4-priority"),
+                None,
             )
             .await
             .unwrap();
@@ -8205,11 +8502,11 @@ mod tests {
             .find(|r| r.data().is_escalated)
             .expect("Should find escalated request");
 
-        // Verify model was NOT overridden in DB (keeps original for hashmap lookup)
+        // Verify escalated request has its own template with the escalated model
         assert_eq!(
             escalated.data().model,
-            "gpt-4",
-            "Escalated request should keep original model in DB (override applied at runtime)"
+            "gpt-4-priority",
+            "Escalated request should have escalated model from its new template"
         );
     }
 
@@ -8286,7 +8583,7 @@ mod tests {
 
         // Try to create escalated requests
         let count = manager
-            .create_escalated_requests("gpt-4", 3600, &[RequestStateFilter::Pending], None)
+            .create_escalated_requests("gpt-4", 3600, &[RequestStateFilter::Pending], None, None)
             .await
             .unwrap();
 
@@ -8348,6 +8645,7 @@ mod tests {
                 3600,
                 &[RequestStateFilter::Pending],
                 Some("gpt-4-priority"),
+                None,
             )
             .await
             .unwrap();
@@ -8368,12 +8666,11 @@ mod tests {
             .find(|r| r.data().is_escalated)
             .expect("Should find escalated request");
 
-        // The model should NOT be overridden in the database
-        // It should keep the original model name for hashmap lookup at runtime
+        // The escalated request has its own template with the escalated model
         assert_eq!(
             escalated.data().model,
-            "gpt-4",
-            "Escalated request should keep original model in DB, not the override"
+            "gpt-4-priority",
+            "Escalated request should have escalated model from its new template"
         );
 
         // Verify it still links to the original request
@@ -8692,5 +8989,183 @@ mod tests {
                 escalated.variant()
             ),
         }
+    }
+
+    #[sqlx::test]
+    async fn test_escalation_with_duplicate_custom_ids_across_batches(pool: sqlx::PgPool) {
+        // Test that when multiple batches have requests with the same custom_id,
+        // escalated requests are correctly paired with their original batch.
+        // This verifies the ROW_NUMBER() fix that ensures 1:1 mapping.
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create two files, each with a request that has custom_id "request-1"
+        let file1_id = manager
+            .create_file(
+                "batch1-file".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("request-1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"model":"gpt-4","prompt":"batch1"}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key1".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let file2_id = manager
+            .create_file(
+                "batch2-file".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("request-1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"model":"gpt-4","prompt":"batch2"}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key2".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Create two batches
+        let batch1 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file1_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "2h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let batch2 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file2_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "2h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Backdate both batches to make them at-risk
+        let now = chrono::Utc::now();
+        sqlx::query!(
+            r#"UPDATE batches SET created_at = $1, expires_at = $2 WHERE id = ANY($3)"#,
+            now - chrono::Duration::minutes(90),
+            now + chrono::Duration::minutes(30),
+            &[*batch1.id, *batch2.id] as &[Uuid]
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Get original requests
+        let batch1_requests = manager.get_batch_requests(batch1.id).await.unwrap();
+        let batch2_requests = manager.get_batch_requests(batch2.id).await.unwrap();
+        assert_eq!(batch1_requests.len(), 1);
+        assert_eq!(batch2_requests.len(), 1);
+        let batch1_orig_id = batch1_requests[0].id();
+        let batch2_orig_id = batch2_requests[0].id();
+
+        // Verify both have the same custom_id
+        assert_eq!(
+            batch1_requests[0].data().custom_id,
+            Some("request-1".to_string())
+        );
+        assert_eq!(
+            batch2_requests[0].data().custom_id,
+            Some("request-1".to_string())
+        );
+
+        // Create escalated requests for both at-risk batches
+        let count = manager
+            .create_escalated_requests(
+                "gpt-4",
+                3600,
+                &[RequestStateFilter::Pending],
+                Some("gpt-4-priority"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count, 2,
+            "Should create 2 escalated requests (one per batch)"
+        );
+
+        // Get all requests for both batches
+        let batch1_all = manager.get_batch_requests(batch1.id).await.unwrap();
+        let batch2_all = manager.get_batch_requests(batch2.id).await.unwrap();
+
+        // Each batch should now have 2 requests: original + escalated
+        assert_eq!(
+            batch1_all.len(),
+            2,
+            "Batch 1 should have original + escalated"
+        );
+        assert_eq!(
+            batch2_all.len(),
+            2,
+            "Batch 2 should have original + escalated"
+        );
+
+        // Find escalated requests
+        let batch1_escalated = batch1_all
+            .iter()
+            .find(|r| r.data().is_escalated)
+            .expect("Batch 1 should have escalated request");
+        let batch2_escalated = batch2_all
+            .iter()
+            .find(|r| r.data().is_escalated)
+            .expect("Batch 2 should have escalated request");
+
+        // Verify: Each escalated request links back to the correct original request
+        assert_eq!(
+            batch1_escalated.data().escalated_from_request_id,
+            Some(batch1_orig_id),
+            "Batch 1 escalated should link to batch 1 original"
+        );
+        assert_eq!(
+            batch2_escalated.data().escalated_from_request_id,
+            Some(batch2_orig_id),
+            "Batch 2 escalated should link to batch 2 original"
+        );
+
+        // Verify: Each escalated request is in the correct batch
+        assert_eq!(
+            batch1_escalated.data().batch_id,
+            batch1.id,
+            "Batch 1 escalated should be in batch 1"
+        );
+        assert_eq!(
+            batch2_escalated.data().batch_id,
+            batch2.id,
+            "Batch 2 escalated should be in batch 2"
+        );
+
+        // Verify: Both have the same custom_id (this is expected and OK)
+        assert_eq!(
+            batch1_escalated.data().custom_id,
+            Some("request-1".to_string())
+        );
+        assert_eq!(
+            batch2_escalated.data().custom_id,
+            Some("request-1".to_string())
+        );
+
+        // Verify: They have the escalated model
+        assert_eq!(batch1_escalated.data().model, "gpt-4-priority");
+        assert_eq!(batch2_escalated.data().model, "gpt-4-priority");
     }
 }

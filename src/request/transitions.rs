@@ -103,6 +103,8 @@
 //! ```
 
 use std::sync::Arc;
+
+use metrics::counter;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -191,7 +193,6 @@ impl Request<Claimed> {
         storage: &S,
     ) -> Result<Request<Processing>> {
         let request_data = self.data.clone();
-        let api_key = request_data.api_key.clone();
 
         // Create a channel for the HTTP result
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -199,7 +200,7 @@ impl Request<Claimed> {
         // Spawn the HTTP request as an async task
         let task_handle = tokio::spawn(async move {
             let result = http_client
-                .execute(&request_data, &api_key, timeout_ms)
+                .execute(&request_data, &request_data.api_key, timeout_ms)
                 .await;
             let _ = tx.send(result).await; // Ignore send errors (receiver dropped)
         });
@@ -283,6 +284,12 @@ impl Request<Failed> {
         if let Some(max_retries) = config.max_retries
             && retry_attempt >= max_retries
         {
+            counter!(
+                "fusillade_retry_denied_total",
+                "model" => self.data.model.clone(),
+                "reason" => "max_retries"
+            )
+            .increment(1);
             tracing::debug!(
                 request_id = %self.data.id,
                 retry_attempt,
@@ -304,6 +311,12 @@ impl Request<Failed> {
 
         // Check if the next retry would start before the effective deadline
         if not_before >= effective_deadline {
+            counter!(
+                "fusillade_retry_denied_total",
+                "model" => self.data.model.clone(),
+                "reason" => "deadline"
+            )
+            .increment(1);
             let time_until_deadline = self.state.batch_expires_at - now;
             tracing::warn!(
                 request_id = %self.data.id,
@@ -427,6 +440,14 @@ impl Request<Processing> {
 
                 // Check if this response should be retried
                 if should_retry(&http_response) {
+                    // Record retriable HTTP status for observability
+                    counter!(
+                        "fusillade_http_status_retriable_total",
+                        "model" => self.data.model.clone(),
+                        "status" => http_response.status.to_string()
+                    )
+                    .increment(1);
+
                     // Treat as failure for retry purposes
                     let failed_state = Failed {
                         reason: FailureReason::RetriableHttpStatus {

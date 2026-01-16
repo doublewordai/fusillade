@@ -120,6 +120,30 @@ pub trait Storage: Send + Sync {
     /// Get all requests for a batch.
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>>;
 
+    /// Stream batch results with merged input/output data.
+    ///
+    /// Returns a stream of BatchResultItem, each containing:
+    /// - The original input body from the request template
+    /// - The response body (for completed requests)
+    /// - The error message (for failed requests)
+    /// - The current status
+    ///
+    /// Results are filtered to exclude superseded requests (those that lost the race
+    /// to their escalated pair). This ensures exactly one result per input template.
+    ///
+    /// # Arguments
+    /// - `batch_id`: The batch to get results for
+    /// - `offset`: Number of results to skip (for pagination)
+    /// - `search`: Optional custom_id filter (case-insensitive substring match)
+    /// - `status`: Optional status filter (completed, failed, pending, in_progress)
+    fn get_batch_results_stream(
+        &self,
+        batch_id: BatchId,
+        offset: usize,
+        search: Option<String>,
+        status: Option<String>,
+    ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>>;
+
     /// Find a pending escalated request for a given original request.
     ///
     /// When a request is escalated, both the original and escalated request race.
@@ -188,6 +212,7 @@ pub trait Storage: Send + Sync {
     /// - `threshold_seconds`: Seconds since batch creation to consider at-risk
     /// - `allowed_states`: List of request states to escalate
     /// - `model_override`: Optional model name to use for escalated requests (e.g., "gpt-4-priority")
+    /// - `api_key_override`: Optional API key to use for escalated requests
     ///
     /// # Returns
     /// The number of escalated requests created
@@ -197,6 +222,7 @@ pub trait Storage: Send + Sync {
         threshold_seconds: i64,
         allowed_states: &[RequestStateFilter],
         model_override: Option<&str>,
+        api_key_override: Option<&str>,
     ) -> Result<i64>;
 
     /// Cancel all pending/in-progress requests for a batch.

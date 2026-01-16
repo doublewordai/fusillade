@@ -1,5 +1,42 @@
 # Changelog
 
+## [1.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.16.0...fusillade-v1.0.0) (2026-01-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* sla escalation through control layer ([#67](https://github.com/doublewordai/fusillade/issues/67))
+
+### Bug Fixes
+
+* sla escalation through control layer ([#67](https://github.com/doublewordai/fusillade/issues/67)) ([b0ada75](https://github.com/doublewordai/fusillade/commit/b0ada75f6ed51337ff121007fa9150f50d5c8210))
+
+## [0.16.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.15.0...fusillade-v0.16.0) (2026-01-12)
+
+
+### Features
+
+* stream_batch_results in postgres manager ([#66](https://github.com/doublewordai/fusillade/issues/66)) ([05a96d5](https://github.com/doublewordai/fusillade/commit/05a96d59463dac3c12d7463e584d60b0f7088f14))
+
+## [0.15.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.14.0...fusillade-v0.15.0) (2026-01-09)
+
+
+### Features
+
+* add enhanced retry and escalation observability metrics ([#64](https://github.com/doublewordai/fusillade/issues/64)) ([7786e97](https://github.com/doublewordai/fusillade/commit/7786e9712c251fe3d7739f69f3003da9499f9721))
+
+## [0.14.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.13.0...fusillade-v0.14.0) (2026-01-08)
+
+
+### Features
+
+* Add metrics for (nearly) missed SLAs ([#61](https://github.com/doublewordai/fusillade/issues/61)) ([b1ab86e](https://github.com/doublewordai/fusillade/commit/b1ab86e725075670a1753c6dea93cc8b12e32db4))
+
+
+### Bug Fixes
+
+* supersede failed requests and do not create more than one escalated request ([#63](https://github.com/doublewordai/fusillade/issues/63)) ([f9be9e9](https://github.com/doublewordai/fusillade/commit/f9be9e9e189c22a98e79aedb00bac7148d63fe7c))
+
 ## [0.13.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.12.4...fusillade-v0.13.0) (2026-01-07)
 
 
