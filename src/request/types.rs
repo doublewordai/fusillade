@@ -214,6 +214,11 @@ pub enum FailureReason {
     /// The HTTP task terminated unexpectedly (panic or crash).
     /// This should be retried as it may be a transient issue.
     TaskTerminated,
+
+    /// Failed to construct the HTTP request before it could be sent.
+    /// This includes invalid header values, malformed URLs, or other builder errors.
+    /// These are data errors that will never succeed on retry.
+    RequestBuilderError { error: String },
 }
 
 impl FailureReason {
@@ -224,6 +229,7 @@ impl FailureReason {
             FailureReason::NonRetriableHttpStatus { .. } => false,
             FailureReason::NetworkError { .. } => true,
             FailureReason::TaskTerminated => true,
+            FailureReason::RequestBuilderError { .. } => false,
         }
     }
 
@@ -246,6 +252,9 @@ impl FailureReason {
                 format!("Network error: {}", error)
             }
             FailureReason::TaskTerminated => "HTTP task terminated unexpectedly".to_string(),
+            FailureReason::RequestBuilderError { error } => {
+                format!("Failed to build HTTP request: {}", error)
+            }
         }
     }
 }

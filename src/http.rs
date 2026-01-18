@@ -151,12 +151,23 @@ impl HttpClient for ReqwestHttpClient {
         }
 
         let response = req.send().await.map_err(|e| {
-            tracing::error!(
-                request_id = %request.id,
-                url = %url,
-                error = %e,
-                "HTTP request failed"
-            );
+            if e.is_builder() {
+                tracing::error!(
+                    request_id = %request.id,
+                    url = %url,
+                    error = %e,
+                    custom_id = ?request.custom_id,
+                    batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
+                    "Failed to build HTTP request (not retriable) - likely invalid header value"
+                );
+            } else {
+                tracing::error!(
+                    request_id = %request.id,
+                    url = %url,
+                    error = %e,
+                    "HTTP request failed"
+                );
+            }
             e
         })?;
 
@@ -725,5 +736,47 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert_eq!(response.body, r#"{"result":"ok"}"#);
+    }
+
+    #[tokio::test]
+    async fn test_custom_id_with_newline_is_not_retriable() {
+        use crate::request::types::FailureReason;
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: Some("invalid\ncustom_id".to_string()), // Contains newline
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            body: "{}".to_string(),
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            batch_metadata: std::collections::HashMap::new(),
+            escalated_from_request_id: None,
+            is_escalated: false,
+            superseded_at: None,
+            superseded_by_request_id: None,
+        };
+
+        let client = ReqwestHttpClient::new();
+        let result = client.execute(&request, "test-key", 5000).await;
+        let err = result.expect_err("Expected builder error for invalid header value");
+
+        // Verify it's a builder error and map to FailureReason (same logic as transitions.rs)
+        let reason = match err {
+            crate::error::FusilladeError::HttpClient(ref reqwest_err) if reqwest_err.is_builder() => {
+                FailureReason::RequestBuilderError {
+                    error: reqwest_err.to_string(),
+                }
+            }
+            _ => panic!("Expected HttpClient builder error, got: {:?}", err),
+        };
+
+        assert!(
+            !reason.is_retriable(),
+            "Builder errors should not be retriable"
+        );
     }
 }
