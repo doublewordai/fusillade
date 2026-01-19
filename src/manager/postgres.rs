@@ -653,9 +653,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         // Exclude requests from cancelled batches
         let mut models = sqlx::query_scalar!(
             r#"
-            SELECT DISTINCT t.model
+            SELECT DISTINCT r.model
             FROM requests r
-            JOIN request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
             WHERE r.state = 'pending'
                 AND (r.not_before IS NULL OR r.not_before <= $1)
@@ -704,8 +703,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 WITH in_progress_count AS (
                     SELECT COUNT(*)::BIGINT as count
                     FROM requests r
-                    JOIN request_templates t ON r.template_id = t.id
-                    WHERE t.model = $4
+                    WHERE r.model = $4
                         AND r.state IN ('claimed', 'processing')
                 ),
                 available_slots AS (
@@ -727,11 +725,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                            b.errors::TEXT as batch_errors,
                            b.total_requests::TEXT as batch_total_requests
                     FROM requests r
-                    JOIN request_templates tc_template ON r.template_id = tc_template.id
                     JOIN batches b ON r.batch_id = b.id
                     CROSS JOIN available_slots
                     WHERE r.state = 'pending'
-                        AND tc_template.model = $4
+                        AND r.model = $4
                         AND r.template_id IS NOT NULL
                         AND (r.not_before IS NULL OR r.not_before <= $3)
                         AND b.cancelling_at IS NULL
@@ -2639,7 +2636,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 FROM requests r
                 JOIN request_templates t ON r.template_id = t.id
                 JOIN batches b ON r.batch_id = b.id
-                WHERE t.model = $1
+                WHERE r.model = $1
                   AND r.is_escalated = false
                   AND r.state = ANY($2)
                   AND b.expires_at IS NOT NULL
