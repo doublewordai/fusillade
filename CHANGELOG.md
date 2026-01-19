@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v1.1.0...fusillade-v1.1.1) (2026-01-19)
+
+
+### Bug Fixes
+
+* builder errors should be unretriable, they're a new class of error ([#72](https://github.com/doublewordai/fusillade/issues/72)) ([77995cc](https://github.com/doublewordai/fusillade/commit/77995cc6f65b02642a2d1756fde4e4a228c82179))
+* remove queries joining request templates without need ([#74](https://github.com/doublewordai/fusillade/issues/74)) ([ca21c95](https://github.com/doublewordai/fusillade/commit/ca21c9564cccab48105ab76fec74e25e0efbcb79))
+
 ## [1.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v1.0.0...fusillade-v1.1.0) (2026-01-16)
 
 
