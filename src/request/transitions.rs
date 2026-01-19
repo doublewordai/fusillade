@@ -499,11 +499,19 @@ impl Request<Processing> {
                 }
             }
             Some(Err(e)) => {
-                // HTTP request failed (network error, timeout, etc.)
-                let failed_state = Failed {
-                    reason: FailureReason::NetworkError {
+                let reason = match &e {
+                    FusilladeError::HttpClient(reqwest_err) if reqwest_err.is_builder() => {
+                        FailureReason::RequestBuilderError {
+                            error: reqwest_err.to_string(),
+                        }
+                    }
+                    _ => FailureReason::NetworkError {
                         error: crate::error::error_serialization::serialize_error(&e.into()),
                     },
+                };
+
+                let failed_state = Failed {
+                    reason,
                     failed_at: chrono::Utc::now(),
                     retry_attempt: self.state.retry_attempt,
                     batch_expires_at: self.state.batch_expires_at,
