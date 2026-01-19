@@ -766,7 +766,9 @@ mod tests {
 
         // Verify it's a builder error and map to FailureReason (same logic as transitions.rs)
         let reason = match err {
-            crate::error::FusilladeError::HttpClient(ref reqwest_err) if reqwest_err.is_builder() => {
+            crate::error::FusilladeError::HttpClient(ref reqwest_err)
+                if reqwest_err.is_builder() =>
+            {
                 FailureReason::RequestBuilderError {
                     error: reqwest_err.to_string(),
                 }
