@@ -633,6 +633,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
 // Implement Storage trait directly (no delegation)
 #[async_trait]
 impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
+    #[tracing::instrument(skip(self), fields(limit))]
     async fn claim_requests(
         &self,
         limit: usize,
@@ -854,6 +855,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(all_claimed)
     }
 
+    #[tracing::instrument(skip(self, request), fields(request_id = %request.data.id))]
     async fn persist<T: RequestState + Clone>(
         &self,
         request: &Request<T>,
@@ -1995,6 +1997,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(file_id = %input.file_id))]
     async fn create_batch(&self, input: BatchInput) -> Result<Batch> {
         let mut tx =
             self.pool.begin().await.map_err(|e| {
@@ -2508,6 +2511,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .collect())
     }
 
+    #[tracing::instrument(skip(self, allowed_states), fields(threshold_seconds))]
     async fn get_at_risk_batches(
         &self,
         threshold_seconds: i64,
@@ -2543,6 +2547,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(result)
     }
 
+    #[tracing::instrument(skip(self, allowed_states))]
     async fn get_missed_sla_batches(
         &self,
         allowed_states: &[RequestStateFilter],
@@ -2588,6 +2593,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     ///
     /// # Returns
     /// The number of escalated requests created
+    #[tracing::instrument(skip(self, allowed_states, escalated_api_key), fields(model, threshold_seconds))]
     async fn create_escalated_requests(
         &self,
         model: &str,
