@@ -11,7 +11,6 @@ pub mod daemon;
 pub mod error;
 pub mod http;
 pub mod manager;
-pub mod pool_provider;
 pub mod request;
 
 // Re-export commonly used types
@@ -19,14 +18,9 @@ pub use batch::*;
 pub use daemon::{Daemon, DaemonConfig, ModelEscalationConfig, SlaThreshold};
 pub use error::{FusilladeError, Result};
 pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient};
-pub use manager::postgres::PostgresRequestManager;
+pub use manager::postgres::{PoolProvider, PostgresRequestManager, TestDbPools};
 pub use manager::{DaemonExecutor, Storage};
-pub use pool_provider::PoolProvider;
 pub use request::*;
-
-// TestDbPools is always available for testing purposes
-// It's only useful in test scenarios and won't affect production code
-pub use pool_provider::TestDbPools;
 
 /// Get the fusillade database migrator
 ///
