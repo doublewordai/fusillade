@@ -1,3 +1,4 @@
+use fusillade::TestDbPools;
 use fusillade::batch::{BatchInput, RequestTemplateInput};
 use fusillade::daemon::{
     DaemonConfig, ModelEscalationConfig, SlaAction, SlaThreshold, default_should_retry,
@@ -44,7 +45,11 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
     };
 
     let manager = Arc::new(
-        PostgresRequestManager::with_client(pool.clone(), http_client.clone()).with_config(config),
+        PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(config),
     );
 
     // Setup: Create a file and batch to associate with our request
@@ -206,7 +211,11 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     };
 
     let manager = Arc::new(
-        PostgresRequestManager::with_client(pool.clone(), http_client.clone()).with_config(config),
+        PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(config),
     );
 
     // Setup: Create a file with 5 templates, all using "gpt-4"
@@ -436,7 +445,11 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
     };
 
     let manager = Arc::new(
-        PostgresRequestManager::with_client(pool.clone(), http_client.clone()).with_config(config),
+        PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(config),
     );
 
     // Setup: Create a file and batch
@@ -565,7 +578,11 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
     };
 
     let manager = Arc::new(
-        PostgresRequestManager::with_client(pool.clone(), http_client.clone()).with_config(config),
+        PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(config),
     );
 
     // Setup: Create a file with 10 requests, all using "gpt-4"
@@ -725,7 +742,11 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
     };
 
     let manager = Arc::new(
-        PostgresRequestManager::with_client(pool.clone(), http_client.clone()).with_config(config),
+        PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(config),
     );
 
     // Create a batch with a very short completion window (2 seconds)
@@ -886,7 +907,11 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
     };
 
     let manager = Arc::new(
-        PostgresRequestManager::with_client(pool.clone(), http_client.clone()).with_config(config),
+        PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(config),
     );
 
     // Create a batch with a 2 second completion window
@@ -1090,8 +1115,11 @@ mod sla {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         // Setup: Create batch that will be at-risk
@@ -1344,8 +1372,11 @@ mod sla {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         let file_id = manager
@@ -1524,8 +1555,11 @@ mod sla {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         let file_id = manager
@@ -1727,8 +1761,11 @@ mod sla {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         let file_id = manager
@@ -1919,8 +1956,11 @@ mod sla {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         // Create 1 file that we'll reuse for all 3 batches
@@ -2160,8 +2200,11 @@ mod sla {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         // Create 1 batch with 3 requests
@@ -2376,7 +2419,11 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
     };
 
     let manager = Arc::new(
-        PostgresRequestManager::with_client(pool.clone(), http_client.clone()).with_config(config),
+        PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(config),
     );
 
     let file_id = manager
@@ -2521,12 +2568,12 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
     // - Original request body contains: "model":"gpt-4"
     // - Escalated request body contains: "model": "gpt-4-priority"
     // Order is non-deterministic, so we check that we have one of each
-    let original_call = test_calls
+    test_calls
         .iter()
         .find(|c| c.body.contains(r#""model":"gpt-4""#) && !c.body.contains("priority"))
         .expect("Should find call with original model gpt-4");
 
-    let escalated_call = test_calls
+    test_calls
         .iter()
         .find(|c| c.body.contains("gpt-4-priority"))
         .expect("Should find call with escalated model gpt-4-priority");
@@ -2611,7 +2658,11 @@ async fn test_sla_escalation_uses_priority_api_key(pool: sqlx::PgPool) {
     };
 
     let manager = Arc::new(
-        PostgresRequestManager::with_client(pool.clone(), http_client.clone()).with_config(config),
+        PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(config),
     );
 
     // Create batch with original API key
@@ -2818,7 +2869,7 @@ mod batch_results_stream {
 
     /// Helper to collect all results from a batch results stream
     async fn collect_batch_results(
-        manager: &PostgresRequestManager<MockHttpClient>,
+        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
         batch_id: fusillade::batch::BatchId,
     ) -> Vec<fusillade::batch::BatchResultItem> {
         let stream = manager.get_batch_results_stream(batch_id, 0, None, None);
@@ -2855,8 +2906,11 @@ mod batch_results_stream {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         // Create file with 2 templates
@@ -3004,8 +3058,11 @@ mod batch_results_stream {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         let file_id = manager
@@ -3161,8 +3218,11 @@ mod batch_results_stream {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         let file_id = manager
@@ -3335,8 +3395,11 @@ mod batch_results_stream {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         let file_id = manager
@@ -3454,7 +3517,7 @@ mod batch_results_stream {
         let http_client = Arc::new(MockHttpClient::new());
 
         let manager = Arc::new(PostgresRequestManager::with_client(
-            pool.clone(),
+            TestDbPools::new(pool.clone()).await.unwrap(),
             http_client,
         ));
 
@@ -3538,8 +3601,11 @@ mod batch_results_stream {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         // Create file with 5 templates
@@ -3654,8 +3720,11 @@ mod batch_results_stream {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         let templates: Vec<_> = (0..3)
@@ -3756,8 +3825,11 @@ mod batch_results_stream {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         let file_id = manager
