@@ -606,7 +606,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             "#,
             *file_id as Uuid,
         )
-        .fetch_optional(self.pools.write())
+        .fetch_optional(self.pools.read())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch file: {}", e)))?
         .ok_or_else(|| FusilladeError::Other(anyhow!("File not found")))?;
@@ -1179,7 +1179,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             &uuid_ids,
         )
-        .fetch_all(self.pools.write())
+        .fetch_all(self.pools.read())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch requests: {}", e)))?;
 
@@ -1665,7 +1665,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             *file_id as Uuid,
         )
-        .fetch_all(self.pools.write())
+        .fetch_all(self.pools.read())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch template stats: {}", e)))?;
 
@@ -1686,7 +1686,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         offset: usize,
         search: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
-        let pool = self.pools.write().clone();
+        let pool = self.pools.read().clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
@@ -1744,7 +1744,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 r#"SELECT created_at FROM files WHERE id = $1"#,
                 **after_id as Uuid
             )
-            .fetch_optional(self.pools.write())
+            .fetch_optional(self.pools.read())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch after cursor: {}", e)))?
             .map(|row| row.created_at)
@@ -1867,7 +1867,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let rows = query_builder
             .build()
-            .fetch_all(self.pools.write())
+            .fetch_all(self.pools.read())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list files: {}", e)))?;
 
@@ -2168,7 +2168,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             *batch_id as Uuid,
         )
-        .fetch_optional(self.pools.write())
+        .fetch_optional(self.pools.read())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
         .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
@@ -2208,7 +2208,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 completed,
                 failed,
             )
-            .execute(self.pools.write())
+            .execute(self.pools.read())
             .await
             .map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
@@ -2278,7 +2278,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             *batch_id as Uuid,
         )
-        .fetch_optional(self.pools.write())
+        .fetch_optional(self.pools.read())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch status: {}", e)))?
         .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
@@ -2338,7 +2338,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     "#,
                     *file_id as Uuid,
                 )
-                .fetch_optional(self.pools.write())
+                .fetch_optional(self.pools.read())
                 .await
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by output file: {}", e)))?;
 
@@ -2378,7 +2378,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     "#,
                     *file_id as Uuid,
                 )
-                .fetch_optional(self.pools.write())
+                .fetch_optional(self.pools.read())
                 .await
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by error file: {}", e)))?;
 
@@ -2404,7 +2404,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 "#,
                 *after_id as Uuid,
             )
-            .fetch_optional(self.pools.write())
+            .fetch_optional(self.pools.read())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e)))?;
 
@@ -2458,7 +2458,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             after_id,
             search_pattern,
         )
-        .fetch_all(self.pools.write())
+        .fetch_all(self.pools.read())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
 
@@ -2498,7 +2498,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             *file_id as Uuid,
         )
-        .fetch_all(self.pools.write())
+        .fetch_all(self.pools.read())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
 
@@ -2543,7 +2543,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             threshold_seconds as f64,
             allowed_states as &[RequestStateFilter],
         )
-        .fetch_all(self.pools.write())
+        .fetch_all(self.pools.read())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to get at-risk batches: {}", e)))?;
 
@@ -2576,7 +2576,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             allowed_states as &[RequestStateFilter],
         )
-        .fetch_all(self.pools.write())
+        .fetch_all(self.pools.read())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to get missed SLA batches: {}", e)))?;
 
@@ -2873,7 +2873,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             *batch_id as Uuid,
         )
-        .fetch_all(self.pools.write())
+        .fetch_all(self.pools.read())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch executions: {}", e)))?;
 
@@ -3086,7 +3086,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         search: Option<String>,
         status: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>> {
-        let pool = self.pools.write().clone();
+        let pool = self.pools.read().clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
@@ -3112,7 +3112,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             *original_request_id as Uuid,
         )
-        .fetch_optional(self.pools.write())
+        .fetch_optional(self.pools.read())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to find pending escalation: {}", e)))?;
 
@@ -3788,7 +3788,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
             "#,
             *daemon_id as Uuid,
         )
-        .fetch_one(self.pools.write())
+        .fetch_one(self.pools.read())
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => FusilladeError::Other(anyhow!("Daemon not found")),
@@ -3867,7 +3867,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
             "#,
             status_str,
         )
-        .fetch_all(self.pools.write())
+        .fetch_all(self.pools.read())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to list daemons: {}", e)))?;
 
