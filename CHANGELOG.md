@@ -1,5 +1,31 @@
 # Changelog
 
+## [2.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v1.1.1...fusillade-v2.0.0) (2026-01-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* separate out db connections into read and write ([#76](https://github.com/doublewordai/fusillade/issues/76))
+
+### Features
+
+* separate out db connections into read and write ([#76](https://github.com/doublewordai/fusillade/issues/76)) ([ce80c3f](https://github.com/doublewordai/fusillade/commit/ce80c3f1d0c63732b07df443e4098898fa899ad2))
+
+## [1.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v1.1.0...fusillade-v1.1.1) (2026-01-19)
+
+
+### Bug Fixes
+
+* builder errors should be unretriable, they're a new class of error ([#72](https://github.com/doublewordai/fusillade/issues/72)) ([77995cc](https://github.com/doublewordai/fusillade/commit/77995cc6f65b02642a2d1756fde4e4a228c82179))
+* remove queries joining request templates without need ([#74](https://github.com/doublewordai/fusillade/issues/74)) ([ca21c95](https://github.com/doublewordai/fusillade/commit/ca21c9564cccab48105ab76fec74e25e0efbcb79))
+
+## [1.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v1.0.0...fusillade-v1.1.0) (2026-01-16)
+
+
+### Features
+
+* remove filename unique constraint ([#70](https://github.com/doublewordai/fusillade/issues/70)) ([3e68874](https://github.com/doublewordai/fusillade/commit/3e68874e34738d7d7f85b364cfa7f8183e5695c3))
+
 ## [1.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v0.16.0...fusillade-v1.0.0) (2026-01-13)
 
 

@@ -18,7 +18,7 @@ pub use batch::*;
 pub use daemon::{Daemon, DaemonConfig, ModelEscalationConfig, SlaThreshold};
 pub use error::{FusilladeError, Result};
 pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient};
-pub use manager::postgres::PostgresRequestManager;
+pub use manager::postgres::{PoolProvider, PostgresRequestManager, TestDbPools};
 pub use manager::{DaemonExecutor, Storage};
 pub use request::*;
 

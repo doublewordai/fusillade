@@ -1048,6 +1048,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TestDbPools;
     use crate::http::{HttpResponse, MockHttpClient};
     use crate::manager::{DaemonExecutor, postgres::PostgresRequestManager};
     use std::time::Duration;
@@ -1090,8 +1091,11 @@ mod tests {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         // Setup: Create a file and batch to associate with our request
@@ -1256,8 +1260,11 @@ mod tests {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         // Setup: Create a file with 5 templates, all using "gpt-4"
@@ -1480,8 +1487,11 @@ mod tests {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         // Setup: Create a file and batch
@@ -1613,8 +1623,11 @@ mod tests {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         // Setup: Create a file with 10 requests, all using "gpt-4"
@@ -1781,8 +1794,11 @@ mod tests {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         // Create a batch with a very short completion window (2 seconds)
@@ -1933,8 +1949,11 @@ mod tests {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
         );
 
         // Create a batch with a 2 second completion window
@@ -2090,8 +2109,11 @@ mod tests {
         };
 
         let manager = Arc::new(
-            PostgresRequestManager::with_client(pool.clone(), Arc::new(http_client.clone()))
-                .with_config(config),
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                Arc::new(http_client.clone()),
+            )
+            .with_config(config),
         );
 
         // Create a batch
