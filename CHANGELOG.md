@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v1.1.1...fusillade-v2.0.0) (2026-01-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* separate out db connections into read and write ([#76](https://github.com/doublewordai/fusillade/issues/76))
+
+### Features
+
+* separate out db connections into read and write ([#76](https://github.com/doublewordai/fusillade/issues/76)) ([ce80c3f](https://github.com/doublewordai/fusillade/commit/ce80c3f1d0c63732b07df443e4098898fa899ad2))
+
 ## [1.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v1.1.0...fusillade-v1.1.1) (2026-01-19)
 
 
