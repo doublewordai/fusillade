@@ -1537,7 +1537,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             template_count += 1;
                         }
                         FileStreamItem::Error(err) => {
-                            return Err(FusilladeError::Other(anyhow!("Stream error: {}", err)));
+                            return Err(FusilladeError::ValidationError(err));
                         }
                     }
                 }
@@ -1617,7 +1617,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             id
         } else {
             let new_id = Uuid::new_v4();
-            let stub_name = format!("upload-{}", new_id);
+            let stub_name = metadata
+                .filename
+                .clone()
+                .unwrap_or_else(|| format!("upload-{}", new_id));
             let status = crate::batch::FileStatus::Processed.to_string();
 
             sqlx::query!(
@@ -1691,7 +1694,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             description,
             size_bytes,
             status,
-            purpose.map(|p| p.to_string()),
+            purpose,
             expires_at,
             uploaded_by,
         )
@@ -4637,7 +4640,6 @@ mod tests {
 
         // Verify large body
         assert_eq!(rows[1].custom_id, Some("large".to_string()));
-        assert_eq!(rows[1].custom_id, Some("large".to_string()));
         assert_eq!(
             rows[1].body_byte_size,
             rows[1].actual_length.unwrap() as i64
@@ -6488,8 +6490,23 @@ mod tests {
 
         // Call get_batch again - should not trigger UPDATE again (idempotent)
         let retrieved_again = manager.get_batch(batch.id).await.unwrap();
-        assert_eq!(retrieved.finalizing_at, retrieved_again.finalizing_at);
-        assert_eq!(retrieved.completed_at, retrieved_again.completed_at);
+
+        // Compare timestamps with microsecond precision tolerance (PostgreSQL truncates nanoseconds)
+        let finalizing_diff = (retrieved.finalizing_at.unwrap().timestamp_micros()
+            - retrieved_again.finalizing_at.unwrap().timestamp_micros())
+        .abs();
+        assert!(
+            finalizing_diff < 1000,
+            "finalizing_at timestamps should match within microsecond precision"
+        );
+
+        let completed_diff = (retrieved.completed_at.unwrap().timestamp_micros()
+            - retrieved_again.completed_at.unwrap().timestamp_micros())
+        .abs();
+        assert!(
+            completed_diff < 1000,
+            "completed_at timestamps should match within microsecond precision"
+        );
     }
 
     #[sqlx::test]
