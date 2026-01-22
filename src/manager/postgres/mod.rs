@@ -2301,7 +2301,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 completed,
                 failed,
             )
-            .execute(self.pools.read())
+            .execute(self.pools.write())
             .await
             .map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
@@ -6404,6 +6404,92 @@ mod tests {
         assert_eq!(retrieved.completed_requests, 1);
         assert_eq!(retrieved.failed_requests, 0);
         assert_eq!(retrieved.canceled_requests, 0);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_lazy_finalization(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a batch with multiple requests
+        let file_id = manager
+            .create_file(
+                "lazy-finalization-test".to_string(),
+                None,
+                (0..3)
+                    .map(|i| RequestTemplateInput {
+                        custom_id: Some(format!("req-{}", i)),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: format!(r#"{{"n":{}}}"#, i),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Manually mark all requests as completed (simulating terminal state without daemon)
+        // This bypasses normal timestamp setting in persist()
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = '{"result":"ok"}',
+                completed_at = NOW()
+            WHERE batch_id = $1
+            "#,
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Call get_batch() - this should trigger lazy finalization UPDATE
+        // If the UPDATE incorrectly used .read() pool, this would fail with TestDbPools
+        let retrieved = manager.get_batch(batch.id).await.unwrap();
+
+        // Verify the batch is marked as completed
+        assert_eq!(retrieved.total_requests, 3);
+        assert_eq!(retrieved.completed_requests, 3);
+        assert_eq!(retrieved.pending_requests, 0);
+        assert_eq!(retrieved.failed_requests, 0);
+
+        // Verify lazy finalization set the timestamps
+        assert!(
+            retrieved.finalizing_at.is_some(),
+            "finalizing_at should be set by lazy finalization"
+        );
+        assert!(
+            retrieved.completed_at.is_some(),
+            "completed_at should be set by lazy finalization"
+        );
+        assert!(
+            retrieved.failed_at.is_none(),
+            "failed_at should be None for completed batch"
+        );
+
+        // Call get_batch again - should not trigger UPDATE again (idempotent)
+        let retrieved_again = manager.get_batch(batch.id).await.unwrap();
+        assert_eq!(retrieved.finalizing_at, retrieved_again.finalizing_at);
+        assert_eq!(retrieved.completed_at, retrieved_again.completed_at);
     }
 
     #[sqlx::test]
