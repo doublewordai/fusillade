@@ -1498,7 +1498,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 id
                             } else {
                                 let new_id = Uuid::new_v4();
-                                let stub_name = format!("upload-{}", new_id);
+                                let stub_name = metadata
+                                    .filename
+                                    .clone()
+                                    .unwrap_or_else(|| format!("upload-{}", new_id));
                                 let status = crate::batch::FileStatus::Processed.to_string();
 
                                 sqlx::query!(
@@ -1552,7 +1555,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             // Ensure we have a file ID (create stub if needed)
                             if file_id.is_none() {
                                 let new_id = Uuid::new_v4();
-                                let stub_name = format!("upload-{}", new_id);
+                                let stub_name = metadata
+                                    .filename
+                                    .clone()
+                                    .unwrap_or_else(|| format!("upload-{}", new_id));
                                 let status = crate::batch::FileStatus::Processed.to_string();
 
                                 sqlx::query!(
@@ -1598,7 +1604,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 }
 
                 // Flush any remaining templates in buffer
-                if !template_buffer.is_empty() && file_id.is_some() {
+                if !template_buffer.is_empty() {
+                    // file_id is guaranteed to be Some if buffer has items
                     Self::insert_template_batch(&mut tx, file_id.unwrap(), &template_buffer)
                         .await?;
                 }
@@ -1634,14 +1641,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let status = crate::batch::FileStatus::Processed.to_string();
         let purpose = metadata.purpose.clone();
 
-        // Calculate expires_at from expires_after if provided
+        // Use provided anchor time if available, otherwise use now
         let expires_at = if let Some(seconds) = metadata.expires_after_seconds {
-            // Use provided anchor time if available, otherwise use now
+            // Calculate expires_at from expires_after if provided
             let anchor = if let Some(anchor_str) = metadata.expires_after_anchor.as_ref() {
-                anchor_str
-                    .parse::<chrono::DateTime<Utc>>()
-                    .ok()
-                    .unwrap_or_else(Utc::now)
+                match anchor_str.as_str() {
+                    "created_at" => Utc::now(), // Use file creation time
+                    _ => {
+                        tracing::warn!(
+                            anchor = anchor_str,
+                            "Unknown expires_after_anchor value, defaulting to 'created_at'"
+                        );
+                        Utc::now()
+                    }
+                }
             } else {
                 Utc::now()
             };
@@ -3203,8 +3216,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// Insert a batch of templates using PostgreSQL UNNEST for bulk insertion.
     /// This is significantly faster than individual INSERTs for large template counts.
-    /// Insert a batch of templates using PostgreSQL UNNEST for bulk insertion.
-    /// This is significantly faster than individual INSERTs for large template counts.
     async fn insert_template_batch(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         file_id: Uuid,
@@ -3223,14 +3234,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         let methods: Vec<&str> = templates.iter().map(|(t, _)| t.method.as_str()).collect();
         let paths: Vec<&str> = templates.iter().map(|(t, _)| t.path.as_str()).collect();
         let bodies: Vec<&str> = templates.iter().map(|(t, _)| t.body.as_str()).collect();
-        let models: Vec<Option<&str>> = templates
-            .iter()
-            .map(|(t, _)| Some(t.model.as_str()))
-            .collect();
-        let api_keys: Vec<Option<&str>> = templates
-            .iter()
-            .map(|(t, _)| Some(t.api_key.as_str()))
-            .collect();
+        let models: Vec<&str> = templates.iter().map(|(t, _)| t.model.as_str()).collect();
+        let api_keys: Vec<&str> = templates.iter().map(|(t, _)| t.api_key.as_str()).collect();
         let line_numbers: Vec<i32> = templates.iter().map(|(_, line)| *line).collect();
         let body_byte_sizes: Vec<i32> =
             templates.iter().map(|(t, _)| t.body.len() as i32).collect();
@@ -3250,8 +3255,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             &methods as &[&str],
             &paths as &[&str],
             &bodies as &[&str],
-            &models as &[Option<&str>],
-            &api_keys as &[Option<&str>],
+            &models as &[&str],
+            &api_keys as &[&str],
             &line_numbers as &[i32],
             &body_byte_sizes as &[i32],
         )
