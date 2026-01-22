@@ -1490,7 +1490,27 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 while let Some(item) = stream.next().await {
                     match item {
                         FileStreamItem::Metadata(meta) => {
-                            metadata = meta;
+                            if meta.filename.is_some() {
+                                metadata.filename = meta.filename;
+                            }
+                            if meta.description.is_some() {
+                                metadata.description = meta.description;
+                            }
+                            if meta.purpose.is_some() {
+                                metadata.purpose = meta.purpose;
+                            }
+                            if meta.expires_after_anchor.is_some() {
+                                metadata.expires_after_anchor = meta.expires_after_anchor;
+                            }
+                            if meta.expires_after_seconds.is_some() {
+                                metadata.expires_after_seconds = meta.expires_after_seconds;
+                            }
+                            if meta.size_bytes.is_some() {
+                                metadata.size_bytes = meta.size_bytes;
+                            }
+                            if meta.uploaded_by.is_some() {
+                                metadata.uploaded_by = meta.uploaded_by;
+                            }
                         }
                         FileStreamItem::Template(template) => {
                             // Ensure we have a file ID (create stub if needed)
@@ -1549,7 +1569,27 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 while let Some(item) = stream.next().await {
                     match item {
                         FileStreamItem::Metadata(meta) => {
-                            metadata = meta;
+                            if meta.filename.is_some() {
+                                metadata.filename = meta.filename;
+                            }
+                            if meta.description.is_some() {
+                                metadata.description = meta.description;
+                            }
+                            if meta.purpose.is_some() {
+                                metadata.purpose = meta.purpose;
+                            }
+                            if meta.expires_after_anchor.is_some() {
+                                metadata.expires_after_anchor = meta.expires_after_anchor;
+                            }
+                            if meta.expires_after_seconds.is_some() {
+                                metadata.expires_after_seconds = meta.expires_after_seconds;
+                            }
+                            if meta.size_bytes.is_some() {
+                                metadata.size_bytes = meta.size_bytes;
+                            }
+                            if meta.uploaded_by.is_some() {
+                                metadata.uploaded_by = meta.uploaded_by;
+                            }
                         }
                         FileStreamItem::Template(template) => {
                             // Ensure we have a file ID (create stub if needed)
@@ -4400,7 +4440,7 @@ mod tests {
         .await
         .expect("Failed to query templates");
 
-        // Verify sequential line numbering across batch boundaries (1-indexed)
+        // Verify sequential line numbering across batch boundaries (0-indexed)
         assert_eq!(rows.len(), template_count);
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(
@@ -4829,7 +4869,7 @@ mod tests {
         .await
         .expect("Failed to query templates");
 
-        // Verify sequential line numbering (1-indexed)
+        // Verify sequential line numbering (0-indexed)
         assert_eq!(rows.len(), template_count);
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(
