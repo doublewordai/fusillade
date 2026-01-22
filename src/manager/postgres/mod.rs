@@ -4629,9 +4629,10 @@ mod tests {
 
         // Verify large body
         assert_eq!(rows[1].custom_id, Some("large".to_string()));
+        assert_eq!(rows[1].custom_id, Some("large".to_string()));
         assert_eq!(
-            rows[1].body_byte_size as i64,
-            rows[1].actual_length.unwrap()
+            rows[1].body_byte_size,
+            rows[1].actual_length.unwrap() as i64
         );
         assert!(rows[1].body_byte_size > 5000);
     }
