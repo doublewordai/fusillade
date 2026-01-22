@@ -1592,7 +1592,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             }
                         }
                         FileStreamItem::Error(err) => {
-                            return Err(FusilladeError::Other(anyhow!("Stream error: {}", err)));
+                            return Err(FusilladeError::ValidationError(err));
                         }
                     }
                 }
@@ -1657,6 +1657,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         // Final update with file metadata
         // Updates the file stub with complete metadata from the stream
+        // Input files always have finalized sizes (calculated at upload time)
         sqlx::query!(
             r#"
             UPDATE files
@@ -1667,6 +1668,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 purpose = $6,
                 expires_at = $7,
                 uploaded_by = $8,
+                size_finalized = TRUE,
                 updated_at = NOW()
             WHERE id = $1
             "#,
