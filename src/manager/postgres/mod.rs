@@ -65,7 +65,6 @@ use super::utils::{
 /// let file_id = manager.create_file(name, description, templates).await?;
 /// let batch_id = manager.create_batch(file_id).await?;
 /// ```
-
 /// Batch insert strategy for template insertion
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -199,13 +198,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// Set the batch insert strategy for template insertion.
     ///
     /// This is a builder method that can be chained after `new()` or `with_client()`.
-    /// 
+    ///
     /// # Examples
     /// ```ignore
     /// // Use individual inserts (original behavior)
     /// let manager = PostgresRequestManager::new(pool)
     ///     .with_batch_insert_strategy(BatchInsertStrategy::Individual);
-    /// 
+    ///
     /// // Use batched inserts with custom batch size
     /// let manager = PostgresRequestManager::new(pool)
     ///     .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 10000 });
@@ -1514,7 +1513,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 .execute(&mut *tx)
                                 .await
                                 .map_err(|e| {
-                                    FusilladeError::Other(anyhow!("Failed to create file stub: {}", e))
+                                    FusilladeError::Other(anyhow!(
+                                        "Failed to create file stub: {}",
+                                        e
+                                    ))
                                 })?;
 
                                 file_id = Some(new_id);
@@ -1522,7 +1524,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             };
 
                             // Insert template immediately
-                            Self::insert_template_individual(&mut tx, fid, &template, template_count).await?;
+                            Self::insert_template_individual(
+                                &mut tx,
+                                fid,
+                                &template,
+                                template_count,
+                            )
+                            .await?;
                             template_count += 1;
                         }
                         FileStreamItem::Error(err) => {
@@ -1559,7 +1567,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 .execute(&mut *tx)
                                 .await
                                 .map_err(|e| {
-                                    FusilladeError::Other(anyhow!("Failed to create file stub: {}", e))
+                                    FusilladeError::Other(anyhow!(
+                                        "Failed to create file stub: {}",
+                                        e
+                                    ))
                                 })?;
 
                                 file_id = Some(new_id);
@@ -1571,7 +1582,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
                             // Flush buffer if it reaches batch size
                             if template_buffer.len() >= batch_size {
-                                Self::insert_template_batch(&mut tx, file_id.unwrap(), &template_buffer).await?;
+                                Self::insert_template_batch(
+                                    &mut tx,
+                                    file_id.unwrap(),
+                                    &template_buffer,
+                                )
+                                .await?;
                                 template_buffer.clear();
                             }
                         }
@@ -1583,7 +1599,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
                 // Flush any remaining templates in buffer
                 if !template_buffer.is_empty() && file_id.is_some() {
-                    Self::insert_template_batch(&mut tx, file_id.unwrap(), &template_buffer).await?;
+                    Self::insert_template_batch(&mut tx, file_id.unwrap(), &template_buffer)
+                        .await?;
                 }
             }
         }
@@ -1621,11 +1638,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let expires_at = if let Some(seconds) = metadata.expires_after_seconds {
             // Use provided anchor time if available, otherwise use now
             let anchor = if let Some(anchor_str) = metadata.expires_after_anchor.as_ref() {
-                anchor_str.parse::<chrono::DateTime<Utc>>().ok().unwrap_or_else(Utc::now)
+                anchor_str
+                    .parse::<chrono::DateTime<Utc>>()
+                    .ok()
+                    .unwrap_or_else(Utc::now)
             } else {
                 Utc::now()
             };
-            
+
             anchor.checked_add_signed(chrono::Duration::seconds(seconds))
         } else {
             None
@@ -1661,9 +1681,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         )
         .execute(&mut *tx)
         .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to update file metadata: {}", e))
-        })?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file metadata: {}", e)))?;
 
         // Commit the transaction
         tx.commit()
@@ -3195,15 +3213,25 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         }
 
         // Prepare parallel arrays for UNNEST
-        let custom_ids: Vec<Option<&str>> = templates.iter().map(|(t, _)| t.custom_id.as_deref()).collect();
+        let custom_ids: Vec<Option<&str>> = templates
+            .iter()
+            .map(|(t, _)| t.custom_id.as_deref())
+            .collect();
         let endpoints: Vec<&str> = templates.iter().map(|(t, _)| t.endpoint.as_str()).collect();
         let methods: Vec<&str> = templates.iter().map(|(t, _)| t.method.as_str()).collect();
         let paths: Vec<&str> = templates.iter().map(|(t, _)| t.path.as_str()).collect();
         let bodies: Vec<&str> = templates.iter().map(|(t, _)| t.body.as_str()).collect();
-        let models: Vec<Option<&str>> = templates.iter().map(|(t, _)| Some(t.model.as_str())).collect();
-        let api_keys: Vec<Option<&str>> = templates.iter().map(|(t, _)| Some(t.api_key.as_str())).collect();
+        let models: Vec<Option<&str>> = templates
+            .iter()
+            .map(|(t, _)| Some(t.model.as_str()))
+            .collect();
+        let api_keys: Vec<Option<&str>> = templates
+            .iter()
+            .map(|(t, _)| Some(t.api_key.as_str()))
+            .collect();
         let line_numbers: Vec<i32> = templates.iter().map(|(_, line)| *line).collect();
-        let body_byte_sizes: Vec<i32> = templates.iter().map(|(t, _)| t.body.len() as i32).collect();
+        let body_byte_sizes: Vec<i32> =
+            templates.iter().map(|(t, _)| t.body.len() as i32).collect();
 
         sqlx::query!(
             r#"
