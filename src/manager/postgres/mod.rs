@@ -3,10 +3,9 @@
 //! This implementation combines PostgreSQL storage with the daemon to provide
 //! a production-ready batching system with persistent storage and real-time updates.
 
-mod pool_provider;
 use crate::request::AnyRequest;
 use futures::StreamExt;
-pub use pool_provider::{PoolProvider, TestDbPools};
+pub use sqlx_pool_router::{PoolProvider, TestDbPools};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
