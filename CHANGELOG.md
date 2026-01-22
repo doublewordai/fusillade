@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v2.0.0...fusillade-v2.0.1) (2026-01-22)
+
+
+### Bug Fixes
+
+* remove test files ([d4234c5](https://github.com/doublewordai/fusillade/commit/d4234c540d2ba01768b350a6b1ba0f46a108d84b))
+* use write pool for UPDATE in get_batch() ([012796c](https://github.com/doublewordai/fusillade/commit/012796c8bf33561b33b7f2b6867581acf3c10279))
+
 ## [2.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v1.1.1...fusillade-v2.0.0) (2026-01-21)
 
 
