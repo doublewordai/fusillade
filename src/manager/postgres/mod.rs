@@ -2209,7 +2209,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 completed,
                 failed,
             )
-            .execute(self.pools.read())
+            .execute(self.pools.write())
             .await
             .map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
