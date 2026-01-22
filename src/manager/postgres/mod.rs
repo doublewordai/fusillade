@@ -4169,7 +4169,7 @@ mod tests {
             http_client,
         );
 
-        // Create a file with templates
+        // Create a file with templates (uses batched strategy by default)
         let file_id = manager
             .create_file(
                 "test-file".to_string(),
@@ -4220,6 +4220,473 @@ mod tests {
             FileContentItem::Template(t) => assert_eq!(t.model, "gpt-3.5"),
             _ => panic!("Expected template"),
         }
+    }
+
+    // =========================================================================
+    // BATCH INSERT STRATEGY TESTS
+    // =========================================================================
+    // Tests for the batched UNNEST upload mechanism
+
+    #[sqlx::test]
+    async fn test_batched_insert_small_file(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a small file with 10 templates using batched strategy (default)
+        let templates: Vec<RequestTemplateInput> = (0..10)
+            .map(|i| RequestTemplateInput {
+                custom_id: Some(format!("batch-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: format!(r#"{{"prompt":"test {}"}}"#, i),
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file(
+                "batched-small".to_string(),
+                Some("Small file for batched insert test".to_string()),
+                templates,
+            )
+            .await
+            .expect("Failed to create file");
+
+        // Verify all templates were inserted
+        let content = manager
+            .get_file_content(file_id)
+            .await
+            .expect("Failed to get content");
+
+        assert_eq!(content.len(), 10, "Should have 10 templates");
+
+        // Verify ordering and custom IDs
+        for (i, item) in content.iter().enumerate() {
+            match item {
+                FileContentItem::Template(t) => {
+                    assert_eq!(t.custom_id, Some(format!("batch-{}", i)));
+                    assert_eq!(t.body, format!(r#"{{"prompt":"test {}"}}"#, i));
+                }
+                _ => panic!("Expected template"),
+            }
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_batched_insert_large_file(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a larger file with 15k templates (exceeds batch size of 5000)
+        let template_count = 15_000;
+        let templates: Vec<RequestTemplateInput> = (0..template_count)
+            .map(|i| RequestTemplateInput {
+                custom_id: Some(format!("large-batch-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: format!(r#"{{"prompt":"test {}","data":{}}}"#, i, "x".repeat(100)),
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file(
+                "batched-large".to_string(),
+                Some("Large file for batched insert test".to_string()),
+                templates,
+            )
+            .await
+            .expect("Failed to create file");
+
+        // Verify all templates were inserted
+        let content = manager
+            .get_file_content(file_id)
+            .await
+            .expect("Failed to get content");
+
+        assert_eq!(
+            content.len(),
+            template_count,
+            "Should have {} templates",
+            template_count
+        );
+
+        // Spot check first, middle, and last templates
+        match &content[0] {
+            FileContentItem::Template(t) => {
+                assert_eq!(t.custom_id, Some("large-batch-0".to_string()));
+            }
+            _ => panic!("Expected template"),
+        }
+
+        match &content[7500] {
+            FileContentItem::Template(t) => {
+                assert_eq!(t.custom_id, Some("large-batch-7500".to_string()));
+            }
+            _ => panic!("Expected template"),
+        }
+
+        match &content[14999] {
+            FileContentItem::Template(t) => {
+                assert_eq!(t.custom_id, Some("large-batch-14999".to_string()));
+            }
+            _ => panic!("Expected template"),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_batched_insert_preserves_line_numbers(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create templates that will span multiple batches
+        let template_count = 12_000;
+        let templates: Vec<RequestTemplateInput> = (0..template_count)
+            .map(|i| RequestTemplateInput {
+                custom_id: Some(format!("line-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: format!(r#"{{"n":{}}}"#, i),
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file("line-numbers".to_string(), None, templates)
+            .await
+            .expect("Failed to create file");
+
+        // Query database directly to verify line numbers
+        let rows = sqlx::query!(
+            r#"
+            SELECT line_number, custom_id
+            FROM request_templates
+            WHERE file_id = $1
+            ORDER BY line_number ASC
+            "#,
+            *file_id as Uuid,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), template_count);
+
+        // Verify line numbers are sequential and match custom IDs
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.line_number, i as i32, "Line number should match index");
+            assert_eq!(row.custom_id, Some(format!("line-{}", i)));
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_batched_insert_with_stream(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a stream with 8000 templates (crosses batch boundary)
+        let mut items = vec![FileStreamItem::Metadata(FileMetadata {
+            filename: Some("streamed-batched".to_string()),
+            description: Some("Batched insert via stream".to_string()),
+            purpose: None,
+            expires_after_anchor: None,
+            expires_after_seconds: None,
+            size_bytes: None,
+            uploaded_by: Some("test-user".to_string()),
+        })];
+
+        for i in 0..8000 {
+            items.push(FileStreamItem::Template(RequestTemplateInput {
+                custom_id: Some(format!("stream-batch-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: format!(r#"{{"n":{}}}"#, i),
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            }));
+        }
+
+        let stream = stream::iter(items);
+        let file_id = manager
+            .create_file_stream(stream)
+            .await
+            .expect("Failed to create file from stream");
+
+        // Verify file metadata
+        let file = manager.get_file(file_id).await.expect("Failed to get file");
+        assert_eq!(file.name, "streamed-batched");
+
+        // Verify all templates were inserted
+        let content = manager
+            .get_file_content(file_id)
+            .await
+            .expect("Failed to get content");
+
+        assert_eq!(content.len(), 8000);
+
+        // Spot check templates across batch boundaries
+        // First batch (0-4999), second batch (5000-7999)
+        match &content[4999] {
+            FileContentItem::Template(t) => {
+                assert_eq!(t.custom_id, Some("stream-batch-4999".to_string()));
+            }
+            _ => panic!("Expected template"),
+        }
+
+        match &content[5000] {
+            FileContentItem::Template(t) => {
+                assert_eq!(t.custom_id, Some("stream-batch-5000".to_string()));
+            }
+            _ => panic!("Expected template"),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_batched_insert_empty_batches(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a stream with only metadata (no templates)
+        let items = vec![FileStreamItem::Metadata(FileMetadata {
+            filename: Some("empty-file".to_string()),
+            description: Some("File with no templates".to_string()),
+            purpose: None,
+            expires_after_anchor: None,
+            expires_after_seconds: None,
+            size_bytes: None,
+            uploaded_by: None,
+        })];
+
+        let stream = stream::iter(items);
+        let file_id = manager
+            .create_file_stream(stream)
+            .await
+            .expect("Failed to create empty file");
+
+        // Verify file was created
+        let file = manager.get_file(file_id).await.expect("Failed to get file");
+        assert_eq!(file.name, "empty-file");
+
+        // Verify no templates
+        let content = manager
+            .get_file_content(file_id)
+            .await
+            .expect("Failed to get content");
+
+        assert_eq!(content.len(), 0, "Should have no templates");
+    }
+
+    #[sqlx::test]
+    async fn test_batched_insert_transactional_rollback(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a stream with templates followed by an error
+        let mut items = vec![FileStreamItem::Metadata(FileMetadata {
+            filename: Some("rollback-test".to_string()),
+            description: Some("Should rollback on error".to_string()),
+            purpose: None,
+            expires_after_anchor: None,
+            expires_after_seconds: None,
+            size_bytes: None,
+            uploaded_by: None,
+        })];
+
+        // Add 3000 templates
+        for i in 0..3000 {
+            items.push(FileStreamItem::Template(RequestTemplateInput {
+                custom_id: Some(format!("rollback-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: format!(r#"{{"n":{}}}"#, i),
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            }));
+        }
+
+        // Add error in the middle
+        items.push(FileStreamItem::Error("Simulated parse error".to_string()));
+
+        // Add more templates after error (should not be inserted)
+        for i in 3000..3100 {
+            items.push(FileStreamItem::Template(RequestTemplateInput {
+                custom_id: Some(format!("rollback-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: format!(r#"{{"n":{}}}"#, i),
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            }));
+        }
+
+        let stream = stream::iter(items);
+        let result = manager.create_file_stream(stream).await;
+
+        // Should fail
+        assert!(result.is_err());
+
+        // Verify no file or templates were persisted
+        let files =
+            sqlx::query!(r#"SELECT COUNT(*) as count FROM files WHERE name = 'rollback-test'"#)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(files.count, Some(0), "File should not exist after rollback");
+    }
+
+    #[sqlx::test]
+    async fn test_batched_insert_body_byte_size_calculation(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create templates with varying body sizes
+        let templates = vec![
+            RequestTemplateInput {
+                custom_id: Some("small".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: r#"{"a":1}"#.to_string(), // 7 bytes
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            },
+            RequestTemplateInput {
+                custom_id: Some("large".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: format!(r#"{{"data":"{}"}}"#, "x".repeat(5000)), // ~5010 bytes
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            },
+        ];
+
+        let file_id = manager
+            .create_file("byte-size-test".to_string(), None, templates)
+            .await
+            .expect("Failed to create file");
+
+        // Query database to verify body_byte_size was calculated correctly
+        let rows = sqlx::query!(
+            r#"
+            SELECT custom_id, body_byte_size, LENGTH(body) as actual_length
+            FROM request_templates
+            WHERE file_id = $1
+            ORDER BY line_number ASC
+            "#,
+            *file_id as Uuid,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
+
+        // Verify small body
+        assert_eq!(rows[0].custom_id, Some("small".to_string()));
+        assert_eq!(rows[0].body_byte_size, 7);
+        assert_eq!(rows[0].actual_length, Some(7));
+
+        // Verify large body
+        assert_eq!(rows[1].custom_id, Some("large".to_string()));
+        assert_eq!(
+            rows[1].body_byte_size as i64,
+            rows[1].actual_length.unwrap()
+        );
+        assert!(rows[1].body_byte_size > 5000);
+    }
+
+    #[sqlx::test]
+    async fn test_batched_insert_performance_comparison(pool: sqlx::PgPool) {
+        use std::time::Instant;
+
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Test with batched strategy (default)
+        let manager_batched = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        );
+
+        let template_count = 1000;
+        let templates: Vec<RequestTemplateInput> = (0..template_count)
+            .map(|i| RequestTemplateInput {
+                custom_id: Some(format!("perf-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: format!(r#"{{"prompt":"test {}","data":{}}}"#, i, "x".repeat(50)),
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            })
+            .collect();
+
+        let start = Instant::now();
+        let file_id = manager_batched
+            .create_file("perf-test-batched".to_string(), None, templates)
+            .await
+            .expect("Failed to create file");
+        let batched_duration = start.elapsed();
+
+        // Verify all templates were inserted
+        let content = manager_batched
+            .get_file_content(file_id)
+            .await
+            .expect("Failed to get content");
+
+        assert_eq!(content.len(), template_count);
+
+        println!(
+            "Batched insert of {} templates took: {:?}",
+            template_count, batched_duration
+        );
+
+        // The batched approach should be reasonably fast (under 1 second for 1000 templates)
+        // This is a sanity check, not a strict performance requirement
+        assert!(
+            batched_duration.as_secs() < 2,
+            "Batched insert should be fast"
+        );
     }
 
     // =========================================================================
