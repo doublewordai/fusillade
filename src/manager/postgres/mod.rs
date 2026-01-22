@@ -1661,7 +1661,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
             anchor.checked_add_signed(chrono::Duration::seconds(seconds))
         } else {
-            None
+            // Default expiration: 30 days from now when no explicit expires_after_seconds is provided
+            Utc::now().checked_add_signed(chrono::Duration::days(30))
         };
 
         let description = metadata.description.clone();
