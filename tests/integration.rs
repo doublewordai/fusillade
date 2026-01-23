@@ -2322,6 +2322,20 @@ mod sla {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
+        // Wait for all 6 requests to reach terminal state (Completed or Superseded)
+        // This ensures supersession logic has fully completed
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+            if requests.iter().all(|r| r.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
         shutdown_token.cancel();
 
         // Verify batch status: 3/3 completed (superseded requests don't count)
@@ -2750,7 +2764,7 @@ async fn test_sla_escalation_uses_priority_api_key(pool: sqlx::PgPool) {
             .get_requests(vec![original_id, escalated_id])
             .await
             .expect("Failed to get requests");
-        if results.iter().any(|r| r.as_ref().unwrap().is_terminal()) {
+        if results.iter().all(|r| r.as_ref().unwrap().is_terminal()) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

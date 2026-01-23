@@ -3,10 +3,9 @@
 //! This implementation combines PostgreSQL storage with the daemon to provide
 //! a production-ready batching system with persistent storage and real-time updates.
 
-mod pool_provider;
 use crate::request::AnyRequest;
 use futures::StreamExt;
-pub use pool_provider::{PoolProvider, TestDbPools};
+pub use sqlx_pool_router::{PoolProvider, TestDbPools};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -4205,6 +4204,7 @@ mod tests {
         Running,
     };
     use crate::http::MockHttpClient;
+    use chrono::Timelike;
 
     // =========================================================================
     // FILE OPERATIONS
@@ -6883,21 +6883,19 @@ mod tests {
         // Call get_batch again - should not trigger UPDATE again (idempotent)
         let retrieved_again = manager.get_batch(batch.id).await.unwrap();
 
-        // Compare timestamps with microsecond precision tolerance (PostgreSQL truncates nanoseconds)
-        let finalizing_diff = (retrieved.finalizing_at.unwrap().timestamp_micros()
-            - retrieved_again.finalizing_at.unwrap().timestamp_micros())
-        .abs();
-        assert!(
-            finalizing_diff < 1000,
-            "finalizing_at timestamps should match within microsecond precision"
-        );
+        // Compare timestamps with microsecond precision (PostgreSQL limitation)
+        // Truncate nanoseconds to avoid precision mismatch
+        let truncate_nanos = |ts: Option<chrono::DateTime<chrono::Utc>>| {
+            ts.map(|t| t.with_nanosecond(t.nanosecond() / 1000 * 1000).unwrap())
+        };
 
-        let completed_diff = (retrieved.completed_at.unwrap().timestamp_micros()
-            - retrieved_again.completed_at.unwrap().timestamp_micros())
-        .abs();
-        assert!(
-            completed_diff < 1000,
-            "completed_at timestamps should match within microsecond precision"
+        assert_eq!(
+            truncate_nanos(retrieved.finalizing_at),
+            truncate_nanos(retrieved_again.finalizing_at)
+        );
+        assert_eq!(
+            truncate_nanos(retrieved.completed_at),
+            truncate_nanos(retrieved_again.completed_at)
         );
     }
 
