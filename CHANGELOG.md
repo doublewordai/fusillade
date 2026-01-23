@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v2.1.0...fusillade-v2.1.1) (2026-01-23)
+
+
+### Bug Fixes
+
+* batch metadata parsing ([6fcca42](https://github.com/doublewordai/fusillade/commit/6fcca420cba3c2b9d84a696a7e9ad4b9deb92e56))
+* simplify batch insert strategy - only batched ([#83](https://github.com/doublewordai/fusillade/issues/83)) ([ed77652](https://github.com/doublewordai/fusillade/commit/ed776528a992739f1e7a6d74033662e44018e53a))
+
 ## [2.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.0.1...fusillade-v2.1.0) (2026-01-23)
 
 
