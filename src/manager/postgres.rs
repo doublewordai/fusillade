@@ -2216,120 +2216,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
-        // Fetch the final batch with status fields populated by triggers
-        self.get_batch(BatchId(batch_id)).await
+        // IMPORTANT: Must query from write pool to guarantee read-after-write consistency.
+        // Different connections from the pool can have different transaction snapshots due to
+        // isolation levels (READ COMMITTED or REPEATABLE READ). Querying from the read pool
+        // immediately after committing on the write pool can result in "Batch not found" if
+        // the read connection's snapshot predates the write commit.
+        self.get_batch_from_pool(BatchId(batch_id), self.pools.write())
+            .await
     }
 
     async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
-        let row = sqlx::query!(
-            r#"
-            SELECT
-                b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
-                b.output_file_id, b.error_file_id, b.created_by, b.created_at,
-                b.expires_at, b.cancelling_at, b.errors,
-                b.total_requests,
-                b.requests_started_at,
-                b.finalizing_at,
-                b.completed_at,
-                b.failed_at,
-                b.cancelled_at,
-                COALESCE(counts.pending, 0)::BIGINT as "pending_requests!",
-                COALESCE(counts.in_progress, 0)::BIGINT as "in_progress_requests!",
-                COALESCE(counts.completed, 0)::BIGINT as "completed_requests!",
-                COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
-                COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
-            FROM batches b
-            LEFT JOIN LATERAL (
-                SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
-                    COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
-                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
-                FROM requests
-                WHERE batch_id = b.id
-                  AND is_escalated = false  -- Exclude escalated requests from batch accounting
-            ) counts ON TRUE
-            WHERE b.id = $1
-            "#,
-            *batch_id as Uuid,
-        )
-        .fetch_optional(self.pools.read())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
-        .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
-
-        // Lazy computation of terminal timestamps
-        // Check if batch is in terminal state and update timestamps if needed
-        let terminal_count = row.completed_requests + row.failed_requests + row.canceled_requests;
-        let is_terminal = terminal_count == row.total_requests && row.total_requests > 0;
-
-        let (finalizing_at, completed_at, failed_at) = if is_terminal
-            && row.completed_at.is_none()
-            && row.failed_at.is_none()
-            && row.cancelled_at.is_none()
-        {
-            let now = Utc::now();
-
-            // Determine which terminal state based on counts
-            let (finalizing, completed, failed) = if row.completed_requests > 0 {
-                // At least one completion = completed batch
-                (Some(now), Some(now), None)
-            } else {
-                // No completions = failed batch
-                (Some(now), None, Some(now))
-            };
-
-            // Update the database with the terminal timestamps
-            sqlx::query!(
-                r#"
-                UPDATE batches
-                SET finalizing_at = COALESCE(finalizing_at, $2),
-                    completed_at = COALESCE(completed_at, $3),
-                    failed_at = COALESCE(failed_at, $4)
-                WHERE id = $1
-                "#,
-                *batch_id as Uuid,
-                finalizing,
-                completed,
-                failed,
-            )
-            .execute(self.pools.write())
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
-            })?;
-
-            (finalizing, completed, failed)
-        } else {
-            (row.finalizing_at, row.completed_at, row.failed_at)
-        };
-
-        Ok(Batch {
-            id: BatchId(row.id),
-            file_id: row.file_id.map(FileId),
-            created_at: row.created_at,
-            metadata: row.metadata,
-            completion_window: row.completion_window,
-            endpoint: row.endpoint,
-            output_file_id: row.output_file_id.map(FileId),
-            error_file_id: row.error_file_id.map(FileId),
-            created_by: row.created_by,
-            expires_at: row.expires_at,
-            cancelling_at: row.cancelling_at,
-            errors: row.errors,
-            total_requests: row.total_requests,
-            pending_requests: row.pending_requests,
-            in_progress_requests: row.in_progress_requests,
-            completed_requests: row.completed_requests,
-            failed_requests: row.failed_requests,
-            canceled_requests: row.canceled_requests,
-            requests_started_at: row.requests_started_at,
-            finalizing_at,
-            completed_at,
-            failed_at,
-            cancelled_at: row.cancelled_at,
-        })
+        self.get_batch_from_pool(batch_id, self.pools.read()).await
     }
 
     async fn get_batch_status(&self, batch_id: BatchId) -> Result<BatchStatus> {
@@ -3208,6 +3105,128 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
 // Helper methods for file streaming and virtual file creation
 impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
+    /// Internal helper to fetch a batch from a specific pool.
+    ///
+    /// This is used when we require read-after-write consistency and must query
+    /// from the same pool where a write was committed. This avoids transaction
+    /// isolation issues where a different connection's snapshot might not yet
+    /// see the committed data.
+    ///
+    /// # Arguments
+    /// * `batch_id` - The ID of the batch to fetch
+    /// * `pool` - The specific pool to query from (typically write pool after commit)
+    async fn get_batch_from_pool(&self, batch_id: BatchId, pool: &PgPool) -> Result<Batch> {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
+                b.output_file_id, b.error_file_id, b.created_by, b.created_at,
+                b.expires_at, b.cancelling_at, b.errors,
+                b.total_requests,
+                b.requests_started_at,
+                b.finalizing_at,
+                b.completed_at,
+                b.failed_at,
+                b.cancelled_at,
+                COALESCE(counts.pending, 0)::BIGINT as "pending_requests!",
+                COALESCE(counts.in_progress, 0)::BIGINT as "in_progress_requests!",
+                COALESCE(counts.completed, 0)::BIGINT as "completed_requests!",
+                COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
+                COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
+            FROM batches b
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
+                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
+                    COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
+                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
+                FROM requests
+                WHERE batch_id = b.id
+                AND is_escalated = false  -- Exclude escalated requests from batch accounting
+            ) counts ON TRUE
+            WHERE b.id = $1
+            "#,
+            *batch_id as Uuid,
+        )
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
+        .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+
+        // Lazy computation of terminal timestamps
+        // Check if batch is in terminal state and update timestamps if needed
+        let terminal_count = row.completed_requests + row.failed_requests + row.canceled_requests;
+        let is_terminal = terminal_count == row.total_requests && row.total_requests > 0;
+
+        let (finalizing_at, completed_at, failed_at) = if is_terminal
+            && row.completed_at.is_none()
+            && row.failed_at.is_none()
+            && row.cancelled_at.is_none()
+        {
+            let now = Utc::now();
+
+            // Determine which terminal state based on counts
+            let (finalizing, completed, failed) = if row.completed_requests > 0 {
+                // At least one completion = completed batch
+                (Some(now), Some(now), None)
+            } else {
+                // No completions = failed batch
+                (Some(now), None, Some(now))
+            };
+
+            // Update the database with the terminal timestamps
+            sqlx::query!(
+                r#"
+                UPDATE batches
+                SET finalizing_at = COALESCE(finalizing_at, $2),
+                    completed_at = COALESCE(completed_at, $3),
+                    failed_at = COALESCE(failed_at, $4)
+                WHERE id = $1
+                "#,
+                *batch_id as Uuid,
+                finalizing,
+                completed,
+                failed,
+            )
+            .execute(self.pools.write()) // Use the provided pool parameter here too
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
+            })?;
+
+            (finalizing, completed, failed)
+        } else {
+            (row.finalizing_at, row.completed_at, row.failed_at)
+        };
+
+        Ok(Batch {
+            id: BatchId(row.id),
+            file_id: row.file_id.map(FileId),
+            created_at: row.created_at,
+            metadata: row.metadata,
+            completion_window: row.completion_window,
+            endpoint: row.endpoint,
+            output_file_id: row.output_file_id.map(FileId),
+            error_file_id: row.error_file_id.map(FileId),
+            created_by: row.created_by,
+            expires_at: row.expires_at,
+            cancelling_at: row.cancelling_at,
+            errors: row.errors,
+            total_requests: row.total_requests,
+            pending_requests: row.pending_requests,
+            in_progress_requests: row.in_progress_requests,
+            completed_requests: row.completed_requests,
+            failed_requests: row.failed_requests,
+            canceled_requests: row.canceled_requests,
+            requests_started_at: row.requests_started_at,
+            finalizing_at,
+            completed_at,
+            failed_at,
+            cancelled_at: row.cancelled_at,
+        })
+    }
+
     /// Insert a batch of templates using PostgreSQL UNNEST for bulk insertion.
     /// This is significantly faster than individual INSERTs for large template counts.
     async fn insert_template_batch(
