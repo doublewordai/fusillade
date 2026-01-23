@@ -68,9 +68,7 @@ use super::utils::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchInsertStrategy {
-    /// Insert templates one at a time (original behavior, slower for large files)
-    Individual,
-    /// Insert templates in batches using UNNEST (optimized for large files)
+    /// Insert templates in batches using UNNEST (optimized for all file sizes)
     Batched { batch_size: usize },
 }
 
@@ -200,10 +198,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     ///
     /// # Examples
     /// ```ignore
-    /// // Use individual inserts (original behavior)
-    /// let manager = PostgresRequestManager::new(pool)
-    ///     .with_batch_insert_strategy(BatchInsertStrategy::Individual);
-    ///
     /// // Use batched inserts with custom batch size
     /// let manager = PostgresRequestManager::new(pool)
     ///     .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 10000 });
@@ -1508,172 +1502,88 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let mut file_id: Option<Uuid> = None;
         let mut template_count = 0;
 
-        match self.batch_insert_strategy {
-            BatchInsertStrategy::Individual => {
-                // Original behavior: insert templates one at a time
-                while let Some(item) = stream.next().await {
-                    match item {
-                        FileStreamItem::Metadata(meta) => {
-                            if meta.filename.is_some() {
-                                metadata.filename = meta.filename;
-                            }
-                            if meta.description.is_some() {
-                                metadata.description = meta.description;
-                            }
-                            if meta.purpose.is_some() {
-                                metadata.purpose = meta.purpose;
-                            }
-                            if meta.expires_after_anchor.is_some() {
-                                metadata.expires_after_anchor = meta.expires_after_anchor;
-                            }
-                            if meta.expires_after_seconds.is_some() {
-                                metadata.expires_after_seconds = meta.expires_after_seconds;
-                            }
-                            if meta.size_bytes.is_some() {
-                                metadata.size_bytes = meta.size_bytes;
-                            }
-                            if meta.uploaded_by.is_some() {
-                                metadata.uploaded_by = meta.uploaded_by;
-                            }
-                        }
-                        FileStreamItem::Template(template) => {
-                            // Ensure we have a file ID (create stub if needed)
-                            let fid = if let Some(id) = file_id {
-                                id
-                            } else {
-                                let new_id = Uuid::new_v4();
-                                let stub_name = metadata
-                                    .filename
-                                    .clone()
-                                    .unwrap_or_else(|| format!("upload-{}", new_id));
-                                let status = crate::batch::FileStatus::Processed.to_string();
+        // Extract batch size from strategy
+        let batch_size = match self.batch_insert_strategy {
+            BatchInsertStrategy::Batched { batch_size } => batch_size,
+        };
 
-                                sqlx::query!(
-                                    r#"
-                                    INSERT INTO files (id, name, status, created_at, updated_at)
-                                    VALUES ($1, $2, $3, NOW(), NOW())
-                                    "#,
-                                    new_id,
-                                    stub_name,
-                                    status,
-                                )
-                                .execute(&mut *tx)
-                                .await
-                                .map_err(|e| {
-                                    FusilladeError::Other(anyhow!(
-                                        "Failed to create file stub: {}",
-                                        e
-                                    ))
-                                })?;
+        // Accumulate templates and insert in batches
+        let mut template_buffer = Vec::with_capacity(batch_size);
 
-                                file_id = Some(new_id);
-                                new_id
-                            };
+        while let Some(item) = stream.next().await {
+            match item {
+                FileStreamItem::Metadata(meta) => {
+                    if meta.filename.is_some() {
+                        metadata.filename = meta.filename;
+                    }
+                    if meta.description.is_some() {
+                        metadata.description = meta.description;
+                    }
+                    if meta.purpose.is_some() {
+                        metadata.purpose = meta.purpose;
+                    }
+                    if meta.expires_after_anchor.is_some() {
+                        metadata.expires_after_anchor = meta.expires_after_anchor;
+                    }
+                    if meta.expires_after_seconds.is_some() {
+                        metadata.expires_after_seconds = meta.expires_after_seconds;
+                    }
+                    if meta.size_bytes.is_some() {
+                        metadata.size_bytes = meta.size_bytes;
+                    }
+                    if meta.uploaded_by.is_some() {
+                        metadata.uploaded_by = meta.uploaded_by;
+                    }
+                }
+                FileStreamItem::Template(template) => {
+                    // Ensure we have a file ID (create stub if needed)
+                    if file_id.is_none() {
+                        let new_id = Uuid::new_v4();
+                        let stub_name = metadata
+                            .filename
+                            .clone()
+                            .unwrap_or_else(|| format!("upload-{}", new_id));
+                        let status = crate::batch::FileStatus::Processed.to_string();
 
-                            // Insert template immediately
-                            Self::insert_template_individual(
-                                &mut tx,
-                                fid,
-                                &template,
-                                template_count,
-                            )
+                        sqlx::query!(
+                            r#"
+                            INSERT INTO files (id, name, status, created_at, updated_at)
+                            VALUES ($1, $2, $3, NOW(), NOW())
+                            "#,
+                            new_id,
+                            stub_name,
+                            status,
+                        )
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            FusilladeError::Other(anyhow!("Failed to create file stub: {}", e))
+                        })?;
+
+                        file_id = Some(new_id);
+                    }
+
+                    // Add to buffer
+                    template_buffer.push((template, template_count));
+                    template_count += 1;
+
+                    // Flush buffer if it reaches batch size
+                    if template_buffer.len() >= batch_size {
+                        Self::insert_template_batch(&mut tx, file_id.unwrap(), &template_buffer)
                             .await?;
-                            template_count += 1;
-                        }
-                        FileStreamItem::Error(err) => {
-                            return Err(FusilladeError::ValidationError(err));
-                        }
+                        template_buffer.clear();
                     }
                 }
-            }
-            BatchInsertStrategy::Batched { batch_size } => {
-                // Optimized behavior: accumulate templates and insert in batches
-                let mut template_buffer = Vec::with_capacity(batch_size);
-
-                while let Some(item) = stream.next().await {
-                    match item {
-                        FileStreamItem::Metadata(meta) => {
-                            if meta.filename.is_some() {
-                                metadata.filename = meta.filename;
-                            }
-                            if meta.description.is_some() {
-                                metadata.description = meta.description;
-                            }
-                            if meta.purpose.is_some() {
-                                metadata.purpose = meta.purpose;
-                            }
-                            if meta.expires_after_anchor.is_some() {
-                                metadata.expires_after_anchor = meta.expires_after_anchor;
-                            }
-                            if meta.expires_after_seconds.is_some() {
-                                metadata.expires_after_seconds = meta.expires_after_seconds;
-                            }
-                            if meta.size_bytes.is_some() {
-                                metadata.size_bytes = meta.size_bytes;
-                            }
-                            if meta.uploaded_by.is_some() {
-                                metadata.uploaded_by = meta.uploaded_by;
-                            }
-                        }
-                        FileStreamItem::Template(template) => {
-                            // Ensure we have a file ID (create stub if needed)
-                            if file_id.is_none() {
-                                let new_id = Uuid::new_v4();
-                                let stub_name = metadata
-                                    .filename
-                                    .clone()
-                                    .unwrap_or_else(|| format!("upload-{}", new_id));
-                                let status = crate::batch::FileStatus::Processed.to_string();
-
-                                sqlx::query!(
-                                    r#"
-                                    INSERT INTO files (id, name, status, created_at, updated_at)
-                                    VALUES ($1, $2, $3, NOW(), NOW())
-                                    "#,
-                                    new_id,
-                                    stub_name,
-                                    status,
-                                )
-                                .execute(&mut *tx)
-                                .await
-                                .map_err(|e| {
-                                    FusilladeError::Other(anyhow!(
-                                        "Failed to create file stub: {}",
-                                        e
-                                    ))
-                                })?;
-
-                                file_id = Some(new_id);
-                            }
-
-                            // Add to buffer
-                            template_buffer.push((template, template_count));
-                            template_count += 1;
-
-                            // Flush buffer if it reaches batch size
-                            if template_buffer.len() >= batch_size {
-                                Self::insert_template_batch(
-                                    &mut tx,
-                                    file_id.unwrap(),
-                                    &template_buffer,
-                                )
-                                .await?;
-                                template_buffer.clear();
-                            }
-                        }
-                        FileStreamItem::Error(err) => {
-                            return Err(FusilladeError::ValidationError(err));
-                        }
-                    }
-                }
-
-                // Flush any remaining templates in buffer
-                if !template_buffer.is_empty() {
-                    // file_id is guaranteed to be Some if buffer has items
-                    Self::insert_template_batch(&mut tx, file_id.unwrap(), &template_buffer)
-                        .await?;
+                FileStreamItem::Error(err) => {
+                    return Err(FusilladeError::ValidationError(err));
                 }
             }
+        }
+
+        // Flush any remaining templates in buffer
+        if !template_buffer.is_empty() {
+            // file_id is guaranteed to be Some if buffer has items
+            Self::insert_template_batch(&mut tx, file_id.unwrap(), &template_buffer).await?;
         }
 
         // If no templates were received, still create an empty file with whatever metadata we have
@@ -3335,38 +3245,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         Ok(())
     }
 
-    /// Insert a single template (original behavior).
-    async fn insert_template_individual(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        file_id: Uuid,
-        template: &RequestTemplateInput,
-        line_number: i32,
-    ) -> Result<()> {
-        let body_byte_size = template.body.len() as i64;
-
-        sqlx::query!(
-            r#"
-            INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key, line_number, body_byte_size)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            "#,
-            file_id,
-            template.custom_id,
-            template.endpoint,
-            template.method,
-            template.path,
-            template.body,
-            template.model,
-            template.api_key,
-            line_number,
-            body_byte_size,
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert template: {}", e)))?;
-
-        Ok(())
-    }
-
     /// Stream request templates from a regular file
     async fn stream_request_templates(
         pool: sqlx::PgPool,
@@ -4770,351 +4648,6 @@ mod tests {
             batched_duration.as_secs() < 2,
             "Batched insert should be fast"
         );
-    }
-
-    // =========================================================================
-    // INDIVIDUAL INSERT STRATEGY TESTS
-    // =========================================================================
-    // Tests for the original individual insert mechanism
-
-    #[sqlx::test]
-    async fn test_individual_insert_small_file(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client,
-        )
-        .with_batch_insert_strategy(BatchInsertStrategy::Individual);
-
-        // Create a small file with 10 templates using individual strategy
-        let templates: Vec<RequestTemplateInput> = (0..10)
-            .map(|i| RequestTemplateInput {
-                custom_id: Some(format!("req-{}", i)),
-                endpoint: "https://api.openai.com/v1".to_string(),
-                method: "POST".to_string(),
-                path: "/chat/completions".to_string(),
-                body: format!(
-                    r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"test {}"}}]}}"#,
-                    i
-                ),
-                model: "gpt-4".to_string(),
-                api_key: "test-key".to_string(),
-            })
-            .collect();
-
-        let file_id = manager
-            .create_file(
-                "test-individual-small".to_string(),
-                Some("Testing individual inserts".to_string()),
-                templates,
-            )
-            .await
-            .expect("Failed to create file");
-
-        // Verify all templates were inserted
-        let content = manager
-            .get_file_content(file_id)
-            .await
-            .expect("Failed to get content");
-
-        assert_eq!(content.len(), 10, "Should have 10 templates");
-
-        // Verify ordering and custom IDs from API response
-        for (i, item) in content.iter().enumerate() {
-            match item {
-                FileContentItem::Template(template) => {
-                    assert_eq!(template.custom_id, Some(format!("req-{}", i)));
-                }
-                _ => panic!("Expected template, got output/error item"),
-            }
-        }
-
-        // Query database to verify line numbers
-        let rows = sqlx::query!(
-            r#"
-            SELECT custom_id, line_number
-            FROM request_templates
-            WHERE file_id = $1
-            ORDER BY line_number
-            "#,
-            *file_id as Uuid,
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("Failed to query templates");
-
-        assert_eq!(rows.len(), 10);
-        for (i, row) in rows.iter().enumerate() {
-            assert_eq!(row.line_number, i as i32);
-            assert_eq!(row.custom_id.as_ref().unwrap(), &format!("req-{}", i));
-        }
-    }
-
-    #[sqlx::test]
-    async fn test_individual_insert_preserves_line_numbers(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client,
-        )
-        .with_batch_insert_strategy(BatchInsertStrategy::Individual);
-
-        let template_count = 100;
-        let templates: Vec<RequestTemplateInput> = (0..template_count)
-            .map(|i| RequestTemplateInput {
-                custom_id: Some(format!("line-{}", i)),
-                endpoint: "https://api.openai.com/v1".to_string(),
-                method: "POST".to_string(),
-                path: "/chat/completions".to_string(),
-                body: format!(
-                    r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"line {}"}}]}}"#,
-                    i
-                ),
-                model: "gpt-4".to_string(),
-                api_key: "test-key".to_string(),
-            })
-            .collect();
-
-        let file_id = manager
-            .create_file("test-individual-lines".to_string(), None, templates)
-            .await
-            .expect("Failed to create file");
-
-        // Query line numbers directly from database
-        let rows = sqlx::query!(
-            r#"
-            SELECT custom_id, line_number
-            FROM request_templates
-            WHERE file_id = $1
-            ORDER BY line_number
-            "#,
-            *file_id as Uuid,
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("Failed to query templates");
-
-        // Verify sequential line numbering (0-indexed)
-        assert_eq!(rows.len(), template_count);
-        for (i, row) in rows.iter().enumerate() {
-            assert_eq!(
-                row.line_number, i as i32,
-                "Line number should be sequential starting from 0"
-            );
-            assert_eq!(row.custom_id.as_ref().unwrap(), &format!("line-{}", i));
-        }
-    }
-
-    #[sqlx::test]
-    async fn test_individual_insert_body_byte_size_calculation(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client,
-        )
-        .with_batch_insert_strategy(BatchInsertStrategy::Individual);
-
-        // Create templates with varying body sizes
-        let templates = vec![
-            RequestTemplateInput {
-                custom_id: Some("small".to_string()),
-                endpoint: "https://api.openai.com/v1".to_string(),
-                method: "POST".to_string(),
-                path: "/chat/completions".to_string(),
-                body: "a".repeat(100), // 100 bytes
-                model: "gpt-4".to_string(),
-                api_key: "test-key".to_string(),
-            },
-            RequestTemplateInput {
-                custom_id: Some("large".to_string()),
-                endpoint: "https://api.openai.com/v1".to_string(),
-                method: "POST".to_string(),
-                path: "/chat/completions".to_string(),
-                body: "b".repeat(10000), // 10KB
-                model: "gpt-4".to_string(),
-                api_key: "test-key".to_string(),
-            },
-        ];
-
-        let file_id = manager
-            .create_file("test-individual-sizes".to_string(), None, templates.clone())
-            .await
-            .expect("Failed to create file");
-
-        // Query body_byte_size directly from database
-        let sizes = sqlx::query!(
-            r#"
-            SELECT body_byte_size
-            FROM request_templates
-            WHERE file_id = $1
-            ORDER BY line_number
-            "#,
-            *file_id as Uuid,
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("Failed to query sizes");
-
-        assert_eq!(sizes.len(), 2);
-        assert_eq!(sizes[0].body_byte_size, 100);
-        assert_eq!(sizes[1].body_byte_size, 10000);
-    }
-
-    #[sqlx::test]
-    async fn test_individual_insert_transactional_rollback(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client,
-        )
-        .with_batch_insert_strategy(BatchInsertStrategy::Individual);
-
-        // Create a file with an intentionally invalid template (empty body would violate constraints if checked)
-        // Since we don't have constraints that fail, we'll test transaction rollback via duplicate file detection
-
-        let templates = vec![RequestTemplateInput {
-            custom_id: Some("test-1".to_string()),
-            endpoint: "https://api.openai.com/v1".to_string(),
-            method: "POST".to_string(),
-            path: "/chat/completions".to_string(),
-            body: r#"{"model":"gpt-4","messages":[]}"#.to_string(),
-            model: "gpt-4".to_string(),
-            api_key: "test-key".to_string(),
-        }];
-
-        let file_id = manager
-            .create_file("test-individual-txn".to_string(), None, templates)
-            .await
-            .expect("Failed to create file");
-
-        // Verify file was created
-        let file = manager.get_file(file_id).await.expect("File should exist");
-        assert_eq!(file.name, "test-individual-txn");
-
-        // Verify content exists
-        let content = manager
-            .get_file_content(file_id)
-            .await
-            .expect("Failed to get content");
-        assert_eq!(content.len(), 1);
-    }
-
-    #[sqlx::test]
-    async fn test_individual_vs_batched_produce_same_result(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-
-        // Create two managers with different strategies
-        let individual_manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_batch_insert_strategy(BatchInsertStrategy::Individual);
-
-        let batched_manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client,
-        )
-        .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 5000 });
-
-        // Create identical templates
-        let templates: Vec<RequestTemplateInput> = (0..50)
-            .map(|i| RequestTemplateInput {
-                custom_id: Some(format!("req-{}", i)),
-                endpoint: "https://api.openai.com/v1".to_string(),
-                method: "POST".to_string(),
-                path: "/chat/completions".to_string(),
-                body: format!(
-                    r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"test {}"}}]}}"#,
-                    i
-                ),
-                model: "gpt-4".to_string(),
-                api_key: "test-key".to_string(),
-            })
-            .collect();
-
-        // Create with individual strategy
-        let individual_file_id = individual_manager
-            .create_file(
-                "individual-file".to_string(),
-                Some("Individual inserts".to_string()),
-                templates.clone(),
-            )
-            .await
-            .expect("Failed to create individual file");
-
-        // Create with batched strategy
-        let batched_file_id = batched_manager
-            .create_file(
-                "batched-file".to_string(),
-                Some("Batched inserts".to_string()),
-                templates.clone(),
-            )
-            .await
-            .expect("Failed to create batched file");
-
-        // Get content from both
-        let individual_content = individual_manager
-            .get_file_content(individual_file_id)
-            .await
-            .expect("Failed to get individual content");
-
-        let batched_content = batched_manager
-            .get_file_content(batched_file_id)
-            .await
-            .expect("Failed to get batched content");
-
-        // Should have same number of templates
-        assert_eq!(individual_content.len(), batched_content.len());
-        assert_eq!(individual_content.len(), 50);
-
-        // Verify all templates match (API response)
-        for (ind, bat) in individual_content.iter().zip(batched_content.iter()) {
-            match (ind, bat) {
-                (FileContentItem::Template(ind_t), FileContentItem::Template(bat_t)) => {
-                    assert_eq!(ind_t.custom_id, bat_t.custom_id);
-                    assert_eq!(ind_t.endpoint, bat_t.endpoint);
-                    assert_eq!(ind_t.method, bat_t.method);
-                    assert_eq!(ind_t.path, bat_t.path);
-                    assert_eq!(ind_t.body, bat_t.body);
-                    assert_eq!(ind_t.model, bat_t.model);
-                }
-                _ => panic!("Expected template items"),
-            }
-        }
-
-        // Query database to verify line numbers for both files
-        for (file_id, label) in &[
-            (individual_file_id, "individual"),
-            (batched_file_id, "batched"),
-        ] {
-            let rows = sqlx::query!(
-                r#"
-                SELECT custom_id, line_number
-                FROM request_templates
-                WHERE file_id = $1
-                ORDER BY line_number
-                "#,
-                **file_id as Uuid,
-            )
-            .fetch_all(&pool)
-            .await
-            .unwrap_or_else(|_| panic!("Failed to query templates for {}", label));
-
-            assert_eq!(rows.len(), 50);
-            for (i, row) in rows.iter().enumerate() {
-                assert_eq!(
-                    row.line_number, i as i32,
-                    "Line number should be sequential for {}",
-                    label
-                );
-                assert_eq!(
-                    row.custom_id.as_ref().unwrap(),
-                    &format!("req-{}", i),
-                    "Custom ID should match for {}",
-                    label
-                );
-            }
-        }
     }
 
     // =========================================================================
