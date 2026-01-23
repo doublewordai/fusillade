@@ -202,7 +202,23 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// let manager = PostgresRequestManager::new(pool)
     ///     .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 10000 });
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `batch_size` is 0. The batch size must be at least 1 to avoid
+    /// attempting to flush the buffer after every single template insertion,
+    /// which would severely degrade performance.
     pub fn with_batch_insert_strategy(mut self, strategy: BatchInsertStrategy) -> Self {
+        // Validate batch size
+        match strategy {
+            BatchInsertStrategy::Batched { batch_size } => {
+                assert!(
+                    batch_size > 0,
+                    "batch_size must be greater than 0, got {}",
+                    batch_size
+                );
+            }
+        }
         self.batch_insert_strategy = strategy;
         self
     }
@@ -4647,6 +4663,99 @@ mod tests {
         assert!(
             batched_duration.as_secs() < 2,
             "Batched insert should be fast"
+        );
+    }
+
+    #[sqlx::test]
+    #[should_panic(expected = "batch_size must be greater than 0")]
+    async fn test_batched_insert_rejects_zero_batch_size(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let _manager =
+            PostgresRequestManager::with_client(TestDbPools::new(pool).await.unwrap(), http_client)
+                .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 0 });
+    }
+
+    #[sqlx::test]
+    async fn test_batched_insert_valid_batch_sizes(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Test batch_size = 1
+        let manager1 = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 1 });
+
+        let templates: Vec<RequestTemplateInput> = (0..5)
+            .map(|i| RequestTemplateInput {
+                custom_id: Some(format!("req-{}", i)),
+                endpoint: "/v1/chat/completions".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                body: format!(
+                    r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"test {}"}}]}}"#,
+                    i
+                ),
+                model: "gpt-4".to_string(),
+                api_key: "test-key".to_string(),
+            })
+            .collect();
+
+        let file_id1 = manager1
+            .create_file("batch-size-1".to_string(), None, templates.clone())
+            .await
+            .expect("Failed to create file with batch_size=1");
+
+        let content1 = manager1
+            .get_file_content(file_id1)
+            .await
+            .expect("Failed to get content");
+        assert_eq!(
+            content1.len(),
+            5,
+            "Should have 5 templates with batch_size=1"
+        );
+
+        // Test batch_size = 100
+        let manager100 = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 100 });
+
+        let file_id100 = manager100
+            .create_file("batch-size-100".to_string(), None, templates.clone())
+            .await
+            .expect("Failed to create file with batch_size=100");
+
+        let content100 = manager100
+            .get_file_content(file_id100)
+            .await
+            .expect("Failed to get content");
+        assert_eq!(
+            content100.len(),
+            5,
+            "Should have 5 templates with batch_size=100"
+        );
+
+        // Test batch_size = 5000 (default)
+        let manager5000 =
+            PostgresRequestManager::with_client(TestDbPools::new(pool).await.unwrap(), http_client)
+                .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 5000 });
+
+        let file_id5000 = manager5000
+            .create_file("batch-size-5000".to_string(), None, templates)
+            .await
+            .expect("Failed to create file with batch_size=5000");
+
+        let content5000 = manager5000
+            .get_file_content(file_id5000)
+            .await
+            .expect("Failed to get content");
+        assert_eq!(
+            content5000.len(),
+            5,
+            "Should have 5 templates with batch_size=5000"
         );
     }
 
