@@ -2219,4 +2219,150 @@ mod tests {
             "Completion window should match"
         );
     }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_metadata_extracts_fields_from_json_metadata(pool: sqlx::PgPool) {
+        let http_client = crate::http::MockHttpClient::new();
+        http_client.add_response(
+            "POST /v1/chat/completions",
+            Ok(crate::http::HttpResponse {
+                status: 200,
+                body: r#"{"id":"chatcmpl-123","choices":[{"message":{"content":"test"}}]}"#
+                    .to_string(),
+            }),
+        );
+
+        // Configure batch_metadata_fields to include "request_source" which is stored
+        // inside the metadata JSON, not as a direct column
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            model_escalations: Arc::new(dashmap::DashMap::new()),
+            max_retries: Some(3),
+            stop_before_deadline_ms: None,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            batch_metadata_fields: vec![
+                "id".to_string(),
+                "endpoint".to_string(),
+                "completion_window".to_string(),
+                "request_source".to_string(), // This comes from metadata JSON
+            ],
+            cancellation_poll_interval_ms: 100,
+            sla_check_interval_seconds: 60,
+            sla_thresholds: vec![],
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                Arc::new(http_client.clone()),
+            )
+            .with_config(config),
+        );
+
+        // Create a batch with metadata containing request_source
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test metadata JSON extraction".to_string()),
+                vec![crate::RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/chat/completions".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: Some(serde_json::json!({
+                    "request_source": "api",
+                    "created_by": "user-123"
+                })),
+                created_by: Some("test-user".to_string()),
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let requests = manager
+            .get_batch_requests(batch.id)
+            .await
+            .expect("Failed to get batch requests");
+        let request_id = requests[0].id();
+
+        // Start the daemon
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for request to be processed
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        shutdown_token.cancel();
+
+        // Wait a bit for shutdown
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Verify the request was completed
+        let results = manager
+            .get_requests(vec![request_id])
+            .await
+            .expect("Failed to get request");
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0], Ok(crate::AnyRequest::Completed(_))),
+            "Expected request to be completed"
+        );
+
+        // Verify batch metadata was passed to HTTP client
+        let calls = http_client.get_calls();
+        assert_eq!(calls.len(), 1, "Expected exactly one HTTP call");
+
+        let call = &calls[0];
+        assert_eq!(
+            call.batch_metadata.len(),
+            4,
+            "Expected 4 batch metadata fields (id, endpoint, completion_window, request_source)"
+        );
+
+        // Verify direct column fields
+        assert!(
+            call.batch_metadata.contains_key("id"),
+            "Expected batch id in metadata"
+        );
+        assert_eq!(
+            call.batch_metadata.get("endpoint"),
+            Some(&"/v1/chat/completions".to_string()),
+            "Batch endpoint should match"
+        );
+
+        // Verify request_source was extracted from metadata JSON
+        assert_eq!(
+            call.batch_metadata.get("request_source"),
+            Some(&"api".to_string()),
+            "request_source should be extracted from metadata JSON"
+        );
+    }
 }

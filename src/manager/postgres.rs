@@ -844,10 +844,28 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
                 remaining_limit -= claimed_count;
 
+                // Cache parsed metadata JSON per batch to avoid re-parsing for each request
+                let mut parsed_metadata_cache: std::collections::HashMap<
+                    Uuid,
+                    Option<serde_json::Value>,
+                > = std::collections::HashMap::new();
+
                 all_claimed.extend(rows.into_iter().map(|row| {
                     // Build batch metadata HashMap from configured fields
                     let mut batch_metadata = std::collections::HashMap::new();
+
+                    // Get or parse the metadata JSON for this batch
+                    let parsed_metadata =
+                        parsed_metadata_cache
+                            .entry(row.batch_id)
+                            .or_insert_with(|| {
+                                row.batch_metadata
+                                    .as_deref()
+                                    .and_then(|s| serde_json::from_str(s).ok())
+                            });
+
                     for field_name in &self.config.batch_metadata_fields {
+                        // First check if it's a known column field
                         let value: Option<&str> = match field_name.as_str() {
                             "id" => Some(&row.batch_id_str),
                             "file_id" => Some(&row.batch_file_id),
@@ -864,8 +882,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             "total_requests" => Some(&row.batch_total_requests),
                             _ => None,
                         };
+
                         if let Some(v) = value {
                             batch_metadata.insert(field_name.clone(), v.to_string());
+                        } else if let Some(metadata_json) = parsed_metadata.as_ref() {
+                            // Fall back to extracting from metadata JSON for unknown field names
+                            if let Some(v) = metadata_json.get(field_name).and_then(|v| v.as_str())
+                            {
+                                batch_metadata.insert(field_name.clone(), v.to_string());
+                            }
                         }
                     }
 
