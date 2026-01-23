@@ -5073,7 +5073,7 @@ mod tests {
             )
             .fetch_all(&pool)
             .await
-            .expect(&format!("Failed to query templates for {}", label));
+            .unwrap_or_else(|_| panic!("Failed to query templates for {}", label));
 
             assert_eq!(rows.len(), 50);
             for (i, row) in rows.iter().enumerate() {
