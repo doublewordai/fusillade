@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.1.2...fusillade-v2.2.0) (2026-01-23)
+
+
+### Features
+
+* race condition fix when creating file and fetching directly after in diff… ([#87](https://github.com/doublewordai/fusillade/issues/87)) ([1f3f690](https://github.com/doublewordai/fusillade/commit/1f3f690497da5883efd3bb4006b7c7eba8c88bc2))
+
 ## [2.1.2](https://github.com/doublewordai/fusillade/compare/fusillade-v2.1.1...fusillade-v2.1.2) (2026-01-23)
 
 
