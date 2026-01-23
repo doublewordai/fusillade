@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.0.1...fusillade-v2.1.0) (2026-01-23)
+
+
+### Features
+
+* templates batched writes ([#80](https://github.com/doublewordai/fusillade/issues/80)) ([94c82c8](https://github.com/doublewordai/fusillade/commit/94c82c8c710b524d70ce3661742cdd3537c149cc))
+
+
+### Bug Fixes
+
+* add sqlx pool provider ([#81](https://github.com/doublewordai/fusillade/issues/81)) ([dce6566](https://github.com/doublewordai/fusillade/commit/dce6566052a382ba5bafa3c39764f1e0618064f1))
+* add test coverage for get batch lazy finalization path ([b1b4fa1](https://github.com/doublewordai/fusillade/commit/b1b4fa1782579daacd207e2ef2dffedca0d60db8))
+
 ## [2.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v2.0.0...fusillade-v2.0.1) (2026-01-22)
 
 
