@@ -206,7 +206,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         // Validate batch size
         match strategy {
             BatchInsertStrategy::Batched { batch_size } => {
-                assert!(batch_size > 0, "batch_size must be greater than 0, got {}", batch_size);
+                assert!(
+                    batch_size > 0,
+                    "batch_size must be greater than 0, got {}",
+                    batch_size
+                );
             }
         }
         self.batch_insert_strategy = strategy;
@@ -4654,6 +4658,15 @@ mod tests {
             batched_duration.as_secs() < 2,
             "Batched insert should be fast"
         );
+    }
+
+    #[sqlx::test]
+    #[should_panic(expected = "batch_size must be greater than 0")]
+    async fn test_batched_insert_rejects_zero_batch_size(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let _manager =
+            PostgresRequestManager::with_client(TestDbPools::new(pool).await.unwrap(), http_client)
+                .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 0 });
     }
 
     // =========================================================================
