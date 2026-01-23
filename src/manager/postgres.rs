@@ -656,7 +656,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             "#,
             *file_id as Uuid,
         )
-        .fetch_optional(self.pools.read())
+        .fetch_optional(self.pool())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch file: {}", e)))?
         .ok_or_else(|| FusilladeError::Other(anyhow!("File not found")))?;
