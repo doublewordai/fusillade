@@ -3984,6 +3984,7 @@ mod tests {
         Running,
     };
     use crate::http::MockHttpClient;
+    use chrono::Timelike;
 
     // =========================================================================
     // FILE OPERATIONS
@@ -5842,8 +5843,21 @@ mod tests {
 
         // Call get_batch again - should not trigger UPDATE again (idempotent)
         let retrieved_again = manager.get_batch(batch.id).await.unwrap();
-        assert_eq!(retrieved.finalizing_at, retrieved_again.finalizing_at);
-        assert_eq!(retrieved.completed_at, retrieved_again.completed_at);
+
+        // Compare timestamps with microsecond precision (PostgreSQL limitation)
+        // Truncate nanoseconds to avoid precision mismatch
+        let truncate_nanos = |ts: Option<chrono::DateTime<chrono::Utc>>| {
+            ts.map(|t| t.with_nanosecond(t.nanosecond() / 1000 * 1000).unwrap())
+        };
+
+        assert_eq!(
+            truncate_nanos(retrieved.finalizing_at),
+            truncate_nanos(retrieved_again.finalizing_at)
+        );
+        assert_eq!(
+            truncate_nanos(retrieved.completed_at),
+            truncate_nanos(retrieved_again.completed_at)
+        );
     }
 
     #[sqlx::test]
