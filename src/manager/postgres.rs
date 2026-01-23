@@ -3120,17 +3120,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             FROM batches b
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*) FILTER (WHERE r.state = 'pending' AND r.template_id IS NOT NULL) as pending,
-                    COUNT(*) FILTER (WHERE r.state IN ('claimed', 'processing')) as in_progress,
-                    COUNT(*) FILTER (WHERE r.state = 'completed') as completed,
-                    COUNT(*) FILTER (WHERE r.state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE r.state = 'canceled' OR (r.state = 'pending' AND r.template_id IS NULL)) as canceled
-                FROM requests r
-                WHERE r.batch_id = b.id
-            ) counts ON true
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
+                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
+                    COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
+                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
+                FROM requests
+                WHERE batch_id = b.id
+                AND is_escalated = false  -- Exclude escalated requests from batch accounting
+            ) counts ON TRUE
             WHERE b.id = $1
             "#,
-            *batch_id as Uuid
+            *batch_id as Uuid,
         )
         .fetch_optional(pool)
         .await
@@ -3138,36 +3139,64 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
 
         // Lazy computation of terminal timestamps
+        // Check if batch is in terminal state and update timestamps if needed
         let terminal_count = row.completed_requests + row.failed_requests + row.canceled_requests;
         let is_terminal = terminal_count == row.total_requests && row.total_requests > 0;
 
-        let (finalizing_at, completed_at, failed_at) =
-            if is_terminal && row.finalizing_at.is_none() && row.cancelled_at.is_none() {
-                let finalizing = row.requests_started_at.or(Some(row.created_at));
-                let completed = if row.failed_requests == 0 && row.completed_requests > 0 {
-                    Some(row.created_at)
-                } else {
-                    None
-                };
-                let failed = if row.failed_requests > 0 {
-                    Some(row.created_at)
-                } else {
-                    None
-                };
-                (finalizing, completed, failed)
+        let (finalizing_at, completed_at, failed_at) = if is_terminal
+            && row.completed_at.is_none()
+            && row.failed_at.is_none()
+            && row.cancelled_at.is_none()
+        {
+            let now = Utc::now();
+
+            // Determine which terminal state based on counts
+            let (finalizing, completed, failed) = if row.completed_requests > 0 {
+                // At least one completion = completed batch
+                (Some(now), Some(now), None)
             } else {
-                (row.finalizing_at, row.completed_at, row.failed_at)
+                // No completions = failed batch
+                (Some(now), None, Some(now))
             };
+
+            // Update the database with the terminal timestamps
+            sqlx::query!(
+                r#"
+                UPDATE batches
+                SET finalizing_at = COALESCE(finalizing_at, $2),
+                    completed_at = COALESCE(completed_at, $3),
+                    failed_at = COALESCE(failed_at, $4)
+                WHERE id = $1
+                "#,
+                *batch_id as Uuid,
+                finalizing,
+                completed,
+                failed,
+            )
+            .execute(self.pools.write()) // Use the provided pool parameter here too
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
+            })?;
+
+            (finalizing, completed, failed)
+        } else {
+            (row.finalizing_at, row.completed_at, row.failed_at)
+        };
 
         Ok(Batch {
             id: BatchId(row.id),
             file_id: row.file_id.map(FileId),
-            endpoint: row.endpoint,
-            completion_window: row.completion_window,
+            created_at: row.created_at,
             metadata: row.metadata,
+            completion_window: row.completion_window,
+            endpoint: row.endpoint,
             output_file_id: row.output_file_id.map(FileId),
             error_file_id: row.error_file_id.map(FileId),
             created_by: row.created_by,
+            expires_at: row.expires_at,
+            cancelling_at: row.cancelling_at,
+            errors: row.errors,
             total_requests: row.total_requests,
             pending_requests: row.pending_requests,
             in_progress_requests: row.in_progress_requests,
@@ -3178,10 +3207,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             finalizing_at,
             completed_at,
             failed_at,
-            expires_at: row.expires_at,
-            errors: row.errors,
-            created_at: row.created_at,
-            cancelling_at: row.cancelling_at,
             cancelled_at: row.cancelled_at,
         })
     }
