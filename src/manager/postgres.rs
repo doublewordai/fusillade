@@ -203,6 +203,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     ///     .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 10000 });
     /// ```
     pub fn with_batch_insert_strategy(mut self, strategy: BatchInsertStrategy) -> Self {
+        // Validate batch size
+        match strategy {
+            BatchInsertStrategy::Batched { batch_size } => {
+                assert!(batch_size > 0, "batch_size must be greater than 0, got {}", batch_size);
+            }
+        }
         self.batch_insert_strategy = strategy;
         self
     }
