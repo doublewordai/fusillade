@@ -52,6 +52,13 @@ pub trait Storage: Send + Sync {
     /// Get a file by ID.
     async fn get_file(&self, file_id: FileId) -> Result<File>;
 
+    /// Get a file by ID from the primary pool for read-after-write consistency.
+    ///
+    /// Use this immediately after creating or modifying a file to ensure you read
+    /// the latest committed data. For normal reads, use `get_file()` which may use
+    /// read replicas for better performance.
+    async fn get_file_from_primary_pool(&self, file_id: FileId) -> Result<File>;
+
     /// List files with optional filtering.
     async fn list_files(&self, filter: FileFilter) -> Result<Vec<File>>;
 

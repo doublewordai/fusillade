@@ -647,7 +647,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         Ok(())
     }
 
-    async fn get_file_from_db(&self, file_id: FileId) -> Result<File> {
+    /// Internal helper to fetch a file from a specific pool.
+    ///
+    /// Accepts a pool parameter to control read-after-write consistency.
+    /// Typically used with the primary pool for immediate reads after writes,
+    /// or replica pools for normal reads.
+    async fn get_file_from_pool(&self, file_id: FileId, pool: &PgPool) -> Result<File> {
         let row = sqlx::query!(
             r#"
             SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
@@ -656,7 +661,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             "#,
             *file_id as Uuid,
         )
-        .fetch_optional(self.pools.read())
+        .fetch_optional(pool)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch file: {}", e)))?
         .ok_or_else(|| FusilladeError::Other(anyhow!("File not found")))?;
@@ -1709,7 +1714,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn get_file(&self, file_id: FileId) -> Result<File> {
-        let mut file = self.get_file_from_db(file_id).await?;
+        let mut file = self.get_file_from_pool(file_id, self.pools.read()).await?;
+
+        // Check and mark as expired if needed (passive expiration)
+        self.check_and_mark_expired(&mut file).await?;
+
+        // Try to finalize size for virtual output/error files. Uses cached value once finalized
+        self.maybe_finalize_file_size(&mut file).await?;
+
+        Ok(file)
+    }
+
+    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    async fn get_file_from_primary_pool(&self, file_id: FileId) -> Result<File> {
+        let mut file = self.get_file_from_pool(file_id, self.pools.write()).await?;
 
         // Check and mark as expired if needed (passive expiration)
         self.check_and_mark_expired(&mut file).await?;
