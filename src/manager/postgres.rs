@@ -206,7 +206,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// # Panics
     ///
     /// Panics if `batch_size` is 0. The batch size must be at least 1 to avoid
-    /// infinite loops in the batching logic.
+    /// attempting to flush the buffer after every single template insertion,
+    /// which would severely degrade performance.
     pub fn with_batch_insert_strategy(mut self, strategy: BatchInsertStrategy) -> Self {
         // Validate batch size
         match strategy {
