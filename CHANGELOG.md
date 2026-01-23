@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.2](https://github.com/doublewordai/fusillade/compare/fusillade-v2.1.1...fusillade-v2.1.2) (2026-01-23)
+
+
+### Bug Fixes
+
+* inserts config validation ([#84](https://github.com/doublewordai/fusillade/issues/84)) ([c5ad534](https://github.com/doublewordai/fusillade/commit/c5ad534913ad61a43d0a65574ab551761ccf3018))
+* use primary pool to fetch batch after creation to avoid race conditions ([#86](https://github.com/doublewordai/fusillade/issues/86)) ([f53d197](https://github.com/doublewordai/fusillade/commit/f53d1974d42265b1174fe17829ad943bd7d62570))
+
 ## [2.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v2.1.0...fusillade-v2.1.1) (2026-01-23)
 
 
