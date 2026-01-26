@@ -5113,7 +5113,7 @@ mod tests {
         let batch_after = manager.get_batch(batch.id).await;
         assert!(batch_after.is_err());
 
-        // Verify requests are gone (cascade deleted)
+        // Verify requests are not returned (orphaned with batch_id = NULL, filtered by view)
         let requests_after = manager.get_batch_requests(batch.id).await.unwrap();
         assert_eq!(requests_after.len(), 0);
 
@@ -10273,14 +10273,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Manually set 2 requests to failed state, leave 1 as pending
+        // Manually set 2 requests to failed state with daemon metadata, leave 1 as pending
+        // This simulates a request that was claimed, started processing, and then failed
         sqlx::query!(
             r#"
             UPDATE requests
             SET state = 'failed',
                 error = 'test error',
                 failed_at = NOW(),
-                retry_attempt = 3
+                retry_attempt = 3,
+                daemon_id = '00000000-0000-0000-0000-000000000001',
+                claimed_at = NOW() - INTERVAL '1 hour',
+                started_at = NOW() - INTERVAL '30 minutes'
             WHERE batch_id = $1
             AND id IN (
                 SELECT id FROM requests WHERE batch_id = $1 ORDER BY created_at LIMIT 2
@@ -10332,6 +10336,24 @@ mod tests {
                 );
             }
         }
+
+        // Verify: daemon_id, claimed_at, started_at are cleared (matching persist(Pending) behavior)
+        let cleared_check = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as "count!"
+            FROM requests
+            WHERE batch_id = $1
+                AND (daemon_id IS NOT NULL OR claimed_at IS NOT NULL OR started_at IS NOT NULL)
+            "#,
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            cleared_check.count, 0,
+            "daemon_id, claimed_at, and started_at should all be NULL after retry"
+        );
 
         // Calling again should return 0 (no failed requests)
         let retried_again = manager
