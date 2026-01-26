@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.2.0...fusillade-v2.3.0) (2026-01-26)
+
+
+### Features
+
+* replace cascade deletes with SET NULL for performance ([#89](https://github.com/doublewordai/fusillade/issues/89)) ([aa47c5c](https://github.com/doublewordai/fusillade/commit/aa47c5caaaf4cff11b009a1116e4327353bf2f88))
+
 ## [2.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.1.2...fusillade-v2.2.0) (2026-01-23)
 
 
