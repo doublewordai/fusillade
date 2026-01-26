@@ -257,6 +257,16 @@ pub trait Storage: Send + Sync {
     /// - Request is not in failed state
     async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>>;
 
+    /// Retry all failed requests for a batch in a single database operation.
+    ///
+    /// This is much more efficient than `retry_failed_requests` when retrying all failed
+    /// requests for a batch, as it performs a single UPDATE query instead of loading
+    /// all requests into memory.
+    ///
+    /// # Returns
+    /// The number of requests that were retried.
+    async fn retry_failed_requests_for_batch(&self, batch_id: BatchId) -> Result<u64>;
+
     /// The following methods are defined specifically for requests - i.e. independent of the
     /// files/batches they belong to.
     ///

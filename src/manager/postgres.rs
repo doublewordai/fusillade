@@ -769,7 +769,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 r#"
                 WITH in_progress_count AS (
                     SELECT COUNT(*)::BIGINT as count
-                    FROM requests r
+                    FROM active_requests r
                     WHERE r.model = $4
                         AND r.state IN ('claimed', 'processing')
                 ),
@@ -810,10 +810,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     daemon_id = $1,
                     claimed_at = $3
                 FROM to_claim tc
-                JOIN request_templates t ON tc.template_id = t.id
+                JOIN active_request_templates t ON tc.template_id = t.id
                 JOIN batches b ON tc.batch_id = b.id
                 WHERE r.id = tc.id
-                RETURNING r.id, r.batch_id, r.template_id as "template_id!", r.retry_attempt,
+                RETURNING r.id, r.batch_id as "batch_id!", r.template_id as "template_id!", r.retry_attempt,
                           t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
                           r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,
                           t.body as "body!", t.model as "model!", t.api_key as "api_key!",
@@ -1245,7 +1245,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let rows = sqlx::query!(
             r#"
             SELECT
-                r.id, r.batch_id, r.template_id as "template_id?", r.state,
+                r.id, r.batch_id as "batch_id!", r.template_id as "template_id?", r.state,
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
                 t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
@@ -1253,7 +1253,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.expires_at as batch_expires_at,
                 r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id
             FROM requests r
-            LEFT JOIN request_templates t ON r.template_id = t.id
+            LEFT JOIN active_request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
             WHERE r.id = ANY($1)
             "#,
@@ -2089,9 +2089,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel batches: {}", e)))?;
 
         // Step 2: Delete the file
-        // This cascades to delete request_templates (which makes template_id NULL on requests)
-        // Pending requests in cancelled batches remain 'pending' but are treated as canceled
-        // They can never be claimed because they have no template_id
+        // This sets file_id to NULL on request_templates (ON DELETE SET NULL)
+        // Templates become orphaned and are excluded from active_request_templates view
+        // Requests referencing orphaned templates will have NULL template data in queries
         let rows_affected = sqlx::query!(
             r#"
             DELETE FROM files
@@ -2529,7 +2529,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let rows = sqlx::query!(
             r#"
             SELECT
-                r.batch_id,
+                r.batch_id as "batch_id!",
                 COUNT(*) as count
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
@@ -2563,7 +2563,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let rows = sqlx::query!(
             r#"
             SELECT
-                r.batch_id,
+                r.batch_id as "batch_id!",
                 COUNT(*) as count
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
@@ -2647,7 +2647,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     t.api_key as original_api_key,
                     b.created_by as batch_created_by
                 FROM requests r
-                JOIN request_templates t ON r.template_id = t.id
+                JOIN active_request_templates t ON r.template_id = t.id
                 JOIN batches b ON r.batch_id = b.id
                 WHERE r.model = $1
                   AND r.is_escalated = false
@@ -2772,8 +2772,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     async fn delete_batch(&self, batch_id: BatchId) -> Result<()> {
-        // Delete the batch - this will cascade delete all associated requests
-        // due to ON DELETE CASCADE on requests.batch_id foreign key
+        // Delete the batch - this sets batch_id to NULL on requests (ON DELETE SET NULL)
+        // Requests become orphaned and are excluded from active_requests view
         let rows_affected = sqlx::query!(
             r#"
             DELETE FROM batches WHERE id = $1
@@ -2855,11 +2855,39 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(results)
     }
 
+    async fn retry_failed_requests_for_batch(&self, batch_id: BatchId) -> Result<u64> {
+        tracing::info!(%batch_id, "Retrying all failed requests for batch");
+
+        let result = sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'pending',
+                retry_attempt = 0,
+                not_before = NULL,
+                error = NULL,
+                failed_at = NULL,
+                daemon_id = NULL,
+                claimed_at = NULL,
+                started_at = NULL
+            WHERE batch_id = $1 AND state = 'failed'
+            "#,
+            *batch_id as Uuid,
+        )
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to retry failed requests: {}", e)))?;
+
+        let count = result.rows_affected();
+        tracing::info!(%batch_id, count, "Retried failed requests for batch");
+
+        Ok(count)
+    }
+
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>> {
         let rows = sqlx::query!(
             r#"
             SELECT
-                r.id, r.batch_id, r.template_id as "template_id?", r.state,
+                r.id, r.batch_id as "batch_id!", r.template_id as "template_id?", r.state,
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
                 t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
@@ -2867,7 +2895,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 r.escalated_from_request_id, r.is_escalated, r.superseded_at, r.superseded_by_request_id,
                 b.expires_at as batch_expires_at
             FROM requests r
-            LEFT JOIN request_templates t ON r.template_id = t.id
+            LEFT JOIN active_request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
             WHERE r.batch_id = $1
             ORDER BY r.created_at ASC
@@ -5085,7 +5113,7 @@ mod tests {
         let batch_after = manager.get_batch(batch.id).await;
         assert!(batch_after.is_err());
 
-        // Verify requests are gone (cascade deleted)
+        // Verify requests are not returned (orphaned with batch_id = NULL, filtered by view)
         let requests_after = manager.get_batch_requests(batch.id).await.unwrap();
         assert_eq!(requests_after.len(), 0);
 
@@ -10186,5 +10214,152 @@ mod tests {
         // Verify: They have the escalated model
         assert_eq!(batch1_escalated.data().model, "gpt-4-priority");
         assert_eq!(batch2_escalated.data().model, "gpt-4-priority");
+    }
+
+    #[sqlx::test]
+    async fn test_retry_failed_requests_for_batch(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        ));
+
+        // Create a file with 3 templates
+        let file_id = manager
+            .create_file(
+                "retry-batch-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req-1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-3".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Manually set 2 requests to failed state with daemon metadata, leave 1 as pending
+        // This simulates a request that was claimed, started processing, and then failed
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'failed',
+                error = 'test error',
+                failed_at = NOW(),
+                retry_attempt = 3,
+                daemon_id = '00000000-0000-0000-0000-000000000001',
+                claimed_at = NOW() - INTERVAL '1 hour',
+                started_at = NOW() - INTERVAL '30 minutes'
+            WHERE batch_id = $1
+            AND id IN (
+                SELECT id FROM requests WHERE batch_id = $1 ORDER BY created_at LIMIT 2
+            )
+            "#,
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Verify initial state: 2 failed, 1 pending
+        let requests_before = manager.get_batch_requests(batch.id).await.unwrap();
+        let failed_count = requests_before
+            .iter()
+            .filter(|r| matches!(r, AnyRequest::Failed(_)))
+            .count();
+        let pending_count = requests_before
+            .iter()
+            .filter(|r| matches!(r, AnyRequest::Pending(_)))
+            .count();
+        assert_eq!(failed_count, 2);
+        assert_eq!(pending_count, 1);
+
+        // Call retry_failed_requests_for_batch
+        let retried = manager
+            .retry_failed_requests_for_batch(batch.id)
+            .await
+            .unwrap();
+        assert_eq!(retried, 2, "Should have retried 2 failed requests");
+
+        // Verify: all 3 requests are now pending
+        let requests_after = manager.get_batch_requests(batch.id).await.unwrap();
+        let pending_after = requests_after
+            .iter()
+            .filter(|r| matches!(r, AnyRequest::Pending(_)))
+            .count();
+        assert_eq!(
+            pending_after, 3,
+            "All requests should be pending after retry"
+        );
+
+        // Verify: retry_attempt is reset to 0
+        for req in &requests_after {
+            if let AnyRequest::Pending(r) = req {
+                assert_eq!(
+                    r.state.retry_attempt, 0,
+                    "retry_attempt should be reset to 0"
+                );
+            }
+        }
+
+        // Verify: daemon_id, claimed_at, started_at are cleared (matching persist(Pending) behavior)
+        let cleared_check = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as "count!"
+            FROM requests
+            WHERE batch_id = $1
+                AND (daemon_id IS NOT NULL OR claimed_at IS NOT NULL OR started_at IS NOT NULL)
+            "#,
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            cleared_check.count, 0,
+            "daemon_id, claimed_at, and started_at should all be NULL after retry"
+        );
+
+        // Calling again should return 0 (no failed requests)
+        let retried_again = manager
+            .retry_failed_requests_for_batch(batch.id)
+            .await
+            .unwrap();
+        assert_eq!(retried_again, 0, "No failed requests to retry");
     }
 }
