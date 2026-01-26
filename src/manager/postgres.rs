@@ -2865,7 +2865,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 retry_attempt = 0,
                 not_before = NULL,
                 error = NULL,
-                failed_at = NULL
+                failed_at = NULL,
+                daemon_id = NULL,
+                claimed_at = NULL,
+                started_at = NULL
             WHERE batch_id = $1 AND state = 'failed'
             "#,
             *batch_id as Uuid,
