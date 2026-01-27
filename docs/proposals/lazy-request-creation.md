@@ -72,13 +72,20 @@ Using `ON DELETE SET NULL` avoids blocking deletes — see [Orphan Cleanup](#orp
 
 ### Batch Creation
 
-Now O(1) — just create the batch row:
+Now O(1) — just create the batch row with a snapshot of the template count:
 
 ```sql
-INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6)
+WITH template_count AS (
+    SELECT COUNT(*) as total FROM request_templates WHERE file_id = $1
+)
+INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, total_requests)
+SELECT $1, $2, $3, $4, $5, $6, tc.total
+FROM template_count tc
 RETURNING *;
 ```
+
+The `total_requests` column (already exists on `batches`) is populated at
+creation time. This avoids expensive COUNT queries when computing batch status.
 
 No request rows are created. The "pending" work is implicit: all templates in
 the file that aren't in `batches_active_in` for this batch.
@@ -90,7 +97,7 @@ backoff from `retry_attempts`:
 
 ```sql
 WITH
--- Get latest retry per template/batch to check not_before. 
+-- Get latest retry per template/batch to check not_before.
 latest_retry AS (
     SELECT DISTINCT ON (template_id, batch_id)
         template_id, batch_id, not_before
@@ -122,13 +129,20 @@ marked AS (
     RETURNING c.template_id, c.batch_id
 ),
 
--- Create request rows
+-- Create request rows with denormalized template snapshot
 created AS (
-    INSERT INTO requests (batch_id, template_id, state, daemon_id, claimed_at, model)
-    SELECT m.batch_id, m.template_id, 'claimed', $4, $2, t.model
+    INSERT INTO requests (
+        batch_id, template_id, state, daemon_id, claimed_at,
+        -- Denormalized snapshot fields
+        endpoint, method, path, body, model, api_key, custom_id
+    )
+    SELECT
+        m.batch_id, m.template_id, 'claimed', $4, $2,
+        t.endpoint, t.method, t.path, t.body, t.model, t.api_key, t.custom_id
     FROM marked m
     JOIN request_templates t ON t.id = m.template_id
-    RETURNING id
+    RETURNING
+        id, batch_id, template_id, endpoint, method, path, body, model, api_key, custom_id
 )
 
 SELECT * FROM created;
@@ -140,6 +154,9 @@ SELECT * FROM created;
 - `$2` — now (TIMESTAMPTZ)
 - `$3` — limit (INTEGER)
 - `$4` — daemon_id (UUID)
+
+The query returns all fields needed by the daemon to execute the request,
+avoiding a separate read after claiming.
 
 ### Retry Handling
 
@@ -159,13 +176,14 @@ updated_template AS (
     WHERE t.id = d.template_id
 ),
 prev_attempt AS (
-    SELECT COALESCE(MAX(attempt), 0) as attempt
-    FROM retry_attempts ra, deleted d
-    WHERE ra.template_id = d.template_id AND ra.batch_id = d.batch_id
+    SELECT d.template_id, d.batch_id, COALESCE(MAX(ra.attempt), 0) as attempt
+    FROM deleted d
+    LEFT JOIN retry_attempts ra ON ra.template_id = d.template_id AND ra.batch_id = d.batch_id
+    GROUP BY d.template_id, d.batch_id
 )
 INSERT INTO retry_attempts (template_id, batch_id, attempt, error_code, not_before)
-SELECT d.template_id, d.batch_id, p.attempt + 1, $2, $3
-FROM deleted d, prev_attempt p;
+SELECT p.template_id, p.batch_id, p.attempt + 1, $2, $3
+FROM prev_attempt p;
 ```
 
 **Parameters:**
@@ -176,6 +194,9 @@ FROM deleted d, prev_attempt p;
 
 The template is now "inactive" for that batch and will be picked up by the
 claiming query once `not_before` has passed.
+
+Note: The `prev_attempt` CTE uses LEFT JOIN to handle the first retry (when no
+`retry_attempts` rows exist yet). The COALESCE ensures we get 0 in that case.
 
 ### Unclaiming
 
@@ -235,7 +256,7 @@ small and containing only genuinely in-flight requests.
 SELECT
     b.id as batch_id,
     b.cancelling_at,
-    (SELECT COUNT(*) FROM request_templates WHERE file_id = b.file_id) as total,
+    b.total_requests as total,  -- Stored at batch creation time
     COUNT(r.id) FILTER (WHERE r.state IN ('claimed', 'processing')) as in_progress,
     COUNT(r.id) FILTER (WHERE r.state = 'completed') as completed,
     COUNT(r.id) FILTER (WHERE r.state = 'failed') as failed
@@ -244,6 +265,10 @@ LEFT JOIN requests r ON r.batch_id = b.id
 WHERE b.id = $1
 GROUP BY b.id;
 ```
+
+Using `b.total_requests` (stored at creation) instead of counting templates
+makes status queries O(requests) instead of O(templates + requests). For large
+files with few completed requests, this is a significant improvement.
 
 Application logic derives pending/canceled based on batch state:
 
@@ -284,6 +309,54 @@ requests. Entries are removed when:
 3. A request is unclaimed (daemon shutdown, timeout)
 
 This keeps arrays small without requiring periodic cleanup.
+
+## Escalation and Supersession
+
+The existing escalation system creates new templates (with escalated model/API
+key) and new request rows when a batch is at risk of missing its SLA. With lazy
+request creation, the workflow simplifies:
+
+### Current Escalation Flow
+
+1. Identify at-risk requests via `escalated_from_request_id`
+2. Create new templates in an `escalation_templates` file
+3. Create new request rows with `is_escalated = true`
+4. Original and escalated requests race to completion
+5. Winner marks the loser as `superseded`
+
+### Updated Escalation Flow
+
+1. Identify at-risk templates (not requests) — templates in `batches_active_in`
+   where `batch.expires_at` is approaching
+2. Create new templates with `escalated_from_template_id` link (new column)
+3. New templates are claimed naturally via the standard claiming query
+4. On completion, supersede the racing request (same as before)
+
+### Schema Addition for Escalation
+
+```sql
+ALTER TABLE request_templates
+    ADD COLUMN escalated_from_template_id UUID REFERENCES request_templates(id) ON DELETE SET NULL,
+    ADD COLUMN is_escalated BOOLEAN NOT NULL DEFAULT FALSE;
+```
+
+The `is_escalated` flag moves from `requests` to `request_templates`. This
+ensures escalated requests are excluded from `total_requests` counting (they're
+in a separate virtual file anyway).
+
+### Supersession Handling
+
+The `superseded` state continues to work as before — it only affects requests
+that have been claimed (and thus have request rows). When an original or
+escalated request completes first, it marks the other as superseded:
+
+```sql
+UPDATE requests
+SET state = 'superseded', superseded_at = $2, superseded_by_request_id = $3
+WHERE id = $1;
+```
+
+No changes needed here since supersession only applies to in-flight requests.
 
 ## Orphan Cleanup
 
@@ -399,11 +472,15 @@ CREATE INDEX retry_attempts_latest
    DELETE FROM requests WHERE state = 'pending';
    ```
 
-4. **Delete canceled request rows** — These are now derived from `batch.cancelling_at`: TODO: Are we really confident these should be deleted? It does make sense they would be.
+4. **Delete canceled request rows** — These are now derived from `batch.cancelling_at`.
 
    ```sql
    DELETE FROM requests WHERE state = 'canceled';
    ```
+
+   This is safe because: (a) canceled count is derived from `total - completed - failed`
+   when `cancelling_at IS NOT NULL`, and (b) canceled requests have no useful response
+   data to preserve.
 
 5. **Deploy new application code** with all logic changes:
    - Batch creation: no longer inserts request rows
@@ -440,11 +517,22 @@ If issues are discovered after deployment:
 The `batches_active_in` column and `retry_attempts` table can remain — they're
 unused by old code but harmless.
 
-## Open Questions
+## Resolved Questions
 
 1. **Index on `batches_active_in`?**
    - A GIN index would speed up cleanup queries but isn't needed for claiming
-   - Recommend: Add later if cleanup becomes a bottleneck
+   - The `ANY()` check during claiming is O(k) per row where k = array length
+   - **Decision**: Skip initially. Add GIN index only if cleanup queries become slow:
+     ```sql
+     CREATE INDEX idx_templates_batches_active_gin
+         ON request_templates USING GIN (batches_active_in);
+     ```
+
+2. **Batch status trigger interaction?**
+   - The `update_batch_on_request_change()` trigger was removed in migration
+     `20250115000000_batch_events_wal.up.sql` in favor of on-demand counting
+   - **Decision**: No trigger changes needed. The system already uses on-demand
+     counting which aligns with this proposal.
 
 ## Deferred Work
 

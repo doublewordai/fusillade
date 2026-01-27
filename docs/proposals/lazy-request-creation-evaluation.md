@@ -55,29 +55,18 @@ This eliminates the need for request rows that exist only to represent "not yet 
 
 ## 3. Critical Issues to Address
 
-### 3.1 Interaction with Denormalized Batch Status (CRITICAL)
+### 3.1 ~~Interaction with Denormalized Batch Status~~ (RESOLVED)
 
-**Problem**: The codebase has a trigger-based denormalized status system (`20250107000008_add_batch_status_columns.up.sql`) that updates `batches.pending_requests`, `in_progress_requests`, etc. on every INSERT/UPDATE/DELETE to `requests`.
+**Update**: This issue was already resolved in the codebase. The trigger
+`update_batch_on_request_change()` was **removed** in migration
+`20250115000000_batch_events_wal.up.sql`. The system now uses on-demand counting,
+which aligns perfectly with this proposal's approach.
 
-The proposal's status query (lines 234-257) ignores this and computes counts on-demand:
-```sql
-SELECT
-    (SELECT COUNT(*) FROM request_templates WHERE file_id = b.file_id) as total,
-    COUNT(r.id) FILTER (WHERE r.state IN ('claimed', 'processing')) as in_progress,
-    ...
-```
+The denormalized columns (`pending_requests`, `in_progress_requests`, etc.) were
+also removed in `20250118000000_remove_wal_use_on_demand_counting.up.sql`.
 
-**Impact**:
-1. The existing trigger would decrement `pending_requests` when requests are deleted (proposal deletes during retry), causing negative counts
-2. The trigger expects `state = 'pending'` rows to exist
-
-**Required Changes**:
-1. Update or remove the `update_batch_on_request_change()` trigger
-2. Either:
-   - (a) Store `total_templates` on batch at creation time and derive pending, OR
-   - (b) Modify trigger to handle lazy creation semantics
-
-**Recommendation**: Option (a) - store `total_templates` at batch creation time. The batch already stores `total_requests` (line 2222), so this is consistent.
+**No action required** — the proposal's on-demand status calculation is consistent
+with the current architecture.
 
 ### 3.2 Interaction with Escalation System (MODERATE)
 
@@ -270,37 +259,45 @@ The proposal's claiming query doesn't set `custom_id` on created requests. This 
 
 ## 9. Recommended Changes to Proposal
 
-1. **Add trigger migration section**: The `update_batch_on_request_change()` trigger must be modified to handle lazy creation semantics.
+1. ~~**Add trigger migration section**~~: ✅ Not needed — trigger was already removed.
 
-2. **Store `total_templates` on batch**: Add to batch creation query and use for status derivation.
+2. **Store `total_templates` on batch**: ✅ Added to proposal — batch creation now
+   includes template count.
 
-3. **Redesign escalation linkage**: Move from `escalated_from_request_id` (request-level) to `escalated_from_template_id` (template-level).
+3. **Redesign escalation linkage**: ✅ Added to proposal — new "Escalation and
+   Supersession" section with `escalated_from_template_id` approach.
 
-4. **Complete claiming query**: Include all denormalized fields (endpoint, method, path, body, api_key, custom_id) in the INSERT and RETURNING clauses.
+4. **Complete claiming query**: ✅ Fixed in proposal — INSERT now includes all
+   denormalized fields and RETURNING clause provides full request data.
 
-5. **Fix retry query**: Use explicit JOIN instead of comma join to handle empty `deleted` CTE.
+5. **Fix retry query**: ✅ Fixed in proposal — uses explicit LEFT JOIN with GROUP BY.
 
-6. **Address `is_escalated`**: Either:
-   - (a) Move to templates, or
-   - (b) Accept that escalated requests always have request rows (created by escalation, not claiming)
+6. **Address `is_escalated`**: ✅ Added to proposal — moves to `request_templates` table.
 
-7. **Add `superseded` state handling**: Clarify that superseded requests continue to work as-is (they only exist after being claimed and completing).
+7. **Add `superseded` state handling**: ✅ Added to proposal — clarified that
+   supersession only applies to claimed requests (which have rows).
 
 ---
 
 ## 10. Conclusion
 
-The lazy request creation proposal is architecturally sound and addresses a real scalability issue. The core insight - using `batches_active_in` arrays instead of existence checks - is elegant and efficient.
+The lazy request creation proposal is architecturally sound and addresses a real
+scalability issue. The core insight — using `batches_active_in` arrays instead of
+existence checks — is elegant and efficient.
 
-However, the proposal needs updates to properly integrate with:
-1. The existing denormalized batch status trigger system
-2. The escalation/supersession tracking system
-3. Request denormalization (template snapshots)
+**Status**: All recommended changes have been incorporated into the proposal:
+- ✅ Trigger issue was already resolved in the codebase (no action needed)
+- ✅ Claiming query now includes all denormalized fields
+- ✅ Retry query fixed with proper JOIN syntax
+- ✅ Batch creation stores `total_requests` for efficient status queries
+- ✅ Escalation section added with template-level tracking
+- ✅ Supersession handling clarified
 
-With these modifications, I recommend proceeding with implementation. The maintenance window requirement is acceptable given the performance benefits for large-scale usage.
+**Recommendation**: Proceed with implementation. The maintenance window requirement
+is acceptable given the performance benefits for large-scale usage.
 
-**Priority for implementation**:
-1. HIGH: Trigger modification (blocks everything else)
-2. HIGH: Claiming query completion (core functionality)
-3. MEDIUM: Escalation redesign (affects SLA features)
-4. LOW: Cleanup job (can be added post-launch)
+**Implementation priority**:
+1. HIGH: Schema additions (Phase 1 — can deploy immediately)
+2. HIGH: Core claiming/completion logic
+3. MEDIUM: Escalation migration to template-level tracking
+4. LOW: Orphan cleanup job (can be added post-launch)
