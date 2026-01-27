@@ -305,6 +305,53 @@ requests. Entries are removed when:
 
 This keeps arrays small without requiring periodic cleanup.
 
+## Escalation
+
+Escalation is handled entirely in Rust at execution time — no database changes
+needed.
+
+### Approach
+
+When the daemon claims a request, it checks the time remaining until batch
+expiration:
+
+```rust
+let time_remaining = batch.expires_at - now;
+let (model, api_key) = if time_remaining < escalation_threshold {
+    // Near deadline — use escalated model/api_key
+    (config.escalated_model, config.escalated_api_key)
+} else {
+    // Plenty of time — use template's model/api_key
+    (template.model, template.api_key)
+};
+```
+
+The HTTP request is made with whichever credentials are selected. The database
+only sees: claim → execute → complete. It has no knowledge of escalation.
+
+### Benefits
+
+- **No schema changes** — No `is_escalated`, `escalated_from_request_id`,
+  `superseded_at`, or `superseded_by_request_id` columns needed
+- **No race conditions** — One request, one HTTP call, one result
+- **Simpler code** — Escalation logic lives in one place (Rust daemon)
+- **No cleanup** — No escalated templates or orphaned escalation records
+
+### Migration
+
+Existing escalation-related columns can be dropped:
+
+```sql
+ALTER TABLE requests
+    DROP COLUMN IF EXISTS is_escalated,
+    DROP COLUMN IF EXISTS escalated_from_request_id,
+    DROP COLUMN IF EXISTS superseded_at,
+    DROP COLUMN IF EXISTS superseded_by_request_id;
+```
+
+The virtual "escalation_templates" files and their templates can be deleted as
+part of cleanup.
+
 ## Orphan Cleanup
 
 This proposal uses `ON DELETE SET NULL` for foreign keys, consistent with the
