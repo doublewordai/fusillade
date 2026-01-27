@@ -68,27 +68,7 @@ also removed in `20250118000000_remove_wal_use_on_demand_counting.up.sql`.
 **No action required** — the proposal's on-demand status calculation is consistent
 with the current architecture.
 
-### 3.2 Interaction with Escalation System (MODERATE)
-
-**Problem**: The escalation system (`postgres.rs:2604-2744`) creates new templates AND new request rows:
-
-```sql
-INSERT INTO requests (
-    id, batch_id, template_id, state, custom_id, retry_attempt, model,
-    escalated_from_request_id, is_escalated, ...
-)
-```
-
-**Impact**: Escalation currently relies on creating `pending` request rows immediately. With lazy creation, this would need modification.
-
-**Solution**: The proposal's approach actually simplifies escalation:
-1. Create escalated template (as now)
-2. The escalated template will be claimed naturally via the new claiming query
-3. Add `is_escalated` flag to templates (not requests)
-
-**However**: The `escalated_from_request_id` linkage becomes problematic - the original request may not exist yet (if still pending). Need to track escalation at template level instead.
-
-### 3.3 `retry_attempts` Table and Existing Retry Tracking
+### 3.2 `retry_attempts` Table and Existing Retry Tracking
 
 **Verdict: Good addition, but consider migration**
 
@@ -264,18 +244,10 @@ The proposal's claiming query doesn't set `custom_id` on created requests. This 
 2. **Store `total_templates` on batch**: ✅ Added to proposal — batch creation now
    includes template count.
 
-3. **Redesign escalation linkage**: ✅ Added to proposal — new "Escalation and
-   Supersession" section with `escalated_from_template_id` approach.
+3. **Complete claiming query**: ✅ Fixed in proposal — creates minimal request rows,
+   JOINs to templates for full data (no denormalization needed).
 
-4. **Complete claiming query**: ✅ Fixed in proposal — INSERT now includes all
-   denormalized fields and RETURNING clause provides full request data.
-
-5. **Fix retry query**: ✅ Fixed in proposal — uses explicit LEFT JOIN with GROUP BY.
-
-6. **Address `is_escalated`**: ✅ Added to proposal — moves to `request_templates` table.
-
-7. **Add `superseded` state handling**: ✅ Added to proposal — clarified that
-   supersession only applies to claimed requests (which have rows).
+4. **Fix retry query**: ✅ Fixed in proposal — uses explicit LEFT JOIN with GROUP BY.
 
 ---
 
@@ -287,11 +259,9 @@ existence checks — is elegant and efficient.
 
 **Status**: All recommended changes have been incorporated into the proposal:
 - ✅ Trigger issue was already resolved in the codebase (no action needed)
-- ✅ Claiming query now includes all denormalized fields
+- ✅ Claiming query creates minimal rows, JOINs for full data (no denormalization)
 - ✅ Retry query fixed with proper JOIN syntax
 - ✅ Batch creation stores `total_requests` for efficient status queries
-- ✅ Escalation section added with template-level tracking
-- ✅ Supersession handling clarified
 
 **Recommendation**: Proceed with implementation. The maintenance window requirement
 is acceptable given the performance benefits for large-scale usage.
@@ -299,5 +269,4 @@ is acceptable given the performance benefits for large-scale usage.
 **Implementation priority**:
 1. HIGH: Schema additions (Phase 1 — can deploy immediately)
 2. HIGH: Core claiming/completion logic
-3. MEDIUM: Escalation migration to template-level tracking
-4. LOW: Orphan cleanup job (can be added post-launch)
+3. LOW: Orphan cleanup job (can be added post-launch)

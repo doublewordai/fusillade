@@ -129,23 +129,18 @@ marked AS (
     RETURNING c.template_id, c.batch_id
 ),
 
--- Create request rows with denormalized template snapshot
+-- Create minimal request rows (template fields fetched via JOIN at execution)
 created AS (
-    INSERT INTO requests (
-        batch_id, template_id, state, daemon_id, claimed_at,
-        -- Denormalized snapshot fields
-        endpoint, method, path, body, model, api_key, custom_id
-    )
-    SELECT
-        m.batch_id, m.template_id, 'claimed', $4, $2,
-        t.endpoint, t.method, t.path, t.body, t.model, t.api_key, t.custom_id
+    INSERT INTO requests (batch_id, template_id, state, daemon_id, claimed_at, model, custom_id)
+    SELECT m.batch_id, m.template_id, 'claimed', $4, $2, t.model, t.custom_id
     FROM marked m
     JOIN request_templates t ON t.id = m.template_id
-    RETURNING
-        id, batch_id, template_id, endpoint, method, path, body, model, api_key, custom_id
+    RETURNING id, batch_id, template_id, model, custom_id
 )
 
-SELECT * FROM created;
+SELECT c.*, t.endpoint, t.method, t.path, t.body, t.api_key
+FROM created c
+JOIN request_templates t ON t.id = c.template_id;
 ```
 
 **Parameters:**
@@ -155,8 +150,8 @@ SELECT * FROM created;
 - `$3` — limit (INTEGER)
 - `$4` — daemon_id (UUID)
 
-The query returns all fields needed by the daemon to execute the request,
-avoiding a separate read after claiming.
+The INSERT creates minimal request rows. The final SELECT JOINs to templates to
+return all fields needed by the daemon — same pattern as current execution.
 
 ### Retry Handling
 
@@ -309,54 +304,6 @@ requests. Entries are removed when:
 3. A request is unclaimed (daemon shutdown, timeout)
 
 This keeps arrays small without requiring periodic cleanup.
-
-## Escalation and Supersession
-
-The existing escalation system creates new templates (with escalated model/API
-key) and new request rows when a batch is at risk of missing its SLA. With lazy
-request creation, the workflow simplifies:
-
-### Current Escalation Flow
-
-1. Identify at-risk requests via `escalated_from_request_id`
-2. Create new templates in an `escalation_templates` file
-3. Create new request rows with `is_escalated = true`
-4. Original and escalated requests race to completion
-5. Winner marks the loser as `superseded`
-
-### Updated Escalation Flow
-
-1. Identify at-risk templates (not requests) — templates in `batches_active_in`
-   where `batch.expires_at` is approaching
-2. Create new templates with `escalated_from_template_id` link (new column)
-3. New templates are claimed naturally via the standard claiming query
-4. On completion, supersede the racing request (same as before)
-
-### Schema Addition for Escalation
-
-```sql
-ALTER TABLE request_templates
-    ADD COLUMN escalated_from_template_id UUID REFERENCES request_templates(id) ON DELETE SET NULL,
-    ADD COLUMN is_escalated BOOLEAN NOT NULL DEFAULT FALSE;
-```
-
-The `is_escalated` flag moves from `requests` to `request_templates`. This
-ensures escalated requests are excluded from `total_requests` counting (they're
-in a separate virtual file anyway).
-
-### Supersession Handling
-
-The `superseded` state continues to work as before — it only affects requests
-that have been claimed (and thus have request rows). When an original or
-escalated request completes first, it marks the other as superseded:
-
-```sql
-UPDATE requests
-SET state = 'superseded', superseded_at = $2, superseded_by_request_id = $3
-WHERE id = $1;
-```
-
-No changes needed here since supersession only applies to in-flight requests.
 
 ## Orphan Cleanup
 
