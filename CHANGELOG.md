@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.1](https://github.com/doublewordai/fusillade/compare/fusillade-v2.3.0...fusillade-v2.3.1) (2026-01-27)
+
+
+### Bug Fixes
+
+* eliminate CPU spikes on batch cancellation ([#95](https://github.com/doublewordai/fusillade/issues/95)) ([6f50e91](https://github.com/doublewordai/fusillade/commit/6f50e916a2933e4d5d6fced3cb68e3953b2a4d74))
+
 ## [2.3.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.2.0...fusillade-v2.3.0) (2026-01-26)
 
 
