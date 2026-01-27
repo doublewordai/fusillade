@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                b.id, b.file_id as \"file_id?\", b.endpoint, b.completion_window, b.metadata,\n                b.output_file_id, b.error_file_id, b.created_by, b.created_at,\n                b.expires_at, b.cancelling_at, b.errors,\n                b.total_requests,\n                b.requests_started_at,\n                b.finalizing_at,\n                b.completed_at,\n                b.failed_at,\n                b.cancelled_at,\n                COALESCE(counts.pending, 0)::BIGINT as \"pending_requests!\",\n                COALESCE(counts.in_progress, 0)::BIGINT as \"in_progress_requests!\",\n                COALESCE(counts.completed, 0)::BIGINT as \"completed_requests!\",\n                COALESCE(counts.failed, 0)::BIGINT as \"failed_requests!\",\n                COALESCE(counts.canceled, 0)::BIGINT as \"canceled_requests!\"\n            FROM batches b\n            LEFT JOIN files f ON b.file_id = f.id\n            LEFT JOIN LATERAL (\n                SELECT\n                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,\n                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,\n                    COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,\n                    COUNT(*) FILTER (WHERE state = 'failed') as failed,\n                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled\n                FROM requests\n                WHERE batch_id = b.id\n                  AND is_escalated = false  -- Exclude escalated requests from batch accounting\n            ) counts ON TRUE\n            WHERE ($1::TEXT IS NULL OR b.created_by = $1)\n              AND ($3::TIMESTAMPTZ IS NULL OR b.created_at < $3 OR (b.created_at = $3 AND b.id < $4))\n              AND ($5::TEXT IS NULL OR LOWER(b.metadata::text) LIKE $5 OR LOWER(f.name) LIKE $5)\n            ORDER BY b.created_at DESC, b.id DESC\n            LIMIT $2\n            ",
+  "query": "\n            SELECT\n                b.id, b.file_id as \"file_id?\", b.endpoint, b.completion_window, b.metadata,\n                b.output_file_id, b.error_file_id, b.created_by, b.created_at,\n                b.expires_at, b.cancelling_at, b.errors,\n                b.total_requests,\n                b.requests_started_at,\n                b.finalizing_at,\n                b.completed_at,\n                b.failed_at,\n                b.cancelled_at,\n                COALESCE(counts.pending, 0)::BIGINT as \"pending_requests!\",\n                COALESCE(counts.in_progress, 0)::BIGINT as \"in_progress_requests!\",\n                COALESCE(counts.completed, 0)::BIGINT as \"completed_requests!\",\n                COALESCE(counts.failed, 0)::BIGINT as \"failed_requests!\",\n                COALESCE(counts.canceled, 0)::BIGINT as \"canceled_requests!\"\n            FROM batches b\n            LEFT JOIN LATERAL (\n                SELECT\n                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,\n                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,\n                    COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,\n                    COUNT(*) FILTER (WHERE state = 'failed') as failed,\n                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled\n                FROM requests\n                WHERE batch_id = b.id\n                AND is_escalated = false  -- Exclude escalated requests from batch accounting\n            ) counts ON TRUE\n            WHERE b.id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -121,11 +121,7 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Int8",
-        "Timestamptz",
-        "Uuid",
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -154,5 +150,5 @@
       null
     ]
   },
-  "hash": "7884ea7ce87edd2fc1acbb5becc0a5bae0e8db416377f99429afb111688f9928"
+  "hash": "aab26f248588d9665d3320d4e12339e99a221585092719f222f43cea5339c7aa"
 }
