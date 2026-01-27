@@ -337,21 +337,6 @@ only sees: claim → execute → complete. It has no knowledge of escalation.
 - **Simpler code** — Escalation logic lives in one place (Rust daemon)
 - **No cleanup** — No escalated templates or orphaned escalation records
 
-### Migration
-
-Existing escalation-related columns can be dropped:
-
-```sql
-ALTER TABLE requests
-    DROP COLUMN IF EXISTS is_escalated,
-    DROP COLUMN IF EXISTS escalated_from_request_id,
-    DROP COLUMN IF EXISTS superseded_at,
-    DROP COLUMN IF EXISTS superseded_by_request_id;
-```
-
-The virtual "escalation_templates" files and their templates can be deleted as
-part of cleanup.
-
 ## Orphan Cleanup
 
 This proposal uses `ON DELETE SET NULL` for foreign keys, consistent with the
@@ -476,15 +461,35 @@ CREATE INDEX retry_attempts_latest
    when `cancelling_at IS NOT NULL`, and (b) canceled requests have no useful response
    data to preserve.
 
-5. **Deploy new application code** with all logic changes:
+5. **Drop escalation columns** — No longer needed with runtime escalation:
+
+   ```sql
+   ALTER TABLE requests
+       DROP COLUMN IF EXISTS is_escalated,
+       DROP COLUMN IF EXISTS escalated_from_request_id,
+       DROP COLUMN IF EXISTS superseded_at,
+       DROP COLUMN IF EXISTS superseded_by_request_id;
+   ```
+
+6. **Clean up escalation templates** — Delete virtual files and their templates:
+
+   ```sql
+   DELETE FROM request_templates
+   WHERE file_id IN (SELECT id FROM files WHERE purpose = 'escalation_templates');
+
+   DELETE FROM files WHERE purpose = 'escalation_templates';
+   ```
+
+7. **Deploy new application code** with all logic changes:
    - Batch creation: no longer inserts request rows
    - Claiming: uses new query (creates request rows lazily)
    - Request completion: removes from `batches_active_in`
    - Retry handling: deletes request, removes from array, inserts `retry_attempt`
    - Unclaiming: deletes request, removes from array
    - Batch status: derives pending/canceled from counts
+   - Escalation: handled at execution time in Rust (check time remaining)
 
-6. **Restart daemons**
+8. **Restart daemons**
 
 ### Rollback Plan
 
