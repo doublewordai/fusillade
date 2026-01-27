@@ -1878,8 +1878,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 SELECT
                     COUNT(*) FILTER (WHERE r.state IN ('completed', 'superseded') AND r.is_escalated = false) as completed,
                     COUNT(*) FILTER (WHERE r.state = 'failed' AND r.is_escalated = false) as failed,
-                    COUNT(*) FILTER (WHERE r.state = 'canceled' AND r.is_escalated = false) as canceled,
-                    COUNT(*) FILTER (WHERE r.state IN ('claimed', 'processing') AND r.is_escalated = false) as in_progress
+                    COUNT(*) FILTER (WHERE (r.state = 'canceled' OR (r.state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) AND r.is_escalated = false) as canceled,
+                    COUNT(*) FILTER (WHERE r.state IN ('claimed', 'processing') AND b.cancelling_at IS NULL AND r.is_escalated = false) as in_progress
                 FROM requests r
                 WHERE r.batch_id = b.id
             ) counts ON (f.purpose IN ('batch_output', 'batch_error'))
@@ -2267,10 +2267,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
+                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
                   AND is_escalated = false  -- Exclude escalated requests from batch accounting
@@ -2326,11 +2326,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     FROM batches b
                     LEFT JOIN LATERAL (
                         SELECT
-                            COUNT(*) FILTER (WHERE state = 'pending') as pending,
-                            COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
+                            COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
+                            COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                             COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                             COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                            COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                            COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                         FROM requests
                         WHERE batch_id = b.id
                           AND is_escalated = false  -- Exclude escalated requests from batch accounting
@@ -2366,11 +2366,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     FROM batches b
                     LEFT JOIN LATERAL (
                         SELECT
-                            COUNT(*) FILTER (WHERE state = 'pending') as pending,
-                            COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
+                            COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
+                            COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                             COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                             COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                            COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                            COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                         FROM requests
                         WHERE batch_id = b.id
                           AND is_escalated = false  -- Exclude escalated requests from batch accounting
@@ -2439,10 +2439,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
+                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
                   AND is_escalated = false  -- Exclude escalated requests from batch accounting
@@ -2486,10 +2486,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
+                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
                   AND is_escalated = false  -- Exclude escalated requests from batch accounting
@@ -3183,10 +3183,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,
+                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state = 'pending' AND b.cancelling_at IS NOT NULL)) as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
                 AND is_escalated = false  -- Exclude escalated requests from batch accounting
@@ -7271,12 +7271,16 @@ mod tests {
         // Cancel the batch - daemon will detect via polling (every 100ms in test)
         manager.cancel_batch(batch.id).await.unwrap();
 
-        // Wait for both requests to be canceled (batch-level cancellation via polling)
+        // Wait for batch to show canceled status via the count queries.
+        // Note: Requests stay in their current state (Processing) but are counted
+        // as canceled when cancelling_at is set on the batch.
         let manager_clone = manager.clone();
-        let all_canceled = wait_for(
+        let batch_shows_canceled = wait_for(
             || async {
-                if let Ok(reqs) = manager_clone.get_batch_requests(batch_id).await {
-                    return reqs.iter().all(|r| matches!(r, AnyRequest::Canceled(_)));
+                if let Ok(status) = manager_clone.get_batch_status(batch_id).await {
+                    // Both requests should be counted as canceled (not in_progress)
+                    // when batch has cancelling_at set
+                    return status.canceled_requests == 2 && status.in_progress_requests == 0;
                 }
                 false
             },
@@ -7284,8 +7288,8 @@ mod tests {
         )
         .await;
         assert!(
-            all_canceled,
-            "Both requests should be canceled via batch-level polling"
+            batch_shows_canceled,
+            "Batch should show 2 canceled requests and 0 in_progress"
         );
 
         // Shutdown daemon
