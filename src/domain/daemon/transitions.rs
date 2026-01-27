@@ -1,6 +1,6 @@
 //! State transition implementations for daemon lifecycle.
 
-use super::types::{DaemonRecord, DaemonStats, Dead, Initializing, Running};
+use super::state::{DaemonRecord, DaemonStats, Dead, Initializing, Running};
 use crate::error::Result;
 use crate::manager::DaemonStorage;
 
@@ -66,9 +66,9 @@ impl DaemonRecord<Running> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{AnyDaemonRecord, DaemonData, DaemonStatus};
+    use super::super::state::{AnyDaemonRecord, DaemonData, DaemonStatus};
     use super::*;
-    use crate::request::DaemonId;
+    use crate::domain::request::DaemonId;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
@@ -81,7 +81,7 @@ mod tests {
 
     #[async_trait]
     impl DaemonStorage for MockDaemonStorage {
-        async fn persist_daemon<T: super::super::types::DaemonState + Clone>(
+        async fn persist_daemon<T: super::super::state::DaemonState + Clone>(
             &self,
             record: &DaemonRecord<T>,
         ) -> Result<()>

@@ -15,12 +15,10 @@ use crate::http::{HttpClient, HttpResponse};
 use crate::manager::{DaemonStorage, Storage};
 use crate::request::{DaemonId, RequestCompletionResult, RequestId, RequestStateFilter};
 
-pub mod transitions;
-pub mod types;
-
-pub use types::{
+// Re-export daemon types from domain module
+pub use crate::domain::daemon::{
     AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
-    Initializing, Running,
+    Initializing, Running, get_hostname, get_pid, get_version,
 };
 
 /// Predicate function to determine if a response should be retried.
@@ -408,9 +406,9 @@ where
         let daemon_record = DaemonRecord {
             data: DaemonData {
                 id: self.daemon_id,
-                hostname: types::get_hostname(),
-                pid: types::get_pid(),
-                version: types::get_version(),
+                hostname: get_hostname(),
+                pid: get_pid(),
+                version: get_version(),
                 config_snapshot: serde_json::to_value(&self.config)
                     .expect("Failed to serialize daemon config"),
             },
@@ -881,14 +879,14 @@ where
                                 let cancellation = async {
                                     tokio::select! {
                                         _ = batch_cancellation_token.cancelled() => {
-                                            crate::request::transitions::CancellationReason::User
+                                            crate::domain::request::transitions::CancellationReason::User
                                         }
                                         _ = request_cancellation_token.cancelled() => {
                                             // Request was superseded by its racing pair - don't persist as canceled
-                                            crate::request::transitions::CancellationReason::Superseded
+                                            crate::domain::request::transitions::CancellationReason::Superseded
                                         }
                                         _ = shutdown_token.cancelled() => {
-                                            crate::request::transitions::CancellationReason::Shutdown
+                                            crate::domain::request::transitions::CancellationReason::Shutdown
                                         }
                                     }
                                 };

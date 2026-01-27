@@ -11,7 +11,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
-use crate::batch::{BatchId, TemplateId};
+use crate::domain::batch::BatchId;
+use crate::domain::file::TemplateId;
 use crate::error::Result;
 use crate::http::HttpResponse;
 
@@ -196,7 +197,7 @@ impl RequestState for Completed {}
 ///
 /// This enum distinguishes between different types of failures to determine
 /// whether a request should be retried.
-#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "details")]
 pub enum FailureReason {
     /// HTTP request returned a status code that should be retried (e.g., 429, 500, 503).

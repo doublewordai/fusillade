@@ -66,7 +66,7 @@
 //! Exponential backoff and retry limits are configured via [`RetryConfig`]:
 //!
 //! ```rust
-//! # use fusillade::request::transitions::RetryConfig;
+//! # use fusillade::domain::request::transitions::RetryConfig;
 //! let config = RetryConfig {
 //!     max_retries: Some(1000),
 //!     stop_before_deadline_ms: Some(900_000),
@@ -74,32 +74,6 @@
 //!     backoff_factor: 2,        // Double each time (1s, 2s, 4s)
 //!     max_backoff_ms: 60000,    // Cap at 60 seconds
 //! };
-//! ```
-//!
-//! # Example Workflow
-//!
-//! ```ignore
-//! // Daemon claims a pending request
-//! let pending: Request<Pending> = storage.next_pending().await?;
-//! let claimed = pending.claim(daemon_id, &storage).await?;
-//!
-//! // Start processing
-//! let processing = claimed.process(http_client, timeout_ms, &storage).await?;
-//!
-//! // Wait for completion
-//! let result = processing.complete(&storage, |resp| resp.status >= 500).await?;
-//!
-//! match result {
-//!     Ok(completed) => println!("Success: {}", completed.state.response_status),
-//!     Err(failed) => {
-//!         // Attempt retry with backoff
-//!         if let Some(retrying) = failed.retry(retry_attempt, config, &storage).await? {
-//!             println!("Retrying request...");
-//!         } else {
-//!             println!("Max retries exceeded");
-//!         }
-//!     }
-//! }
 //! ```
 
 use std::sync::Arc;
@@ -114,7 +88,7 @@ use crate::{
     manager::Storage,
 };
 
-use super::types::{
+use super::state::{
     Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, Pending, Processing, Request,
     RequestCompletionResult,
 };

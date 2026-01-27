@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::types::RequestId;
+use crate::domain::request::RequestId;
 
 /// Result type alias using the fusillade error type.
 pub type Result<T> = std::result::Result<T, FusilladeError>;

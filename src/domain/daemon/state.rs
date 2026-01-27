@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::request::DaemonId;
+use crate::domain::request::DaemonId;
 
 /// Marker trait for valid daemon states.
 pub trait DaemonState: Send + Sync {}

@@ -1443,7 +1443,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     data,
                 })),
                 "superseded" => Ok(AnyRequest::Superseded(Request {
-                    state: crate::request::types::Superseded {
+                    state: crate::domain::request::Superseded {
                         superseded_at: row.superseded_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!(
                                 "Missing superseded_at for superseded request"
@@ -3079,7 +3079,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     data,
                 }),
                 "superseded" => AnyRequest::Superseded(Request {
-                    state: crate::request::types::Superseded {
+                    state: crate::domain::request::Superseded {
                         superseded_at: row.superseded_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!(
                                 "Missing superseded_at for superseded execution"

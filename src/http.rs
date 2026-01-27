@@ -3,8 +3,8 @@
 //! This module defines the `HttpClient` trait to abstract HTTP request execution,
 //! enabling testability with mock implementations.
 
+use crate::domain::request::RequestData;
 use crate::error::Result;
-use crate::types::RequestData;
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -740,7 +740,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_custom_id_with_newline_is_not_retriable() {
-        use crate::request::types::FailureReason;
+        use crate::domain::request::FailureReason;
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),

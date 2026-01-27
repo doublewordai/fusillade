@@ -1,13 +1,9 @@
 //! Request aggregate - domain model and state transitions.
 //!
-//! This module contains the core domain logic for requests:
-//! - Request types and states (typestate pattern)
-//! - State transition methods
-//! - Value objects (RequestData, etc.)
+//! This module re-exports types from `domain::request`.
+//! See that module for the actual implementations.
 
-pub mod transitions;
-pub mod types;
-
-// Re-export commonly used types
-pub use transitions::CancellationReason;
-pub use types::*;
+// Re-export all request types and transitions
+pub use crate::domain::request::{
+    state::*, transitions::CancellationReason, transitions::RetryConfig,
+};
