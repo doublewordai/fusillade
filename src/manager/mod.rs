@@ -269,6 +269,13 @@ pub trait Storage: Send + Sync {
 
     /// The following methods are defined specifically for requests - i.e. independent of the
     /// files/batches they belong to.
+
+    /// Get pending request counts grouped by model and completion window.
+    ///
+    /// This excludes escalated racing requests (`is_escalated = true`).
+    async fn get_pending_request_counts_by_model_and_completion_window(
+        &self,
+    ) -> Result<HashMap<String, HashMap<String, i64>>>;
     ///
     /// Cancel one or more individual pending or in-progress requests.
     ///

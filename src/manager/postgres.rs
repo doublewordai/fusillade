@@ -700,6 +700,45 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 // Implement Storage trait directly (no delegation)
 #[async_trait]
 impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManager<P, H> {
+    async fn get_pending_request_counts_by_model_and_completion_window(
+        &self,
+    ) -> Result<HashMap<String, HashMap<String, i64>>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                r.model as "model!",
+                b.completion_window as "completion_window!",
+                COUNT(*)::BIGINT as "count!"
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            WHERE r.state = 'pending'
+              AND r.is_escalated = false
+              AND r.template_id IS NOT NULL
+              AND b.cancelling_at IS NULL
+            GROUP BY r.model, b.completion_window
+            ORDER BY r.model ASC, b.completion_window ASC
+            "#
+        )
+        .fetch_all(self.pools.read())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to get pending request counts by model and completion window: {}",
+                e
+            ))
+        })?;
+
+        let mut result: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        for row in rows {
+            result
+                .entry(row.model)
+                .or_default()
+                .insert(row.completion_window, row.count);
+        }
+
+        Ok(result)
+    }
+
     async fn claim_requests(
         &self,
         limit: usize,
