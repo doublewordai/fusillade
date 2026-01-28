@@ -46,9 +46,11 @@ fn default_model_escalations() -> Arc<dashmap::DashMap<String, ModelEscalationCo
     Arc::new(dashmap::DashMap::new())
 }
 
-/// Default escalation threshold (1 hour)
+/// Default escalation threshold (15 minutes)
+/// This should be greater than the processing timeout (10 minutes) to allow
+/// a processing request to fall back to pending before escalation kicks in.
 fn default_escalation_threshold_seconds() -> i64 {
-    3600
+    900
 }
 
 /// Model-based escalation configuration for routing requests to a different model
@@ -64,7 +66,7 @@ pub struct ModelEscalationConfig {
     pub escalation_model: String,
 
     /// Time threshold in seconds - escalate when time remaining before batch expiry
-    /// is less than this value. Default: 3600 (1 hour)
+    /// is less than this value. Default: 900 (15 minutes)
     #[serde(default = "default_escalation_threshold_seconds")]
     pub escalation_threshold_seconds: i64,
 }
