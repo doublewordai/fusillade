@@ -10,12 +10,9 @@ use crate::batch::{
 use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::http::HttpClient;
-use crate::request::{
-    AnyRequest, Claimed, DaemonId, Request, RequestId, RequestState, RequestStateFilter,
-};
+use crate::request::{AnyRequest, Claimed, DaemonId, Request, RequestId, RequestState};
 use async_trait::async_trait;
 use futures::stream::Stream;
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -135,9 +132,6 @@ pub trait Storage: Send + Sync {
     /// - The error message (for failed requests)
     /// - The current status
     ///
-    /// Results are filtered to exclude superseded requests (those that lost the race
-    /// to their escalated pair). This ensures exactly one result per input template.
-    ///
     /// # Arguments
     /// - `batch_id`: The batch to get results for
     /// - `offset`: Number of results to skip (for pagination)
@@ -150,87 +144,6 @@ pub trait Storage: Send + Sync {
         search: Option<String>,
         status: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>>;
-
-    /// Find a pending escalated request for a given original request.
-    ///
-    /// When a request is escalated, both the original and escalated request race.
-    /// This method finds the escalated request (if any) that was created from
-    /// the given original request ID and is still in a pending/claimed/processing state.
-    ///
-    /// This is much more efficient than `get_batch_requests` for finding a single
-    /// escalated request, as it uses a targeted query instead of fetching all
-    /// requests in the batch.
-    ///
-    /// # Returns
-    /// The request ID of the pending escalated request, or None if not found.
-    async fn find_pending_escalation(
-        &self,
-        original_request_id: RequestId,
-    ) -> Result<Option<RequestId>>;
-
-    /// Get batches at risk of missing their SLA deadline.
-    ///
-    /// Returns a map of batch IDs to the count of requests in that batch
-    /// that are at risk of missing the SLA. Useful for logging SLA violations.
-    ///
-    /// # Arguments
-    /// - `threshold_seconds`: Time remaining threshold (e.g., 3600 for 1 hour)
-    /// - `allowed_states`: List of request states to count
-    ///
-    /// # Returns
-    /// HashMap mapping BatchId to the count of at-risk requests
-    async fn get_at_risk_batches(
-        &self,
-        threshold_seconds: i64,
-        allowed_states: &[RequestStateFilter],
-    ) -> Result<HashMap<BatchId, usize>>;
-
-    /// Get batches with requests that have already missed their SLA deadline.
-    ///
-    /// Returns a count of requests per batch where the deadline has passed.
-    /// Only considers batches that are not completed, failed, or cancelled.
-    ///
-    /// # Arguments
-    /// - `allowed_states`: List of request states to count
-    ///
-    /// # Returns
-    /// HashMap mapping BatchId to the count of requests that missed SLA
-    async fn get_missed_sla_batches(
-        &self,
-        allowed_states: &[RequestStateFilter],
-    ) -> Result<HashMap<BatchId, usize>>;
-
-    /// Create escalated requests for at-risk requests in a single operation.
-    ///
-    /// Creates escalated copies of all requests matching the criteria.
-    /// Automatically skips requests that already have escalations.
-    ///
-    /// Escalated requests:
-    /// - Have the same template/body as the original (from request_templates)
-    /// - Use the overridden model if provided, otherwise same model as original
-    /// - Are marked with `is_escalated = true` (invisible to batch accounting)
-    /// - Link back to original via `escalated_from_request_id`
-    /// - Priority endpoint routing is handled by the daemon at request processing time
-    ///
-    /// Both requests race through normal queue processing. First to complete wins.
-    ///
-    /// # Arguments
-    /// - `model`: The model to filter requests by (e.g., "gpt-4")
-    /// - `threshold_seconds`: Seconds since batch creation to consider at-risk
-    /// - `allowed_states`: List of request states to escalate
-    /// - `model_override`: Optional model name to use for escalated requests (e.g., "gpt-4-priority")
-    /// - `api_key_override`: Optional API key to use for escalated requests
-    ///
-    /// # Returns
-    /// The number of escalated requests created
-    async fn create_escalated_requests(
-        &self,
-        model: &str,
-        threshold_seconds: i64,
-        allowed_states: &[RequestStateFilter],
-        model_override: Option<&str>,
-        api_key_override: Option<&str>,
-    ) -> Result<i64>;
 
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
@@ -306,14 +219,13 @@ pub trait Storage: Send + Sync {
                         req.cancel(self).await?;
                         Ok(())
                     }
-                    AnyRequest::Completed(_)
-                    | AnyRequest::Failed(_)
-                    | AnyRequest::Canceled(_)
-                    | AnyRequest::Superseded(_) => Err(crate::error::FusilladeError::InvalidState(
-                        id,
-                        "terminal state".to_string(),
-                        "cancellable state".to_string(),
-                    )),
+                    AnyRequest::Completed(_) | AnyRequest::Failed(_) | AnyRequest::Canceled(_) => {
+                        Err(crate::error::FusilladeError::InvalidState(
+                            id,
+                            "terminal state".to_string(),
+                            "cancellable state".to_string(),
+                        ))
+                    }
                 },
                 Err(e) => Err(e),
             };
