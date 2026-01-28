@@ -718,7 +718,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let now = Utc::now();
 
         // Get all models with pending requests
-        // Exclude requests from cancelled batches
+        // Exclude requests from cancelled or soft-deleted batches
         let mut models = sqlx::query_scalar!(
             r#"
             SELECT DISTINCT r.model
@@ -727,6 +727,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             WHERE r.state = 'pending'
                 AND (r.not_before IS NULL OR r.not_before <= $1)
                 AND b.cancelling_at IS NULL
+                AND b.deleted_at IS NULL
             "#,
             now
         )
@@ -800,6 +801,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         AND r.template_id IS NOT NULL
                         AND (r.not_before IS NULL OR r.not_before <= $3)
                         AND b.cancelling_at IS NULL
+                        AND b.deleted_at IS NULL
                         AND available_slots.slots > 0
                     ORDER BY b.expires_at ASC
                     LIMIT LEAST($5, (SELECT slots FROM available_slots))
@@ -2521,6 +2523,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
               AND b.failed_at IS NULL
               AND b.cancelled_at IS NULL
               AND b.cancelling_at IS NULL
+              AND b.deleted_at IS NULL
               AND r.state = ANY($2)
             GROUP BY r.batch_id
             "#,
@@ -2555,6 +2558,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
               AND b.failed_at IS NULL
               AND b.cancelled_at IS NULL
               AND b.cancelling_at IS NULL
+              AND b.deleted_at IS NULL
               AND r.state = ANY($1)
             GROUP BY r.batch_id
             "#,
@@ -2639,6 +2643,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                   AND b.completed_at IS NULL
                   AND b.cancelled_at IS NULL
                   AND b.cancelling_at IS NULL
+                  AND b.deleted_at IS NULL
                   AND (b.expires_at - NOW()) <= make_interval(secs => $3::float8)
                   -- Only create escalation if one doesn't already exist
                   AND NOT EXISTS (
