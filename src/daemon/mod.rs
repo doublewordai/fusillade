@@ -529,7 +529,9 @@ where
                         // For now, we'll check each batch individually
                         for batch_id in active_batch_ids {
                             // Try to get the batch - if it has cancelling_at set, cancel the token
-                            if let Ok(batch) = storage.get_batch(batch_id).await
+                            if let Ok(batch) = storage
+                                .get_batch(batch_id, crate::batch::ErrorFilter::All)
+                                .await
                                 && batch.cancelling_at.is_some()
                                     && let Some(entry) = cancellation_tokens.get(&batch_id) {
                                         entry.value().cancel();
@@ -1410,7 +1412,7 @@ mod tests {
 
         while start.elapsed() < timeout {
             let status = manager
-                .get_batch_status(batch.id)
+                .get_batch_status(batch.id, crate::batch::ErrorFilter::All)
                 .await
                 .expect("Failed to get batch status");
 
@@ -1735,7 +1737,7 @@ mod tests {
 
         while start.elapsed() < timeout {
             let status = manager
-                .get_batch_status(batch.id)
+                .get_batch_status(batch.id, crate::batch::ErrorFilter::All)
                 .await
                 .expect("Failed to get batch status");
 

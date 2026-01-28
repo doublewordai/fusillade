@@ -371,7 +371,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
 
     while start.elapsed() < timeout {
         let status = manager
-            .get_batch_status(batch.id)
+            .get_batch_status(batch.id, fusillade::batch::ErrorFilter::All)
             .await
             .expect("Failed to get batch status");
 
@@ -686,7 +686,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
 
     while start.elapsed() < timeout {
         let status = manager
-            .get_batch_status(batch.id)
+            .get_batch_status(batch.id, fusillade::batch::ErrorFilter::All)
             .await
             .expect("Failed to get batch status");
 
@@ -1310,7 +1310,7 @@ mod sla {
 
         // Verify: Batch progress counts only the winner (escalated requests don't count)
         let batch_status = manager
-            .get_batch_status(batch.id)
+            .get_batch_status(batch.id, fusillade::batch::ErrorFilter::All)
             .await
             .expect("Failed to get batch status");
 
@@ -1488,7 +1488,7 @@ mod sla {
 
         // Verify batch status
         let batch_status = manager
-            .get_batch_status(batch.id)
+            .get_batch_status(batch.id, fusillade::batch::ErrorFilter::All)
             .await
             .expect("Failed to get batch status");
         assert_eq!(batch_status.total_requests, 1);
@@ -1680,7 +1680,7 @@ mod sla {
 
         // Batch should show 0/1 completed, 1/1 failed
         let batch_status = manager
-            .get_batch_status(batch.id)
+            .get_batch_status(batch.id, fusillade::batch::ErrorFilter::All)
             .await
             .expect("Failed to get batch status");
         assert_eq!(
@@ -1893,7 +1893,7 @@ mod sla {
 
         // Batch shows 1/1 completed (superseded doesn't count as complete or failed)
         let batch_status = manager
-            .get_batch_status(batch.id)
+            .get_batch_status(batch.id, fusillade::batch::ErrorFilter::All)
             .await
             .expect("Failed to get batch status");
         assert_eq!(batch_status.completed_requests, 1);
@@ -2088,15 +2088,15 @@ mod sla {
         let start = tokio::time::Instant::now();
         while start.elapsed() < Duration::from_secs(3) {
             let status1 = manager
-                .get_batch_status(batch1.id)
+                .get_batch_status(batch1.id, fusillade::batch::ErrorFilter::All)
                 .await
                 .expect("Failed to get batch1 status");
             let status2 = manager
-                .get_batch_status(batch2.id)
+                .get_batch_status(batch2.id, fusillade::batch::ErrorFilter::All)
                 .await
                 .expect("Failed to get batch2 status");
             let status3 = manager
-                .get_batch_status(batch3.id)
+                .get_batch_status(batch3.id, fusillade::batch::ErrorFilter::All)
                 .await
                 .expect("Failed to get batch3 status");
             if status1.completed_requests == 1
@@ -2112,15 +2112,15 @@ mod sla {
 
         // All 3 batches should show 1/1 completed
         let batch1_status = manager
-            .get_batch_status(batch1.id)
+            .get_batch_status(batch1.id, fusillade::batch::ErrorFilter::All)
             .await
             .expect("Failed to get batch1 status");
         let batch2_status = manager
-            .get_batch_status(batch2.id)
+            .get_batch_status(batch2.id, fusillade::batch::ErrorFilter::All)
             .await
             .expect("Failed to get batch2 status");
         let batch3_status = manager
-            .get_batch_status(batch3.id)
+            .get_batch_status(batch3.id, fusillade::batch::ErrorFilter::All)
             .await
             .expect("Failed to get batch3 status");
 
@@ -2313,7 +2313,7 @@ mod sla {
         let start = tokio::time::Instant::now();
         while start.elapsed() < Duration::from_secs(3) {
             let status = manager
-                .get_batch_status(batch.id)
+                .get_batch_status(batch.id, fusillade::batch::ErrorFilter::All)
                 .await
                 .expect("Failed to get status");
             if status.completed_requests == 3 {
@@ -2340,7 +2340,7 @@ mod sla {
 
         // Verify batch status: 3/3 completed (superseded requests don't count)
         let batch_status = manager
-            .get_batch_status(batch.id)
+            .get_batch_status(batch.id, fusillade::batch::ErrorFilter::All)
             .await
             .expect("Failed to get batch status");
         assert_eq!(batch_status.total_requests, 3);
@@ -2538,7 +2538,7 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
         }
 
         let status = manager
-            .get_batch_status(batch.id)
+            .get_batch_status(batch.id, fusillade::batch::ErrorFilter::All)
             .await
             .expect("Failed to get batch status");
 
@@ -2553,7 +2553,7 @@ async fn test_sla_escalation_model_override(pool: sqlx::PgPool) {
 
     // Verify batch status
     let batch_status = manager
-        .get_batch_status(batch.id)
+        .get_batch_status(batch.id, fusillade::batch::ErrorFilter::All)
         .await
         .expect("Failed to get batch status");
     assert_eq!(batch_status.total_requests, 1);
@@ -2886,7 +2886,13 @@ mod batch_results_stream {
         manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
         batch_id: fusillade::batch::BatchId,
     ) -> Vec<fusillade::batch::BatchResultItem> {
-        let stream = manager.get_batch_results_stream(batch_id, 0, None, None);
+        let stream = manager.get_batch_results_stream(
+            batch_id,
+            0,
+            None,
+            None,
+            fusillade::batch::ErrorFilter::All,
+        );
         stream
             .filter_map(|r| async { r.ok() })
             .collect::<Vec<_>>()
@@ -3573,7 +3579,13 @@ mod batch_results_stream {
         .expect("Failed to clear file_id");
 
         // Try to get results - should get an error
-        let stream = manager.get_batch_results_stream(batch.id, 0, None, None);
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            0,
+            None,
+            None,
+            fusillade::batch::ErrorFilter::All,
+        );
         let results: Vec<_> = stream.collect().await;
 
         // Should have one error result
@@ -3678,7 +3690,13 @@ mod batch_results_stream {
         assert_eq!(all_results.len(), 5, "Should have 5 results");
 
         // Get with offset 2
-        let stream = manager.get_batch_results_stream(batch.id, 2, None, None);
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            2,
+            None,
+            None,
+            fusillade::batch::ErrorFilter::All,
+        );
         let offset_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(
@@ -3791,8 +3809,13 @@ mod batch_results_stream {
         shutdown_token.cancel();
 
         // Filter by completed
-        let stream =
-            manager.get_batch_results_stream(batch.id, 0, None, Some("completed".to_string()));
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            0,
+            None,
+            Some("completed".to_string()),
+            fusillade::batch::ErrorFilter::All,
+        );
         let completed_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(
@@ -3805,8 +3828,13 @@ mod batch_results_stream {
         }
 
         // Filter by failed
-        let stream =
-            manager.get_batch_results_stream(batch.id, 0, None, Some("failed".to_string()));
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            0,
+            None,
+            Some("failed".to_string()),
+            fusillade::batch::ErrorFilter::All,
+        );
         let failed_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(failed_results.len(), 1, "Should have 1 failed result");
@@ -3916,8 +3944,13 @@ mod batch_results_stream {
         shutdown_token.cancel();
 
         // Search for "request" (case-insensitive)
-        let stream =
-            manager.get_batch_results_stream(batch.id, 0, Some("request".to_string()), None);
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            0,
+            Some("request".to_string()),
+            None,
+            fusillade::batch::ErrorFilter::All,
+        );
         let search_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(
@@ -3934,7 +3967,13 @@ mod batch_results_stream {
         assert!(custom_ids.contains(&&"Beta-Request".to_string()));
 
         // Search for "ALPHA" (case-insensitive)
-        let stream = manager.get_batch_results_stream(batch.id, 0, Some("ALPHA".to_string()), None);
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            0,
+            Some("ALPHA".to_string()),
+            None,
+            fusillade::batch::ErrorFilter::All,
+        );
         let alpha_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(alpha_results.len(), 1, "Should find 1 result for 'ALPHA'");

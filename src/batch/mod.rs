@@ -107,6 +107,18 @@ pub enum OutputFileType {
     Error,
 }
 
+/// Filter for error types when querying batch/file data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorFilter {
+    /// Include all failed requests regardless of retryability
+    All,
+    /// Include only retriable failures (429, 503, network errors, etc.)
+    OnlyRetriable,
+    /// Include only non-retriable failures (400, 404, validation errors, etc.)
+    OnlyNonRetriable,
+}
+
 impl fmt::Display for Purpose {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -407,6 +419,8 @@ pub struct Batch {
     pub in_progress_requests: i64,
     pub completed_requests: i64,
     pub failed_requests: i64,
+    pub failed_requests_retriable: i64,
+    pub failed_requests_non_retriable: i64,
     pub canceled_requests: i64,
     pub requests_started_at: Option<DateTime<Utc>>,
 
@@ -428,6 +442,8 @@ pub struct BatchStatus {
     pub in_progress_requests: i64,
     pub completed_requests: i64,
     pub failed_requests: i64,
+    pub failed_requests_retriable: i64,
+    pub failed_requests_non_retriable: i64,
     pub canceled_requests: i64,
     pub started_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
