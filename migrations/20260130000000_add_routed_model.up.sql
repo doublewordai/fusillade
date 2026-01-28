@@ -34,7 +34,11 @@ ALTER TABLE requests ADD CONSTRAINT state_check CHECK (
     state IN ('pending', 'claimed', 'processing', 'completed', 'failed', 'canceled')
 );
 
--- Recreate the active_requests view without the removed columns
+-- Add routed_model to track what model was actually used (may differ from template
+-- if request was routed to escalation model at claim time)
+ALTER TABLE requests ADD COLUMN routed_model TEXT NULL;
+
+-- Recreate the active_requests view without the removed columns, including routed_model
 CREATE VIEW active_requests AS
 SELECT
     id,
@@ -56,6 +60,7 @@ SELECT
     updated_at,
     custom_id,
     model,
-    response_size
+    response_size,
+    routed_model
 FROM requests
 WHERE batch_id IS NOT NULL;

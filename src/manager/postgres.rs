@@ -979,7 +979,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         claimed_at = $4,
                         started_at = $5,
                         completed_at = $6,
-                        response_size = $7
+                        response_size = $7,
+                        routed_model = $8
                     WHERE id = $1
                     "#,
                     *req.data.id as Uuid,
@@ -989,6 +990,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     req.state.started_at,
                     req.state.completed_at,
                     response_size,
+                    req.state.routed_model,
                 )
                 .execute(self.pools.write())
                 .await
@@ -1016,14 +1018,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         retry_attempt = $2,
                         error = $3,
                         failed_at = $4,
-                        response_size = $5
+                        response_size = $5,
+                        routed_model = $6
                     WHERE id = $1
                     "#,
                     *req.data.id as Uuid,
                     req.state.retry_attempt as i32,
                     error_json,
                     req.state.failed_at,
-                    response_size
+                    response_size,
+                    req.state.routed_model,
                 )
                 .execute(self.pools.write())
                 .await
@@ -1070,7 +1074,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
-                b.expires_at as batch_expires_at
+                b.expires_at as batch_expires_at, r.routed_model
             FROM requests r
             LEFT JOIN active_request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
@@ -1215,6 +1219,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 "Missing completed_at for completed request"
                             ))
                         })?,
+                        // Fall back to template model for old data without routed_model
+                        routed_model: row.routed_model.unwrap_or_else(|| data.model.clone()),
                     },
                     data,
                 })),
@@ -1243,6 +1249,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             })?,
                             retry_attempt: row.retry_attempt as u32,
                             batch_expires_at: row.batch_expires_at,
+                            // Fall back to template model for old data without routed_model
+                            routed_model: row.routed_model.unwrap_or_else(|| data.model.clone()),
                         },
                         data,
                     }))
@@ -2511,7 +2519,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
-                b.expires_at as batch_expires_at
+                b.expires_at as batch_expires_at, r.routed_model
             FROM requests r
             LEFT JOIN active_request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
@@ -2650,6 +2658,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 "Missing completed_at for completed execution"
                             ))
                         })?,
+                        // Fall back to template model for old data without routed_model
+                        routed_model: row.routed_model.unwrap_or_else(|| data.model.clone()),
                     },
                     data,
                 }),
@@ -2678,6 +2688,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             })?,
                             retry_attempt: row.retry_attempt as u32,
                             batch_expires_at: row.batch_expires_at,
+                            // Fall back to template model for old data without routed_model
+                            routed_model: row.routed_model.unwrap_or_else(|| data.model.clone()),
                         },
                         data,
                     })

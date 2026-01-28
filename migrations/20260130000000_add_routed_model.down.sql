@@ -1,6 +1,9 @@
 -- Restore escalation support columns, constraints, and indexes
 -- Note: This does not restore any deleted escalated/superseded requests
 
+-- Drop routed_model column added in the up migration
+ALTER TABLE requests DROP COLUMN IF EXISTS routed_model;
+
 -- Add 'superseded' to the allowed states
 ALTER TABLE requests DROP CONSTRAINT state_check;
 ALTER TABLE requests ADD CONSTRAINT state_check CHECK (

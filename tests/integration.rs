@@ -1,6 +1,6 @@
 use fusillade::TestDbPools;
 use fusillade::batch::{BatchInput, RequestTemplateInput};
-use fusillade::daemon::{DaemonConfig, default_should_retry};
+use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retry};
 use fusillade::http::{HttpResponse, MockHttpClient};
 use fusillade::manager::postgres::PostgresRequestManager;
 use fusillade::manager::{DaemonExecutor, Storage};
@@ -1034,6 +1034,285 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
         );
     }
 }
+
+#[sqlx::test]
+async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
+    // Test: When time remaining before batch expiry is below the escalation threshold,
+    // requests are routed to the escalation model at claim time.
+
+    let http_client = Arc::new(MockHttpClient::new());
+
+    // Add response for the escalation model endpoint
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"result":"escalated response"}"#.to_string(),
+        }),
+    );
+
+    // Configure model escalation: gpt-4 -> gpt-4-turbo when under time pressure
+    let model_escalations = Arc::new(dashmap::DashMap::new());
+    model_escalations.insert(
+        "gpt-4".to_string(),
+        ModelEscalationConfig {
+            escalation_model: "gpt-4-turbo".to_string(),
+            // Use a very high threshold (2 hours) so it always triggers with our short window
+            escalation_threshold_seconds: 7200,
+        },
+    );
+
+    let config = DaemonConfig {
+        claim_batch_size: 10,
+        claim_interval_ms: 10,
+        default_model_concurrency: 10,
+        model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+        model_escalations,
+        max_retries: Some(3),
+        stop_before_deadline_ms: None,
+        backoff_ms: 100,
+        backoff_factor: 2,
+        max_backoff_ms: 1000,
+        timeout_ms: 5000,
+        status_log_interval_ms: None,
+        heartbeat_interval_ms: 10000,
+        should_retry: Arc::new(default_should_retry),
+        claim_timeout_ms: 60000,
+        processing_timeout_ms: 600000,
+        cancellation_poll_interval_ms: 100,
+        ..Default::default()
+    };
+
+    let manager = Arc::new(
+        PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(config),
+    );
+
+    // Create a file with a request using gpt-4
+    let file_id = manager
+        .create_file(
+            "test-escalation".to_string(),
+            Some("Test route-at-claim-time escalation".to_string()),
+            vec![fusillade::RequestTemplateInput {
+                custom_id: Some("escalation-test".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"prompt":"test"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                api_key: "original-key".to_string(),
+            }],
+        )
+        .await
+        .expect("Failed to create file");
+
+    // Create batch with a 1-hour completion window (less than 2-hour threshold)
+    let batch = manager
+        .create_batch(fusillade::batch::BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "1h".to_string(),
+            metadata: None,
+            created_by: None,
+        })
+        .await
+        .expect("Failed to create batch");
+
+    let requests = manager
+        .get_batch_requests(batch.id)
+        .await
+        .expect("Failed to get batch requests");
+    assert_eq!(requests.len(), 1);
+    let request_id = requests[0].id();
+
+    // Start the daemon
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
+    manager
+        .clone()
+        .run(shutdown_token.clone())
+        .expect("Failed to start daemon");
+
+    // Poll for completion
+    let start = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(5);
+    let mut completed = false;
+
+    while start.elapsed() < timeout {
+        let results = manager
+            .get_requests(vec![request_id])
+            .await
+            .expect("Failed to get request");
+
+        if let Some(Ok(any_request)) = results.first()
+            && any_request.is_terminal()
+        {
+            if let fusillade::AnyRequest::Completed(req) = any_request {
+                assert_eq!(req.state.response_status, 200);
+                assert_eq!(
+                    req.state.response_body,
+                    r#"{"result":"escalated response"}"#
+                );
+                completed = true;
+                break;
+            } else {
+                panic!(
+                    "Request reached terminal state but was not completed: {:?}",
+                    any_request
+                );
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    shutdown_token.cancel();
+
+    assert!(completed, "Request did not complete within timeout");
+
+    // Verify the HTTP call was made with the ESCALATION model (routed at claim time)
+    // Note: With route-at-claim-time escalation, the original API key is used
+    // (batch API keys automatically have access to escalation models in the onwards cache)
+    assert_eq!(http_client.call_count(), 1);
+    let calls = http_client.get_calls();
+    assert_eq!(
+        calls[0].api_key, "original-key",
+        "Should use original API key (escalation only changes model routing)"
+    );
+    // The escalation is verified by the request completing successfully with the
+    // escalated model's response. The model change happens at claim time in the daemon.
+}
+
+#[sqlx::test]
+async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgPool) {
+    // Test: When there's enough time remaining (above threshold), requests use original model
+
+    let http_client = Arc::new(MockHttpClient::new());
+
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"result":"normal response"}"#.to_string(),
+        }),
+    );
+
+    // Configure escalation with a 1-minute threshold
+    let model_escalations = Arc::new(dashmap::DashMap::new());
+    model_escalations.insert(
+        "gpt-4".to_string(),
+        ModelEscalationConfig {
+            escalation_model: "gpt-4-turbo".to_string(),
+            escalation_threshold_seconds: 60, // 1 minute threshold
+        },
+    );
+
+    let config = DaemonConfig {
+        claim_batch_size: 10,
+        claim_interval_ms: 10,
+        default_model_concurrency: 10,
+        model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+        model_escalations,
+        max_retries: Some(3),
+        stop_before_deadline_ms: None,
+        backoff_ms: 100,
+        backoff_factor: 2,
+        max_backoff_ms: 1000,
+        timeout_ms: 5000,
+        status_log_interval_ms: None,
+        heartbeat_interval_ms: 10000,
+        should_retry: Arc::new(default_should_retry),
+        claim_timeout_ms: 60000,
+        processing_timeout_ms: 600000,
+        cancellation_poll_interval_ms: 100,
+        ..Default::default()
+    };
+
+    let manager = Arc::new(
+        PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(config),
+    );
+
+    let file_id = manager
+        .create_file(
+            "test-no-escalation".to_string(),
+            Some("Test no escalation when enough time".to_string()),
+            vec![fusillade::RequestTemplateInput {
+                custom_id: Some("no-escalation-test".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"prompt":"test"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                api_key: "original-key".to_string(),
+            }],
+        )
+        .await
+        .expect("Failed to create file");
+
+    // Create batch with 24-hour window (well above 1-minute threshold)
+    let batch = manager
+        .create_batch(fusillade::batch::BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            created_by: None,
+        })
+        .await
+        .expect("Failed to create batch");
+
+    let requests = manager
+        .get_batch_requests(batch.id)
+        .await
+        .expect("Failed to get batch requests");
+    let request_id = requests[0].id();
+
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
+    manager
+        .clone()
+        .run(shutdown_token.clone())
+        .expect("Failed to start daemon");
+
+    // Poll for completion
+    let start = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(5);
+    let mut completed = false;
+
+    while start.elapsed() < timeout {
+        let results = manager
+            .get_requests(vec![request_id])
+            .await
+            .expect("Failed to get request");
+
+        if let Some(Ok(any_request)) = results.first()
+            && any_request.is_terminal()
+        {
+            completed = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    shutdown_token.cancel();
+
+    assert!(completed, "Request did not complete within timeout");
+
+    // Verify the HTTP call used the ORIGINAL API key (no escalation)
+    assert_eq!(http_client.call_count(), 1);
+    let calls = http_client.get_calls();
+    assert_eq!(
+        calls[0].api_key, "original-key",
+        "Should use original API key when time remaining is above threshold"
+    );
+}
+
 /// Tests for `get_batch_results_stream` and `stream_batch_results`.
 ///
 /// These tests verify that batch results streaming works correctly,

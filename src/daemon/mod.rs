@@ -56,15 +56,12 @@ fn default_escalation_threshold_seconds() -> i64 {
 ///
 /// When a request is claimed with less than `escalation_threshold_seconds` remaining
 /// before batch expiry, it will be routed to the `escalation_model` instead of the
-/// original model.
+/// original model. The batch API key automatically has access to escalation models
+/// in the onwards routing cache (no separate API key needed).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelEscalationConfig {
     /// The model to escalate to (e.g., "o1-preview" for requests using "gpt-4")
     pub escalation_model: String,
-
-    /// Optional API key to use for the escalated model
-    /// If provided, escalated requests will use this API key instead of the original
-    pub escalation_api_key: Option<String>,
 
     /// Time threshold in seconds - escalate when time remaining before batch expiry
     /// is less than this value. Default: 3600 (1 hour)
@@ -516,9 +513,8 @@ where
                     if time_remaining.num_seconds() < config.escalation_threshold_seconds {
                         let original_model = request.data.model.clone();
                         request.data.model = config.escalation_model.clone();
-                        if let Some(ref key) = config.escalation_api_key {
-                            request.data.api_key = key.clone();
-                        }
+                        // No API key swap needed - batch API keys automatically have access
+                        // to escalation models in the onwards routing cache
                         counter!("fusillade_requests_routed_to_escalation_total", "original_model" => original_model.clone(), "escalation_model" => config.escalation_model.clone()).increment(1);
                         tracing::info!(
                             request_id = %request.data.id,

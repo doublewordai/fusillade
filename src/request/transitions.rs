@@ -455,6 +455,7 @@ impl Request<Processing> {
                         failed_at: chrono::Utc::now(),
                         retry_attempt: self.state.retry_attempt,
                         batch_expires_at: self.state.batch_expires_at,
+                        routed_model: self.data.model.clone(),
                     };
                     let request = Request {
                         data: self.data,
@@ -472,6 +473,7 @@ impl Request<Processing> {
                         failed_at: chrono::Utc::now(),
                         retry_attempt: self.state.retry_attempt,
                         batch_expires_at: self.state.batch_expires_at,
+                        routed_model: self.data.model.clone(),
                     };
                     let request = Request {
                         data: self.data,
@@ -487,6 +489,7 @@ impl Request<Processing> {
                         claimed_at: self.state.claimed_at,
                         started_at: self.state.started_at,
                         completed_at: chrono::Utc::now(),
+                        routed_model: self.data.model.clone(),
                     };
                     let request = Request {
                         data: self.data,
@@ -513,6 +516,7 @@ impl Request<Processing> {
                     failed_at: chrono::Utc::now(),
                     retry_attempt: self.state.retry_attempt,
                     batch_expires_at: self.state.batch_expires_at,
+                    routed_model: self.data.model.clone(),
                 };
                 let request = Request {
                     data: self.data,
@@ -527,6 +531,7 @@ impl Request<Processing> {
                     failed_at: chrono::Utc::now(),
                     retry_attempt: self.state.retry_attempt,
                     batch_expires_at: self.state.batch_expires_at,
+                    routed_model: self.data.model.clone(),
                 };
                 let request = Request {
                     data: self.data,

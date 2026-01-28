@@ -172,6 +172,8 @@ pub struct Completed {
     pub claimed_at: DateTime<Utc>,
     pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
+    /// The model that was actually used (may differ from template if escalated)
+    pub routed_model: String,
 }
 
 impl RequestState for Completed {}
@@ -252,6 +254,8 @@ pub struct Failed {
     pub retry_attempt: u32,
     /// When the batch expires (carried over from Processing)
     pub batch_expires_at: DateTime<Utc>,
+    /// The model that was actually used (may differ from template if escalated)
+    pub routed_model: String,
 }
 
 impl RequestState for Failed {}
