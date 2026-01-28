@@ -1,5 +1,23 @@
 # Changelog
 
+## [3.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.5.0...fusillade-v3.0.0) (2026-01-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* Removes the following from the public API:
+    - SlaThreshold struct and related types
+    - Superseded request state
+    - Escalation-related fields on RequestData (is_escalated,
+      escalated_from_request_id, superseded_at, superseded_by_request_id)
+    - Manager trait methods: find_pending_escalation, get_at_risk_batches,
+      get_missed_sla_batches, create_escalated_requests
+    - DaemonConfig fields: sla_check_interval_seconds, sla_thresholds
+
+### Features
+
+* replace escalation racing with route-at-claim-time ([#98](https://github.com/doublewordai/fusillade/issues/98)) ([8fa21ea](https://github.com/doublewordai/fusillade/commit/8fa21ea313ccfd50a43b592678265966b06279bf))
+
 ## [2.5.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.4.0...fusillade-v2.5.0) (2026-01-28)
 
 
