@@ -2149,8 +2149,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         error_filter: crate::batch::ErrorFilter,
     ) -> Result<BatchStatus> {
         // Get SQL fragments for error filtering
-        let (_, failed_count) =
-            Self::error_filter_sql_fragments(error_filter);
+        let (_, failed_count) = Self::error_filter_sql_fragments(error_filter);
 
         let mut query_builder = QueryBuilder::new(
             r#"
@@ -2203,8 +2202,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         file_type: OutputFileType,
     ) -> Result<Option<Batch>> {
         // Use ErrorFilter::All since this method doesn't take a filter parameter
-        let (_, failed_count) =
-            Self::error_filter_sql_fragments(crate::batch::ErrorFilter::All);
+        let (_, failed_count) = Self::error_filter_sql_fragments(crate::batch::ErrorFilter::All);
 
         let mut query_builder = QueryBuilder::new(
             r#"
@@ -2305,8 +2303,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         };
 
         // Get SQL fragments for error filtering
-        let (_, failed_count) =
-            Self::error_filter_sql_fragments(error_filter);
+        let (_, failed_count) = Self::error_filter_sql_fragments(error_filter);
 
         // Use a single query with optional cursor filtering and on-demand counting
         // Join with files table to enable searching by input filename
@@ -2388,8 +2385,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         error_filter: crate::batch::ErrorFilter,
     ) -> Result<Vec<BatchStatus>> {
         // Get SQL fragments for error filtering
-        let (_, failed_count) =
-            Self::error_filter_sql_fragments(error_filter);
+        let (_, failed_count) = Self::error_filter_sql_fragments(error_filter);
 
         let mut query_builder = QueryBuilder::new(
             r#"
@@ -2839,8 +2835,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         pool: &PgPool,
     ) -> Result<Batch> {
         // Get SQL fragments for error filtering
-        let (_, failed_count) =
-            Self::error_filter_sql_fragments(error_filter);
+        let (_, failed_count) = Self::error_filter_sql_fragments(error_filter);
 
         let mut query_builder = QueryBuilder::new(
             r#"
