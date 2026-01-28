@@ -3604,6 +3604,128 @@ mod batch_results_stream {
     }
 
     #[sqlx::test]
+    async fn test_output_file_streamable_after_batch_deleted(pool: sqlx::PgPool) {
+        // Test: Output files can still be streamed after the batch is soft-deleted
+        // This ensures users can download completed results even if the batch is deleted
+        let http_client = Arc::new(MockHttpClient::new());
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success"}"#.to_string(),
+            }),
+        );
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        let file_id = manager
+            .create_file(
+                "output-after-delete".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("test".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        // Run daemon to process the request
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for completion
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let b = manager
+                .get_batch(batch.id, fusillade::batch::ErrorFilter::All)
+                .await
+                .expect("get_batch failed");
+            if b.completed_requests == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        shutdown_token.cancel();
+
+        // Get the output file ID
+        let batch = manager
+            .get_batch(batch.id, fusillade::batch::ErrorFilter::All)
+            .await
+            .expect("get_batch failed");
+        let output_file_id = batch
+            .output_file_id
+            .expect("Batch should have output_file_id");
+
+        // Verify we can get output file content before deletion
+        let results_before = manager
+            .get_file_content(output_file_id)
+            .await
+            .expect("Should be able to get output file content before deletion");
+        assert!(
+            !results_before.is_empty(),
+            "Output file should have content before deletion"
+        );
+
+        // Soft-delete the batch
+        manager
+            .delete_batch(batch.id)
+            .await
+            .expect("delete_batch failed");
+
+        // Verify batch is no longer accessible
+        let batch_result = manager
+            .get_batch(batch.id, fusillade::batch::ErrorFilter::All)
+            .await;
+        assert!(
+            batch_result.is_err(),
+            "Batch should not be found after deletion"
+        );
+
+        // Verify we can STILL get the output file content after batch deletion
+        let results_after = manager
+            .get_file_content(output_file_id)
+            .await
+            .expect("Should still be able to get output file content after batch deletion");
+        assert!(
+            !results_after.is_empty(),
+            "Output file should still have content after batch deletion"
+        );
+    }
+
+    #[sqlx::test]
     async fn test_batch_results_pagination(pool: sqlx::PgPool) {
         // Test: Pagination works correctly with offset
         let http_client = Arc::new(MockHttpClient::new());

@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.5.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.4.0...fusillade-v2.5.0) (2026-01-28)
+
+
+### Features
+
+* implement soft deletes for files and batches ([#101](https://github.com/doublewordai/fusillade/issues/101)) ([37f4726](https://github.com/doublewordai/fusillade/commit/37f47265cc7a17aac8d092c913217d64a6044f2b))
+
+## [2.4.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.3.1...fusillade-v2.4.0) (2026-01-27)
+
+
+### Features
+
+* add index for schedulable pending requests query ([#97](https://github.com/doublewordai/fusillade/issues/97)) ([48eb459](https://github.com/doublewordai/fusillade/commit/48eb4593bd766673dfa80920c7ee8299abb4216b))
+
 ## [2.3.1](https://github.com/doublewordai/fusillade/compare/fusillade-v2.3.0...fusillade-v2.3.1) (2026-01-27)
 
 

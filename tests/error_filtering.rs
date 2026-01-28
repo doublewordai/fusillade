@@ -2,8 +2,8 @@ use fusillade::TestDbPools;
 use fusillade::batch::{BatchInput, ErrorFilter, RequestTemplateInput};
 use fusillade::daemon::DaemonConfig;
 use fusillade::http::MockHttpClient;
-use fusillade::manager::postgres::PostgresRequestManager;
 use fusillade::manager::Storage;
+use fusillade::manager::postgres::PostgresRequestManager;
 use fusillade::request::FailureReason;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -200,15 +200,15 @@ async fn setup_batch_with_mixed_failures(
 async fn test_get_batch_error_filter_all(pool: sqlx::PgPool) {
     let (manager, batch_id, _) = setup_batch_with_mixed_failures(pool).await;
 
-    let batch = manager
-        .get_batch(batch_id, ErrorFilter::All)
-        .await
-        .unwrap();
+    let batch = manager.get_batch(batch_id, ErrorFilter::All).await.unwrap();
 
     assert_eq!(batch.total_requests, 6);
     assert_eq!(batch.completed_requests, 1);
     assert_eq!(batch.pending_requests, 1);
-    assert_eq!(batch.failed_requests, 4, "All filter should show all 4 failures");
+    assert_eq!(
+        batch.failed_requests, 4,
+        "All filter should show all 4 failures"
+    );
     assert_eq!(
         batch.failed_requests_retriable, 2,
         "Should have 2 retriable failures"
@@ -349,7 +349,13 @@ async fn test_list_batches_error_filter(pool: sqlx::PgPool) {
 
     // Test All filter
     let batches = manager
-        .list_batches(Some("test-user".to_string()), None, None, 10, ErrorFilter::All)
+        .list_batches(
+            Some("test-user".to_string()),
+            None,
+            None,
+            10,
+            ErrorFilter::All,
+        )
         .await
         .unwrap();
     assert_eq!(batches.len(), 1);
@@ -391,10 +397,7 @@ async fn test_get_file_content_stream_error_filter(pool: sqlx::PgPool) {
     let (manager, batch_id, _) = setup_batch_with_mixed_failures(pool).await;
 
     // Get the error file ID
-    let batch = manager
-        .get_batch(batch_id, ErrorFilter::All)
-        .await
-        .unwrap();
+    let batch = manager.get_batch(batch_id, ErrorFilter::All).await.unwrap();
     let error_file_id = batch.error_file_id.expect("Batch should have error file");
 
     // Test All filter - should get all 4 failures
@@ -565,9 +568,6 @@ async fn test_error_filter_with_null_is_retriable_error(pool: sqlx::PgPool) {
         "NULL should be counted as non-retriable"
     );
 
-    let batch = manager
-        .get_batch(batch.id, ErrorFilter::All)
-        .await
-        .unwrap();
+    let batch = manager.get_batch(batch.id, ErrorFilter::All).await.unwrap();
     assert_eq!(batch.failed_requests, 1, "All should include NULL");
 }

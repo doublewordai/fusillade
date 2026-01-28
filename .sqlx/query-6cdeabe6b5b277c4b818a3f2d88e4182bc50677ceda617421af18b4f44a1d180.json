@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at\n            FROM files\n            WHERE id = $1\n            ",
+  "query": "\n            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at\n            FROM files\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -90,5 +90,5 @@
       false
     ]
   },
-  "hash": "529187574fdbdc120ccbd99832e29ed2e8a74529bfd754516cf9eabeda56cad8"
+  "hash": "6cdeabe6b5b277c4b818a3f2d88e4182bc50677ceda617421af18b4f44a1d180"
 }

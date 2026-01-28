@@ -118,6 +118,7 @@ macro_rules! batch_from_row {
             completed_at: $row.completed_at,
             failed_at: $row.failed_at,
             cancelled_at: $row.cancelled_at,
+            deleted_at: $row.deleted_at,
             pending_requests: $row.pending_requests,
             in_progress_requests: $row.in_progress_requests,
             completed_requests: $row.completed_requests,
@@ -659,7 +660,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             r#"
             SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
             FROM files
-            WHERE id = $1
+            WHERE id = $1 AND deleted_at IS NULL
             "#,
             *file_id as Uuid,
         )
@@ -719,7 +720,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let now = Utc::now();
 
         // Get all models with pending requests
-        // Exclude requests from cancelled batches
+        // Exclude requests from cancelled or soft-deleted batches
         let mut models = sqlx::query_scalar!(
             r#"
             SELECT DISTINCT r.model
@@ -728,6 +729,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             WHERE r.state = 'pending'
                 AND (r.not_before IS NULL OR r.not_before <= $1)
                 AND b.cancelling_at IS NULL
+                AND b.deleted_at IS NULL
             "#,
             now
         )
@@ -801,6 +803,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         AND r.template_id IS NOT NULL
                         AND (r.not_before IS NULL OR r.not_before <= $3)
                         AND b.cancelling_at IS NULL
+                        AND b.deleted_at IS NULL
                         AND available_slots.slots > 0
                     ORDER BY b.expires_at ASC
                     LIMIT LEAST($5, (SELECT slots FROM available_slots))
@@ -1809,7 +1812,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 r#"
                 SELECT purpose
                 FROM files
-                WHERE id = $1
+                WHERE id = $1 AND deleted_at IS NULL
                 "#,
                 *file_id as Uuid,
             )
@@ -1902,43 +1905,27 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
         );
 
-        // Build WHERE clause
-        let mut has_where = false;
+        // Build WHERE clause - always filter out soft-deleted files
+        query_builder.push(" WHERE f.deleted_at IS NULL");
 
         if let Some(uploaded_by) = &filter.uploaded_by {
-            query_builder.push(" WHERE f.uploaded_by = ");
+            query_builder.push(" AND f.uploaded_by = ");
             query_builder.push_bind(uploaded_by);
-            has_where = true;
         }
 
         if let Some(status) = &filter.status {
-            if has_where {
-                query_builder.push(" AND f.status = ");
-            } else {
-                query_builder.push(" WHERE f.status = ");
-                has_where = true;
-            }
+            query_builder.push(" AND f.status = ");
             query_builder.push_bind(status);
         }
 
         if let Some(purpose) = &filter.purpose {
-            if has_where {
-                query_builder.push(" AND f.purpose = ");
-            } else {
-                query_builder.push(" WHERE f.purpose = ");
-                has_where = true;
-            }
+            query_builder.push(" AND f.purpose = ");
             query_builder.push_bind(purpose);
         }
 
         if let Some(search) = &filter.search {
             let search_pattern = format!("%{}%", search.to_lowercase());
-            if has_where {
-                query_builder.push(" AND LOWER(f.name) LIKE ");
-            } else {
-                query_builder.push(" WHERE LOWER(f.name) LIKE ");
-                has_where = true;
-            }
+            query_builder.push(" AND LOWER(f.name) LIKE ");
             query_builder.push_bind(search_pattern);
         }
 
@@ -1946,13 +1933,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         if let (Some(after_id), Some(after_ts)) = (&filter.after, after_created_at) {
             let comparison = if filter.ascending { ">" } else { "<" };
 
-            if has_where {
-                query_builder.push(" AND ");
-            } else {
-                query_builder.push(" WHERE ");
-            }
-
-            query_builder.push("(f.created_at ");
+            query_builder.push(" AND (f.created_at ");
             query_builder.push(comparison);
             query_builder.push(" ");
             query_builder.push_bind(after_ts);
@@ -2074,48 +2055,101 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn delete_file(&self, file_id: FileId) -> Result<()> {
-        // Step 1: Cancel all in-progress batches associated with this file
+        // Use a transaction to ensure atomicity
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
+        // Step 1: Cancel non-terminal batches associated with this file
         // This will:
         // - Prevent pending requests from being claimed (claim_requests filters by cancelling_at)
         // - Count pending requests as canceled in batch status
         // - Signal daemons to abort in-flight (claimed/processing) requests
-        // Only cancel batches that haven't reached a terminal state yet
+        // Only cancel batches that haven't already reached a terminal state
+        // All batches get file_id = NULL so they remain visible but unlinked
         sqlx::query!(
             r#"
             UPDATE batches
-            SET cancelling_at = NOW(),
-                cancelled_at = NOW()
+            SET cancelling_at = CASE
+                    WHEN completed_at IS NULL AND failed_at IS NULL AND cancelled_at IS NULL
+                        THEN COALESCE(cancelling_at, NOW())
+                    ELSE cancelling_at
+                END,
+                cancelled_at = CASE
+                    WHEN completed_at IS NULL AND failed_at IS NULL AND cancelled_at IS NULL
+                        THEN COALESCE(cancelled_at, NOW())
+                    ELSE cancelled_at
+                END,
+                file_id = NULL
             WHERE file_id = $1
-              AND cancelling_at IS NULL
-              AND completed_at IS NULL
-              AND failed_at IS NULL
-              AND cancelled_at IS NULL
             "#,
             *file_id as Uuid,
         )
-        .execute(self.pools.write())
+        .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel batches: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update batches: {}", e)))?;
 
-        // Step 2: Delete the file
-        // This sets file_id to NULL on request_templates (ON DELETE SET NULL)
-        // Templates become orphaned and are excluded from active_request_templates view
-        // Requests referencing orphaned templates will have NULL template data in queries
+        // Step 2: Clear output_file_id and error_file_id references
+        // This mirrors the ON DELETE SET NULL FK behavior for soft deletes
+        // Without this, batches would have dangling references to soft-deleted files
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET output_file_id = NULL
+            WHERE output_file_id = $1
+            "#,
+            *file_id as Uuid,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to clear output_file_id reference: {}", e))
+        })?;
+
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET error_file_id = NULL
+            WHERE error_file_id = $1
+            "#,
+            *file_id as Uuid,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to clear error_file_id reference: {}", e))
+        })?;
+
+        // Step 3: Soft-delete the file
+        // Set deleted_at and status to 'deleted'
+        // The file and its templates remain in the database for audit purposes
+        // Templates are excluded from active_request_templates view via the JOIN on files.deleted_at
         let rows_affected = sqlx::query!(
             r#"
-            DELETE FROM files
+            UPDATE files
+            SET deleted_at = NOW(),
+                status = 'deleted'
             WHERE id = $1
+              AND deleted_at IS NULL
             "#,
             *file_id as Uuid,
         )
-        .execute(self.pools.write())
+        .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete file: {}", e)))?
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to soft-delete file: {}", e)))?
         .rows_affected();
 
         if rows_affected == 0 {
+            tx.rollback()
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to rollback: {}", e)))?;
             return Err(FusilladeError::Other(anyhow!("File not found")));
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
         Ok(())
     }
@@ -2310,7 +2344,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 WHERE batch_id = b.id
                   AND is_escalated = false  -- Exclude escalated requests from batch accounting
             ) counts ON TRUE
-            WHERE b.id = $1
+            WHERE b.id = $1 AND b.deleted_at IS NULL
             "#,
             failed_select
         );
@@ -2386,6 +2420,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         b.completed_at,
                         b.failed_at,
                         b.cancelled_at,
+                        b.deleted_at,
                         b.failed_requests_retriable,
                         b.failed_requests_non_retriable,
                         COALESCE(counts.pending, 0)::BIGINT as "pending_requests!",
@@ -2405,7 +2440,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         WHERE batch_id = b.id
                           AND is_escalated = false  -- Exclude escalated requests from batch accounting
                     ) counts ON TRUE
-                    WHERE b.output_file_id = $1
+                    WHERE b.output_file_id = $1 AND b.deleted_at IS NULL
                     "#,
                     *file_id as Uuid,
                 )
@@ -2428,6 +2463,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         b.completed_at,
                         b.failed_at,
                         b.cancelled_at,
+                        b.deleted_at,
                         b.failed_requests_retriable,
                         b.failed_requests_non_retriable,
                         COALESCE(counts.pending, 0)::BIGINT as "pending_requests!",
@@ -2447,7 +2483,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         WHERE batch_id = b.id
                           AND is_escalated = false  -- Exclude escalated requests from batch accounting
                     ) counts ON TRUE
-                    WHERE b.error_file_id = $1
+                    WHERE b.error_file_id = $1 AND b.deleted_at IS NULL
                     "#,
                     *file_id as Uuid,
                 )
@@ -2513,6 +2549,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.completed_at,
                 b.failed_at,
                 b.cancelled_at,
+                b.deleted_at,
                 b.failed_requests_retriable,
                 b.failed_requests_non_retriable,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
@@ -2533,7 +2570,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 WHERE batch_id = b.id
                   AND is_escalated = false  -- Exclude escalated requests from batch accounting
             ) counts ON TRUE
-            WHERE ($1::TEXT IS NULL OR b.created_by = $1)
+            WHERE b.deleted_at IS NULL
+              AND ($1::TEXT IS NULL OR b.created_by = $1)
               AND ($3::TIMESTAMPTZ IS NULL OR b.created_at < $3 OR (b.created_at = $3 AND b.id < $4))
               AND ($5::TEXT IS NULL OR LOWER(b.metadata::text) LIKE $5 OR LOWER(f.name) LIKE $5)
             ORDER BY b.created_at DESC, b.id DESC
@@ -2646,6 +2684,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     canceled_requests: row.try_get("canceled_requests").map_err(|e| {
                         FusilladeError::Other(anyhow!("Column canceled_requests: {}", e))
                     })?,
+                    deleted_at: row
+                        .try_get("deleted_at")
+                        .map_err(|e| FusilladeError::Other(anyhow!("Column deleted_at: {}", e)))?,
                 })
             })
             .collect()
@@ -2695,7 +2736,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 WHERE batch_id = b.id
                   AND is_escalated = false  -- Exclude escalated requests from batch accounting
             ) counts ON TRUE
-            WHERE b.file_id = $1
+            WHERE b.file_id = $1 AND b.deleted_at IS NULL
             ORDER BY b.created_at DESC
             "#,
             failed_select
@@ -2784,6 +2825,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
               AND b.failed_at IS NULL
               AND b.cancelled_at IS NULL
               AND b.cancelling_at IS NULL
+              AND b.deleted_at IS NULL
               AND r.state = ANY($2)
             GROUP BY r.batch_id
             "#,
@@ -2818,6 +2860,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
               AND b.failed_at IS NULL
               AND b.cancelled_at IS NULL
               AND b.cancelling_at IS NULL
+              AND b.deleted_at IS NULL
               AND r.state = ANY($1)
             GROUP BY r.batch_id
             "#,
@@ -2902,6 +2945,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                   AND b.completed_at IS NULL
                   AND b.cancelled_at IS NULL
                   AND b.cancelling_at IS NULL
+                  AND b.deleted_at IS NULL
                   AND (b.expires_at - NOW()) <= make_interval(secs => $3::float8)
                   -- Only create escalation if one doesn't already exist
                   AND NOT EXISTS (
@@ -3018,17 +3062,31 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     async fn delete_batch(&self, batch_id: BatchId) -> Result<()> {
-        // Delete the batch - this sets batch_id to NULL on requests (ON DELETE SET NULL)
-        // Requests become orphaned and are excluded from active_requests view
+        // Soft-delete the batch by setting deleted_at
+        // Also cancel it if not already in a terminal state
+        // Requests are excluded from active_requests view via the JOIN on batches.deleted_at
         let rows_affected = sqlx::query!(
             r#"
-            DELETE FROM batches WHERE id = $1
+            UPDATE batches
+            SET deleted_at = NOW(),
+                cancelling_at = CASE
+                    WHEN completed_at IS NULL AND failed_at IS NULL AND cancelled_at IS NULL
+                        THEN COALESCE(cancelling_at, NOW())
+                    ELSE cancelling_at
+                END,
+                cancelled_at = CASE
+                    WHEN completed_at IS NULL AND failed_at IS NULL AND cancelled_at IS NULL
+                        THEN COALESCE(cancelled_at, NOW())
+                    ELSE cancelled_at
+                END
+            WHERE id = $1
+              AND deleted_at IS NULL
             "#,
             *batch_id as Uuid,
         )
         .execute(self.pools.write())
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete batch: {}", e)))?
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to soft-delete batch: {}", e)))?
         .rows_affected();
 
         if rows_affected == 0 {
@@ -3143,7 +3201,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FROM requests r
             LEFT JOIN active_request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
-            WHERE r.batch_id = $1
+            WHERE r.batch_id = $1 AND b.deleted_at IS NULL
             ORDER BY r.created_at ASC
             "#,
             *batch_id as Uuid,
@@ -3442,6 +3500,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 b.completed_at,
                 b.failed_at,
                 b.cancelled_at,
+                b.deleted_at,
                 b.failed_requests_retriable,
                 b.failed_requests_non_retriable,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
@@ -3461,7 +3520,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 WHERE batch_id = b.id
                 AND is_escalated = false  -- Exclude escalated requests from batch accounting
             ) counts ON TRUE
-            WHERE b.id = $1
+            WHERE b.id = $1 AND b.deleted_at IS NULL
             "#,
             failed_select
         );
@@ -3554,6 +3613,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             canceled_requests: row
                 .try_get("canceled_requests")
                 .map_err(|e| FusilladeError::Other(anyhow!("Column canceled_requests: {}", e)))?,
+            deleted_at: row
+                .try_get("deleted_at")
+                .map_err(|e| FusilladeError::Other(anyhow!("Column deleted_at: {}", e)))?,
         };
 
         // Lazy computation of terminal timestamps
@@ -3766,6 +3828,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) {
         // First, find the batch that owns this output file
+        // Note: We allow streaming even for soft-deleted batches since the output file
+        // represents completed work that users should be able to download
         let batch_result = sqlx::query!(
             r#"
             SELECT id
@@ -3896,6 +3960,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) {
         // First, find the batch that owns this error file
+        // Note: We allow streaming even for soft-deleted batches since the error file
+        // represents completed work that users should be able to download
         let batch_result = sqlx::query!(
             r#"
             SELECT id
@@ -4051,7 +4117,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         // First, get the file_id from the batch
         // This allows us to query by file_id to avoid duplicates from SLA escalation
         let file_id = match sqlx::query_scalar!(
-            r#"SELECT file_id FROM batches WHERE id = $1"#,
+            r#"SELECT file_id FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
             *batch_id as Uuid,
         )
         .fetch_optional(&pool)
@@ -7779,7 +7845,10 @@ mod tests {
         let manager_clone = manager.clone();
         let batch_shows_canceled = wait_for(
             || async {
-                if let Ok(status) = manager_clone.get_batch_status(batch_id).await {
+                if let Ok(status) = manager_clone
+                    .get_batch_status(batch_id, crate::batch::ErrorFilter::All)
+                    .await
+                {
                     // Both requests should be counted as canceled (not in_progress)
                     // when batch has cancelling_at set
                     return status.canceled_requests == 2 && status.in_progress_requests == 0;
