@@ -415,6 +415,9 @@ pub struct Batch {
     pub completed_at: Option<DateTime<Utc>>,
     pub failed_at: Option<DateTime<Utc>>,
     pub cancelled_at: Option<DateTime<Utc>>,
+
+    /// When batch was soft-deleted. NULL means active.
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 /// Status information for a batch, computed from its executions.
