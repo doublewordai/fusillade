@@ -520,6 +520,21 @@ where
                     if time_remaining.num_seconds() < config.escalation_threshold_seconds {
                         let original_model = request.data.model.clone();
                         request.data.model = config.escalation_model.clone();
+
+                        // Update the model field in the request body JSON
+                        if let Ok(mut json) =
+                            serde_json::from_str::<serde_json::Value>(&request.data.body)
+                            && let Some(obj) = json.as_object_mut()
+                        {
+                            obj.insert(
+                                "model".to_string(),
+                                serde_json::Value::String(config.escalation_model.clone()),
+                            );
+                            if let Ok(new_body) = serde_json::to_string(&json) {
+                                request.data.body = new_body;
+                            }
+                        }
+
                         // No API key swap needed - batch API keys automatically have access
                         // to escalation models in the onwards routing cache
                         counter!("fusillade_requests_routed_to_escalation_total", "original_model" => original_model.clone(), "escalation_model" => config.escalation_model.clone()).increment(1);
