@@ -89,8 +89,8 @@ pub struct PostgresRequestManager<P: PoolProvider, H: HttpClient> {
 
 /// Macro for extracting a [`Batch`] from a dynamic query row (PgRow).
 ///
-/// Unlike `batch_from_row!()`, this works with `sqlx::query()` (not `sqlx::query!()`)
-/// results where fields must be accessed via `.get()` instead of direct access.
+/// This works with `sqlx::query()` (not `sqlx::query!()`) results where fields must
+/// be accessed via `.get()` instead of direct access.
 macro_rules! batch_from_dynamic_row {
     ($row:expr) => {
         Batch {
