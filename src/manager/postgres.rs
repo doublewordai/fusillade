@@ -2046,23 +2046,38 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn delete_file(&self, file_id: FileId) -> Result<()> {
-        // Step 1: Cancel all in-progress batches associated with this file
+        // Use a transaction to ensure atomicity
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
+        // Step 1: Cancel non-terminal batches associated with this file
         // This will:
         // - Prevent pending requests from being claimed (claim_requests filters by cancelling_at)
         // - Count pending requests as canceled in batch status
         // - Signal daemons to abort in-flight (claimed/processing) requests
-        // Batches remain visible (not soft-deleted) but with file_id = NULL
+        // Only cancel batches that haven't already reached a terminal state
+        // All batches get file_id = NULL so they remain visible but unlinked
         sqlx::query!(
             r#"
             UPDATE batches
-            SET cancelling_at = COALESCE(cancelling_at, NOW()),
-                cancelled_at = COALESCE(cancelled_at, NOW()),
+            SET cancelling_at = CASE
+                    WHEN completed_at IS NULL AND failed_at IS NULL AND cancelled_at IS NULL
+                        THEN COALESCE(cancelling_at, NOW())
+                    ELSE cancelling_at
+                END,
+                cancelled_at = CASE
+                    WHEN completed_at IS NULL AND failed_at IS NULL AND cancelled_at IS NULL
+                        THEN COALESCE(cancelled_at, NOW())
+                    ELSE cancelled_at
+                END,
                 file_id = NULL
             WHERE file_id = $1
             "#,
             *file_id as Uuid,
         )
-        .execute(self.pools.write())
+        .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to update batches: {}", e)))?;
 
@@ -2080,14 +2095,21 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             *file_id as Uuid,
         )
-        .execute(self.pools.write())
+        .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to soft-delete file: {}", e)))?
         .rows_affected();
 
         if rows_affected == 0 {
+            tx.rollback()
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to rollback: {}", e)))?;
             return Err(FusilladeError::Other(anyhow!("File not found")));
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
         Ok(())
     }
@@ -2761,14 +2783,22 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
     async fn delete_batch(&self, batch_id: BatchId) -> Result<()> {
         // Soft-delete the batch by setting deleted_at
-        // Also cancel it if not already cancelled
+        // Also cancel it if not already in a terminal state
         // Requests are excluded from active_requests view via the JOIN on batches.deleted_at
         let rows_affected = sqlx::query!(
             r#"
             UPDATE batches
             SET deleted_at = NOW(),
-                cancelling_at = COALESCE(cancelling_at, NOW()),
-                cancelled_at = COALESCE(cancelled_at, NOW())
+                cancelling_at = CASE
+                    WHEN completed_at IS NULL AND failed_at IS NULL AND cancelled_at IS NULL
+                        THEN COALESCE(cancelling_at, NOW())
+                    ELSE cancelling_at
+                END,
+                cancelled_at = CASE
+                    WHEN completed_at IS NULL AND failed_at IS NULL AND cancelled_at IS NULL
+                        THEN COALESCE(cancelled_at, NOW())
+                    ELSE cancelled_at
+                END
             WHERE id = $1
               AND deleted_at IS NULL
             "#,

@@ -3,7 +3,10 @@
 
 ALTER TABLE batches ADD COLUMN deleted_at TIMESTAMPTZ;
 
--- Partial index for efficient filtering of non-deleted batches
-CREATE INDEX idx_batches_deleted_at ON batches(deleted_at) WHERE deleted_at IS NULL;
+-- Partial index matching common access pattern: non-deleted batches ordered by creation time
+-- This supports list_batches which filters by deleted_at IS NULL and orders by created_at DESC, id DESC
+CREATE INDEX idx_batches_active_created_at_id
+    ON batches (created_at DESC, id DESC)
+    WHERE deleted_at IS NULL;
 
 COMMENT ON COLUMN batches.deleted_at IS 'When batch was soft-deleted. NULL means active. Set when batch or parent file is deleted.';
