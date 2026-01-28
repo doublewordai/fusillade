@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE batches\n            SET deleted_at = NOW(),\n                cancelling_at = COALESCE(cancelling_at, NOW()),\n                cancelled_at = COALESCE(cancelled_at, NOW())\n            WHERE id = $1\n              AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "91969419872e6ca0c37e58403bada02568c2c901dd1db19ec5a4bc5cbb67315b"
+}

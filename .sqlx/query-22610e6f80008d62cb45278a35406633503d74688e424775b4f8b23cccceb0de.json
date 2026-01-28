@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.batch_id as \"batch_id!\", r.template_id as \"template_id?\", r.state,\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", t.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at\n            FROM requests r\n            LEFT JOIN active_request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.batch_id = $1\n            ORDER BY r.created_at ASC\n            ",
+  "query": "\n            SELECT\n                r.id, r.batch_id as \"batch_id!\", r.template_id as \"template_id?\", r.state,\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", t.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at\n            FROM requests r\n            LEFT JOIN active_request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.batch_id = $1 AND b.deleted_at IS NULL\n            ORDER BY r.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -150,5 +150,5 @@
       false
     ]
   },
-  "hash": "26d46cdd7c0c481fc2790e4ae5883243ec92385a5ef59929c98e2052dc788b55"
+  "hash": "22610e6f80008d62cb45278a35406633503d74688e424775b4f8b23cccceb0de"
 }
