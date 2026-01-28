@@ -296,7 +296,7 @@ sed -i '' 's/\.get_file_content_stream(\([^,]*\), 0, None)/.get_file_content_str
 - ✅ Batch and BatchStatus structs updated with new count fields
 - ✅ Storage trait updated with error_filter parameters
 - ✅ Created `error_filter_sql_fragments()` helper function
-- ✅ Created three row mapping macros (batch_from_row!, batch_from_dynamic_row!, batch_status_from_dynamic_row!)
+- ✅ Created row mapping macros (batch_from_dynamic_row!, batch_status_from_dynamic_row!)
 - ✅ Request persistence updated to set is_retriable_error in persist() method
 
 **Query Methods (All converted to dynamic SQL):**
