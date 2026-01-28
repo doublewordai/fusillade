@@ -13,7 +13,7 @@ use crate::batch::BatchId;
 use crate::error::Result;
 use crate::http::{HttpClient, HttpResponse};
 use crate::manager::{DaemonStorage, Storage};
-use crate::request::{DaemonId, RequestCompletionResult, RequestId, RequestStateFilter};
+use crate::request::{DaemonId, RequestCompletionResult};
 
 pub mod transitions;
 pub mod types;
@@ -41,81 +41,34 @@ fn default_should_retry_fn() -> ShouldRetryFn {
     Arc::new(default_should_retry)
 }
 
-/// Default SLA check interval (1 minute)
-fn default_sla_check_interval_seconds() -> u64 {
-    60
-}
-
 /// Default model escalations (empty map)
 fn default_model_escalations() -> Arc<dashmap::DashMap<String, ModelEscalationConfig>> {
     Arc::new(dashmap::DashMap::new())
 }
 
-/// Log level for SLA threshold violations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SlaLogLevel {
-    /// Log as warning
-    Warn,
-    /// Log as error
-    Error,
+/// Default escalation threshold (15 minutes)
+/// This should be greater than the processing timeout (10 minutes) to allow
+/// a processing request to fall back to pending before escalation kicks in.
+fn default_escalation_threshold_seconds() -> i64 {
+    900
 }
 
-/// Model-based escalation configuration for SLA escalation.
-/// When configured, escalated requests are routed to a different model in the control layer
-/// while keeping the original model visible to the user.
+/// Model-based escalation configuration for routing requests to a different model
+/// at claim time when approaching SLA deadline.
+///
+/// When a request is claimed with less than `escalation_threshold_seconds` remaining
+/// before batch expiry, it will be routed to the `escalation_model` instead of the
+/// original model. The batch API key automatically has access to escalation models
+/// in the onwards routing cache (no separate API key needed).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelEscalationConfig {
     /// The model to escalate to (e.g., "o1-preview" for requests using "gpt-4")
-    /// Escalated requests are created with a new template using this model
     pub escalation_model: String,
 
-    /// Optional API key to use for the escalated model
-    /// If provided, escalated requests will use this API key instead of the original
-    pub escalation_api_key: Option<String>,
-}
-
-/// Action to take when a batch crosses an SLA threshold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SlaAction {
-    /// Log the SLA violation at the specified level
-    Log {
-        /// Log level (warn or error)
-        level: SlaLogLevel,
-    },
-    /// Escalate at-risk requests to priority endpoints
-    ///
-    /// Creates a cloned request sent to the priority endpoint configured for the model,
-    /// while the original request continues processing. First to complete wins.
-    Escalate,
-    // Future actions:
-    // Notify,    // Send notification/webhook
-    // Abort,     // Cancel the batch
-}
-
-/// SLA threshold configuration.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SlaThreshold {
-    /// Human-readable name for this threshold (e.g., "warning", "critical")
-    pub name: String,
-
-    /// Trigger when time remaining is less than this many seconds
-    pub threshold_seconds: i64,
-
-    /// Action to take when threshold is crossed
-    pub action: SlaAction,
-
-    /// Request states to act on for this threshold.
-    /// Allows configuring different state filters for different thresholds
-    /// (e.g., escalate only pending at 1 hour, but escalate pending+claimed at 5 minutes).
-    /// Defaults to `[Pending]` if not specified.
-    #[serde(default = "default_sla_allowed_states")]
-    pub allowed_states: Vec<crate::request::RequestStateFilter>,
-}
-
-fn default_sla_allowed_states() -> Vec<crate::request::RequestStateFilter> {
-    vec![crate::request::RequestStateFilter::Pending]
+    /// Time threshold in seconds - escalate when time remaining before batch expiry
+    /// is less than this value. Default: 900 (15 minutes)
+    #[serde(default = "default_escalation_threshold_seconds")]
+    pub escalation_threshold_seconds: i64,
 }
 
 /// Configuration for the daemon.
@@ -180,44 +133,13 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution.
     pub processing_timeout_ms: u64,
 
+    /// Maximum number of stale requests to unclaim in a single poll cycle.
+    /// Limits database load when many requests become stale simultaneously (e.g., daemon crash).
+    pub unclaim_batch_size: usize,
+
     /// Interval for polling database to check for cancelled batches (milliseconds)
     /// Determines how quickly in-flight requests are aborted when their batch is cancelled
     pub cancellation_poll_interval_ms: u64,
-
-    /// How often to check for batches approaching SLA deadlines (seconds)
-    /// Default: 60 (1 minute)
-    /// Only used if sla_thresholds is non-empty
-    #[serde(default = "default_sla_check_interval_seconds")]
-    pub sla_check_interval_seconds: u64,
-
-    /// SLA threshold configurations.
-    /// Each threshold defines a time limit and action to take when batches approach expiration.
-    /// The daemon will query the database once per threshold to find at-risk batches.
-    ///
-    /// Example: Two thresholds (warning at 1 hour, critical at 15 minutes)
-    /// ```
-    /// use fusillade::daemon::{SlaThreshold, SlaAction, SlaLogLevel};
-    /// use fusillade::request::RequestStateFilter;
-    ///
-    /// vec![
-    ///     SlaThreshold {
-    ///         name: "warning".to_string(),
-    ///         threshold_seconds: 3600,
-    ///         action: SlaAction::Log { level: SlaLogLevel::Warn },
-    ///         allowed_states: vec![RequestStateFilter::Pending],
-    ///     },
-    ///     SlaThreshold {
-    ///         name: "critical".to_string(),
-    ///         threshold_seconds: 900,
-    ///         action: SlaAction::Log { level: SlaLogLevel::Error },
-    ///         // Act on both pending and claimed requests for critical threshold
-    ///         allowed_states: vec![RequestStateFilter::Pending, RequestStateFilter::Claimed],
-    ///     },
-    /// ]
-    /// # ;
-    /// ```
-    #[serde(default)]
-    pub sla_thresholds: Vec<SlaThreshold>,
 
     /// Batch table column names to include as request headers.
     /// These values are sent as `x-fusillade-batch-{column}` headers with each request.
@@ -257,9 +179,8 @@ impl Default for DaemonConfig {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,             // 1 minute
             processing_timeout_ms: 600000,       // 10 minutes
+            unclaim_batch_size: 100,             // Unclaim up to 100 stale requests per poll
             cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
-            sla_check_interval_seconds: default_sla_check_interval_seconds(),
-            sla_thresholds: vec![],
             batch_metadata_fields: default_batch_metadata_fields(),
         }
     }
@@ -286,10 +207,6 @@ where
     /// Map of batch_id -> cancellation token for batch-level cancellation
     /// All requests in a batch share the same cancellation token
     cancellation_tokens: Arc<dashmap::DashMap<BatchId, tokio_util::sync::CancellationToken>>,
-    /// Map of request_id -> cancellation token for request-level cancellation
-    /// Used to abort in-flight HTTP requests when their racing pair completes first (supersession)
-    request_cancellation_tokens:
-        Arc<dashmap::DashMap<RequestId, tokio_util::sync::CancellationToken>>,
 }
 
 impl<S, H> Daemon<S, H>
@@ -315,7 +232,6 @@ where
             requests_failed: Arc::new(AtomicU64::new(0)),
             shutdown_token,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
-            request_cancellation_tokens: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -550,201 +466,6 @@ where
             }
         });
 
-        // SLA Monitoring Task
-        // Periodically checks for batches approaching their SLA deadline and logs warnings/errors
-        if !self.config.sla_thresholds.is_empty() {
-            let storage = self.storage.clone();
-            let shutdown_token = self.shutdown_token.clone();
-            let sla_thresholds = self.config.sla_thresholds.clone();
-            let sla_check_interval_seconds = self.config.sla_check_interval_seconds;
-            let model_escalations = self.config.model_escalations.clone();
-
-            // Warn about configuration mismatches
-            let has_escalate_threshold = sla_thresholds
-                .iter()
-                .any(|t| matches!(t.action, SlaAction::Escalate));
-            if !model_escalations.is_empty() && !has_escalate_threshold {
-                tracing::warn!(
-                    "Model escalations are configured but no SLA thresholds with Escalate action are set. Model escalations will not be used."
-                );
-            }
-
-            tracing::info!("Starting SLA monitoring task");
-            tracing::debug!("SLA check interval: {} seconds", sla_check_interval_seconds);
-            tracing::debug!("Configured SLA thresholds: {:?}", sla_thresholds);
-            if !model_escalations.is_empty() {
-                tracing::debug!(
-                    "Configured model escalations for models: {:?}",
-                    model_escalations
-                        .iter()
-                        .map(|entry| format!(
-                            "{} -> {}",
-                            entry.key(),
-                            entry.value().escalation_model
-                        ))
-                        .collect::<Vec<_>>()
-                );
-            }
-
-            tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(Duration::from_secs(sla_check_interval_seconds));
-
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            tracing::trace!("SLA Tick");
-                            // Query once per configured threshold
-                            for threshold in &sla_thresholds {
-                                tracing::trace!("Threshold: {}", threshold.name);
-                                // Match on action type to determine what DB operation to perform
-                                match threshold.action {
-                                    SlaAction::Log { level } => {
-                                        // Get batch counts for logging
-                                        match storage.get_at_risk_batches(threshold.threshold_seconds, &threshold.allowed_states).await {
-                                            Ok(batch_counts) => {
-                                                if batch_counts.is_empty() {
-                                                    continue;
-                                                }
-
-                                                for (batch_id, at_risk_count) in batch_counts {
-                                                    // Record metric for SLA near-miss
-                                                    counter!(
-                                                        "fusillade_sla_near_miss_total",
-                                                        "sla_name" => threshold.name.clone(),
-                                                        "batch_id" => batch_id.to_string()
-                                                    ).increment(at_risk_count as u64);
-
-                                                    match level {
-                                                        SlaLogLevel::Error => {
-                                                            tracing::error!(
-                                                                batch_id = %batch_id,
-                                                                at_risk_count = at_risk_count,
-                                                                threshold_seconds = threshold.threshold_seconds,
-                                                                sla_name = %threshold.name,
-                                                                "Requests at risk of missing SLA"
-                                                            );
-                                                        }
-                                                        SlaLogLevel::Warn => {
-                                                            tracing::warn!(
-                                                                batch_id = %batch_id,
-                                                                at_risk_count = at_risk_count,
-                                                                threshold_seconds = threshold.threshold_seconds,
-                                                                sla_name = %threshold.name,
-                                                                "Requests at risk of missing SLA"
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    error = %e,
-                                                    "Failed to get at-risk batches"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    SlaAction::Escalate => {
-                                        if model_escalations.is_empty() {
-                                            tracing::warn!(
-                                                sla_name = %threshold.name,
-                                                "SLA threshold configured with Escalate action but no model_escalations are set. No escalations will be created."
-                                            );
-                                        } else {
-                                            // Escalate for each configured model
-                                            for entry in model_escalations.iter() {
-                                                let model = entry.key();
-                                                let escalation_config = entry.value();
-                                                tracing::trace!(
-                                                    model = %model,
-                                                    escalation_model = %escalation_config.escalation_model,
-                                                    "Checking for requests to escalate"
-                                                );
-
-                                                match storage
-                                                    .create_escalated_requests(
-                                                        model,
-                                                        threshold.threshold_seconds,
-                                                        &threshold.allowed_states,
-                                                        Some(&escalation_config.escalation_model),
-                                                        escalation_config.escalation_api_key.as_deref(),
-                                                    )
-                                                    .await
-                                                {
-                                                    Ok(escalated_count) => {
-                                                        if escalated_count > 0 {
-                                                            counter!(
-                                                                "fusillade_escalations_created_total",
-                                                                "model" => model.to_string(),
-                                                                "sla_name" => threshold.name.clone()
-                                                            ).increment(escalated_count as u64);
-                                                            tracing::debug!(
-                                                                model = %model,
-                                                                escalated_count = escalated_count,
-                                                                escalation_model = %escalation_config.escalation_model,
-                                                                threshold_seconds = threshold.threshold_seconds,
-                                                                sla_name = %threshold.name,
-                                                                "Successfully created escalated requests"
-                                                            );
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::error!(
-                                                            model = %model,
-                                                            error = %e,
-                                                            "Failed to escalate requests"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Check for batches that have already missed their SLA deadline
-                            // This runs regardless of configured thresholds to catch any missed SLAs
-                            let all_states = vec![
-                                RequestStateFilter::Pending,
-                                RequestStateFilter::Claimed,
-                                RequestStateFilter::Processing,
-                            ];
-                            match storage.get_missed_sla_batches(&all_states).await {
-                                Ok(missed_batch_counts) => {
-                                    if !missed_batch_counts.is_empty() {
-                                        for (batch_id, missed_count) in missed_batch_counts {
-                                            // Record metric for SLA miss
-                                            counter!(
-                                                "fusillade_sla_missed_total",
-                                                "batch_id" => batch_id.to_string()
-                                            ).increment(missed_count as u64);
-
-                                            tracing::error!(
-                                                batch_id = %batch_id,
-                                                missed_count = missed_count,
-                                                "Requests have missed their SLA deadline"
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        "Failed to get missed SLA batches"
-                                    );
-                                }
-                            }
-                        }
-                        _ = shutdown_token.cancelled() => {
-                            tracing::debug!("SLA checker shutting down");
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
         let run_result = loop {
@@ -778,7 +499,7 @@ where
                 }
             }
             // Claim a batch of pending requests
-            let claimed = self
+            let mut claimed = self
                 .storage
                 .claim_requests(self.config.claim_batch_size, self.daemon_id)
                 .await?;
@@ -791,8 +512,47 @@ where
                 "Claimed requests from storage"
             );
 
+            // Route requests to escalated models if time is running low
+            // This replaces the old SLA racing system with a simpler approach:
+            // at claim time, we check if there's enough time remaining and route
+            // to the escalated model if below threshold
+            for request in &mut claimed {
+                if let Some(config) = self.config.model_escalations.get(&request.data.model) {
+                    let time_remaining = request.state.batch_expires_at - chrono::Utc::now();
+                    if time_remaining.num_seconds() < config.escalation_threshold_seconds {
+                        let original_model = request.data.model.clone();
+                        request.data.model = config.escalation_model.clone();
+
+                        // Update the model field in the request body JSON
+                        if let Ok(mut json) =
+                            serde_json::from_str::<serde_json::Value>(&request.data.body)
+                            && let Some(obj) = json.as_object_mut()
+                        {
+                            obj.insert(
+                                "model".to_string(),
+                                serde_json::Value::String(config.escalation_model.clone()),
+                            );
+                            if let Ok(new_body) = serde_json::to_string(&json) {
+                                request.data.body = new_body;
+                            }
+                        }
+
+                        // No API key swap needed - batch API keys automatically have access
+                        // to escalation models in the onwards routing cache
+                        counter!("fusillade_requests_routed_to_escalation_total", "original_model" => original_model.clone(), "escalation_model" => config.escalation_model.clone()).increment(1);
+                        tracing::info!(
+                            request_id = %request.data.id,
+                            original_model = %original_model,
+                            escalation_model = %config.escalation_model,
+                            time_remaining_seconds = time_remaining.num_seconds(),
+                            threshold_seconds = config.escalation_threshold_seconds,
+                            "Routing request to escalation model due to time pressure"
+                        );
+                    }
+                }
+            }
+
             // Group requests by model for better concurrency control visibility
-            // Escalated requests have their own template with the escalated model
             let mut by_model: HashMap<String, Vec<_>> = HashMap::new();
             for request in claimed {
                 let model = request.data.model.clone();
@@ -835,19 +595,11 @@ where
                             let should_retry = self.config.should_retry.clone();
                             let shutdown_token = self.shutdown_token.clone();
                             let cancellation_tokens = self.cancellation_tokens.clone();
-                            let request_cancellation_tokens =
-                                self.request_cancellation_tokens.clone();
 
                             // Get or create a cancellation token for this batch
                             // All requests in a batch share the same token
                             let batch_cancellation_token =
                                 cancellation_tokens.entry(batch_id).or_default().clone();
-
-                            // Create a request-specific cancellation token for supersession
-                            let request_cancellation_token =
-                                tokio_util::sync::CancellationToken::new();
-                            request_cancellation_tokens
-                                .insert(request_id, request_cancellation_token.clone());
 
                             // Increment in-flight counter and gauge
                             requests_in_flight.fetch_add(1, Ordering::Relaxed);
@@ -885,10 +637,6 @@ where
                                         _ = batch_cancellation_token.cancelled() => {
                                             crate::request::transitions::CancellationReason::User
                                         }
-                                        _ = request_cancellation_token.cancelled() => {
-                                            // Request was superseded by its racing pair - don't persist as canceled
-                                            crate::request::transitions::CancellationReason::Superseded
-                                        }
                                         _ = shutdown_token.cancelled() => {
                                             crate::request::transitions::CancellationReason::Shutdown
                                         }
@@ -899,7 +647,7 @@ where
                                 match processing.complete(storage.as_ref(), |response| {
                                     (should_retry)(response)
                                 }, cancellation).await {
-                                    Ok(RequestCompletionResult::Completed(completed)) => {
+                                    Ok(RequestCompletionResult::Completed(_completed)) => {
                                         requests_processed.fetch_add(1, Ordering::Relaxed);
                                         counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
                                         histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
@@ -908,33 +656,6 @@ where
                                         histogram!("fusillade_retry_attempts_on_success", "model" => model_clone.clone())
                                             .record(retry_attempt_at_completion as f64);
                                         tracing::info!(request_id = %request_id, retry_attempts = retry_attempt_at_completion, "Request completed successfully");
-
-                                        // If this request is part of a race, cancel the superseded racing pair's token
-                                        let superseded_id_opt = if completed.data.is_escalated {
-                                            // This is an escalated request - the original was superseded
-                                            completed.data.escalated_from_request_id
-                                        } else {
-                                            // This is an original - check if there's an escalated request to supersede
-                                            // Use targeted query instead of fetching all batch requests
-                                            storage.find_pending_escalation(request_id).await.unwrap_or(None)
-                                        };
-
-                                        if let Some(sid) = superseded_id_opt
-                                            && let Some((_, token)) = request_cancellation_tokens.remove(&sid) {
-                                                let winner = if completed.data.is_escalated { "escalated" } else { "original" };
-                                                counter!(
-                                                    "fusillade_escalation_winner_total",
-                                                    "model" => model_clone.clone(),
-                                                    "winner" => winner
-                                                ).increment(1);
-                                                token.cancel();
-                                                tracing::debug!(
-                                                    winner_id = %request_id,
-                                                    superseded_id = %sid,
-                                                    winner = winner,
-                                                    "Cancelled superseded request's in-flight HTTP task"
-                                                );
-                                            }
                                     }
                                     Ok(RequestCompletionResult::Failed(failed)) => {
                                         let retry_attempt = failed.state.retry_attempt;
@@ -1004,9 +725,6 @@ where
                                         return Err(e);
                                     }
                                 }
-
-                                // Clean up request-specific cancellation token
-                                request_cancellation_tokens.remove(&request_id);
 
                                 // Note: We don't remove the batch cancellation token here since
                                 // multiple requests in the same batch share it. Tokens are cleaned
@@ -1086,10 +804,9 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![], // Disable SLA monitoring in tests
         };
 
         let manager = Arc::new(
@@ -1255,10 +972,9 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![], // Disable SLA monitoring in tests
         };
 
         let manager = Arc::new(
@@ -1482,10 +1198,9 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![], // Disable SLA monitoring in tests
         };
 
         let manager = Arc::new(
@@ -1618,10 +1333,9 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![], // Disable SLA monitoring in tests
         };
 
         let manager = Arc::new(
@@ -1789,10 +1503,9 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![],
         };
 
         let manager = Arc::new(
@@ -1944,10 +1657,9 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![],
         };
 
         let manager = Arc::new(
@@ -2099,6 +1811,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![
                 "id".to_string(),
                 "endpoint".to_string(),
@@ -2106,8 +1819,6 @@ mod tests {
                 "completion_window".to_string(),
             ],
             cancellation_poll_interval_ms: 100,
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![],
         };
 
         let manager = Arc::new(
@@ -2254,6 +1965,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![
                 "id".to_string(),
                 "endpoint".to_string(),
@@ -2261,8 +1973,6 @@ mod tests {
                 "request_source".to_string(), // This comes from metadata JSON
             ],
             cancellation_poll_interval_ms: 100,
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![],
         };
 
         let manager = Arc::new(
