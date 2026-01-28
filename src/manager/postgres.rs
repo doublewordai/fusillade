@@ -2081,7 +2081,38 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to update batches: {}", e)))?;
 
-        // Step 2: Soft-delete the file
+        // Step 2: Clear output_file_id and error_file_id references
+        // This mirrors the ON DELETE SET NULL FK behavior for soft deletes
+        // Without this, batches would have dangling references to soft-deleted files
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET output_file_id = NULL
+            WHERE output_file_id = $1
+            "#,
+            *file_id as Uuid,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to clear output_file_id reference: {}", e))
+        })?;
+
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET error_file_id = NULL
+            WHERE error_file_id = $1
+            "#,
+            *file_id as Uuid,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to clear error_file_id reference: {}", e))
+        })?;
+
+        // Step 3: Soft-delete the file
         // Set deleted_at and status to 'deleted'
         // The file and its templates remain in the database for audit purposes
         // Templates are excluded from active_request_templates view via the JOIN on files.deleted_at
