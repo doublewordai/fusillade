@@ -47,7 +47,6 @@ fmt:
 # CI pipeline
 ci:
     just db-setup
-    cargo test
     cargo llvm-cov --lcov --output-path lcov.info
     just lint
 
