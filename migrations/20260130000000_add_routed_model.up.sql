@@ -1,10 +1,10 @@
 -- Remove escalation support - replace with route-at-claim-time approach
 -- This migration removes the SLA racing/supersession system in favor of
 -- routing requests to escalated models at claim time based on time remaining.
-
--- First, clean up any escalated or superseded requests
--- These are infrastructure artifacts that won't exist under the new approach
-DELETE FROM requests WHERE is_escalated = true OR state = 'superseded';
+--
+-- Note: Any escalated/superseded requests will have their tracking columns dropped.
+-- If cleanup is needed, run manually before this migration:
+--   DELETE FROM requests WHERE is_escalated = true OR state = 'superseded';
 
 -- Drop the views that depend on the columns we're removing
 DROP VIEW IF EXISTS active_requests;
@@ -39,28 +39,9 @@ ALTER TABLE requests ADD CONSTRAINT state_check CHECK (
 ALTER TABLE requests ADD COLUMN routed_model TEXT NULL;
 
 -- Recreate the active_requests view without the removed columns, including routed_model
+-- Preserves soft delete filtering from 20260129000001_update_active_views
 CREATE VIEW active_requests AS
-SELECT
-    id,
-    batch_id,
-    template_id,
-    state,
-    retry_attempt,
-    not_before,
-    daemon_id,
-    claimed_at,
-    started_at,
-    response_status,
-    response_body,
-    completed_at,
-    error,
-    failed_at,
-    canceled_at,
-    created_at,
-    updated_at,
-    custom_id,
-    model,
-    response_size,
-    routed_model
-FROM requests
-WHERE batch_id IS NOT NULL;
+SELECT r.*
+FROM requests r
+JOIN batches b ON r.batch_id = b.id
+WHERE b.deleted_at IS NULL;
