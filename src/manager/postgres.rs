@@ -2389,13 +2389,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         query_builder.push("::TEXT IS NULL OR b.created_by = ");
         query_builder.push_bind(&created_by);
         query_builder.push(") AND (");
-        query_builder.push_bind(&after_created_at);
+        query_builder.push_bind(after_created_at);
         query_builder.push("::TIMESTAMPTZ IS NULL OR b.created_at < ");
-        query_builder.push_bind(&after_created_at);
+        query_builder.push_bind(after_created_at);
         query_builder.push(" OR (b.created_at = ");
-        query_builder.push_bind(&after_created_at);
+        query_builder.push_bind(after_created_at);
         query_builder.push(" AND b.id < ");
-        query_builder.push_bind(&after_id);
+        query_builder.push_bind(after_id);
         query_builder.push(")) AND (");
         query_builder.push_bind(&search_pattern);
         query_builder.push("::TEXT IS NULL OR LOWER(b.metadata::text) LIKE ");
