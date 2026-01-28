@@ -11,7 +11,7 @@ on:
 
 jobs:
   test:
-    runs-on: depot-ubuntu-24.04
+    runs-on: depot-ubuntu-24.04-16
 
     services:
       postgres:
@@ -45,29 +45,15 @@ jobs:
           cargo install sqlx-cli --no-default-features --features native-tls,postgres --locked
           cargo install cargo-llvm-cov --locked
 
-      - name: Setup database
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/fusillade
-        run: |
-          PGPASSWORD=postgres createdb -h localhost -U postgres fusillade
-          echo "DATABASE_URL=postgres://postgres:postgres@localhost:5432/fusillade" > .env
-          sqlx migrate run
+      - name: Install just
+        uses: extractions/setup-just@v3
 
-      - name: Run tests
+      - name: Run CI pipeline
         env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/fusillade
-        run: cargo test
-
-      - name: Run tests with coverage
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/fusillade
-        run: cargo llvm-cov --lcov --output-path lcov.info
-
-      - name: Lint
-        run: |
-          cargo fmt --check
-          cargo clippy -- -D warnings
-          cargo sqlx prepare --check
+          DB_HOST: localhost
+          DB_USER: postgres
+          DB_PASS: postgres
+        run: just ci
 
   publish:
     if: github.event_name == 'release' && !github.event.release.prerelease
