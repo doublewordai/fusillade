@@ -179,7 +179,7 @@ pub trait Storage: Send + Sync {
     /// * `offset` - Number of results to skip (for pagination)
     /// * `search` - Optional custom_id filter (case-insensitive substring match)
     /// * `status` - Optional status filter (completed, failed, pending, in_progress)
-    /// * `error_filter` - Filter for which error types to include (only applies when status=failed)
+    /// * `error_filter` - Filter for which error types to include (only affects failed results; other statuses are unaffected)
     fn get_batch_results_stream(
         &self,
         batch_id: BatchId,

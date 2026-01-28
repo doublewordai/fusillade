@@ -177,21 +177,6 @@ async fn setup_batch_with_mixed_failures(
         }
     }
 
-    // Manually update batch counts since we bypassed the normal flow
-    // In production, the trigger handles this, but for testing we need to sync manually
-    sqlx::query!(
-        r#"
-        UPDATE batches
-        SET failed_requests_retriable = 2,
-            failed_requests_non_retriable = 2
-        WHERE id = $1
-        "#,
-        *batch.id as uuid::Uuid,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
     (manager, batch.id, file_id)
 }
 

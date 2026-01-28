@@ -474,10 +474,51 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     }
 
     /// Check if a batch is complete based on request counts.
+    /// Note: This function expects to be called with a batch fetched using ErrorFilter::All
+    /// to ensure failed_requests contains the total count of all failures.
     fn is_batch_complete(batch: &Batch) -> bool {
         let terminal_count =
             batch.completed_requests + batch.failed_requests + batch.canceled_requests;
         terminal_count == batch.total_requests && batch.total_requests > 0
+    }
+
+    /// Get SQL fragments for filtering failed requests based on ErrorFilter.
+    ///
+    /// Returns separate static string fragments to avoid SQL injection risks from format!().
+    /// All returned strings are compile-time constants from match arms.
+    ///
+    /// # Returns
+    /// Tuple of (where_clause, failed_count, failed_retriable_count, failed_non_retriable_count):
+    /// - where_clause: Additional WHERE condition for stream filtering (empty for All)
+    /// - failed_count: COUNT expression for failed requests (varies based on filter)
+    /// - failed_retriable_count: COUNT expression for retriable failures (always the same)
+    /// - failed_non_retriable_count: COUNT expression for non-retriable failures (always the same)
+    fn error_filter_sql_fragments(
+        filter: crate::batch::ErrorFilter,
+    ) -> (&'static str, &'static str, &'static str, &'static str) {
+        // These are always the same regardless of filter
+        const FAILED_RETRIABLE: &str =
+            "COUNT(*) FILTER (WHERE state = 'failed' AND is_retriable_error = true)";
+        const FAILED_NON_RETRIABLE: &str = "COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL))";
+
+        let (where_clause, failed_count) = match filter {
+            crate::batch::ErrorFilter::All => ("", "COUNT(*) FILTER (WHERE state = 'failed')"),
+            crate::batch::ErrorFilter::OnlyRetriable => (
+                "AND is_retriable_error = true",
+                "COUNT(*) FILTER (WHERE state = 'failed' AND is_retriable_error = true)",
+            ),
+            crate::batch::ErrorFilter::OnlyNonRetriable => (
+                "AND (is_retriable_error = false OR is_retriable_error IS NULL)",
+                "COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL))",
+            ),
+        };
+
+        (
+            where_clause,
+            failed_count,
+            FAILED_RETRIABLE,
+            FAILED_NON_RETRIABLE,
+        )
     }
 
     /// Finalize a virtual file's size in the database.
@@ -2304,16 +2345,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         batch_id: BatchId,
         error_filter: crate::batch::ErrorFilter,
     ) -> Result<BatchStatus> {
-        // Determine which failure counts to include based on the filter
-        let failed_select = match error_filter {
-            crate::batch::ErrorFilter::All => "COUNT(*) FILTER (WHERE state = 'failed') as failed",
-            crate::batch::ErrorFilter::OnlyRetriable => {
-                "COUNT(*) FILTER (WHERE state = 'failed' AND is_retriable_error = true) as failed"
-            }
-            crate::batch::ErrorFilter::OnlyNonRetriable => {
-                "COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL)) as failed"
-            }
-        };
+        let (_where_clause, failed, failed_retriable, failed_non_retriable) =
+            Self::error_filter_sql_fragments(error_filter);
 
         let query = format!(
             r#"
@@ -2324,12 +2357,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.total_requests,
                 b.requests_started_at as started_at,
                 b.created_at,
-                b.failed_requests_retriable,
-                b.failed_requests_non_retriable,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
                 COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                COALESCE(counts.failed_retriable, 0)::BIGINT as failed_requests_retriable,
+                COALESCE(counts.failed_non_retriable, 0)::BIGINT as failed_requests_non_retriable,
                 COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN files f ON f.id = b.file_id
@@ -2338,7 +2371,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
-                    {},
+                    {} as failed,
+                    {} as failed_retriable,
+                    {} as failed_non_retriable,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
@@ -2346,7 +2381,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ) counts ON TRUE
             WHERE b.id = $1 AND b.deleted_at IS NULL
             "#,
-            failed_select
+            failed, failed_retriable, failed_non_retriable
         );
 
         let row = sqlx::query(&query)
@@ -2421,12 +2456,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         b.failed_at,
                         b.cancelled_at,
                         b.deleted_at,
-                        b.failed_requests_retriable,
-                        b.failed_requests_non_retriable,
                         COALESCE(counts.pending, 0)::BIGINT as "pending_requests!",
                         COALESCE(counts.in_progress, 0)::BIGINT as "in_progress_requests!",
                         COALESCE(counts.completed, 0)::BIGINT as "completed_requests!",
                         COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
+                        COALESCE(counts.failed_retriable, 0)::BIGINT as "failed_requests_retriable!",
+                        COALESCE(counts.failed_non_retriable, 0)::BIGINT as "failed_requests_non_retriable!",
                         COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
                     FROM batches b
                     LEFT JOIN LATERAL (
@@ -2435,6 +2470,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                             COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                             COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                            COUNT(*) FILTER (WHERE state = 'failed' AND is_retriable_error = true) as failed_retriable,
+                            COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL)) as failed_non_retriable,
                             COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                         FROM requests
                         WHERE batch_id = b.id
@@ -2464,12 +2501,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         b.failed_at,
                         b.cancelled_at,
                         b.deleted_at,
-                        b.failed_requests_retriable,
-                        b.failed_requests_non_retriable,
                         COALESCE(counts.pending, 0)::BIGINT as "pending_requests!",
                         COALESCE(counts.in_progress, 0)::BIGINT as "in_progress_requests!",
                         COALESCE(counts.completed, 0)::BIGINT as "completed_requests!",
                         COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
+                        COALESCE(counts.failed_retriable, 0)::BIGINT as "failed_requests_retriable!",
+                        COALESCE(counts.failed_non_retriable, 0)::BIGINT as "failed_requests_non_retriable!",
                         COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
                     FROM batches b
                     LEFT JOIN LATERAL (
@@ -2478,6 +2515,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                             COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
                             COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                            COUNT(*) FILTER (WHERE state = 'failed' AND is_retriable_error = true) as failed_retriable,
+                            COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL)) as failed_non_retriable,
                             COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                         FROM requests
                         WHERE batch_id = b.id
@@ -2527,15 +2566,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // Join with files table to enable searching by input filename
         let search_pattern = search.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
 
-        let failed_select = match error_filter {
-            crate::batch::ErrorFilter::All => "COUNT(*) FILTER (WHERE state = 'failed') as failed",
-            crate::batch::ErrorFilter::OnlyRetriable => {
-                "COUNT(*) FILTER (WHERE state = 'failed' AND is_retriable_error = true) as failed"
-            }
-            crate::batch::ErrorFilter::OnlyNonRetriable => {
-                "COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL)) as failed"
-            }
-        };
+        let (_where_clause, failed, failed_retriable, failed_non_retriable) =
+            Self::error_filter_sql_fragments(error_filter);
 
         let query = format!(
             r#"
@@ -2550,12 +2582,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.failed_at,
                 b.cancelled_at,
                 b.deleted_at,
-                b.failed_requests_retriable,
-                b.failed_requests_non_retriable,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
                 COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                COALESCE(counts.failed_retriable, 0)::BIGINT as failed_requests_retriable,
+                COALESCE(counts.failed_non_retriable, 0)::BIGINT as failed_requests_non_retriable,
                 COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN files f ON b.file_id = f.id
@@ -2564,7 +2596,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
-                    {},
+                    {} as failed,
+                    {} as failed_retriable,
+                    {} as failed_non_retriable,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
@@ -2577,7 +2611,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ORDER BY b.created_at DESC, b.id DESC
             LIMIT $2
             "#,
-            failed_select
+            failed, failed_retriable, failed_non_retriable
         );
 
         let rows = sqlx::query(&query)
@@ -2697,15 +2731,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         file_id: FileId,
         error_filter: crate::batch::ErrorFilter,
     ) -> Result<Vec<BatchStatus>> {
-        let failed_select = match error_filter {
-            crate::batch::ErrorFilter::All => "COUNT(*) FILTER (WHERE state = 'failed') as failed",
-            crate::batch::ErrorFilter::OnlyRetriable => {
-                "COUNT(*) FILTER (WHERE state = 'failed' AND is_retriable_error = true) as failed"
-            }
-            crate::batch::ErrorFilter::OnlyNonRetriable => {
-                "COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL)) as failed"
-            }
-        };
+        let (_where_clause, failed, failed_retriable, failed_non_retriable) =
+            Self::error_filter_sql_fragments(error_filter);
 
         let query = format!(
             r#"
@@ -2716,12 +2743,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.total_requests,
                 b.requests_started_at as started_at,
                 b.created_at,
-                b.failed_requests_retriable,
-                b.failed_requests_non_retriable,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
                 COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                COALESCE(counts.failed_retriable, 0)::BIGINT as failed_requests_retriable,
+                COALESCE(counts.failed_non_retriable, 0)::BIGINT as failed_requests_non_retriable,
                 COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN files f ON f.id = b.file_id
@@ -2730,7 +2757,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
-                    {},
+                    {} as failed,
+                    {} as failed_retriable,
+                    {} as failed_non_retriable,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
@@ -2739,7 +2768,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             WHERE b.file_id = $1 AND b.deleted_at IS NULL
             ORDER BY b.created_at DESC
             "#,
-            failed_select
+            failed, failed_retriable, failed_non_retriable
         );
 
         let rows = sqlx::query(&query)
@@ -3473,20 +3502,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         pool: &PgPool,
         error_filter: crate::batch::ErrorFilter,
     ) -> Result<Batch> {
-        // Determine which failure counts to include based on the filter
-        let (_failed_where_clause, failed_select) = match error_filter {
-            crate::batch::ErrorFilter::All => {
-                ("", "COUNT(*) FILTER (WHERE state = 'failed') as failed")
-            }
-            crate::batch::ErrorFilter::OnlyRetriable => (
-                "AND is_retriable_error = true",
-                "COUNT(*) FILTER (WHERE state = 'failed' AND is_retriable_error = true) as failed",
-            ),
-            crate::batch::ErrorFilter::OnlyNonRetriable => (
-                "AND (is_retriable_error = false OR is_retriable_error IS NULL)",
-                "COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL)) as failed",
-            ),
-        };
+        let (_where_clause, failed, failed_retriable, failed_non_retriable) =
+            Self::error_filter_sql_fragments(error_filter);
 
         let query = format!(
             r#"
@@ -3501,12 +3518,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 b.failed_at,
                 b.cancelled_at,
                 b.deleted_at,
-                b.failed_requests_retriable,
-                b.failed_requests_non_retriable,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
                 COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                COALESCE(counts.failed_retriable, 0)::BIGINT as failed_requests_retriable,
+                COALESCE(counts.failed_non_retriable, 0)::BIGINT as failed_requests_non_retriable,
                 COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN LATERAL (
@@ -3514,7 +3531,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state IN ('completed', 'superseded')) as completed,
-                    {},
+                    {} as failed,
+                    {} as failed_retriable,
+                    {} as failed_non_retriable,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
@@ -3522,7 +3541,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             ) counts ON TRUE
             WHERE b.id = $1 AND b.deleted_at IS NULL
             "#,
-            failed_select
+            failed, failed_retriable, failed_non_retriable
         );
 
         let row = sqlx::query(&query)
@@ -3620,6 +3639,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
         // Lazy computation of terminal timestamps
         // Check if batch is in terminal state and update timestamps if needed
+        // Note: This function must be called with ErrorFilter::All to ensure failed_requests
+        // contains the total count of all failures for accurate terminal detection.
         let terminal_count =
             batch.completed_requests + batch.failed_requests + batch.canceled_requests;
         let is_terminal = terminal_count == batch.total_requests && batch.total_requests > 0;
@@ -4003,14 +4024,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             };
             is_first_batch = false;
 
-            // Add error filter clause
-            let error_filter_clause = match error_filter {
-                crate::batch::ErrorFilter::All => "",
-                crate::batch::ErrorFilter::OnlyRetriable => "AND is_retriable_error = true",
-                crate::batch::ErrorFilter::OnlyNonRetriable => {
-                    "AND (is_retriable_error = false OR is_retriable_error IS NULL)"
-                }
-            };
+            let (where_clause, _failed, _failed_retriable, _failed_non_retriable) =
+                Self::error_filter_sql_fragments(error_filter);
 
             let query = format!(
                 r#"
@@ -4027,7 +4042,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 OFFSET $4
                 LIMIT $5
                 "#,
-                error_filter_clause
+                where_clause
             );
 
             let request_batch = sqlx::query(&query)
@@ -4061,10 +4076,43 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                                 return;
                             }
                         };
-                        let custom_id: Option<String> = row.try_get("custom_id").ok();
-                        let error: Option<String> = row.try_get("error").ok();
+                        let custom_id: Option<String> = match row.try_get("custom_id") {
+                            Ok(value) => value,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(FusilladeError::Other(anyhow!(
+                                        "Failed to extract custom_id: {}",
+                                        e
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                        };
+                        let error: Option<String> = match row.try_get("error") {
+                            Ok(value) => value,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(FusilladeError::Other(anyhow!(
+                                        "Failed to extract error: {}",
+                                        e
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                        };
                         let failed_at: Option<chrono::DateTime<chrono::Utc>> =
-                            row.try_get("failed_at").ok();
+                            match row.try_get("failed_at") {
+                                Ok(value) => value,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(FusilladeError::Other(anyhow!(
+                                            "Failed to extract failed_at: {}",
+                                            e
+                                        ))))
+                                        .await;
+                                    return;
+                                }
+                            };
 
                         last_failed_at = failed_at;
                         last_id = id;
@@ -4243,7 +4291,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                                 return;
                             }
                         };
-                        let custom_id: Option<String> = row.try_get("custom_id").ok();
+                        let custom_id: Option<String> = match row.try_get("custom_id") {
+                            Ok(value) => value,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(FusilladeError::Other(anyhow!(
+                                        "Failed to extract custom_id: {}",
+                                        e
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                        };
                         let model: String = match row.try_get("model") {
                             Ok(m) => m,
                             Err(e) => {
@@ -4280,8 +4339,30 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                                 return;
                             }
                         };
-                        let response_body_str: Option<String> = row.try_get("response_body").ok();
-                        let error: Option<String> = row.try_get("error").ok();
+                        let response_body_str: Option<String> = match row.try_get("response_body") {
+                            Ok(value) => value,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(FusilladeError::Other(anyhow!(
+                                        "Failed to extract response_body: {}",
+                                        e
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                        };
+                        let error: Option<String> = match row.try_get("error") {
+                            Ok(value) => value,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(FusilladeError::Other(anyhow!(
+                                        "Failed to extract error: {}",
+                                        e
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                        };
                         last_line_number = match row.try_get("line_number") {
                             Ok(ln) => ln,
                             Err(e) => {
@@ -7968,7 +8049,8 @@ mod tests {
             SET state = 'failed',
                 error = $2,
                 response_size = $3,
-                failed_at = NOW()
+                failed_at = NOW(),
+                is_retriable_error = false
             WHERE id = $1
             "#,
             *requests[1].id() as Uuid,
@@ -8753,7 +8835,8 @@ mod tests {
             SET state = 'failed',
                 error = '{"error":"all failed"}',
                 response_size = 22,
-                failed_at = NOW()
+                failed_at = NOW(),
+                is_retriable_error = false
             WHERE batch_id = $1
             "#,
             *batch.id as Uuid,
