@@ -13,9 +13,9 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
+use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::postgres::{PgListener, PgPool};
-use sqlx::QueryBuilder;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -258,14 +258,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         // These are always the same regardless of filter
         const FAILED_RETRIABLE: &str =
             "COUNT(*) FILTER (WHERE state = 'failed' AND is_retriable_error = true)";
-        const FAILED_NON_RETRIABLE: &str =
-            "COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL))";
+        const FAILED_NON_RETRIABLE: &str = "COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL))";
 
         let (where_clause, failed_count) = match filter {
-            crate::batch::ErrorFilter::All => (
-                "",
-                "COUNT(*) FILTER (WHERE state = 'failed')",
-            ),
+            crate::batch::ErrorFilter::All => ("", "COUNT(*) FILTER (WHERE state = 'failed')"),
             crate::batch::ErrorFilter::OnlyRetriable => (
                 "AND is_retriable_error = true",
                 "COUNT(*) FILTER (WHERE state = 'failed' AND is_retriable_error = true)",
@@ -276,7 +272,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             ),
         };
 
-        (where_clause, failed_count, FAILED_RETRIABLE, FAILED_NON_RETRIABLE)
+        (
+            where_clause,
+            failed_count,
+            FAILED_RETRIABLE,
+            FAILED_NON_RETRIABLE,
+        )
     }
 
     /// Get the connection pool.
@@ -1610,12 +1611,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     async fn get_file_content(&self, file_id: FileId) -> Result<Vec<FileContentItem>> {
-        let mut stream = self.get_file_content_stream(
-            file_id,
-            0,
-            None,
-            crate::batch::ErrorFilter::All,
-        );
+        let mut stream =
+            self.get_file_content_stream(file_id, 0, None, crate::batch::ErrorFilter::All);
         let mut items = Vec::new();
 
         while let Some(result) = stream.next().await {
@@ -2160,7 +2157,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         batch_id: BatchId,
         error_filter: crate::batch::ErrorFilter,
     ) -> Result<Batch> {
-        self.get_batch_from_pool(batch_id, error_filter, self.pools.read()).await
+        self.get_batch_from_pool(batch_id, error_filter, self.pools.read())
+            .await
     }
 
     async fn get_batch_status(
@@ -2195,7 +2193,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    "#
+                    "#,
         );
         query_builder.push(failed_count);
         query_builder.push(" as failed, ");
@@ -2213,7 +2211,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         query_builder.push_bind(*batch_id as Uuid);
         query_builder.push(" AND b.deleted_at IS NULL");
 
-        let row = query_builder.build()
+        let row = query_builder
+            .build()
             .fetch_optional(self.pools.read())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch status: {}", e)))?
@@ -2257,7 +2256,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                             COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                             COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                            "#
+                            "#,
         );
         query_builder.push(failed_count);
         query_builder.push(" as failed, ");
@@ -2279,10 +2278,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 query_builder.push_bind(*file_id as Uuid);
                 query_builder.push(" AND b.deleted_at IS NULL");
 
-                let row = query_builder.build()
+                let row = query_builder
+                    .build()
                     .fetch_optional(self.pools.read())
                     .await
-                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by output file: {}", e)))?;
+                    .map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to get batch by output file: {}", e))
+                    })?;
 
                 Ok(row.map(|row| batch_from_dynamic_row!(row)))
             }
@@ -2291,11 +2293,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 query_builder.push_bind(*file_id as Uuid);
                 query_builder.push(" AND b.deleted_at IS NULL");
 
-                let row = query_builder.build()
+                let row = query_builder
+                    .build()
                     .bind(*file_id as Uuid)
                     .fetch_optional(self.pools.read())
                     .await
-                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by error file: {}", e)))?;
+                    .map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to get batch by error file: {}", e))
+                    })?;
 
                 Ok(row.map(|row| batch_from_dynamic_row!(row)))
             }
@@ -2364,7 +2369,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    "#
+                    "#,
         );
         query_builder.push(failed_count);
         query_builder.push(" as failed, ");
@@ -2400,12 +2405,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         query_builder.push(") ORDER BY b.created_at DESC, b.id DESC LIMIT ");
         query_builder.push_bind(limit);
 
-        let rows = query_builder.build()
+        let rows = query_builder
+            .build()
             .fetch_all(self.pools.read())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
 
-        Ok(rows.into_iter().map(|row| batch_from_dynamic_row!(row)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| batch_from_dynamic_row!(row))
+            .collect())
     }
 
     async fn list_file_batches(
@@ -2440,7 +2449,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    "#
+                    "#,
         );
         query_builder.push(failed_count);
         query_builder.push(" as failed, ");
@@ -2458,7 +2467,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         query_builder.push_bind(*file_id as Uuid);
         query_builder.push(" AND b.deleted_at IS NULL ORDER BY b.created_at DESC");
 
-        let rows = query_builder.build()
+        let rows = query_builder
+            .build()
             .fetch_all(self.pools.read())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
@@ -2898,7 +2908,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    "#
+                    "#,
         );
         query_builder.push(failed_count);
         query_builder.push(" as failed, ");
@@ -2916,7 +2926,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         query_builder.push_bind(*batch_id as Uuid);
         query_builder.push(" AND b.deleted_at IS NULL");
 
-        let row = query_builder.build()
+        let row = query_builder
+            .build()
             .fetch_optional(pool)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
@@ -3342,7 +3353,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 r#"
                 SELECT id, custom_id, error, failed_at
                 FROM requests
-                WHERE batch_id = "#
+                WHERE batch_id = "#,
             );
             query_builder.push_bind(batch_id);
             query_builder.push(" AND state = 'failed' AND (");
@@ -3370,9 +3381,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             query_builder.push(" LIMIT ");
             query_builder.push_bind(BATCH_SIZE);
 
-            let request_batch = query_builder.build()
-                .fetch_all(&pool)
-                .await;
+            let request_batch = query_builder.build().fetch_all(&pool).await;
 
             match request_batch {
                 Ok(requests) => {
@@ -3509,7 +3518,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     r.error,
                     t.line_number
                 FROM request_templates t
-                JOIN requests r ON r.template_id = t.id AND r.batch_id = "#
+                JOIN requests r ON r.template_id = t.id AND r.batch_id = "#,
             );
             query_builder.push_bind(*batch_id as Uuid);
             query_builder.push(" WHERE t.file_id = ");
@@ -3542,9 +3551,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
             // Query from request_templates joined to requests.
             // For each template, we find the matching request for this batch.
-            let request_batch = query_builder.build()
-                .fetch_all(&pool)
-                .await;
+            let request_batch = query_builder.build().fetch_all(&pool).await;
 
             match request_batch {
                 Ok(requests) => {
@@ -4772,7 +4779,10 @@ mod tests {
         assert_eq!(claimed2.len(), 2);
 
         // Verify batch status shows claimed requests
-        let status = manager.get_batch_status(batch.id, crate::batch::ErrorFilter::All).await.unwrap();
+        let status = manager
+            .get_batch_status(batch.id, crate::batch::ErrorFilter::All)
+            .await
+            .unwrap();
         assert_eq!(status.total_requests, 5);
         assert_eq!(status.pending_requests, 0);
         assert_eq!(status.in_progress_requests, 5); // All claimed
@@ -4818,7 +4828,10 @@ mod tests {
             .unwrap();
 
         // Verify all are pending
-        let status_before = manager.get_batch_status(batch.id, crate::batch::ErrorFilter::All).await.unwrap();
+        let status_before = manager
+            .get_batch_status(batch.id, crate::batch::ErrorFilter::All)
+            .await
+            .unwrap();
         assert_eq!(status_before.pending_requests, 3);
         assert_eq!(status_before.canceled_requests, 0);
 
@@ -4826,7 +4839,10 @@ mod tests {
         manager.cancel_batch(batch.id).await.unwrap();
 
         // Verify all are canceled
-        let status_after = manager.get_batch_status(batch.id, crate::batch::ErrorFilter::All).await.unwrap();
+        let status_after = manager
+            .get_batch_status(batch.id, crate::batch::ErrorFilter::All)
+            .await
+            .unwrap();
         assert_eq!(status_after.pending_requests, 0);
         assert_eq!(status_after.canceled_requests, 3);
 
@@ -4889,7 +4905,9 @@ mod tests {
             .unwrap();
 
         // Verify batch exists
-        let batch_before = manager.get_batch(batch.id, crate::batch::ErrorFilter::All).await;
+        let batch_before = manager
+            .get_batch(batch.id, crate::batch::ErrorFilter::All)
+            .await;
         assert!(batch_before.is_ok());
 
         // Verify requests exist
@@ -4900,7 +4918,9 @@ mod tests {
         manager.delete_batch(batch.id).await.unwrap();
 
         // Verify batch is gone
-        let batch_after = manager.get_batch(batch.id, crate::batch::ErrorFilter::All).await;
+        let batch_after = manager
+            .get_batch(batch.id, crate::batch::ErrorFilter::All)
+            .await;
         assert!(batch_after.is_err());
 
         // Verify requests are not returned (orphaned with batch_id = NULL, filtered by view)
@@ -4971,7 +4991,10 @@ mod tests {
         }
 
         // Verify batch status
-        let status = manager.get_batch_status(batch.id, crate::batch::ErrorFilter::All).await.unwrap();
+        let status = manager
+            .get_batch_status(batch.id, crate::batch::ErrorFilter::All)
+            .await
+            .unwrap();
         assert_eq!(status.pending_requests, 2);
         assert_eq!(status.canceled_requests, 3);
 
@@ -5092,7 +5115,10 @@ mod tests {
             .unwrap();
 
         // List batches for this file
-        let batches = manager.list_file_batches(file_id, crate::batch::ErrorFilter::All).await.unwrap();
+        let batches = manager
+            .list_file_batches(file_id, crate::batch::ErrorFilter::All)
+            .await
+            .unwrap();
 
         assert_eq!(batches.len(), 3);
 
@@ -5159,7 +5185,10 @@ mod tests {
             .unwrap();
 
         // Verify the batch exists with file_id set
-        let batch_before = manager.get_batch(batch.id, crate::batch::ErrorFilter::All).await.unwrap();
+        let batch_before = manager
+            .get_batch(batch.id, crate::batch::ErrorFilter::All)
+            .await
+            .unwrap();
         assert_eq!(batch_before.file_id, Some(file_id));
         assert!(batch_before.cancelling_at.is_none());
         assert!(batch_before.cancelled_at.is_none());
@@ -5177,7 +5206,10 @@ mod tests {
         assert!(file_result.is_err());
 
         // Verify batch still exists but file_id is NULL and batch is cancelled
-        let batch_after = manager.get_batch(batch.id, crate::batch::ErrorFilter::All).await.unwrap();
+        let batch_after = manager
+            .get_batch(batch.id, crate::batch::ErrorFilter::All)
+            .await
+            .unwrap();
         assert_eq!(batch_after.file_id, None);
         assert!(batch_after.cancelling_at.is_some());
         assert!(batch_after.cancelled_at.is_some());
@@ -5268,7 +5300,10 @@ mod tests {
         assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
 
         // Verify the request is now claimed by daemon2
-        let status = manager.get_batch_status(batch.id, crate::batch::ErrorFilter::All).await.unwrap();
+        let status = manager
+            .get_batch_status(batch.id, crate::batch::ErrorFilter::All)
+            .await
+            .unwrap();
         assert_eq!(status.in_progress_requests, 1);
     }
 
@@ -5341,7 +5376,10 @@ mod tests {
         .unwrap();
 
         // Verify it's in processing state
-        let status_before = manager.get_batch_status(batch.id, crate::batch::ErrorFilter::All).await.unwrap();
+        let status_before = manager
+            .get_batch_status(batch.id, crate::batch::ErrorFilter::All)
+            .await
+            .unwrap();
         assert_eq!(status_before.in_progress_requests, 1);
 
         // Now daemon2 tries to claim - should unclaim the stale processing request
@@ -5659,7 +5697,12 @@ mod tests {
         .expect("Failed to mark request as failed");
 
         // Stream the output file - should contain 2 completed requests
-        let output_stream = manager.get_file_content_stream(output_file_id, 0, None, crate::batch::ErrorFilter::All);
+        let output_stream = manager.get_file_content_stream(
+            output_file_id,
+            0,
+            None,
+            crate::batch::ErrorFilter::All,
+        );
         let output_items: Vec<_> = output_stream.collect().await;
 
         assert_eq!(output_items.len(), 2, "Should have 2 output items");
@@ -5693,7 +5736,8 @@ mod tests {
         );
 
         // Stream the error file - should contain 1 failed request
-        let error_stream = manager.get_file_content_stream(error_file_id, 0, None, crate::batch::ErrorFilter::All);
+        let error_stream =
+            manager.get_file_content_stream(error_file_id, 0, None, crate::batch::ErrorFilter::All);
         let error_items: Vec<_> = error_stream.collect().await;
 
         assert_eq!(error_items.len(), 1, "Should have 1 error item");
@@ -5713,7 +5757,8 @@ mod tests {
         }
 
         // Verify that streaming a regular input file still works
-        let input_stream = manager.get_file_content_stream(file_id, 0, None, crate::batch::ErrorFilter::All);
+        let input_stream =
+            manager.get_file_content_stream(file_id, 0, None, crate::batch::ErrorFilter::All);
         let input_items: Vec<_> = input_stream.collect().await;
 
         assert_eq!(input_items.len(), 3, "Input file should have 3 templates");
@@ -6241,7 +6286,9 @@ mod tests {
 
         // Try to get a batch that doesn't exist
         let fake_batch_id = BatchId(Uuid::new_v4());
-        let result = manager.get_batch(fake_batch_id, crate::batch::ErrorFilter::All).await;
+        let result = manager
+            .get_batch(fake_batch_id, crate::batch::ErrorFilter::All)
+            .await;
 
         // Should return an error
         assert!(result.is_err());
@@ -6313,7 +6360,10 @@ mod tests {
         .unwrap();
 
         // Get the batch and verify progress
-        let retrieved = manager.get_batch(batch.id, crate::batch::ErrorFilter::All).await.unwrap();
+        let retrieved = manager
+            .get_batch(batch.id, crate::batch::ErrorFilter::All)
+            .await
+            .unwrap();
         assert_eq!(retrieved.total_requests, 5);
         assert_eq!(retrieved.pending_requests, 3);
         assert_eq!(retrieved.in_progress_requests, 1); // Still claimed
@@ -6380,7 +6430,10 @@ mod tests {
 
         // Call get_batch() - this should trigger lazy finalization UPDATE
         // If the UPDATE incorrectly used .read() pool, this would fail with TestDbPools
-        let retrieved = manager.get_batch(batch.id, crate::batch::ErrorFilter::All).await.unwrap();
+        let retrieved = manager
+            .get_batch(batch.id, crate::batch::ErrorFilter::All)
+            .await
+            .unwrap();
 
         // Verify the batch is marked as completed
         assert_eq!(retrieved.total_requests, 3);
@@ -6403,7 +6456,10 @@ mod tests {
         );
 
         // Call get_batch again - should not trigger UPDATE again (idempotent)
-        let retrieved_again = manager.get_batch(batch.id, crate::batch::ErrorFilter::All).await.unwrap();
+        let retrieved_again = manager
+            .get_batch(batch.id, crate::batch::ErrorFilter::All)
+            .await
+            .unwrap();
 
         // Compare timestamps with microsecond precision (PostgreSQL limitation)
         // Truncate nanoseconds to avoid precision mismatch

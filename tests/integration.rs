@@ -1326,7 +1326,13 @@ mod batch_results_stream {
         manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
         batch_id: fusillade::batch::BatchId,
     ) -> Vec<fusillade::batch::BatchResultItem> {
-        let stream = manager.get_batch_results_stream(batch_id, 0, None, None, fusillade::batch::ErrorFilter::All);
+        let stream = manager.get_batch_results_stream(
+            batch_id,
+            0,
+            None,
+            None,
+            fusillade::batch::ErrorFilter::All,
+        );
         stream
             .filter_map(|r| async { r.ok() })
             .collect::<Vec<_>>()
@@ -1501,7 +1507,13 @@ mod batch_results_stream {
         .expect("Failed to clear file_id");
 
         // Try to get results - should get an error
-        let stream = manager.get_batch_results_stream(batch.id, 0, None, None, fusillade::batch::ErrorFilter::All);
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            0,
+            None,
+            None,
+            fusillade::batch::ErrorFilter::All,
+        );
         let results: Vec<_> = stream.collect().await;
 
         // Should have one error result
@@ -1585,7 +1597,10 @@ mod batch_results_stream {
         // Wait for completion
         let start = tokio::time::Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
-            let b = manager.get_batch(batch.id, fusillade::batch::ErrorFilter::All).await.expect("get_batch failed");
+            let b = manager
+                .get_batch(batch.id, fusillade::batch::ErrorFilter::All)
+                .await
+                .expect("get_batch failed");
             if b.completed_requests == 1 {
                 break;
             }
@@ -1594,7 +1609,10 @@ mod batch_results_stream {
         shutdown_token.cancel();
 
         // Get the output file ID
-        let batch = manager.get_batch(batch.id, fusillade::batch::ErrorFilter::All).await.expect("get_batch failed");
+        let batch = manager
+            .get_batch(batch.id, fusillade::batch::ErrorFilter::All)
+            .await
+            .expect("get_batch failed");
         let output_file_id = batch
             .output_file_id
             .expect("Batch should have output_file_id");
@@ -1616,7 +1634,9 @@ mod batch_results_stream {
             .expect("delete_batch failed");
 
         // Verify batch is no longer accessible
-        let batch_result = manager.get_batch(batch.id, fusillade::batch::ErrorFilter::All).await;
+        let batch_result = manager
+            .get_batch(batch.id, fusillade::batch::ErrorFilter::All)
+            .await;
         assert!(
             batch_result.is_err(),
             "Batch should not be found after deletion"
@@ -1720,7 +1740,13 @@ mod batch_results_stream {
         assert_eq!(all_results.len(), 5, "Should have 5 results");
 
         // Get with offset 2
-        let stream = manager.get_batch_results_stream(batch.id, 2, None, None, fusillade::batch::ErrorFilter::All);
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            2,
+            None,
+            None,
+            fusillade::batch::ErrorFilter::All,
+        );
         let offset_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(
@@ -1833,8 +1859,13 @@ mod batch_results_stream {
         shutdown_token.cancel();
 
         // Filter by completed
-        let stream =
-            manager.get_batch_results_stream(batch.id, 0, None, Some("completed".to_string()), fusillade::batch::ErrorFilter::All);
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            0,
+            None,
+            Some("completed".to_string()),
+            fusillade::batch::ErrorFilter::All,
+        );
         let completed_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(
@@ -1847,8 +1878,13 @@ mod batch_results_stream {
         }
 
         // Filter by failed
-        let stream =
-            manager.get_batch_results_stream(batch.id, 0, None, Some("failed".to_string()), fusillade::batch::ErrorFilter::All);
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            0,
+            None,
+            Some("failed".to_string()),
+            fusillade::batch::ErrorFilter::All,
+        );
         let failed_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(failed_results.len(), 1, "Should have 1 failed result");
@@ -1958,8 +1994,13 @@ mod batch_results_stream {
         shutdown_token.cancel();
 
         // Search for "request" (case-insensitive)
-        let stream =
-            manager.get_batch_results_stream(batch.id, 0, Some("request".to_string()), None, fusillade::batch::ErrorFilter::All);
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            0,
+            Some("request".to_string()),
+            None,
+            fusillade::batch::ErrorFilter::All,
+        );
         let search_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(
@@ -1976,7 +2017,13 @@ mod batch_results_stream {
         assert!(custom_ids.contains(&&"Beta-Request".to_string()));
 
         // Search for "ALPHA" (case-insensitive)
-        let stream = manager.get_batch_results_stream(batch.id, 0, Some("ALPHA".to_string()), None, fusillade::batch::ErrorFilter::All);
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            0,
+            Some("ALPHA".to_string()),
+            None,
+            fusillade::batch::ErrorFilter::All,
+        );
         let alpha_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(alpha_results.len(), 1, "Should find 1 result for 'ALPHA'");
