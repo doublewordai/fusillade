@@ -413,9 +413,16 @@ impl Request<Processing> {
         // Handle cancellation outside the mutex guard
         let result = match outcome {
             Outcome::Canceled(CancellationReason::User) => {
-                // User cancellation: persist Canceled state
-                // (self.cancel() will abort the HTTP task)
-                let canceled = self.cancel(storage).await?;
+                // User cancellation: abort HTTP task but don't persist state change.
+                // The batch's cancelling_at flag causes these requests to be counted
+                // as canceled in queries, so no individual UPDATE is needed.
+                self.state.abort_handle.abort();
+                let canceled = Request {
+                    data: self.data,
+                    state: Canceled {
+                        canceled_at: chrono::Utc::now(),
+                    },
+                };
                 return Ok(RequestCompletionResult::Canceled(canceled));
             }
             Outcome::Canceled(CancellationReason::Shutdown) => {
