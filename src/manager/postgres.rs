@@ -1803,7 +1803,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 r#"
                 SELECT purpose
                 FROM files
-                WHERE id = $1
+                WHERE id = $1 AND deleted_at IS NULL
                 "#,
                 *file_id as Uuid,
             )
@@ -2256,7 +2256,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 WHERE batch_id = b.id
                   AND is_escalated = false  -- Exclude escalated requests from batch accounting
             ) counts ON TRUE
-            WHERE b.id = $1
+            WHERE b.id = $1 AND b.deleted_at IS NULL
             "#,
             *batch_id as Uuid,
         )
@@ -2317,7 +2317,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         WHERE batch_id = b.id
                           AND is_escalated = false  -- Exclude escalated requests from batch accounting
                     ) counts ON TRUE
-                    WHERE b.output_file_id = $1
+                    WHERE b.output_file_id = $1 AND b.deleted_at IS NULL
                     "#,
                     *file_id as Uuid,
                 )
@@ -2358,7 +2358,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         WHERE batch_id = b.id
                           AND is_escalated = false  -- Exclude escalated requests from batch accounting
                     ) counts ON TRUE
-                    WHERE b.error_file_id = $1
+                    WHERE b.error_file_id = $1 AND b.deleted_at IS NULL
                     "#,
                     *file_id as Uuid,
                 )
@@ -3423,7 +3423,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             r#"
             SELECT id
             FROM batches
-            WHERE output_file_id = $1
+            WHERE output_file_id = $1 AND deleted_at IS NULL
             "#,
             *file_id as Uuid,
         )
@@ -3552,7 +3552,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             r#"
             SELECT id
             FROM batches
-            WHERE error_file_id = $1
+            WHERE error_file_id = $1 AND deleted_at IS NULL
             "#,
             *file_id as Uuid,
         )
@@ -3672,7 +3672,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         // First, get the file_id from the batch
         // This allows us to query by file_id to avoid duplicates from SLA escalation
         let file_id = match sqlx::query_scalar!(
-            r#"SELECT file_id FROM batches WHERE id = $1"#,
+            r#"SELECT file_id FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
             *batch_id as Uuid,
         )
         .fetch_optional(&pool)
