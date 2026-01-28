@@ -133,6 +133,10 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution.
     pub processing_timeout_ms: u64,
 
+    /// Maximum number of stale requests to unclaim in a single poll cycle.
+    /// Limits database load when many requests become stale simultaneously (e.g., daemon crash).
+    pub unclaim_batch_size: usize,
+
     /// Interval for polling database to check for cancelled batches (milliseconds)
     /// Determines how quickly in-flight requests are aborted when their batch is cancelled
     pub cancellation_poll_interval_ms: u64,
@@ -175,6 +179,7 @@ impl Default for DaemonConfig {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,             // 1 minute
             processing_timeout_ms: 600000,       // 10 minutes
+            unclaim_batch_size: 100,             // Unclaim up to 100 stale requests per poll
             cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
             batch_metadata_fields: default_batch_metadata_fields(),
         }
@@ -782,6 +787,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
         };
@@ -949,6 +955,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
         };
@@ -1174,6 +1181,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
         };
@@ -1308,6 +1316,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
         };
@@ -1477,6 +1486,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
         };
@@ -1630,6 +1640,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
         };
@@ -1783,6 +1794,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![
                 "id".to_string(),
                 "endpoint".to_string(),
@@ -1936,6 +1948,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
             batch_metadata_fields: vec![
                 "id".to_string(),
                 "endpoint".to_string(),
