@@ -194,14 +194,6 @@ async fn test_get_batch_error_filter_all(pool: sqlx::PgPool) {
         batch.failed_requests, 4,
         "All filter should show all 4 failures"
     );
-    assert_eq!(
-        batch.failed_requests_retriable, 2,
-        "Should have 2 retriable failures"
-    );
-    assert_eq!(
-        batch.failed_requests_non_retriable, 2,
-        "Should have 2 non-retriable failures"
-    );
 }
 
 #[sqlx::test]
@@ -221,9 +213,6 @@ async fn test_get_batch_error_filter_only_retriable(pool: sqlx::PgPool) {
         batch.failed_requests, 2,
         "OnlyRetriable filter should show only 2 retriable failures"
     );
-    // Always present full counts
-    assert_eq!(batch.failed_requests_retriable, 2);
-    assert_eq!(batch.failed_requests_non_retriable, 2);
 }
 
 #[sqlx::test]
@@ -243,9 +232,6 @@ async fn test_get_batch_error_filter_only_non_retriable(pool: sqlx::PgPool) {
         batch.failed_requests, 2,
         "OnlyNonRetriable filter should show only 2 non-retriable failures"
     );
-    // Always present full counts
-    assert_eq!(batch.failed_requests_retriable, 2);
-    assert_eq!(batch.failed_requests_non_retriable, 2);
 }
 
 #[sqlx::test]
@@ -260,8 +246,6 @@ async fn test_get_batch_status_error_filter_all(pool: sqlx::PgPool) {
 
     assert_eq!(status.total_requests, 6);
     assert_eq!(status.failed_requests, 4);
-    assert_eq!(status.failed_requests_retriable, 2);
-    assert_eq!(status.failed_requests_non_retriable, 2);
 }
 
 #[sqlx::test]
@@ -276,8 +260,6 @@ async fn test_get_batch_status_error_filter_only_retriable(pool: sqlx::PgPool) {
 
     assert_eq!(status.total_requests, 6);
     assert_eq!(status.failed_requests, 2);
-    assert_eq!(status.failed_requests_retriable, 2);
-    assert_eq!(status.failed_requests_non_retriable, 2);
 }
 
 #[sqlx::test]
@@ -292,8 +274,6 @@ async fn test_get_batch_status_error_filter_only_non_retriable(pool: sqlx::PgPoo
 
     assert_eq!(status.total_requests, 6);
     assert_eq!(status.failed_requests, 2);
-    assert_eq!(status.failed_requests_retriable, 2);
-    assert_eq!(status.failed_requests_non_retriable, 2);
 }
 
 #[sqlx::test]

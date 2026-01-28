@@ -419,8 +419,6 @@ pub struct Batch {
     pub in_progress_requests: i64,
     pub completed_requests: i64,
     pub failed_requests: i64,
-    pub failed_requests_retriable: i64,
-    pub failed_requests_non_retriable: i64,
     pub canceled_requests: i64,
     pub requests_started_at: Option<DateTime<Utc>>,
 
@@ -445,8 +443,6 @@ pub struct BatchStatus {
     pub in_progress_requests: i64,
     pub completed_requests: i64,
     pub failed_requests: i64,
-    pub failed_requests_retriable: i64,
-    pub failed_requests_non_retriable: i64,
     pub canceled_requests: i64,
     pub started_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,

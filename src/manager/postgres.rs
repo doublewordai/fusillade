@@ -117,8 +117,6 @@ macro_rules! batch_from_dynamic_row {
             in_progress_requests: $row.get("in_progress_requests"),
             completed_requests: $row.get("completed_requests"),
             failed_requests: $row.get("failed_requests"),
-            failed_requests_retriable: $row.get("failed_requests_retriable"),
-            failed_requests_non_retriable: $row.get("failed_requests_non_retriable"),
             canceled_requests: $row.get("canceled_requests"),
         }
     };
@@ -136,8 +134,6 @@ macro_rules! batch_status_from_dynamic_row {
             in_progress_requests: $row.get("in_progress_requests"),
             completed_requests: $row.get("completed_requests"),
             failed_requests: $row.get("failed_requests"),
-            failed_requests_retriable: $row.get("failed_requests_retriable"),
-            failed_requests_non_retriable: $row.get("failed_requests_non_retriable"),
             canceled_requests: $row.get("canceled_requests"),
             started_at: $row.get("started_at"),
             created_at: $row.get("created_at"),
@@ -247,20 +243,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// All returned strings are compile-time constants from match arms.
     ///
     /// # Returns
-    /// Tuple of (where_clause, failed_count, failed_retriable_count, failed_non_retriable_count):
+    /// Tuple of (where_clause, failed_count):
     /// - where_clause: Additional WHERE condition for stream filtering (empty for All)
     /// - failed_count: COUNT expression for failed requests (varies based on filter)
-    /// - failed_retriable_count: COUNT expression for retriable failures (always the same)
-    /// - failed_non_retriable_count: COUNT expression for non-retriable failures (always the same)
     fn error_filter_sql_fragments(
         filter: crate::batch::ErrorFilter,
-    ) -> (&'static str, &'static str, &'static str, &'static str) {
-        // These are always the same regardless of filter
-        const FAILED_RETRIABLE: &str =
-            "COUNT(*) FILTER (WHERE state = 'failed' AND is_retriable_error = true)";
-        const FAILED_NON_RETRIABLE: &str = "COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL))";
-
-        let (where_clause, failed_count) = match filter {
+    ) -> (&'static str, &'static str) {
+        match filter {
             crate::batch::ErrorFilter::All => ("", "COUNT(*) FILTER (WHERE state = 'failed')"),
             crate::batch::ErrorFilter::OnlyRetriable => (
                 "AND is_retriable_error = true",
@@ -270,14 +259,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 "AND (is_retriable_error = false OR is_retriable_error IS NULL)",
                 "COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL))",
             ),
-        };
-
-        (
-            where_clause,
-            failed_count,
-            FAILED_RETRIABLE,
-            FAILED_NON_RETRIABLE,
-        )
+        }
     }
 
     /// Get the connection pool.
@@ -2167,7 +2149,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         error_filter: crate::batch::ErrorFilter,
     ) -> Result<BatchStatus> {
         // Get SQL fragments for error filtering
-        let (_, failed_count, failed_retriable, failed_non_retriable) =
+        let (_, failed_count) =
             Self::error_filter_sql_fragments(error_filter);
 
         let mut query_builder = QueryBuilder::new(
@@ -2183,8 +2165,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
                 COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.failed_retriable, 0)::BIGINT as failed_requests_retriable,
-                COALESCE(counts.failed_non_retriable, 0)::BIGINT as failed_requests_non_retriable,
                 COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN files f ON f.id = b.file_id
@@ -2196,12 +2176,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     "#,
         );
         query_builder.push(failed_count);
-        query_builder.push(" as failed, ");
-        query_builder.push(failed_retriable);
-        query_builder.push(" as failed_retriable, ");
-        query_builder.push(failed_non_retriable);
         query_builder.push(
-            r#" as failed_non_retriable,
+            r#" as failed,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
@@ -2227,7 +2203,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         file_type: OutputFileType,
     ) -> Result<Option<Batch>> {
         // Use ErrorFilter::All since this method doesn't take a filter parameter
-        let (_, failed_count, failed_retriable, failed_non_retriable) =
+        let (_, failed_count) =
             Self::error_filter_sql_fragments(crate::batch::ErrorFilter::All);
 
         let mut query_builder = QueryBuilder::new(
@@ -2247,8 +2223,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                         COALESCE(counts.completed, 0)::BIGINT as completed_requests,
                         COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                        COALESCE(counts.failed_retriable, 0)::BIGINT as failed_requests_retriable,
-                        COALESCE(counts.failed_non_retriable, 0)::BIGINT as failed_requests_non_retriable,
                         COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
                     FROM batches b
                     LEFT JOIN LATERAL (
@@ -2260,11 +2234,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         );
         query_builder.push(failed_count);
         query_builder.push(" as failed, ");
-        query_builder.push(failed_retriable);
-        query_builder.push(" as failed_retriable, ");
-        query_builder.push(failed_non_retriable);
         query_builder.push(
-            r#" as failed_non_retriable,
+            r#"
                             COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                         FROM requests
                         WHERE batch_id = b.id
@@ -2295,7 +2266,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
                 let row = query_builder
                     .build()
-                    .bind(*file_id as Uuid)
                     .fetch_optional(self.pools.read())
                     .await
                     .map_err(|e| {
@@ -2335,7 +2305,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         };
 
         // Get SQL fragments for error filtering
-        let (_, failed_count, failed_retriable, failed_non_retriable) =
+        let (_, failed_count) =
             Self::error_filter_sql_fragments(error_filter);
 
         // Use a single query with optional cursor filtering and on-demand counting
@@ -2359,8 +2329,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
                 COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.failed_retriable, 0)::BIGINT as failed_requests_retriable,
-                COALESCE(counts.failed_non_retriable, 0)::BIGINT as failed_requests_non_retriable,
                 COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN files f ON b.file_id = f.id
@@ -2373,11 +2341,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         );
         query_builder.push(failed_count);
         query_builder.push(" as failed, ");
-        query_builder.push(failed_retriable);
-        query_builder.push(" as failed_retriable, ");
-        query_builder.push(failed_non_retriable);
         query_builder.push(
-            r#" as failed_non_retriable,
+            r#"
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
@@ -2423,7 +2388,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         error_filter: crate::batch::ErrorFilter,
     ) -> Result<Vec<BatchStatus>> {
         // Get SQL fragments for error filtering
-        let (_, failed_count, failed_retriable, failed_non_retriable) =
+        let (_, failed_count) =
             Self::error_filter_sql_fragments(error_filter);
 
         let mut query_builder = QueryBuilder::new(
@@ -2439,8 +2404,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
                 COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.failed_retriable, 0)::BIGINT as failed_requests_retriable,
-                COALESCE(counts.failed_non_retriable, 0)::BIGINT as failed_requests_non_retriable,
                 COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN files f ON f.id = b.file_id
@@ -2453,11 +2416,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         );
         query_builder.push(failed_count);
         query_builder.push(" as failed, ");
-        query_builder.push(failed_retriable);
-        query_builder.push(" as failed_retriable, ");
-        query_builder.push(failed_non_retriable);
         query_builder.push(
-            r#" as failed_non_retriable,
+            r#"
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
@@ -2879,7 +2839,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         pool: &PgPool,
     ) -> Result<Batch> {
         // Get SQL fragments for error filtering
-        let (_, failed_count, failed_retriable, failed_non_retriable) =
+        let (_, failed_count) =
             Self::error_filter_sql_fragments(error_filter);
 
         let mut query_builder = QueryBuilder::new(
@@ -2899,8 +2859,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
                 COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.failed_retriable, 0)::BIGINT as failed_requests_retriable,
-                COALESCE(counts.failed_non_retriable, 0)::BIGINT as failed_requests_non_retriable,
                 COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN LATERAL (
@@ -2911,12 +2869,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     "#,
         );
         query_builder.push(failed_count);
-        query_builder.push(" as failed, ");
-        query_builder.push(failed_retriable);
-        query_builder.push(" as failed_retriable, ");
-        query_builder.push(failed_non_retriable);
         query_builder.push(
-            r#" as failed_non_retriable,
+            r#" as failed,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
@@ -3009,8 +2963,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             in_progress_requests,
             completed_requests,
             failed_requests,
-            failed_requests_retriable: row.get("failed_requests_retriable"),
-            failed_requests_non_retriable: row.get("failed_requests_non_retriable"),
             canceled_requests,
             requests_started_at: row.get("requests_started_at"),
             finalizing_at,
@@ -3329,7 +3281,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         };
 
         // Get error filter SQL fragment
-        let (error_where_clause, _, _, _) = Self::error_filter_sql_fragments(error_filter);
+        let (error_where_clause, _) = Self::error_filter_sql_fragments(error_filter);
 
         // Stream failed requests, ordered by failure time
         // This ensures new failures always append (no out-of-order issues)
@@ -3481,7 +3433,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         };
 
         // Get error filter SQL fragment
-        let (error_where_clause, _, _, _) = Self::error_filter_sql_fragments(error_filter);
+        let (error_where_clause, _) = Self::error_filter_sql_fragments(error_filter);
 
         const BATCH_SIZE: i64 = 1000;
         let mut last_line_number: i32 = -1;
