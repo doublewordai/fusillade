@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use sqlx::Row;
 use sqlx::postgres::{PgListener, PgPool};
+use sqlx::QueryBuilder;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -84,49 +85,6 @@ pub struct PostgresRequestManager<P: PoolProvider, H: HttpClient> {
     config: DaemonConfig,
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
-}
-
-/// Macro to construct a `Batch` from a database row.
-///
-/// This eliminates the duplication of mapping database row fields to Batch objects
-/// across multiple query methods.
-///
-/// # Example
-/// ```ignore
-/// let row = sqlx::query!(...).fetch_one(&pool).await?;
-/// let batch = batch_from_row!(row);
-/// ```
-macro_rules! batch_from_row {
-    ($row:expr) => {
-        Batch {
-            id: BatchId($row.id),
-            file_id: $row.file_id.map(FileId),
-            endpoint: $row.endpoint,
-            completion_window: $row.completion_window,
-            metadata: $row.metadata,
-            output_file_id: $row.output_file_id.map(FileId),
-            error_file_id: $row.error_file_id.map(FileId),
-            created_by: $row.created_by,
-            created_at: $row.created_at,
-            expires_at: $row.expires_at,
-            cancelling_at: $row.cancelling_at,
-            errors: $row.errors,
-            total_requests: $row.total_requests,
-            requests_started_at: $row.requests_started_at,
-            finalizing_at: $row.finalizing_at,
-            completed_at: $row.completed_at,
-            failed_at: $row.failed_at,
-            cancelled_at: $row.cancelled_at,
-            deleted_at: $row.deleted_at,
-            pending_requests: $row.pending_requests,
-            in_progress_requests: $row.in_progress_requests,
-            completed_requests: $row.completed_requests,
-            failed_requests: $row.failed_requests,
-            failed_requests_retriable: $row.failed_requests_retriable,
-            failed_requests_non_retriable: $row.failed_requests_non_retriable,
-            canceled_requests: $row.canceled_requests,
-        }
-    };
 }
 
 /// Macro for extracting a [`Batch`] from a dynamic query row (PgRow).
@@ -2214,7 +2172,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let (_, failed_count, failed_retriable, failed_non_retriable) =
             Self::error_filter_sql_fragments(error_filter);
 
-        let query = format!(
+        let mut query_builder = QueryBuilder::new(
             r#"
             SELECT
                 b.id as batch_id,
@@ -2237,20 +2195,25 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    {} as failed,
-                    {} as failed_retriable,
-                    {} as failed_non_retriable,
+                    "#
+        );
+        query_builder.push(failed_count);
+        query_builder.push(" as failed, ");
+        query_builder.push(failed_retriable);
+        query_builder.push(" as failed_retriable, ");
+        query_builder.push(failed_non_retriable);
+        query_builder.push(
+            r#" as failed_non_retriable,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
-            WHERE b.id = $1 AND b.deleted_at IS NULL
-            "#,
-            failed_count, failed_retriable, failed_non_retriable
+            WHERE b.id = "#
         );
+        query_builder.push_bind(*batch_id as Uuid);
+        query_builder.push(" AND b.deleted_at IS NULL");
 
-        let row = sqlx::query(&query)
-            .bind(*batch_id as Uuid)
+        let row = query_builder.build()
             .fetch_optional(self.pools.read())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch status: {}", e)))?
@@ -2268,10 +2231,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let (_, failed_count, failed_retriable, failed_non_retriable) =
             Self::error_filter_sql_fragments(crate::batch::ErrorFilter::All);
 
-        match file_type {
-            OutputFileType::Output => {
-                let query = format!(
-                    r#"
+        let mut query_builder = QueryBuilder::new(
+            r#"
                     SELECT
                         b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
                         b.output_file_id, b.error_file_id, b.created_by, b.created_at,
@@ -2296,20 +2257,29 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                             COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                             COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                            {} as failed,
-                            {} as failed_retriable,
-                            {} as failed_non_retriable,
+                            "#
+        );
+        query_builder.push(failed_count);
+        query_builder.push(" as failed, ");
+        query_builder.push(failed_retriable);
+        query_builder.push(" as failed_retriable, ");
+        query_builder.push(failed_non_retriable);
+        query_builder.push(
+            r#" as failed_non_retriable,
                             COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                         FROM requests
                         WHERE batch_id = b.id
                     ) counts ON TRUE
-                    WHERE b.output_file_id = $1 AND b.deleted_at IS NULL
-                    "#,
-                    failed_count, failed_retriable, failed_non_retriable
-                );
+                    WHERE "#
+        );
 
-                let row = sqlx::query(&query)
-                    .bind(*file_id as Uuid)
+        match file_type {
+            OutputFileType::Output => {
+                query_builder.push("b.output_file_id = ");
+                query_builder.push_bind(*file_id as Uuid);
+                query_builder.push(" AND b.deleted_at IS NULL");
+
+                let row = query_builder.build()
                     .fetch_optional(self.pools.read())
                     .await
                     .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by output file: {}", e)))?;
@@ -2317,45 +2287,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 Ok(row.map(|row| batch_from_dynamic_row!(row)))
             }
             OutputFileType::Error => {
-                let query = format!(
-                    r#"
-                    SELECT
-                        b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
-                        b.output_file_id, b.error_file_id, b.created_by, b.created_at,
-                        b.expires_at, b.cancelling_at, b.errors,
-                        b.total_requests,
-                        b.requests_started_at,
-                        b.finalizing_at,
-                        b.completed_at,
-                        b.failed_at,
-                        b.cancelled_at,
-                        b.deleted_at,
-                        COALESCE(counts.pending, 0)::BIGINT as pending_requests,
-                        COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
-                        COALESCE(counts.completed, 0)::BIGINT as completed_requests,
-                        COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                        COALESCE(counts.failed_retriable, 0)::BIGINT as failed_requests_retriable,
-                        COALESCE(counts.failed_non_retriable, 0)::BIGINT as failed_requests_non_retriable,
-                        COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
-                    FROM batches b
-                    LEFT JOIN LATERAL (
-                        SELECT
-                            COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                            COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
-                            COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                            {} as failed,
-                            {} as failed_retriable,
-                            {} as failed_non_retriable,
-                            COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
-                        FROM requests
-                        WHERE batch_id = b.id
-                    ) counts ON TRUE
-                    WHERE b.error_file_id = $1 AND b.deleted_at IS NULL
-                    "#,
-                    failed_count, failed_retriable, failed_non_retriable
-                );
+                query_builder.push("b.error_file_id = ");
+                query_builder.push_bind(*file_id as Uuid);
+                query_builder.push(" AND b.deleted_at IS NULL");
 
-                let row = sqlx::query(&query)
+                let row = query_builder.build()
                     .bind(*file_id as Uuid)
                     .fetch_optional(self.pools.read())
                     .await
@@ -2401,7 +2337,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // Join with files table to enable searching by input filename
         let search_pattern = search.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
 
-        let query = format!(
+        let mut query_builder = QueryBuilder::new(
             r#"
             SELECT
                 b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
@@ -2428,29 +2364,43 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    {} as failed,
-                    {} as failed_retriable,
-                    {} as failed_non_retriable,
+                    "#
+        );
+        query_builder.push(failed_count);
+        query_builder.push(" as failed, ");
+        query_builder.push(failed_retriable);
+        query_builder.push(" as failed_retriable, ");
+        query_builder.push(failed_non_retriable);
+        query_builder.push(
+            r#" as failed_non_retriable,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
             WHERE b.deleted_at IS NULL
-              AND ($1::TEXT IS NULL OR b.created_by = $1)
-              AND ($3::TIMESTAMPTZ IS NULL OR b.created_at < $3 OR (b.created_at = $3 AND b.id < $4))
-              AND ($5::TEXT IS NULL OR LOWER(b.metadata::text) LIKE $5 OR LOWER(f.name) LIKE $5)
-            ORDER BY b.created_at DESC, b.id DESC
-            LIMIT $2
-            "#,
-            failed_count, failed_retriable, failed_non_retriable
+              AND ("#
         );
+        query_builder.push_bind(&created_by);
+        query_builder.push("::TEXT IS NULL OR b.created_by = ");
+        query_builder.push_bind(&created_by);
+        query_builder.push(") AND (");
+        query_builder.push_bind(&after_created_at);
+        query_builder.push("::TIMESTAMPTZ IS NULL OR b.created_at < ");
+        query_builder.push_bind(&after_created_at);
+        query_builder.push(" OR (b.created_at = ");
+        query_builder.push_bind(&after_created_at);
+        query_builder.push(" AND b.id < ");
+        query_builder.push_bind(&after_id);
+        query_builder.push(")) AND (");
+        query_builder.push_bind(&search_pattern);
+        query_builder.push("::TEXT IS NULL OR LOWER(b.metadata::text) LIKE ");
+        query_builder.push_bind(&search_pattern);
+        query_builder.push(" OR LOWER(f.name) LIKE ");
+        query_builder.push_bind(&search_pattern);
+        query_builder.push(") ORDER BY b.created_at DESC, b.id DESC LIMIT ");
+        query_builder.push_bind(limit);
 
-        let rows = sqlx::query(&query)
-            .bind(created_by)
-            .bind(limit)
-            .bind(after_created_at)
-            .bind(after_id)
-            .bind(search_pattern)
+        let rows = query_builder.build()
             .fetch_all(self.pools.read())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
@@ -2467,7 +2417,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let (_, failed_count, failed_retriable, failed_non_retriable) =
             Self::error_filter_sql_fragments(error_filter);
 
-        let query = format!(
+        let mut query_builder = QueryBuilder::new(
             r#"
             SELECT
                 b.id as batch_id,
@@ -2490,21 +2440,25 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    {} as failed,
-                    {} as failed_retriable,
-                    {} as failed_non_retriable,
+                    "#
+        );
+        query_builder.push(failed_count);
+        query_builder.push(" as failed, ");
+        query_builder.push(failed_retriable);
+        query_builder.push(" as failed_retriable, ");
+        query_builder.push(failed_non_retriable);
+        query_builder.push(
+            r#" as failed_non_retriable,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
-            WHERE b.file_id = $1 AND b.deleted_at IS NULL
-            ORDER BY b.created_at DESC
-            "#,
-            failed_count, failed_retriable, failed_non_retriable
+            WHERE b.file_id = "#
         );
+        query_builder.push_bind(*file_id as Uuid);
+        query_builder.push(" AND b.deleted_at IS NULL ORDER BY b.created_at DESC");
 
-        let rows = sqlx::query(&query)
-            .bind(*file_id as Uuid)
+        let rows = query_builder.build()
             .fetch_all(self.pools.read())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
@@ -2918,7 +2872,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         let (_, failed_count, failed_retriable, failed_non_retriable) =
             Self::error_filter_sql_fragments(error_filter);
 
-        let query = format!(
+        let mut query_builder = QueryBuilder::new(
             r#"
             SELECT
                 b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
@@ -2944,20 +2898,25 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    {} as failed,
-                    {} as failed_retriable,
-                    {} as failed_non_retriable,
+                    "#
+        );
+        query_builder.push(failed_count);
+        query_builder.push(" as failed, ");
+        query_builder.push(failed_retriable);
+        query_builder.push(" as failed_retriable, ");
+        query_builder.push(failed_non_retriable);
+        query_builder.push(
+            r#" as failed_non_retriable,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
-            WHERE b.id = $1 AND b.deleted_at IS NULL
-            "#,
-            failed_count, failed_retriable, failed_non_retriable
+            WHERE b.id = "#
         );
+        query_builder.push_bind(*batch_id as Uuid);
+        query_builder.push(" AND b.deleted_at IS NULL");
 
-        let row = sqlx::query(&query)
-            .bind(*batch_id as Uuid)
+        let row = query_builder.build()
             .fetch_optional(pool)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
@@ -3379,35 +3338,39 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             is_first_batch = false;
 
             // Build dynamic query with error filter
-            let error_filter_condition = if error_where_clause.is_empty() {
-                String::new()
-            } else {
-                format!("  AND {}", &error_where_clause[4..]) // Remove "AND " prefix from fragment
-            };
-
-            let query = format!(
+            let mut query_builder = QueryBuilder::new(
                 r#"
                 SELECT id, custom_id, error, failed_at
                 FROM requests
-                WHERE batch_id = $1
-                  AND state = 'failed'
-                  AND ($2::TIMESTAMPTZ IS NULL OR failed_at > $2 OR (failed_at = $2 AND id > $3))
-                  AND ($6::text IS NULL OR LOWER(custom_id) LIKE $6)
-                  {}
-                ORDER BY failed_at ASC, id ASC
-                OFFSET $4
-                LIMIT $5
-                "#,
-                error_filter_condition
+                WHERE batch_id = "#
             );
+            query_builder.push_bind(batch_id);
+            query_builder.push(" AND state = 'failed' AND (");
+            query_builder.push_bind(cursor_time);
+            query_builder.push("::TIMESTAMPTZ IS NULL OR failed_at > ");
+            query_builder.push_bind(cursor_time);
+            query_builder.push(" OR (failed_at = ");
+            query_builder.push_bind(cursor_time);
+            query_builder.push(" AND id > ");
+            query_builder.push_bind(cursor_id);
+            query_builder.push(")) AND (");
+            query_builder.push_bind(search_pattern.as_deref());
+            query_builder.push("::text IS NULL OR LOWER(custom_id) LIKE ");
+            query_builder.push_bind(search_pattern.as_deref());
+            query_builder.push(")");
 
-            let request_batch = sqlx::query(&query)
-                .bind(batch_id)
-                .bind(cursor_time)
-                .bind(cursor_id)
-                .bind(offset_val)
-                .bind(BATCH_SIZE)
-                .bind(search_pattern.as_deref())
+            // Add error filter condition if present
+            if !error_where_clause.is_empty() {
+                query_builder.push(" ");
+                query_builder.push(error_where_clause);
+            }
+
+            query_builder.push(" ORDER BY failed_at ASC, id ASC OFFSET ");
+            query_builder.push_bind(offset_val);
+            query_builder.push(" LIMIT ");
+            query_builder.push_bind(BATCH_SIZE);
+
+            let request_batch = query_builder.build()
                 .fetch_all(&pool)
                 .await;
 
@@ -3534,13 +3497,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
             // Build dynamic query with error filter
             // The error filter only applies to failed requests
-            let error_filter_condition = if error_where_clause.is_empty() {
-                String::new()
-            } else {
-                format!("  AND (r.state != 'failed' OR (r.state = 'failed' {}))", error_where_clause)
-            };
-
-            let query = format!(
+            let mut query_builder = QueryBuilder::new(
                 r#"
                 SELECT
                     r.id,
@@ -3552,29 +3509,40 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     r.error,
                     t.line_number
                 FROM request_templates t
-                JOIN requests r ON r.template_id = t.id AND r.batch_id = $1
-                WHERE t.file_id = $2
-                  AND ($3 = -1 OR t.line_number > $3)
-                  AND ($6::text IS NULL OR LOWER(r.custom_id) LIKE $6)
-                  AND ($7::text[] IS NULL OR r.state = ANY($7))
-                  {}
-                ORDER BY t.line_number ASC
-                OFFSET $4
-                LIMIT $5
-                "#,
-                error_filter_condition
+                JOIN requests r ON r.template_id = t.id AND r.batch_id = "#
             );
+            query_builder.push_bind(*batch_id as Uuid);
+            query_builder.push(" WHERE t.file_id = ");
+            query_builder.push_bind(file_id);
+            query_builder.push(" AND (");
+            query_builder.push_bind(line_filter);
+            query_builder.push(" = -1 OR t.line_number > ");
+            query_builder.push_bind(line_filter);
+            query_builder.push(") AND (");
+            query_builder.push_bind(search_pattern.as_deref());
+            query_builder.push("::text IS NULL OR LOWER(r.custom_id) LIKE ");
+            query_builder.push_bind(search_pattern.as_deref());
+            query_builder.push(") AND (");
+            query_builder.push_bind(state_filter.as_deref());
+            query_builder.push("::text[] IS NULL OR r.state = ANY(");
+            query_builder.push_bind(state_filter.as_deref());
+            query_builder.push("))");
+
+            // Add error filter condition if present (only applies to failed requests)
+            if !error_where_clause.is_empty() {
+                query_builder.push(" AND (r.state != 'failed' OR (r.state = 'failed' ");
+                query_builder.push(error_where_clause);
+                query_builder.push("))");
+            }
+
+            query_builder.push(" ORDER BY t.line_number ASC OFFSET ");
+            query_builder.push_bind(offset_val);
+            query_builder.push(" LIMIT ");
+            query_builder.push_bind(BATCH_SIZE);
 
             // Query from request_templates joined to requests.
             // For each template, we find the matching request for this batch.
-            let request_batch = sqlx::query(&query)
-                .bind(*batch_id as Uuid)
-                .bind(file_id)
-                .bind(line_filter)
-                .bind(offset_val)
-                .bind(BATCH_SIZE)
-                .bind(search_pattern.as_deref())
-                .bind(state_filter.as_deref())
+            let request_batch = query_builder.build()
                 .fetch_all(&pool)
                 .await;
 
