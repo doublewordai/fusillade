@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id\n            FROM batches\n            WHERE output_file_id = $1 AND deleted_at IS NULL\n            ",
+  "query": "\n            SELECT id\n            FROM batches\n            WHERE error_file_id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -18,5 +18,5 @@
       false
     ]
   },
-  "hash": "6432bef9086fd59460898b093eaaffedcbc468a242bcf5b2366c082d26209e7c"
+  "hash": "6f913a28d09539e0a60f06e3cc88ddcbac2419f4c55135425635a7ad329ec93d"
 }

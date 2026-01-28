@@ -3449,11 +3449,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) {
         // First, find the batch that owns this output file
+        // Note: We allow streaming even for soft-deleted batches since the output file
+        // represents completed work that users should be able to download
         let batch_result = sqlx::query!(
             r#"
             SELECT id
             FROM batches
-            WHERE output_file_id = $1 AND deleted_at IS NULL
+            WHERE output_file_id = $1
             "#,
             *file_id as Uuid,
         )
@@ -3578,11 +3580,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) {
         // First, find the batch that owns this error file
+        // Note: We allow streaming even for soft-deleted batches since the error file
+        // represents completed work that users should be able to download
         let batch_result = sqlx::query!(
             r#"
             SELECT id
             FROM batches
-            WHERE error_file_id = $1 AND deleted_at IS NULL
+            WHERE error_file_id = $1
             "#,
             *file_id as Uuid,
         )

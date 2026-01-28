@@ -9,4 +9,4 @@ CREATE INDEX idx_batches_active_created_at_id
     ON batches (created_at DESC, id DESC)
     WHERE deleted_at IS NULL;
 
-COMMENT ON COLUMN batches.deleted_at IS 'When batch was soft-deleted. NULL means active. Set when batch or parent file is deleted.';
+COMMENT ON COLUMN batches.deleted_at IS 'When batch was soft-deleted. NULL means active.';
