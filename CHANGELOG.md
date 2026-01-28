@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v3.0.0...fusillade-v3.0.1) (2026-01-28)
+
+
+### Bug Fixes
+
+* add limit to stale request unclaim query ([#105](https://github.com/doublewordai/fusillade/issues/105)) ([b03c0f4](https://github.com/doublewordai/fusillade/commit/b03c0f4bed5169ed79110c5d523f6a282cbfb43a))
+* update model field in request body when escalating ([#108](https://github.com/doublewordai/fusillade/issues/108)) ([7527537](https://github.com/doublewordai/fusillade/commit/75275373815892177ec615d1a4838a69cc91fd9a))
+
 ## [3.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.5.0...fusillade-v3.0.0) (2026-01-28)
 
 
