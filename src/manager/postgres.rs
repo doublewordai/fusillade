@@ -249,12 +249,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// Unclaim stale requests that have been stuck in "claimed" or "processing" states
     /// for longer than the configured timeouts. This handles daemon crashes.
     ///
-    /// Returns the number of requests that were unclaimed.
+    /// Returns the number of requests that were unclaimed. Limited by `unclaim_batch_size`
+    /// to prevent unbounded database load when many requests become stale simultaneously.
     async fn unclaim_stale_requests(&self) -> Result<usize> {
         let claim_timeout_ms = self.config.claim_timeout_ms as i64;
         let processing_timeout_ms = self.config.processing_timeout_ms as i64;
+        let limit = self.config.unclaim_batch_size as i64;
 
-        // Unclaim requests that are stuck in claimed or processing states
+        // Unclaim requests that are stuck in claimed or processing states.
+        // Uses a subquery with LIMIT to bound the number of rows updated per poll cycle.
         let result = sqlx::query!(
             r#"
             UPDATE requests
@@ -263,26 +266,28 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 daemon_id = NULL,
                 claimed_at = NULL,
                 started_at = NULL
-            WHERE
-                (state = 'claimed' AND claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL)
-                OR
-                (state = 'processing' AND started_at < NOW() - ($2 || ' milliseconds')::INTERVAL)
-            RETURNING id
+            WHERE id IN (
+                SELECT id FROM requests
+                WHERE
+                    (state = 'claimed' AND claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL)
+                    OR
+                    (state = 'processing' AND started_at < NOW() - ($2 || ' milliseconds')::INTERVAL)
+                LIMIT $3
+            )
             "#,
             claim_timeout_ms.to_string(),
             processing_timeout_ms.to_string(),
+            limit,
         )
-        .fetch_all(self.pools.write())
+        .execute(self.pools.write())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to unclaim stale requests: {}", e)))?;
 
-        let count = result.len();
+        let count = result.rows_affected() as usize;
 
         if count > 0 {
-            let request_ids: Vec<_> = result.iter().map(|r| r.id).collect();
             tracing::warn!(
                 count = count,
-                request_ids = ?request_ids,
                 claim_timeout_ms,
                 processing_timeout_ms,
                 "Unclaimed stale requests (likely due to daemon crash)"
