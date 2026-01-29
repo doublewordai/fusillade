@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::stream::Stream;
+use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::{Mutex, mpsc};
@@ -86,43 +87,56 @@ pub struct PostgresRequestManager<P: PoolProvider, H: HttpClient> {
     batch_insert_strategy: BatchInsertStrategy,
 }
 
-/// Macro to construct a `Batch` from a database row.
+/// Macro for extracting a [`Batch`] from a dynamic query row (PgRow).
 ///
-/// This eliminates the duplication of mapping database row fields to Batch objects
-/// across multiple query methods.
-///
-/// # Example
-/// ```ignore
-/// let row = sqlx::query!(...).fetch_one(&pool).await?;
-/// let batch = batch_from_row!(row);
-/// ```
-macro_rules! batch_from_row {
+/// This works with `sqlx::query()` (not `sqlx::query!()`) results where fields must
+/// be accessed via `.get()` instead of direct access.
+macro_rules! batch_from_dynamic_row {
     ($row:expr) => {
         Batch {
-            id: BatchId($row.id),
-            file_id: $row.file_id.map(FileId),
-            endpoint: $row.endpoint,
-            completion_window: $row.completion_window,
-            metadata: $row.metadata,
-            output_file_id: $row.output_file_id.map(FileId),
-            error_file_id: $row.error_file_id.map(FileId),
-            created_by: $row.created_by,
-            created_at: $row.created_at,
-            expires_at: $row.expires_at,
-            cancelling_at: $row.cancelling_at,
-            errors: $row.errors,
-            total_requests: $row.total_requests,
-            requests_started_at: $row.requests_started_at,
-            finalizing_at: $row.finalizing_at,
-            completed_at: $row.completed_at,
-            failed_at: $row.failed_at,
-            cancelled_at: $row.cancelled_at,
-            deleted_at: $row.deleted_at,
-            pending_requests: $row.pending_requests,
-            in_progress_requests: $row.in_progress_requests,
-            completed_requests: $row.completed_requests,
-            failed_requests: $row.failed_requests,
-            canceled_requests: $row.canceled_requests,
+            id: BatchId($row.get("id")),
+            file_id: $row.get::<Option<Uuid>, _>("file_id").map(FileId),
+            endpoint: $row.get("endpoint"),
+            completion_window: $row.get("completion_window"),
+            metadata: $row.get("metadata"),
+            output_file_id: $row.get::<Option<Uuid>, _>("output_file_id").map(FileId),
+            error_file_id: $row.get::<Option<Uuid>, _>("error_file_id").map(FileId),
+            created_by: $row.get("created_by"),
+            created_at: $row.get("created_at"),
+            expires_at: $row.get("expires_at"),
+            cancelling_at: $row.get("cancelling_at"),
+            errors: $row.get("errors"),
+            total_requests: $row.get("total_requests"),
+            requests_started_at: $row.get("requests_started_at"),
+            finalizing_at: $row.get("finalizing_at"),
+            completed_at: $row.get("completed_at"),
+            failed_at: $row.get("failed_at"),
+            cancelled_at: $row.get("cancelled_at"),
+            deleted_at: $row.get("deleted_at"),
+            pending_requests: $row.get("pending_requests"),
+            in_progress_requests: $row.get("in_progress_requests"),
+            completed_requests: $row.get("completed_requests"),
+            failed_requests: $row.get("failed_requests"),
+            canceled_requests: $row.get("canceled_requests"),
+        }
+    };
+}
+
+/// Macro for extracting a [`BatchStatus`] from a dynamic query row (PgRow).
+macro_rules! batch_status_from_dynamic_row {
+    ($row:expr) => {
+        BatchStatus {
+            batch_id: BatchId($row.get("batch_id")),
+            file_id: $row.get::<Option<Uuid>, _>("file_id").map(FileId),
+            file_name: $row.get("file_name"),
+            total_requests: $row.get("total_requests"),
+            pending_requests: $row.get("pending_requests"),
+            in_progress_requests: $row.get("in_progress_requests"),
+            completed_requests: $row.get("completed_requests"),
+            failed_requests: $row.get("failed_requests"),
+            canceled_requests: $row.get("canceled_requests"),
+            started_at: $row.get("started_at"),
+            created_at: $row.get("created_at"),
         }
     };
 }
@@ -221,6 +235,32 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         }
         self.batch_insert_strategy = strategy;
         self
+    }
+
+    /// Get SQL fragments for filtering failed requests based on SLA status.
+    ///
+    /// When `hide_retriable_before_sla` is true, generates SQL that filters per-batch
+    /// based on each batch's expires_at timestamp, hiding retriable errors before SLA expiry.
+    ///
+    /// # Returns
+    /// Tuple of (where_clause, failed_count):
+    /// - where_clause: Additional WHERE condition for stream filtering (empty when not hiding)
+    /// - failed_count: COUNT expression with CASE for per-batch SLA filtering
+    fn error_filter_sql_fragments(hide_retriable_before_sla: bool) -> (&'static str, &'static str) {
+        if hide_retriable_before_sla {
+            (
+                // For stream filtering: check batch SLA and apply filter
+                "AND (b.expires_at <= NOW() OR is_retriable_error = false OR is_retriable_error IS NULL)",
+                // For failed count: use CASE to check per-batch SLA status
+                r#"CASE
+                    WHEN b.expires_at > NOW() THEN COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL))
+                    ELSE COUNT(*) FILTER (WHERE state = 'failed')
+                END"#,
+            )
+        } else {
+            // No filtering - show all errors
+            ("", "COUNT(*) FILTER (WHERE state = 'failed')")
+        }
     }
 
     /// Get the connection pool.
@@ -1016,6 +1056,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 let response_size = calculate_error_message_size(&error_json)
                     .ok_or_else(|| FusilladeError::Other(anyhow!("Error message too large")))?;
 
+                // Determine if this is a retriable error
+                let is_retriable_error = req.state.reason.is_retriable();
+
                 let rows_affected = sqlx::query!(
                     r#"
                     UPDATE requests SET
@@ -1024,7 +1067,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         error = $3,
                         failed_at = $4,
                         response_size = $5,
-                        routed_model = $6
+                        routed_model = $6,
+                        is_retriable_error = $7
                     WHERE id = $1
                     "#,
                     *req.data.id as Uuid,
@@ -1033,6 +1077,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     req.state.failed_at,
                     response_size,
                     req.state.routed_model,
+                    is_retriable_error,
                 )
                 .execute(self.pools.write())
                 .await
@@ -1549,7 +1594,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     async fn get_file_content(&self, file_id: FileId) -> Result<Vec<FileContentItem>> {
-        let mut stream = self.get_file_content_stream(file_id, 0, None);
+        let mut stream = self.get_file_content_stream(file_id, 0, None, false);
         let mut items = Vec::new();
 
         while let Some(result) = stream.next().await {
@@ -1599,6 +1644,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         file_id: FileId,
         offset: usize,
         search: Option<String>,
+        hide_retriable_before_sla: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
         let pool = self.pools.read().clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
@@ -1636,7 +1682,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     Self::stream_batch_output(pool, file_id, offset, search, tx).await;
                 }
                 Some("batch_error") => {
-                    Self::stream_batch_error(pool, file_id, offset, search, tx).await;
+                    Self::stream_batch_error(
+                        pool,
+                        file_id,
+                        offset,
+                        search,
+                        hide_retriable_before_sla,
+                        tx,
+                    )
+                    .await;
                 }
                 _ => {
                     // Regular file or purpose='batch': stream request templates
@@ -2080,29 +2134,37 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // isolation levels (READ COMMITTED or REPEATABLE READ). Querying from the read pool
         // immediately after committing on the write pool can result in "Batch not found" if
         // the read connection's snapshot predates the write commit.
-        self.get_batch_from_pool(BatchId(batch_id), self.pools.write())
+        self.get_batch_from_pool(BatchId(batch_id), false, self.pools.write())
             .await
     }
 
-    async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
-        self.get_batch_from_pool(batch_id, self.pools.read()).await
+    async fn get_batch(&self, batch_id: BatchId, hide_retriable_before_sla: bool) -> Result<Batch> {
+        self.get_batch_from_pool(batch_id, hide_retriable_before_sla, self.pools.read())
+            .await
     }
 
-    async fn get_batch_status(&self, batch_id: BatchId) -> Result<BatchStatus> {
-        let row = sqlx::query!(
+    async fn get_batch_status(
+        &self,
+        batch_id: BatchId,
+        hide_retriable_before_sla: bool,
+    ) -> Result<BatchStatus> {
+        // Get SQL fragments for error filtering
+        let (_, failed_count) = Self::error_filter_sql_fragments(hide_retriable_before_sla);
+
+        let mut query_builder = QueryBuilder::new(
             r#"
             SELECT
                 b.id as batch_id,
-                b.file_id as "file_id?",
-                f.name as "file_name?",
+                b.file_id,
+                f.name as file_name,
                 b.total_requests,
                 b.requests_started_at as started_at,
                 b.created_at,
-                COALESCE(counts.pending, 0)::BIGINT as "pending_requests!",
-                COALESCE(counts.in_progress, 0)::BIGINT as "in_progress_requests!",
-                COALESCE(counts.completed, 0)::BIGINT as "completed_requests!",
-                COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
-                COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
+                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
+                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
+                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
+                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
@@ -2110,33 +2172,28 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                    "#,
+        );
+        query_builder.push(failed_count);
+        query_builder.push(
+            r#" as failed,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
-            WHERE b.id = $1 AND b.deleted_at IS NULL
-            "#,
-            *batch_id as Uuid,
-        )
-        .fetch_optional(self.pools.read())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch status: {}", e)))?
-        .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+            WHERE b.id = "#
+        );
+        query_builder.push_bind(*batch_id as Uuid);
+        query_builder.push(" AND b.deleted_at IS NULL");
 
-        Ok(BatchStatus {
-            batch_id: BatchId(row.batch_id),
-            file_id: row.file_id.map(FileId),
-            file_name: row.file_name,
-            total_requests: row.total_requests,
-            pending_requests: row.pending_requests,
-            in_progress_requests: row.in_progress_requests,
-            completed_requests: row.completed_requests,
-            failed_requests: row.failed_requests,
-            canceled_requests: row.canceled_requests,
-            started_at: row.started_at,
-            created_at: row.created_at,
-        })
+        let row = query_builder
+            .build()
+            .fetch_optional(self.pools.read())
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch status: {}", e)))?
+            .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+
+        Ok(batch_status_from_dynamic_row!(row))
     }
 
     async fn get_batch_by_output_file_id(
@@ -2144,86 +2201,76 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         file_id: FileId,
         file_type: OutputFileType,
     ) -> Result<Option<Batch>> {
+        // Don't hide any errors since this method doesn't take a filter parameter
+        let (_, failed_count) = Self::error_filter_sql_fragments(false);
+
+        let mut query_builder = QueryBuilder::new(
+            r#"
+                    SELECT
+                        b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                        b.output_file_id, b.error_file_id, b.created_by, b.created_at,
+                        b.expires_at, b.cancelling_at, b.errors,
+                        b.total_requests,
+                        b.requests_started_at,
+                        b.finalizing_at,
+                        b.completed_at,
+                        b.failed_at,
+                        b.cancelled_at,
+                        b.deleted_at,
+                        COALESCE(counts.pending, 0)::BIGINT as pending_requests,
+                        COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
+                        COALESCE(counts.completed, 0)::BIGINT as completed_requests,
+                        COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                        COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
+                    FROM batches b
+                    LEFT JOIN LATERAL (
+                        SELECT
+                            COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
+                            COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
+                            COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                            "#,
+        );
+        query_builder.push(failed_count);
+        query_builder.push(" as failed, ");
+        query_builder.push(
+            r#"
+                            COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
+                        FROM requests
+                        WHERE batch_id = b.id
+                    ) counts ON TRUE
+                    WHERE "#
+        );
+
         match file_type {
             OutputFileType::Output => {
-                let row = sqlx::query!(
-                    r#"
-                    SELECT
-                        b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
-                        b.output_file_id, b.error_file_id, b.created_by, b.created_at,
-                        b.expires_at, b.cancelling_at, b.errors,
-                        b.total_requests,
-                        b.requests_started_at,
-                        b.finalizing_at,
-                        b.completed_at,
-                        b.failed_at,
-                        b.cancelled_at,
-                        b.deleted_at,
-                        COALESCE(counts.pending, 0)::BIGINT as "pending_requests!",
-                        COALESCE(counts.in_progress, 0)::BIGINT as "in_progress_requests!",
-                        COALESCE(counts.completed, 0)::BIGINT as "completed_requests!",
-                        COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
-                        COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
-                    FROM batches b
-                    LEFT JOIN LATERAL (
-                        SELECT
-                            COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                            COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
-                            COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                            COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                            COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
-                        FROM requests
-                        WHERE batch_id = b.id
-                    ) counts ON TRUE
-                    WHERE b.output_file_id = $1 AND b.deleted_at IS NULL
-                    "#,
-                    *file_id as Uuid,
-                )
-                .fetch_optional(self.pools.read())
-                .await
-                .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by output file: {}", e)))?;
+                query_builder.push("b.output_file_id = ");
+                query_builder.push_bind(*file_id as Uuid);
+                query_builder.push(" AND b.deleted_at IS NULL");
 
-                Ok(row.map(|row| batch_from_row!(row)))
+                let row = query_builder
+                    .build()
+                    .fetch_optional(self.pools.read())
+                    .await
+                    .map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to get batch by output file: {}", e))
+                    })?;
+
+                Ok(row.map(|row| batch_from_dynamic_row!(row)))
             }
             OutputFileType::Error => {
-                let row = sqlx::query!(
-                    r#"
-                    SELECT
-                        b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
-                        b.output_file_id, b.error_file_id, b.created_by, b.created_at,
-                        b.expires_at, b.cancelling_at, b.errors,
-                        b.total_requests,
-                        b.requests_started_at,
-                        b.finalizing_at,
-                        b.completed_at,
-                        b.failed_at,
-                        b.cancelled_at,
-                        b.deleted_at,
-                        COALESCE(counts.pending, 0)::BIGINT as "pending_requests!",
-                        COALESCE(counts.in_progress, 0)::BIGINT as "in_progress_requests!",
-                        COALESCE(counts.completed, 0)::BIGINT as "completed_requests!",
-                        COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
-                        COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
-                    FROM batches b
-                    LEFT JOIN LATERAL (
-                        SELECT
-                            COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                            COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
-                            COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                            COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                            COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
-                        FROM requests
-                        WHERE batch_id = b.id
-                    ) counts ON TRUE
-                    WHERE b.error_file_id = $1 AND b.deleted_at IS NULL
-                    "#,
-                    *file_id as Uuid,
-                )
-                .fetch_optional(self.pools.read())
-                .await
-                .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by error file: {}", e)))?;
+                query_builder.push("b.error_file_id = ");
+                query_builder.push_bind(*file_id as Uuid);
+                query_builder.push(" AND b.deleted_at IS NULL");
 
-                Ok(row.map(|row| batch_from_row!(row)))
+                let row = query_builder
+                    .build()
+                    .fetch_optional(self.pools.read())
+                    .await
+                    .map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to get batch by error file: {}", e))
+                    })?;
+
+                Ok(row.map(|row| batch_from_dynamic_row!(row)))
             }
         }
     }
@@ -2234,6 +2281,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         search: Option<String>,
         after: Option<BatchId>,
         limit: i64,
+        hide_retriable_before_sla: bool,
     ) -> Result<Vec<Batch>> {
         // If after is provided, get the created_at timestamp of that batch for cursor-based pagination
         let (after_created_at, after_id) = if let Some(after_id) = after {
@@ -2254,13 +2302,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             (None, None)
         };
 
+        // Get SQL fragments for error filtering
+        let (_, failed_count) = Self::error_filter_sql_fragments(hide_retriable_before_sla);
+
         // Use a single query with optional cursor filtering and on-demand counting
         // Join with files table to enable searching by input filename
         let search_pattern = search.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
-        let rows = sqlx::query!(
+
+        let mut query_builder = QueryBuilder::new(
             r#"
             SELECT
-                b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
+                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
                 b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                 b.expires_at, b.cancelling_at, b.errors,
                 b.total_requests,
@@ -2270,11 +2322,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.failed_at,
                 b.cancelled_at,
                 b.deleted_at,
-                COALESCE(counts.pending, 0)::BIGINT as "pending_requests!",
-                COALESCE(counts.in_progress, 0)::BIGINT as "in_progress_requests!",
-                COALESCE(counts.completed, 0)::BIGINT as "completed_requests!",
-                COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
-                COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
+                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
+                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
+                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
+                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN files f ON b.file_id = f.id
             LEFT JOIN LATERAL (
@@ -2282,46 +2334,73 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                    "#,
+        );
+        query_builder.push(failed_count);
+        query_builder.push(" as failed, ");
+        query_builder.push(
+            r#"
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
             WHERE b.deleted_at IS NULL
-              AND ($1::TEXT IS NULL OR b.created_by = $1)
-              AND ($3::TIMESTAMPTZ IS NULL OR b.created_at < $3 OR (b.created_at = $3 AND b.id < $4))
-              AND ($5::TEXT IS NULL OR LOWER(b.metadata::text) LIKE $5 OR LOWER(f.name) LIKE $5)
-            ORDER BY b.created_at DESC, b.id DESC
-            LIMIT $2
-            "#,
-            created_by,
-            limit,
-            after_created_at,
-            after_id,
-            search_pattern,
-        )
-        .fetch_all(self.pools.read())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
+              AND ("#
+        );
+        query_builder.push_bind(&created_by);
+        query_builder.push("::TEXT IS NULL OR b.created_by = ");
+        query_builder.push_bind(&created_by);
+        query_builder.push(") AND (");
+        query_builder.push_bind(after_created_at);
+        query_builder.push("::TIMESTAMPTZ IS NULL OR b.created_at < ");
+        query_builder.push_bind(after_created_at);
+        query_builder.push(" OR (b.created_at = ");
+        query_builder.push_bind(after_created_at);
+        query_builder.push(" AND b.id < ");
+        query_builder.push_bind(after_id);
+        query_builder.push(")) AND (");
+        query_builder.push_bind(&search_pattern);
+        query_builder.push("::TEXT IS NULL OR LOWER(b.metadata::text) LIKE ");
+        query_builder.push_bind(&search_pattern);
+        query_builder.push(" OR LOWER(f.name) LIKE ");
+        query_builder.push_bind(&search_pattern);
+        query_builder.push(") ORDER BY b.created_at DESC, b.id DESC LIMIT ");
+        query_builder.push_bind(limit);
 
-        Ok(rows.into_iter().map(|row| batch_from_row!(row)).collect())
+        let rows = query_builder
+            .build()
+            .fetch_all(self.pools.read())
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| batch_from_dynamic_row!(row))
+            .collect())
     }
 
-    async fn list_file_batches(&self, file_id: FileId) -> Result<Vec<BatchStatus>> {
-        let rows = sqlx::query!(
+    async fn list_file_batches(
+        &self,
+        file_id: FileId,
+        hide_retriable_before_sla: bool,
+    ) -> Result<Vec<BatchStatus>> {
+        // Get SQL fragments for error filtering
+        let (_, failed_count) = Self::error_filter_sql_fragments(hide_retriable_before_sla);
+
+        let mut query_builder = QueryBuilder::new(
             r#"
             SELECT
                 b.id as batch_id,
-                b.file_id as "file_id?",
-                f.name as "file_name?",
+                b.file_id,
+                f.name as file_name,
                 b.total_requests,
                 b.requests_started_at as started_at,
                 b.created_at,
-                COALESCE(counts.pending, 0)::BIGINT as "pending_requests!",
-                COALESCE(counts.in_progress, 0)::BIGINT as "in_progress_requests!",
-                COALESCE(counts.completed, 0)::BIGINT as "completed_requests!",
-                COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
-                COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
+                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
+                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
+                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
+                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
@@ -2329,35 +2408,30 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                    "#,
+        );
+        query_builder.push(failed_count);
+        query_builder.push(" as failed, ");
+        query_builder.push(
+            r#"
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
-            WHERE b.file_id = $1 AND b.deleted_at IS NULL
-            ORDER BY b.created_at DESC
-            "#,
-            *file_id as Uuid,
-        )
-        .fetch_all(self.pools.read())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
+            WHERE b.file_id = "#
+        );
+        query_builder.push_bind(*file_id as Uuid);
+        query_builder.push(" AND b.deleted_at IS NULL ORDER BY b.created_at DESC");
+
+        let rows = query_builder
+            .build()
+            .fetch_all(self.pools.read())
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
 
         Ok(rows
             .into_iter()
-            .map(|row| BatchStatus {
-                batch_id: BatchId(row.batch_id),
-                file_id: row.file_id.map(FileId),
-                file_name: row.file_name,
-                total_requests: row.total_requests,
-                pending_requests: row.pending_requests,
-                in_progress_requests: row.in_progress_requests,
-                completed_requests: row.completed_requests,
-                failed_requests: row.failed_requests,
-                canceled_requests: row.canceled_requests,
-                started_at: row.started_at,
-                created_at: row.created_at,
-            })
+            .map(|row| batch_status_from_dynamic_row!(row))
             .collect())
     }
 
@@ -2727,13 +2801,23 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         offset: usize,
         search: Option<String>,
         status: Option<String>,
+        hide_retriable_before_sla: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>> {
         let pool = self.pools.read().clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
         tokio::spawn(async move {
-            Self::stream_batch_results(pool, batch_id, offset, search, status, tx).await;
+            Self::stream_batch_results(
+                pool,
+                batch_id,
+                offset,
+                search,
+                status,
+                hide_retriable_before_sla,
+                tx,
+            )
+            .await;
         });
 
         Box::pin(ReceiverStream::new(rx))
@@ -2752,11 +2836,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// # Arguments
     /// * `batch_id` - The ID of the batch to fetch
     /// * `pool` - The specific pool to query from (typically write pool after commit)
-    async fn get_batch_from_pool(&self, batch_id: BatchId, pool: &PgPool) -> Result<Batch> {
-        let row = sqlx::query!(
+    async fn get_batch_from_pool(
+        &self,
+        batch_id: BatchId,
+        hide_retriable_before_sla: bool,
+        pool: &PgPool,
+    ) -> Result<Batch> {
+        // Get SQL fragments for error filtering
+        let (_, failed_count) = Self::error_filter_sql_fragments(hide_retriable_before_sla);
+
+        let mut query_builder = QueryBuilder::new(
             r#"
             SELECT
-                b.id, b.file_id as "file_id?", b.endpoint, b.completion_window, b.metadata,
+                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
                 b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                 b.expires_at, b.cancelling_at, b.errors,
                 b.total_requests,
@@ -2766,45 +2858,64 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 b.failed_at,
                 b.cancelled_at,
                 b.deleted_at,
-                COALESCE(counts.pending, 0)::BIGINT as "pending_requests!",
-                COALESCE(counts.in_progress, 0)::BIGINT as "in_progress_requests!",
-                COALESCE(counts.completed, 0)::BIGINT as "completed_requests!",
-                COALESCE(counts.failed, 0)::BIGINT as "failed_requests!",
-                COALESCE(counts.canceled, 0)::BIGINT as "canceled_requests!"
+                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
+                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
+                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
+                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                    "#,
+        );
+        query_builder.push(failed_count);
+        query_builder.push(
+            r#" as failed,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
-            WHERE b.id = $1 AND b.deleted_at IS NULL
-            "#,
-            *batch_id as Uuid,
-        )
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
-        .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+            WHERE b.id = "#
+        );
+        query_builder.push_bind(*batch_id as Uuid);
+        query_builder.push(" AND b.deleted_at IS NULL");
+
+        let row = query_builder
+            .build()
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
+            .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+
+        // Extract counts for terminal state checking
+        let pending_requests: i64 = row.get("pending_requests");
+        let in_progress_requests: i64 = row.get("in_progress_requests");
+        let completed_requests: i64 = row.get("completed_requests");
+        let failed_requests: i64 = row.get("failed_requests");
+        let canceled_requests: i64 = row.get("canceled_requests");
+        let total_requests: i64 = row.get("total_requests");
+        let completed_at: Option<DateTime<Utc>> = row.get("completed_at");
+        let failed_at: Option<DateTime<Utc>> = row.get("failed_at");
+        let cancelled_at: Option<DateTime<Utc>> = row.get("cancelled_at");
+        let finalizing_at_db: Option<DateTime<Utc>> = row.get("finalizing_at");
 
         // Lazy computation of terminal timestamps
         // Check if batch is in terminal state and update timestamps if needed
-        let terminal_count = row.completed_requests + row.failed_requests + row.canceled_requests;
-        let is_terminal = terminal_count == row.total_requests && row.total_requests > 0;
+        let terminal_count = completed_requests + failed_requests + canceled_requests;
+        let is_terminal = terminal_count == total_requests && total_requests > 0;
 
         let (finalizing_at, completed_at, failed_at) = if is_terminal
-            && row.completed_at.is_none()
-            && row.failed_at.is_none()
-            && row.cancelled_at.is_none()
+            && completed_at.is_none()
+            && failed_at.is_none()
+            && cancelled_at.is_none()
         {
             let now = Utc::now();
 
             // Determine which terminal state based on counts
-            let (finalizing, completed, failed) = if row.completed_requests > 0 {
+            let (finalizing, completed, failed) = if completed_requests > 0 {
                 // At least one completion = completed batch
                 (Some(now), Some(now), None)
             } else {
@@ -2834,34 +2945,34 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
             (finalizing, completed, failed)
         } else {
-            (row.finalizing_at, row.completed_at, row.failed_at)
+            (finalizing_at_db, completed_at, failed_at)
         };
 
         Ok(Batch {
-            id: BatchId(row.id),
-            file_id: row.file_id.map(FileId),
-            created_at: row.created_at,
-            metadata: row.metadata,
-            completion_window: row.completion_window,
-            endpoint: row.endpoint,
-            output_file_id: row.output_file_id.map(FileId),
-            error_file_id: row.error_file_id.map(FileId),
-            created_by: row.created_by,
-            expires_at: row.expires_at,
-            cancelling_at: row.cancelling_at,
-            errors: row.errors,
-            total_requests: row.total_requests,
-            pending_requests: row.pending_requests,
-            in_progress_requests: row.in_progress_requests,
-            completed_requests: row.completed_requests,
-            failed_requests: row.failed_requests,
-            canceled_requests: row.canceled_requests,
-            requests_started_at: row.requests_started_at,
+            id: BatchId(row.get("id")),
+            file_id: row.get::<Option<Uuid>, _>("file_id").map(FileId),
+            created_at: row.get("created_at"),
+            metadata: row.get("metadata"),
+            completion_window: row.get("completion_window"),
+            endpoint: row.get("endpoint"),
+            output_file_id: row.get::<Option<Uuid>, _>("output_file_id").map(FileId),
+            error_file_id: row.get::<Option<Uuid>, _>("error_file_id").map(FileId),
+            created_by: row.get("created_by"),
+            expires_at: row.get("expires_at"),
+            cancelling_at: row.get("cancelling_at"),
+            errors: row.get("errors"),
+            total_requests,
+            pending_requests,
+            in_progress_requests,
+            completed_requests,
+            failed_requests,
+            canceled_requests,
+            requests_started_at: row.get("requests_started_at"),
             finalizing_at,
             completed_at,
             failed_at,
-            cancelled_at: row.cancelled_at,
-            deleted_at: row.deleted_at,
+            cancelled_at,
+            deleted_at: row.get("deleted_at"),
         })
     }
 
@@ -3142,6 +3253,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         file_id: FileId,
         offset: i64,
         search: Option<String>,
+        hide_retriable_before_sla: bool,
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) {
         // First, find the batch that owns this error file
@@ -3149,7 +3261,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         // represents completed work that users should be able to download
         let batch_result = sqlx::query!(
             r#"
-            SELECT id
+            SELECT id, expires_at
             FROM batches
             WHERE error_file_id = $1
             "#,
@@ -3158,8 +3270,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         .fetch_one(&pool)
         .await;
 
-        let batch_id = match batch_result {
-            Ok(row) => row.id,
+        let (batch_id, expires_at) = match batch_result {
+            Ok(row) => (row.id, row.expires_at),
             Err(e) => {
                 let _ = tx
                     .send(Err(FusilladeError::Other(anyhow!(
@@ -3170,6 +3282,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 return;
             }
         };
+
+        // Determine whether to filter retriable errors based on SLA status
+        let should_filter_retriable = hide_retriable_before_sla && chrono::Utc::now() < expires_at;
 
         // Stream failed requests, ordered by failure time
         // This ensures new failures always append (no out-of-order issues)
@@ -3188,27 +3303,40 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             };
             is_first_batch = false;
 
-            let request_batch = sqlx::query!(
+            // Build dynamic query with error filter
+            let mut query_builder = QueryBuilder::new(
                 r#"
                 SELECT id, custom_id, error, failed_at
                 FROM requests
-                WHERE batch_id = $1
-                  AND state = 'failed'
-                  AND ($2::TIMESTAMPTZ IS NULL OR failed_at > $2 OR (failed_at = $2 AND id > $3))
-                  AND ($6::text IS NULL OR LOWER(custom_id) LIKE $6)
-                ORDER BY failed_at ASC, id ASC
-                OFFSET $4
-                LIMIT $5
-                "#,
-                batch_id,
-                cursor_time,
-                cursor_id,
-                offset_val,
-                BATCH_SIZE,
-                search_pattern.as_deref(),
-            )
-            .fetch_all(&pool)
-            .await;
+                WHERE batch_id = "#,
+            );
+            query_builder.push_bind(batch_id);
+            query_builder.push(" AND state = 'failed' AND (");
+            query_builder.push_bind(cursor_time);
+            query_builder.push("::TIMESTAMPTZ IS NULL OR failed_at > ");
+            query_builder.push_bind(cursor_time);
+            query_builder.push(" OR (failed_at = ");
+            query_builder.push_bind(cursor_time);
+            query_builder.push(" AND id > ");
+            query_builder.push_bind(cursor_id);
+            query_builder.push(")) AND (");
+            query_builder.push_bind(search_pattern.as_deref());
+            query_builder.push("::text IS NULL OR LOWER(custom_id) LIKE ");
+            query_builder.push_bind(search_pattern.as_deref());
+            query_builder.push(")");
+
+            // Filter retriable errors if before SLA expiry
+            if should_filter_retriable {
+                query_builder
+                    .push(" AND (is_retriable_error = false OR is_retriable_error IS NULL)");
+            }
+
+            query_builder.push(" ORDER BY failed_at ASC, id ASC OFFSET ");
+            query_builder.push_bind(offset_val);
+            query_builder.push(" LIMIT ");
+            query_builder.push_bind(BATCH_SIZE);
+
+            let request_batch = query_builder.build().fetch_all(&pool).await;
 
             match request_batch {
                 Ok(requests) => {
@@ -3219,16 +3347,21 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     tracing::debug!("Fetched batch of {} failed requests", requests.len());
 
                     for row in requests {
-                        last_failed_at = row.failed_at;
-                        last_id = row.id;
+                        let id: Uuid = row.get("id");
+                        let custom_id: Option<String> = row.get("custom_id");
+                        let error: Option<String> = row.get("error");
+                        let failed_at: Option<DateTime<Utc>> = row.get("failed_at");
+
+                        last_failed_at = failed_at;
+                        last_id = id;
 
                         let error_item = BatchErrorItem {
-                            id: format!("batch_req_{}", row.id),
-                            custom_id: row.custom_id,
+                            id: format!("batch_req_{}", id),
+                            custom_id,
                             response: None,
                             error: BatchErrorDetails {
                                 code: None, // Could parse from error field if structured
-                                message: row.error.unwrap_or_else(|| "Unknown error".to_string()),
+                                message: error.unwrap_or_else(|| "Unknown error".to_string()),
                             },
                         };
 
@@ -3262,27 +3395,32 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         offset: i64,
         search: Option<String>,
         status: Option<String>,
+        hide_retriable_before_sla: bool,
         tx: mpsc::Sender<Result<crate::batch::BatchResultItem>>,
     ) {
         use crate::batch::{BatchResultItem, BatchResultStatus};
 
-        // First, get the file_id from the batch
+        // First, get the file_id and expires_at from the batch
         // This allows us to query by file_id to avoid duplicates from SLA escalation
-        let file_id = match sqlx::query_scalar!(
-            r#"SELECT file_id FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
+        // and to check if we should filter retriable errors
+        let (file_id, expires_at) = match sqlx::query!(
+            r#"SELECT file_id, expires_at FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
             *batch_id as Uuid,
         )
         .fetch_optional(&pool)
         .await
         {
-            Ok(Some(Some(fid))) => fid,
-            Ok(Some(None)) => {
-                let _ = tx
-                    .send(Err(FusilladeError::Other(anyhow!(
-                        "Batch has no associated file_id"
-                    ))))
-                    .await;
-                return;
+            Ok(Some(row)) => {
+                if let Some(fid) = row.file_id {
+                    (fid, row.expires_at)
+                } else {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Batch has no associated file_id"
+                        ))))
+                        .await;
+                    return;
+                }
             }
             Ok(None) => {
                 let _ = tx
@@ -3300,6 +3438,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 return;
             }
         };
+
+        // Determine if we should filter retriable errors based on SLA
+        // Before SLA expiry: hide retriable errors
+        // After SLA expiry: show all errors
+        let should_filter_retriable = hide_retriable_before_sla && chrono::Utc::now() < expires_at;
 
         const BATCH_SIZE: i64 = 1000;
         let mut last_line_number: i32 = -1;
@@ -3322,39 +3465,53 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             };
             is_first_batch = false;
 
-            // Query from request_templates joined to requests.
-            // For each template, we find the matching request for this batch.
-            let request_batch = sqlx::query!(
+            // Build dynamic query with error filter
+            // The error filter only applies to failed requests
+            let mut query_builder = QueryBuilder::new(
                 r#"
                 SELECT
-                    r.id as "id!",
-                    r.custom_id as "custom_id?",
-                    r.model as "model!",
-                    r.state as "state!",
+                    r.id,
+                    r.custom_id,
+                    r.model,
+                    r.state,
                     t.body as input_body,
-                    r.response_body as "response_body?",
-                    r.error as "error?",
-                    t.line_number as "line_number!"
+                    r.response_body,
+                    r.error,
+                    t.line_number
                 FROM request_templates t
-                JOIN requests r ON r.template_id = t.id AND r.batch_id = $1
-                WHERE t.file_id = $2
-                  AND ($3 = -1 OR t.line_number > $3)
-                  AND ($6::text IS NULL OR LOWER(r.custom_id) LIKE $6)
-                  AND ($7::text[] IS NULL OR r.state = ANY($7))
-                ORDER BY t.line_number ASC
-                OFFSET $4
-                LIMIT $5
-                "#,
-                *batch_id as Uuid,
-                file_id,
-                line_filter,
-                offset_val,
-                BATCH_SIZE,
-                search_pattern.as_deref(),
-                state_filter.as_deref(),
-            )
-            .fetch_all(&pool)
-            .await;
+                JOIN requests r ON r.template_id = t.id AND r.batch_id = "#,
+            );
+            query_builder.push_bind(*batch_id as Uuid);
+            query_builder.push(" WHERE t.file_id = ");
+            query_builder.push_bind(file_id);
+            query_builder.push(" AND (");
+            query_builder.push_bind(line_filter);
+            query_builder.push(" = -1 OR t.line_number > ");
+            query_builder.push_bind(line_filter);
+            query_builder.push(") AND (");
+            query_builder.push_bind(search_pattern.as_deref());
+            query_builder.push("::text IS NULL OR LOWER(r.custom_id) LIKE ");
+            query_builder.push_bind(search_pattern.as_deref());
+            query_builder.push(") AND (");
+            query_builder.push_bind(state_filter.as_deref());
+            query_builder.push("::text[] IS NULL OR r.state = ANY(");
+            query_builder.push_bind(state_filter.as_deref());
+            query_builder.push("))");
+
+            // Add error filter condition if needed (only applies to failed requests)
+            // Before SLA expiry: hide retriable errors
+            if should_filter_retriable {
+                query_builder.push(" AND (r.state != 'failed' OR (r.state = 'failed' AND (r.is_retriable_error = false OR r.is_retriable_error IS NULL)))");
+            }
+
+            query_builder.push(" ORDER BY t.line_number ASC OFFSET ");
+            query_builder.push_bind(offset_val);
+            query_builder.push(" LIMIT ");
+            query_builder.push_bind(BATCH_SIZE);
+
+            // Query from request_templates joined to requests.
+            // For each template, we find the matching request for this batch.
+            let request_batch = query_builder.build().fetch_all(&pool).await;
 
             match request_batch {
                 Ok(requests) => {
@@ -3365,21 +3522,30 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     tracing::debug!("Fetched batch of {} results", requests.len());
 
                     for row in requests {
-                        last_line_number = row.line_number;
+                        let line_number: i32 = row.get("line_number");
+                        last_line_number = line_number;
+
+                        let input_body_str: String = row.get("input_body");
+                        let response_body_opt: Option<String> = row.get("response_body");
+                        let state: String = row.get("state");
+                        let id: Uuid = row.get("id");
+                        let custom_id: Option<String> = row.get("custom_id");
+                        let model: String = row.get("model");
+                        let error: Option<String> = row.get("error");
 
                         // Parse input body as JSON
-                        let input_body: serde_json::Value = serde_json::from_str(&row.input_body)
-                            .unwrap_or_else(|_| serde_json::Value::String(row.input_body.clone()));
+                        let input_body: serde_json::Value = serde_json::from_str(&input_body_str)
+                            .unwrap_or_else(|_| serde_json::Value::String(input_body_str.clone()));
 
                         // Parse response body as JSON if present
                         let response_body: Option<serde_json::Value> =
-                            row.response_body.as_ref().map(|body| {
+                            response_body_opt.as_ref().map(|body| {
                                 serde_json::from_str(body)
                                     .unwrap_or_else(|_| serde_json::Value::String(body.to_string()))
                             });
 
                         // Map state to BatchResultStatus
-                        let status = match row.state.as_str() {
+                        let status = match state.as_str() {
                             "completed" => BatchResultStatus::Completed,
                             "failed" => BatchResultStatus::Failed,
                             "pending" => BatchResultStatus::Pending,
@@ -3388,12 +3554,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                         };
 
                         let result_item = BatchResultItem {
-                            id: row.id.to_string(),
-                            custom_id: row.custom_id,
-                            model: row.model,
+                            id: id.to_string(),
+                            custom_id,
+                            model,
                             input_body,
                             response_body,
-                            error: row.error,
+                            error,
                             status,
                         };
 
@@ -4481,7 +4647,7 @@ mod tests {
 
         // Get batch status
         let status = manager
-            .get_batch_status(batch.id)
+            .get_batch_status(batch.id, false)
             .await
             .expect("Failed to get batch status");
 
@@ -4573,7 +4739,7 @@ mod tests {
         assert_eq!(claimed2.len(), 2);
 
         // Verify batch status shows claimed requests
-        let status = manager.get_batch_status(batch.id).await.unwrap();
+        let status = manager.get_batch_status(batch.id, false).await.unwrap();
         assert_eq!(status.total_requests, 5);
         assert_eq!(status.pending_requests, 0);
         assert_eq!(status.in_progress_requests, 5); // All claimed
@@ -4619,7 +4785,7 @@ mod tests {
             .unwrap();
 
         // Verify all are pending
-        let status_before = manager.get_batch_status(batch.id).await.unwrap();
+        let status_before = manager.get_batch_status(batch.id, false).await.unwrap();
         assert_eq!(status_before.pending_requests, 3);
         assert_eq!(status_before.canceled_requests, 0);
 
@@ -4627,7 +4793,7 @@ mod tests {
         manager.cancel_batch(batch.id).await.unwrap();
 
         // Verify all are canceled
-        let status_after = manager.get_batch_status(batch.id).await.unwrap();
+        let status_after = manager.get_batch_status(batch.id, false).await.unwrap();
         assert_eq!(status_after.pending_requests, 0);
         assert_eq!(status_after.canceled_requests, 3);
 
@@ -4690,7 +4856,7 @@ mod tests {
             .unwrap();
 
         // Verify batch exists
-        let batch_before = manager.get_batch(batch.id).await;
+        let batch_before = manager.get_batch(batch.id, false).await;
         assert!(batch_before.is_ok());
 
         // Verify requests exist
@@ -4701,7 +4867,7 @@ mod tests {
         manager.delete_batch(batch.id).await.unwrap();
 
         // Verify batch is gone
-        let batch_after = manager.get_batch(batch.id).await;
+        let batch_after = manager.get_batch(batch.id, false).await;
         assert!(batch_after.is_err());
 
         // Verify requests are not returned (orphaned with batch_id = NULL, filtered by view)
@@ -4772,7 +4938,7 @@ mod tests {
         }
 
         // Verify batch status
-        let status = manager.get_batch_status(batch.id).await.unwrap();
+        let status = manager.get_batch_status(batch.id, false).await.unwrap();
         assert_eq!(status.pending_requests, 2);
         assert_eq!(status.canceled_requests, 3);
 
@@ -4893,7 +5059,7 @@ mod tests {
             .unwrap();
 
         // List batches for this file
-        let batches = manager.list_file_batches(file_id).await.unwrap();
+        let batches = manager.list_file_batches(file_id, false).await.unwrap();
 
         assert_eq!(batches.len(), 3);
 
@@ -4960,7 +5126,7 @@ mod tests {
             .unwrap();
 
         // Verify the batch exists with file_id set
-        let batch_before = manager.get_batch(batch.id).await.unwrap();
+        let batch_before = manager.get_batch(batch.id, false).await.unwrap();
         assert_eq!(batch_before.file_id, Some(file_id));
         assert!(batch_before.cancelling_at.is_none());
         assert!(batch_before.cancelled_at.is_none());
@@ -4978,7 +5144,7 @@ mod tests {
         assert!(file_result.is_err());
 
         // Verify batch still exists but file_id is NULL and batch is cancelled
-        let batch_after = manager.get_batch(batch.id).await.unwrap();
+        let batch_after = manager.get_batch(batch.id, false).await.unwrap();
         assert_eq!(batch_after.file_id, None);
         assert!(batch_after.cancelling_at.is_some());
         assert!(batch_after.cancelled_at.is_some());
@@ -5069,7 +5235,7 @@ mod tests {
         assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
 
         // Verify the request is now claimed by daemon2
-        let status = manager.get_batch_status(batch.id).await.unwrap();
+        let status = manager.get_batch_status(batch.id, false).await.unwrap();
         assert_eq!(status.in_progress_requests, 1);
     }
 
@@ -5142,7 +5308,7 @@ mod tests {
         .unwrap();
 
         // Verify it's in processing state
-        let status_before = manager.get_batch_status(batch.id).await.unwrap();
+        let status_before = manager.get_batch_status(batch.id, false).await.unwrap();
         assert_eq!(status_before.in_progress_requests, 1);
 
         // Now daemon2 tries to claim - should unclaim the stale processing request
@@ -5460,7 +5626,7 @@ mod tests {
         .expect("Failed to mark request as failed");
 
         // Stream the output file - should contain 2 completed requests
-        let output_stream = manager.get_file_content_stream(output_file_id, 0, None);
+        let output_stream = manager.get_file_content_stream(output_file_id, 0, None, false);
         let output_items: Vec<_> = output_stream.collect().await;
 
         assert_eq!(output_items.len(), 2, "Should have 2 output items");
@@ -5494,7 +5660,7 @@ mod tests {
         );
 
         // Stream the error file - should contain 1 failed request
-        let error_stream = manager.get_file_content_stream(error_file_id, 0, None);
+        let error_stream = manager.get_file_content_stream(error_file_id, 0, None, false);
         let error_items: Vec<_> = error_stream.collect().await;
 
         assert_eq!(error_items.len(), 1, "Should have 1 error item");
@@ -5514,7 +5680,7 @@ mod tests {
         }
 
         // Verify that streaming a regular input file still works
-        let input_stream = manager.get_file_content_stream(file_id, 0, None);
+        let input_stream = manager.get_file_content_stream(file_id, 0, None, false);
         let input_items: Vec<_> = input_stream.collect().await;
 
         assert_eq!(input_items.len(), 3, "Input file should have 3 templates");
@@ -6011,7 +6177,7 @@ mod tests {
 
         // Retrieve the batch
         let retrieved_batch = manager
-            .get_batch(created_batch.id)
+            .get_batch(created_batch.id, false)
             .await
             .expect("Failed to get batch");
 
@@ -6042,7 +6208,7 @@ mod tests {
 
         // Try to get a batch that doesn't exist
         let fake_batch_id = BatchId(Uuid::new_v4());
-        let result = manager.get_batch(fake_batch_id).await;
+        let result = manager.get_batch(fake_batch_id, false).await;
 
         // Should return an error
         assert!(result.is_err());
@@ -6114,7 +6280,7 @@ mod tests {
         .unwrap();
 
         // Get the batch and verify progress
-        let retrieved = manager.get_batch(batch.id).await.unwrap();
+        let retrieved = manager.get_batch(batch.id, false).await.unwrap();
         assert_eq!(retrieved.total_requests, 5);
         assert_eq!(retrieved.pending_requests, 3);
         assert_eq!(retrieved.in_progress_requests, 1); // Still claimed
@@ -6181,7 +6347,7 @@ mod tests {
 
         // Call get_batch() - this should trigger lazy finalization UPDATE
         // If the UPDATE incorrectly used .read() pool, this would fail with TestDbPools
-        let retrieved = manager.get_batch(batch.id).await.unwrap();
+        let retrieved = manager.get_batch(batch.id, false).await.unwrap();
 
         // Verify the batch is marked as completed
         assert_eq!(retrieved.total_requests, 3);
@@ -6204,7 +6370,7 @@ mod tests {
         );
 
         // Call get_batch again - should not trigger UPDATE again (idempotent)
-        let retrieved_again = manager.get_batch(batch.id).await.unwrap();
+        let retrieved_again = manager.get_batch(batch.id, false).await.unwrap();
 
         // Compare timestamps with microsecond precision (PostgreSQL limitation)
         // Truncate nanoseconds to avoid precision mismatch
@@ -6867,7 +7033,7 @@ mod tests {
         let manager_clone = manager.clone();
         let batch_shows_canceled = wait_for(
             || async {
-                if let Ok(status) = manager_clone.get_batch_status(batch_id).await {
+                if let Ok(status) = manager_clone.get_batch_status(batch_id, false).await {
                     // Both requests should be counted as canceled (not in_progress)
                     // when batch has cancelling_at set
                     return status.canceled_requests == 2 && status.in_progress_requests == 0;

@@ -31,9 +31,12 @@ pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
 /// Semaphore entry tracking both the semaphore and its configured limit.
 type SemaphoreEntry = (Arc<Semaphore>, usize);
 
-/// Default retry predicate: retry on server errors (5xx), rate limits (429), and timeouts (408).
+/// Default retry predicate: retry on server errors (5xx), rate limits (429), timeouts (408), and not found (404).
 pub fn default_should_retry(response: &HttpResponse) -> bool {
-    response.status >= 500 || response.status == 429 || response.status == 408
+    response.status >= 500
+        || response.status == 429
+        || response.status == 408
+        || response.status == 404
 }
 
 /// Default function for creating the should_retry Arc
@@ -121,7 +124,7 @@ pub struct DaemonConfig {
     pub heartbeat_interval_ms: u64,
 
     /// Predicate function to determine if a response should be retried.
-    /// Defaults to retrying 5xx, 429, and 408 status codes.
+    /// Defaults to retrying 5xx, 429, 408, and 404 status codes.
     #[serde(skip, default = "default_should_retry_fn")]
     pub should_retry: ShouldRetryFn,
 
@@ -445,7 +448,9 @@ where
                         // For now, we'll check each batch individually
                         for batch_id in active_batch_ids {
                             // Try to get the batch - if it has cancelling_at set, cancel the token
-                            if let Ok(batch) = storage.get_batch(batch_id).await
+                            if let Ok(batch) = storage
+                                .get_batch(batch_id, false)
+                                .await
                                 && batch.cancelling_at.is_some()
                                     && let Some(entry) = cancellation_tokens.get(&batch_id) {
                                         entry.value().cancel();
@@ -1126,7 +1131,7 @@ mod tests {
 
         while start.elapsed() < timeout {
             let status = manager
-                .get_batch_status(batch.id)
+                .get_batch_status(batch.id, false)
                 .await
                 .expect("Failed to get batch status");
 
@@ -1449,7 +1454,7 @@ mod tests {
 
         while start.elapsed() < timeout {
             let status = manager
-                .get_batch_status(batch.id)
+                .get_batch_status(batch.id, false)
                 .await
                 .expect("Failed to get batch status");
 
