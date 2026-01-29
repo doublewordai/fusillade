@@ -126,8 +126,6 @@ pub enum CancellationReason {
     User,
     /// Daemon shutdown (abort HTTP but don't persist state change).
     Shutdown,
-    /// Request superseded by racing pair (abort HTTP but don't persist - supersede_racing_pair already updated DB).
-    Superseded,
 }
 
 impl Request<Pending> {
@@ -373,13 +371,12 @@ impl Request<Processing> {
     /// resolve to a `CancellationReason`:
     /// - `CancellationReason::User`: User-initiated cancellation (persists Canceled state)
     /// - `CancellationReason::Shutdown`: Daemon shutdown (aborts HTTP but doesn't persist)
-    /// - `CancellationReason::Superseded`: Request superseded by racing pair (aborts HTTP but doesn't persist)
     ///
     /// Returns:
     /// - `RequestCompletionResult::Completed` if the HTTP request succeeded
     /// - `RequestCompletionResult::Failed` if the HTTP request failed or should be retried
     /// - `RequestCompletionResult::Canceled` if the request was canceled by user
-    /// - `Err(FusilladeError::Shutdown)` if the daemon is shutting down or request was superseded
+    /// - `Err(FusilladeError::Shutdown)` if the daemon is shutting down
     pub async fn complete<S, F, Fut>(
         self,
         storage: &S,
@@ -413,20 +410,21 @@ impl Request<Processing> {
         // Handle cancellation outside the mutex guard
         let result = match outcome {
             Outcome::Canceled(CancellationReason::User) => {
-                // User cancellation: persist Canceled state
-                // (self.cancel() will abort the HTTP task)
-                let canceled = self.cancel(storage).await?;
+                // User cancellation: abort HTTP task but don't persist state change.
+                // The batch's cancelling_at flag causes these requests to be counted
+                // as canceled in queries, so no individual UPDATE is needed.
+                self.state.abort_handle.abort();
+                let canceled = Request {
+                    data: self.data,
+                    state: Canceled {
+                        canceled_at: chrono::Utc::now(),
+                    },
+                };
                 return Ok(RequestCompletionResult::Canceled(canceled));
             }
             Outcome::Canceled(CancellationReason::Shutdown) => {
                 // Shutdown: abort HTTP task but don't persist state change
                 // Request stays in Processing state and will be reclaimed later
-                self.state.abort_handle.abort();
-                return Err(FusilladeError::Shutdown);
-            }
-            Outcome::Canceled(CancellationReason::Superseded) => {
-                // Superseded: abort HTTP task but don't persist state change
-                // supersede_racing_pair already updated the DB to state='superseded'
                 self.state.abort_handle.abort();
                 return Err(FusilladeError::Shutdown);
             }
@@ -457,6 +455,7 @@ impl Request<Processing> {
                         failed_at: chrono::Utc::now(),
                         retry_attempt: self.state.retry_attempt,
                         batch_expires_at: self.state.batch_expires_at,
+                        routed_model: self.data.model.clone(),
                     };
                     let request = Request {
                         data: self.data,
@@ -474,6 +473,7 @@ impl Request<Processing> {
                         failed_at: chrono::Utc::now(),
                         retry_attempt: self.state.retry_attempt,
                         batch_expires_at: self.state.batch_expires_at,
+                        routed_model: self.data.model.clone(),
                     };
                     let request = Request {
                         data: self.data,
@@ -489,6 +489,7 @@ impl Request<Processing> {
                         claimed_at: self.state.claimed_at,
                         started_at: self.state.started_at,
                         completed_at: chrono::Utc::now(),
+                        routed_model: self.data.model.clone(),
                     };
                     let request = Request {
                         data: self.data,
@@ -515,6 +516,7 @@ impl Request<Processing> {
                     failed_at: chrono::Utc::now(),
                     retry_attempt: self.state.retry_attempt,
                     batch_expires_at: self.state.batch_expires_at,
+                    routed_model: self.data.model.clone(),
                 };
                 let request = Request {
                     data: self.data,
@@ -529,6 +531,7 @@ impl Request<Processing> {
                     failed_at: chrono::Utc::now(),
                     retry_attempt: self.state.retry_attempt,
                     batch_expires_at: self.state.batch_expires_at,
+                    routed_model: self.data.model.clone(),
                 };
                 let request = Request {
                     data: self.data,

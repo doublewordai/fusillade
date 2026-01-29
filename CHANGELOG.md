@@ -1,5 +1,52 @@
 # Changelog
 
+## [3.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v3.0.0...fusillade-v3.0.1) (2026-01-28)
+
+
+### Bug Fixes
+
+* add limit to stale request unclaim query ([#105](https://github.com/doublewordai/fusillade/issues/105)) ([b03c0f4](https://github.com/doublewordai/fusillade/commit/b03c0f4bed5169ed79110c5d523f6a282cbfb43a))
+* update model field in request body when escalating ([#108](https://github.com/doublewordai/fusillade/issues/108)) ([7527537](https://github.com/doublewordai/fusillade/commit/75275373815892177ec615d1a4838a69cc91fd9a))
+
+## [3.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.5.0...fusillade-v3.0.0) (2026-01-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* Removes the following from the public API:
+    - SlaThreshold struct and related types
+    - Superseded request state
+    - Escalation-related fields on RequestData (is_escalated,
+      escalated_from_request_id, superseded_at, superseded_by_request_id)
+    - Manager trait methods: find_pending_escalation, get_at_risk_batches,
+      get_missed_sla_batches, create_escalated_requests
+    - DaemonConfig fields: sla_check_interval_seconds, sla_thresholds
+
+### Features
+
+* replace escalation racing with route-at-claim-time ([#98](https://github.com/doublewordai/fusillade/issues/98)) ([8fa21ea](https://github.com/doublewordai/fusillade/commit/8fa21ea313ccfd50a43b592678265966b06279bf))
+
+## [2.5.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.4.0...fusillade-v2.5.0) (2026-01-28)
+
+
+### Features
+
+* implement soft deletes for files and batches ([#101](https://github.com/doublewordai/fusillade/issues/101)) ([37f4726](https://github.com/doublewordai/fusillade/commit/37f47265cc7a17aac8d092c913217d64a6044f2b))
+
+## [2.4.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.3.1...fusillade-v2.4.0) (2026-01-27)
+
+
+### Features
+
+* add index for schedulable pending requests query ([#97](https://github.com/doublewordai/fusillade/issues/97)) ([48eb459](https://github.com/doublewordai/fusillade/commit/48eb4593bd766673dfa80920c7ee8299abb4216b))
+
+## [2.3.1](https://github.com/doublewordai/fusillade/compare/fusillade-v2.3.0...fusillade-v2.3.1) (2026-01-27)
+
+
+### Bug Fixes
+
+* eliminate CPU spikes on batch cancellation ([#95](https://github.com/doublewordai/fusillade/issues/95)) ([6f50e91](https://github.com/doublewordai/fusillade/commit/6f50e916a2933e4d5d6fced3cb68e3953b2a4d74))
+
 ## [2.3.0](https://github.com/doublewordai/fusillade/compare/fusillade-v2.2.0...fusillade-v2.3.0) (2026-01-26)
 
 
