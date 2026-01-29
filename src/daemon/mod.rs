@@ -31,9 +31,12 @@ pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
 /// Semaphore entry tracking both the semaphore and its configured limit.
 type SemaphoreEntry = (Arc<Semaphore>, usize);
 
-/// Default retry predicate: retry on server errors (5xx), rate limits (429), and timeouts (408).
+/// Default retry predicate: retry on server errors (5xx), rate limits (429), timeouts (408), and not found (404).
 pub fn default_should_retry(response: &HttpResponse) -> bool {
-    response.status >= 500 || response.status == 429 || response.status == 408
+    response.status >= 500
+        || response.status == 429
+        || response.status == 408
+        || response.status == 404
 }
 
 /// Default function for creating the should_retry Arc
@@ -121,7 +124,7 @@ pub struct DaemonConfig {
     pub heartbeat_interval_ms: u64,
 
     /// Predicate function to determine if a response should be retried.
-    /// Defaults to retrying 5xx, 429, and 408 status codes.
+    /// Defaults to retrying 5xx, 429, 408, and 404 status codes.
     #[serde(skip, default = "default_should_retry_fn")]
     pub should_retry: ShouldRetryFn,
 

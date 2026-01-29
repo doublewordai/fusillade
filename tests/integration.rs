@@ -1997,4 +1997,1055 @@ mod batch_results_stream {
             Some("Alpha-Request".to_string())
         );
     }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_hide_retriable_before_sla_filters_before_expiry(pool: sqlx::PgPool) {
+        // Test that retriable errors are hidden before SLA expiry when hide_retriable_before_sla=true
+
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Add responses: 3 retriable failures (429, 503, 404) and 1 non-retriable failure (400)
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 429,
+                body: "rate limited".to_string(),
+            }),
+        );
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 503,
+                body: "service unavailable".to_string(),
+            }),
+        );
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 404,
+                body: "not found".to_string(),
+            }),
+        );
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 400,
+                body: "bad request".to_string(),
+            }),
+        );
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            max_retries: Some(0), // No retries - fail immediately
+            stop_before_deadline_ms: None,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        let templates = vec![
+            fusillade::RequestTemplateInput {
+                custom_id: Some("req-429".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"test":"429"}"#.to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            },
+            fusillade::RequestTemplateInput {
+                custom_id: Some("req-503".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"test":"503"}"#.to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            },
+            fusillade::RequestTemplateInput {
+                custom_id: Some("req-400".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"test":"400"}"#.to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            },
+            fusillade::RequestTemplateInput {
+                custom_id: Some("req-404".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"test":"404"}"#.to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            },
+        ];
+
+        let file_id = manager
+            .create_file("test-file".to_string(), None, templates)
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(fusillade::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(), // 1 hour - plenty of time before expiry
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for all requests to fail
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let status = manager
+                .get_batch_status(batch.id, false)
+                .await
+                .expect("Failed to get batch status");
+            if status.failed_requests == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        shutdown_token.cancel();
+
+        // Test 1: Query with hide_retriable_before_sla = true (before SLA expiry)
+        // Should only show non-retriable failures (400)
+        let batch_filtered = manager
+            .get_batch(batch.id, true)
+            .await
+            .expect("Failed to get batch");
+        assert_eq!(
+            batch_filtered.failed_requests, 1,
+            "Should only show 1 non-retriable failure when hide_retriable_before_sla=true"
+        );
+
+        // Test 2: Query with hide_retriable_before_sla = false
+        // Should show all failures
+        let batch_unfiltered = manager
+            .get_batch(batch.id, false)
+            .await
+            .expect("Failed to get batch");
+        assert_eq!(
+            batch_unfiltered.failed_requests, 4,
+            "Should show all 4 failures when hide_retriable_before_sla=false"
+        );
+
+        // Test 3: Error file stream with filtering
+        let error_file_id = batch_filtered
+            .error_file_id
+            .expect("Should have error file");
+        let stream = manager.get_file_content_stream(error_file_id, 0, None, true);
+        let errors: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
+        assert_eq!(
+            errors.len(),
+            1,
+            "Error file stream should only show 1 non-retriable error when filtered"
+        );
+
+        // Test 4: Error file stream without filtering
+        let stream = manager.get_file_content_stream(error_file_id, 0, None, false);
+        let all_errors: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
+        assert_eq!(
+            all_errors.len(),
+            4,
+            "Error file stream should show all 4 errors when not filtered"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_hide_retriable_shows_all_after_sla_expiry(pool: sqlx::PgPool) {
+        // Test that all errors are shown after SLA expiry regardless of hide_retriable_before_sla value
+
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Add 2 retriable failures (429) and 2 non-retriable failures (400)
+        for _ in 0..2 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 429,
+                    body: "rate limited".to_string(),
+                }),
+            );
+        }
+        for _ in 0..2 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 400,
+                    body: "bad request".to_string(),
+                }),
+            );
+        }
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            max_retries: Some(0), // No retries - fail immediately
+            stop_before_deadline_ms: None,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        let templates = (0..4)
+            .map(|i| fusillade::RequestTemplateInput {
+                custom_id: Some(format!("req-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"test":"data"}"#.to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file("test-file".to_string(), None, templates)
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(fusillade::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1s".to_string(), // 1 second - will expire quickly
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for all requests to fail
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let status = manager
+                .get_batch_status(batch.id, false)
+                .await
+                .expect("Failed to get batch status");
+            if status.failed_requests == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Wait for SLA to expire (1 second completion window + buffer)
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        shutdown_token.cancel();
+
+        // Query with hide_retriable_before_sla = true AFTER SLA expiry
+        // Should show ALL failures because SLA has expired
+        let batch_after_expiry = manager
+            .get_batch(batch.id, true)
+            .await
+            .expect("Failed to get batch");
+        assert_eq!(
+            batch_after_expiry.failed_requests, 4,
+            "Should show all 4 failures after SLA expiry, even with hide_retriable_before_sla=true"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_results_stream_respects_hide_retriable(pool: sqlx::PgPool) {
+        // Test that batch results stream respects hide_retriable_before_sla parameter
+
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Add 1 success, 2 retriable failures (429), and 2 non-retriable failures (400)
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success"}"#.to_string(),
+            }),
+        );
+        for _ in 0..2 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 429,
+                    body: "rate limited".to_string(),
+                }),
+            );
+        }
+        for _ in 0..2 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 400,
+                    body: "bad request".to_string(),
+                }),
+            );
+        }
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            max_retries: Some(0), // No retries
+            stop_before_deadline_ms: None,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        let templates = (0..5)
+            .map(|i| fusillade::RequestTemplateInput {
+                custom_id: Some(format!("req-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"test":"data"}"#.to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file("test-file".to_string(), None, templates)
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(fusillade::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(), // Plenty of time before SLA expiry
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for all requests to complete
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+            if requests.iter().all(|r| r.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        shutdown_token.cancel();
+
+        // Test 1: Stream all results with hide_retriable_before_sla = false
+        let stream = manager.get_batch_results_stream(batch.id, 0, None, None, false);
+        let all_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
+        assert_eq!(all_results.len(), 5, "Should stream all 5 results");
+
+        // Test 2: Stream failed results with hide_retriable_before_sla = true (before SLA)
+        // Should only show non-retriable failures
+        let stream =
+            manager.get_batch_results_stream(batch.id, 0, None, Some("failed".to_string()), true);
+        let filtered_failures: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
+        assert_eq!(
+            filtered_failures.len(),
+            2,
+            "Should only stream 2 non-retriable failures when filtered"
+        );
+
+        // Test 3: Stream failed results without filtering
+        let stream =
+            manager.get_batch_results_stream(batch.id, 0, None, Some("failed".to_string()), false);
+        let all_failures: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
+        assert_eq!(
+            all_failures.len(),
+            4,
+            "Should stream all 4 failures when not filtered"
+        );
+
+        // Test 4: Completed results should not be affected by filtering
+        let stream = manager.get_batch_results_stream(
+            batch.id,
+            0,
+            None,
+            Some("completed".to_string()),
+            true,
+        );
+        let completed: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
+        assert_eq!(
+            completed.len(),
+            1,
+            "Should still show 1 completed result (not affected by error filtering)"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_batch_status_respects_hide_retriable(pool: sqlx::PgPool) {
+        // Test that get_batch_status respects hide_retriable_before_sla parameter
+
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Add 3 retriable failures (429) and 2 non-retriable failures (400)
+        for _ in 0..3 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 429,
+                    body: "rate limited".to_string(),
+                }),
+            );
+        }
+        for _ in 0..2 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 400,
+                    body: "bad request".to_string(),
+                }),
+            );
+        }
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            max_retries: Some(0), // No retries
+            stop_before_deadline_ms: None,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        let templates = (0..5)
+            .map(|i| fusillade::RequestTemplateInput {
+                custom_id: Some(format!("req-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"test":"data"}"#.to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file("test-file".to_string(), None, templates)
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(fusillade::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for all to fail
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let status = manager
+                .get_batch_status(batch.id, false)
+                .await
+                .expect("Failed to get status");
+            if status.failed_requests == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        shutdown_token.cancel();
+
+        // Test with hide_retriable_before_sla = true
+        let status_filtered = manager
+            .get_batch_status(batch.id, true)
+            .await
+            .expect("Failed to get batch status");
+        assert_eq!(
+            status_filtered.failed_requests, 2,
+            "Should show only 2 non-retriable failures"
+        );
+        assert_eq!(status_filtered.total_requests, 5);
+
+        // Test with hide_retriable_before_sla = false
+        let status_unfiltered = manager
+            .get_batch_status(batch.id, false)
+            .await
+            .expect("Failed to get batch status");
+        assert_eq!(
+            status_unfiltered.failed_requests, 5,
+            "Should show all 5 failures"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_file_batches_respects_hide_retriable(pool: sqlx::PgPool) {
+        // Test that list_file_batches respects hide_retriable_before_sla parameter
+
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Add failures for 2 batches - interleave so each batch gets mixed errors
+        // Batch 1: 2x 429, 2x 400
+        // Batch 2: 2x 429, 2x 400
+        for _ in 0..2 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 429,
+                    body: "rate limited".to_string(),
+                }),
+            );
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 400,
+                    body: "bad request".to_string(),
+                }),
+            );
+        }
+        for _ in 0..2 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 429,
+                    body: "rate limited".to_string(),
+                }),
+            );
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 400,
+                    body: "bad request".to_string(),
+                }),
+            );
+        }
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            max_retries: Some(0),
+            stop_before_deadline_ms: None,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        // Create file with templates
+        let templates = (0..4)
+            .map(|i| fusillade::RequestTemplateInput {
+                custom_id: Some(format!("req-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"test":"data"}"#.to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file("test-file".to_string(), None, templates)
+            .await
+            .expect("Failed to create file");
+
+        // Create 2 batches from the same file
+        let batch1 = manager
+            .create_batch(fusillade::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch1");
+
+        let batch2 = manager
+            .create_batch(fusillade::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch2");
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for all requests to fail
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let status1 = manager
+                .get_batch_status(batch1.id, false)
+                .await
+                .expect("Failed to get status");
+            let status2 = manager
+                .get_batch_status(batch2.id, false)
+                .await
+                .expect("Failed to get status");
+            if status1.failed_requests == 4 && status2.failed_requests == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        shutdown_token.cancel();
+
+        // Test list_file_batches with hide_retriable_before_sla = true
+        let batches_filtered = manager
+            .list_file_batches(file_id, true)
+            .await
+            .expect("Failed to list batches");
+        assert_eq!(batches_filtered.len(), 2);
+        for batch_status in &batches_filtered {
+            assert_eq!(
+                batch_status.failed_requests, 2,
+                "Each batch should show 2 non-retriable failures when filtered"
+            );
+        }
+
+        // Test list_file_batches with hide_retriable_before_sla = false
+        let batches_unfiltered = manager
+            .list_file_batches(file_id, false)
+            .await
+            .expect("Failed to list batches");
+        assert_eq!(batches_unfiltered.len(), 2);
+        for batch_status in &batches_unfiltered {
+            assert_eq!(
+                batch_status.failed_requests, 4,
+                "Each batch should show all 4 failures when not filtered"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batches_respects_hide_retriable(pool: sqlx::PgPool) {
+        // Test that list_batches respects hide_retriable_before_sla parameter
+
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Add failures: 2 retriable (429) and 1 non-retriable (400) per batch (3 batches)
+        // Interleave to ensure each batch gets the pattern: 429, 429, 400
+        for _ in 0..3 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 429,
+                    body: "rate limited".to_string(),
+                }),
+            );
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 429,
+                    body: "rate limited".to_string(),
+                }),
+            );
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 400,
+                    body: "bad request".to_string(),
+                }),
+            );
+        }
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            max_retries: Some(0),
+            stop_before_deadline_ms: None,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        // Create 3 separate batches
+        let mut batch_ids = Vec::new();
+        for i in 0..3 {
+            let templates = (0..3)
+                .map(|j| fusillade::RequestTemplateInput {
+                    custom_id: Some(format!("batch{}-req{}", i, j)),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"test":"data"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "test-key".to_string(),
+                })
+                .collect();
+
+            let file_id = manager
+                .create_file(format!("file-{}", i), None, templates)
+                .await
+                .expect("Failed to create file");
+
+            let batch = manager
+                .create_batch(fusillade::batch::BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "1h".to_string(),
+                    metadata: Some(serde_json::json!({"batch": i})),
+                    created_by: Some("test-user".to_string()),
+                })
+                .await
+                .expect("Failed to create batch");
+
+            batch_ids.push(batch.id);
+        }
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for all requests to fail
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let mut all_failed = true;
+            for batch_id in &batch_ids {
+                let status = manager
+                    .get_batch_status(*batch_id, false)
+                    .await
+                    .expect("Failed to get status");
+                if status.failed_requests != 3 {
+                    all_failed = false;
+                    break;
+                }
+            }
+            if all_failed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        shutdown_token.cancel();
+
+        // Test list_batches with hide_retriable_before_sla = true
+        let batches_filtered = manager
+            .list_batches(Some("test-user".to_string()), None, None, 10, true)
+            .await
+            .expect("Failed to list batches");
+        assert_eq!(batches_filtered.len(), 3);
+        for batch in &batches_filtered {
+            assert_eq!(
+                batch.failed_requests, 1,
+                "Each batch should show 1 non-retriable failure when filtered"
+            );
+        }
+
+        // Test list_batches with hide_retriable_before_sla = false
+        let batches_unfiltered = manager
+            .list_batches(Some("test-user".to_string()), None, None, 10, false)
+            .await
+            .expect("Failed to list batches");
+        assert_eq!(batches_unfiltered.len(), 3);
+        for batch in &batches_unfiltered {
+            assert_eq!(
+                batch.failed_requests, 3,
+                "Each batch should show all 3 failures when not filtered"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_retry_failed_requests_for_batch_retries_all(pool: sqlx::PgPool) {
+        // Test that retry_failed_requests_for_batch retries both retriable and non-retriable errors
+
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // First round: 2 retriable failures (429) and 2 non-retriable failures (400)
+        for _ in 0..2 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 429,
+                    body: "rate limited".to_string(),
+                }),
+            );
+        }
+        for _ in 0..2 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 400,
+                    body: "bad request".to_string(),
+                }),
+            );
+        }
+
+        // Second round after retry: all succeed
+        for _ in 0..4 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 200,
+                    body: r#"{"result":"success"}"#.to_string(),
+                }),
+            );
+        }
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            max_retries: Some(0), // No automatic retries
+            stop_before_deadline_ms: None,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            cancellation_poll_interval_ms: 100,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        let templates = (0..4)
+            .map(|i| fusillade::RequestTemplateInput {
+                custom_id: Some(format!("req-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"test":"data"}"#.to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file("test-file".to_string(), None, templates)
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(fusillade::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for all to fail
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let status = manager
+                .get_batch_status(batch.id, false)
+                .await
+                .expect("Failed to get status");
+            if status.failed_requests == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Verify we have 4 failed requests (2 retriable + 2 non-retriable)
+        let status_before = manager
+            .get_batch_status(batch.id, false)
+            .await
+            .expect("Failed to get status");
+        assert_eq!(status_before.failed_requests, 4);
+
+        // Retry all failed requests using bulk method
+        let retried_count = manager
+            .retry_failed_requests_for_batch(batch.id)
+            .await
+            .expect("Failed to retry batch");
+        assert_eq!(retried_count, 4, "Should retry all 4 failed requests");
+
+        // Wait for retries to complete successfully
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let status = manager
+                .get_batch_status(batch.id, false)
+                .await
+                .expect("Failed to get status");
+            if status.completed_requests == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        shutdown_token.cancel();
+
+        // Verify all requests completed successfully after retry
+        let status_after = manager
+            .get_batch_status(batch.id, false)
+            .await
+            .expect("Failed to get status");
+        assert_eq!(
+            status_after.completed_requests, 4,
+            "All 4 requests should complete after retry"
+        );
+        assert_eq!(status_after.failed_requests, 0, "No failed requests remain");
+    }
 }

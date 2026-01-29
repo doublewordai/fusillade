@@ -5,56 +5,55 @@
 
 ## Overview
 
-This document describes the error filtering feature added to Fusillade, which allows clients to distinguish between temporary failures (retriable errors like rate limits) and permanent failures (non-retriable errors like validation failures) when querying batch status and streaming error data.
+This document describes the SLA-aware error filtering feature added to Fusillade, which allows clients to hide transient retriable errors (rate limits, network failures) before their batch SLA expires, while always showing permanent non-retriable errors (validation failures, bad requests).
 
 ## Motivation
 
 Previously, all failed requests were aggregated into a single `failed_requests` count. This created several problems for clients:
 
-1. **Lack of actionability** - Clients couldn't distinguish between errors that indicated problems with their requests (400 Bad Request, validation errors) versus temporary infrastructure issues (429 Rate Limit, 503 Service Unavailable).
+1. **Noisy monitoring** - Batch health monitoring included transient errors like rate limits and network timeouts that would be retried automatically, making it difficult to identify batches with genuine problems requiring user attention.
 
-2. **Noisy monitoring** - Batch health monitoring included transient errors that would resolve on retry, making it difficult to identify batches with genuine problems.
+2. **Premature alerts** - Clients couldn't distinguish between errors that indicated problems with their requests (400 Bad Request, validation errors) versus temporary infrastructure issues (429 Rate Limit, 503 Service Unavailable) that were still within the retry window.
 
-3. **Limited error analysis** - When streaming error file contents, clients received all failures without the ability to filter to only the errors requiring their attention.
+3. **Confusing error streams** - When streaming error file contents before batch completion, clients received all failures including those that might still succeed on retry, creating confusion about which errors were actionable.
 
-The error filtering feature addresses these issues by allowing clients to explicitly choose which types of failures they want to see in queries and streams.
+The SLA-aware error filtering feature addresses these issues by allowing clients to hide retriable errors that are still within their retry window (before the batch SLA expires).
 
 ## What Changed
 
-### New ErrorFilter Type
+### New hide_retriable_before_sla Parameter
 
-Introduced a public `ErrorFilter` enum for specifying which error types to include:
+Introduced a boolean `hide_retriable_before_sla` parameter across all batch query and streaming methods:
 
-- **`All`** - Include all failures regardless of retryability (default behavior)
-- **`OnlyRetriable`** - Only retriable failures (rate limits, service errors, network timeouts)
-- **`OnlyNonRetriable`** - Only non-retriable failures (bad requests, validation errors, auth failures)
+- **`false`** - Show all errors regardless of retryability or SLA status (complete picture)
+- **`true`** - Hide retriable errors if the batch SLA hasn't expired yet (cleaner monitoring view)
+
+The filtering is SLA-aware:
+- **Before SLA expiry**: When `true`, retriable failures are hidden (they might still succeed on retry)
+- **After SLA expiry**: All failures are shown regardless of the parameter value (retries have been exhausted)
+
+This gives clients a cleaner view during batch execution while ensuring all errors become visible once the batch is complete.
 
 ### Breaking API Changes
 
-All batch and file query methods now require an explicit `error_filter` parameter:
+All batch and file query methods now require an explicit `hide_retriable_before_sla` parameter:
 
-- `get_batch(batch_id, error_filter)`
-- `get_batch_status(batch_id, error_filter)`
-- `list_batches(..., error_filter)`
-- `list_file_batches(file_id, error_filter)`
-- `get_file_content_stream(file_id, offset, search, error_filter)`
-- `get_batch_results_stream(batch_id, offset, search, status, error_filter)`
+- `get_batch(batch_id, hide_retriable_before_sla)`
+- `get_batch_status(batch_id, hide_retriable_before_sla)`
+- `list_batches(..., hide_retriable_before_sla)`
+- `list_file_batches(file_id, hide_retriable_before_sla)`
+- `get_file_content_stream(file_id, offset, search, hide_retriable_before_sla)`
+- `get_batch_results_stream(batch_id, offset, search, status, hide_retriable_before_sla)`
 
-This is intentionally a required parameter (not `Option<ErrorFilter>`) to force clients to make an explicit choice about which errors they want to see.
+This is intentionally a required parameter (not `Option<bool>`) to force clients to make an explicit choice about whether they want the filtered view.
 
-### Simplified Data Model
+### Data Model
 
-During implementation, we identified and removed redundant fields that were creating confusion. The `Batch` and `BatchStatus` structs now use a simpler model:
+The `Batch` and `BatchStatus` structs have a single `failed_requests` field whose meaning depends on the query parameters:
 
-- `failed_requests` - The count of failed requests, filtered based on the `ErrorFilter` parameter passed to the query method
-- No separate `failed_requests_retriable` or `failed_requests_non_retriable` fields
-
-The meaning of `failed_requests` changes based on the filter:
-- With `ErrorFilter::All`: total failures
-- With `ErrorFilter::OnlyRetriable`: only retriable failures
-- With `ErrorFilter::OnlyNonRetriable`: only non-retriable failures
-
-This design eliminates redundancy and makes the API more intuitive - the filter controls what you see, and the counts reflect that filter.
+- When `hide_retriable_before_sla = false`: Total failures
+- When `hide_retriable_before_sla = true` AND before SLA expiry: Only non-retriable failures
+- When `hide_retriable_before_sla = true` AND after SLA expiry: Total failures (SLA expired, all errors now actionable)
 
 ### Database Changes
 
@@ -64,11 +63,67 @@ Added a new `is_retriable_error` boolean column to the `requests` table:
 - NULL values (for historical data) are treated as non-retriable (safe default)
 - Indexed for efficient filtering: `idx_requests_failed_retriable`
 
-No changes to the `batches` table - all filtering is performed dynamically at query time.
+No changes to the `batches` table - all filtering is performed dynamically at query time using SQL CASE expressions that check batch SLA status.
 
 ## Key Architectural Decisions
 
-### 1. On-Demand Counting
+### 1. Boolean Parameter Instead of Enum
+
+**Decision:** Use a simple boolean flag instead of introducing an `ErrorFilter` enum with multiple variants.
+
+**Rationale:**
+- Simpler API surface area - no new enum type to maintain
+- The use case is specifically about hiding transient noise during monitoring
+- The SLA-aware behavior naturally maps to a boolean (hide before SLA, show after SLA)
+- Easier for clients to understand: "Should I hide retriable errors before SLA?" Yes/No
+
+**Trade-off:** Less flexible than an enum, but covers the primary use case cleanly.
+
+### 2. SLA-Aware Filtering
+
+**Decision:** Make the filtering conditional on batch SLA status (expires_at timestamp).
+
+**Rationale:**
+- Retriable errors are only "noise" while they're still being retried
+- Once the SLA expires, all errors are permanent and actionable
+- Allows a single boolean to give sensible behavior across the batch lifecycle
+- Prevents confusion where errors seem to "appear" - they're always shown after SLA expiry
+
+**Implementation:** SQL queries use CASE expressions:
+```sql
+CASE WHEN b.expires_at > NOW() THEN
+  COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL))
+ELSE
+  COUNT(*) FILTER (WHERE state = 'failed')
+END
+```
+
+**Trade-off:** More complex SQL, but better user experience.
+
+### 3. Required Parameter
+
+**Decision:** The `hide_retriable_before_sla` parameter is required, not optional.
+
+**Rationale:**
+- Forces intentional choice - clients must decide what view they want
+- Makes code self-documenting - looking at a call site reveals filtering intent
+- Prevents "wrong default" bugs where code implicitly assumes one behavior but gets another
+
+**Trade-off:** More verbose API, but improved clarity and correctness.
+
+### 4. Dynamic SQL with QueryBuilder
+
+**Decision:** Use sqlx's `QueryBuilder` for dynamic SQL construction instead of compile-time checked `query!()` macros.
+
+**Rationale:**
+- The SQL varies based on the hide_retriable_before_sla parameter and batch SLA status
+- QueryBuilder provides SQL injection protection through parameterized binding
+- Cannot use compile-time macros when query structure (CASE expressions) varies at runtime
+- The CASE expressions need to reference batch table columns (b.expires_at) which aren't available in all contexts
+
+**Trade-off:** Lose some compile-time checking, but gain necessary flexibility while maintaining safety.
+
+### 5. On-Demand Counting
 
 **Decision:** All error counts are computed dynamically using SQL `COUNT(*) FILTER` expressions rather than maintaining denormalized count columns.
 
@@ -80,86 +135,61 @@ No changes to the `batches` table - all filtering is performed dynamically at qu
 
 **Trade-off:** Queries are slightly more complex, but this is offset by simpler data model and no trigger maintenance.
 
-### 2. Required Parameter
+### 6. Intentional Terminal State Behavior
 
-**Decision:** The `error_filter` parameter is required, not optional.
-
-**Rationale:**
-- Forces intentional choice - clients must decide what errors they care about
-- Makes code self-documenting - looking at a call site reveals filtering intent
-- Prevents "wrong default" bugs where code implicitly assumes one filter but gets another
-
-**Trade-off:** More verbose API, but improved clarity and correctness.
-
-### 3. Dynamic SQL with QueryBuilder
-
-**Decision:** Use sqlx's `QueryBuilder` for dynamic SQL construction instead of compile-time checked `query!()` macros.
+**Decision:** Terminal state detection uses the filtered `failed_requests` count, meaning batches may not be marked as terminal when `hide_retriable_before_sla = true` if there are still pending retriable failures within the SLA window.
 
 **Rationale:**
-- The SQL varies based on the filter parameter (different COUNT expressions)
-- QueryBuilder provides SQL injection protection through parameterized binding
-- Cannot use compile-time macros when query structure varies at runtime
+- The filter is meant to affect the entire view of the batch, including completion status
+- A batch with only retriable errors before SLA should not be considered "failed" yet
+- Only non-retriable failures should trigger finalization before SLA expiry
+- After SLA expiry, all failures count and the batch will finalize normally
 
-**Trade-off:** Lose some compile-time checking, but gain necessary flexibility while maintaining safety.
-
-### 4. Simplified Design
-
-**Decision:** During code review, we identified and removed the `failed_requests_retriable` and `failed_requests_non_retriable` fields that existed in an earlier iteration.
-
-**Rationale:**
-- These fields were redundant when combined with the `error_filter` parameter
-- Created confusion about what they represented (always total counts? filtered counts?)
-- The filter parameter already controls what the caller wants to see
-- Simpler model: one count field whose meaning is determined by the filter
-
-This decision came from recognizing that returning both filtered and unfiltered counts was overcomplicating the API without adding value.
+This is intentional behavior: the filter affects both error visibility and batch completion semantics.
 
 ## Breaking Changes
 
 This is a **major breaking change** requiring a version bump:
 
-1. **All query methods require error_filter parameter** - Every method that queries batch or file data now requires an explicit `ErrorFilter` argument.
+1. **All query methods require hide_retriable_before_sla parameter** - Every method that queries batch or file data now requires an explicit boolean argument.
 
-2. **Batch/BatchStatus field removal** - The `failed_requests_retriable` and `failed_requests_non_retriable` fields no longer exist. Use the `error_filter` parameter to control what `failed_requests` represents.
+2. **Terminal state semantics** - Batches with only retriable failures may not enter terminal states (finalizing/completed/failed) until after SLA expiry when queried with `hide_retriable_before_sla = true`.
 
 ## Migration Path
 
-Clients need to update all batch and file query calls to pass an explicit filter:
+Clients need to update all batch and file query calls to pass the boolean flag:
 
 ```rust
 // Before:
 let batch = manager.get_batch(batch_id).await?;
 let status = manager.get_batch_status(batch_id).await?;
 
-// After - preserve previous behavior:
-let batch = manager.get_batch(batch_id, ErrorFilter::All).await?;
-let status = manager.get_batch_status(batch_id, ErrorFilter::All).await?;
+// After - preserve previous behavior (show all errors):
+let batch = manager.get_batch(batch_id, false).await?;
+let status = manager.get_batch_status(batch_id, false).await?;
 
-// Or filter to only actionable errors:
-let batch = manager.get_batch(batch_id, ErrorFilter::OnlyNonRetriable).await?;
+// Or hide transient errors for cleaner monitoring:
+let batch = manager.get_batch(batch_id, true).await?;
 
-// Or only transient failures:
-let batch = manager.get_batch(batch_id, ErrorFilter::OnlyRetriable).await?;
+// Note: After SLA expiry, both return the same result (all errors visible)
 ```
-
-Clients should also remove any code that references the deleted `failed_requests_retriable` or `failed_requests_non_retriable` fields.
 
 ## Use Cases
 
 This feature enables several important workflows:
 
-**Monitoring batch health** - Query with `ErrorFilter::OnlyNonRetriable` to see if there are any permanent failures requiring attention, filtering out transient rate limits and network errors.
+**Clean monitoring dashboards** - Query with `hide_retriable_before_sla = true` to show only actionable errors during batch execution, reducing noise from rate limits and network timeouts that will resolve on retry.
 
-**Error analysis** - Stream error file contents with `ErrorFilter::OnlyNonRetriable` to focus on errors that indicate problems with request data or configuration.
+**Error analysis** - Stream error file contents with `hide_retriable_before_sla = true` to focus on errors that indicate problems with request data or configuration, ignoring transient infrastructure issues.
 
-**Retry decision making** - Query with `ErrorFilter::OnlyRetriable` to understand how many failures are transient and may resolve on retry.
+**Complete error picture** - Use `hide_retriable_before_sla = false` when you need to see everything, regardless of retryability or SLA status.
 
-**Complete error picture** - Use `ErrorFilter::All` (the previous behavior) when you need total failure counts regardless of retryability.
+**Time-aware views** - The same query automatically adapts as the batch ages - transient errors are hidden during execution but become visible once the SLA expires.
 
 ## Future Enhancements
 
 Potential future additions not included in this implementation:
 
 - Filter by specific `FailureReason` variants (e.g., only 429 rate limits)
-- Separate `retried_requests` count (failures that succeeded on retry)
+- Separate counts for retriable vs non-retriable errors in Batch/BatchStatus structs
 - Time-series tracking of retriable vs non-retriable failure rates
