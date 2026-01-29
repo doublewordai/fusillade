@@ -5,7 +5,7 @@
 
 ### ⚠ BREAKING CHANGES
 
-* The ErrorFilter enum has been removed and replaced with a boolean parameter across all Storage trait methods.
+* Boolean parameter (`hide_retriable_before_sla`) across all Storage trait methods to ignore retryable errors before sla completion.
 
 ### Features
 
