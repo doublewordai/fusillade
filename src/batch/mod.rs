@@ -107,17 +107,6 @@ pub enum OutputFileType {
     Error,
 }
 
-/// Filter for error types when querying batch/file data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorFilter {
-    /// Include all failed requests regardless of retryability
-    All,
-    /// Include only retriable failures (429, 503, network errors, etc.)
-    OnlyRetriable,
-    /// Include only non-retriable failures (400, 404, validation errors, etc.)
-    OnlyNonRetriable,
-}
 
 impl fmt::Display for Purpose {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

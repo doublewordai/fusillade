@@ -368,7 +368,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
 
     while start.elapsed() < timeout {
         let status = manager
-            .get_batch_status(batch.id, fusillade::batch::ErrorFilter::All)
+            .get_batch_status(batch.id, false)
             .await
             .expect("Failed to get batch status");
 
@@ -683,7 +683,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
 
     while start.elapsed() < timeout {
         let status = manager
-            .get_batch_status(batch.id, fusillade::batch::ErrorFilter::All)
+            .get_batch_status(batch.id, false)
             .await
             .expect("Failed to get batch status");
 
@@ -1331,7 +1331,7 @@ mod batch_results_stream {
             0,
             None,
             None,
-            fusillade::batch::ErrorFilter::All,
+            false,
         );
         stream
             .filter_map(|r| async { r.ok() })
@@ -1512,7 +1512,7 @@ mod batch_results_stream {
             0,
             None,
             None,
-            fusillade::batch::ErrorFilter::All,
+            false,
         );
         let results: Vec<_> = stream.collect().await;
 
@@ -1598,7 +1598,7 @@ mod batch_results_stream {
         let start = tokio::time::Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             let b = manager
-                .get_batch(batch.id, fusillade::batch::ErrorFilter::All)
+                .get_batch(batch.id, false)
                 .await
                 .expect("get_batch failed");
             if b.completed_requests == 1 {
@@ -1610,7 +1610,7 @@ mod batch_results_stream {
 
         // Get the output file ID
         let batch = manager
-            .get_batch(batch.id, fusillade::batch::ErrorFilter::All)
+            .get_batch(batch.id, false)
             .await
             .expect("get_batch failed");
         let output_file_id = batch
@@ -1635,7 +1635,7 @@ mod batch_results_stream {
 
         // Verify batch is no longer accessible
         let batch_result = manager
-            .get_batch(batch.id, fusillade::batch::ErrorFilter::All)
+            .get_batch(batch.id, false)
             .await;
         assert!(
             batch_result.is_err(),
@@ -1745,7 +1745,7 @@ mod batch_results_stream {
             2,
             None,
             None,
-            fusillade::batch::ErrorFilter::All,
+            false,
         );
         let offset_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
@@ -1864,7 +1864,7 @@ mod batch_results_stream {
             0,
             None,
             Some("completed".to_string()),
-            fusillade::batch::ErrorFilter::All,
+            false,
         );
         let completed_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
@@ -1883,7 +1883,7 @@ mod batch_results_stream {
             0,
             None,
             Some("failed".to_string()),
-            fusillade::batch::ErrorFilter::All,
+            false,
         );
         let failed_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
@@ -1999,7 +1999,7 @@ mod batch_results_stream {
             0,
             Some("request".to_string()),
             None,
-            fusillade::batch::ErrorFilter::All,
+            false,
         );
         let search_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
@@ -2022,7 +2022,7 @@ mod batch_results_stream {
             0,
             Some("ALPHA".to_string()),
             None,
-            fusillade::batch::ErrorFilter::All,
+            false,
         );
         let alpha_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
