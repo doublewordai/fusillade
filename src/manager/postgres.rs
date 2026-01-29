@@ -3261,7 +3261,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         // represents completed work that users should be able to download
         let batch_result = sqlx::query!(
             r#"
-            SELECT id
+            SELECT id, expires_at
             FROM batches
             WHERE error_file_id = $1
             "#,
@@ -3270,8 +3270,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         .fetch_one(&pool)
         .await;
 
-        let batch_id = match batch_result {
-            Ok(row) => row.id,
+        let (batch_id, expires_at) = match batch_result {
+            Ok(row) => (row.id, row.expires_at),
             Err(e) => {
                 let _ = tx
                     .send(Err(FusilladeError::Other(anyhow!(
@@ -3283,8 +3283,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             }
         };
 
-        // Get error filter SQL fragment
-        let (error_where_clause, _) = Self::error_filter_sql_fragments(hide_retriable_before_sla);
+        // Determine whether to filter retriable errors based on SLA status
+        let should_filter_retriable = hide_retriable_before_sla && chrono::Utc::now() < expires_at;
 
         // Stream failed requests, ordered by failure time
         // This ensures new failures always append (no out-of-order issues)
@@ -3325,10 +3325,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             query_builder.push_bind(search_pattern.as_deref());
             query_builder.push(")");
 
-            // Add error filter condition if present
-            if !error_where_clause.is_empty() {
-                query_builder.push(" ");
-                query_builder.push(error_where_clause);
+            // Filter retriable errors if before SLA expiry
+            if should_filter_retriable {
+                query_builder
+                    .push(" AND (is_retriable_error = false OR is_retriable_error IS NULL)");
             }
 
             query_builder.push(" ORDER BY failed_at ASC, id ASC OFFSET ");
