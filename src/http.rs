@@ -6,7 +6,9 @@
 use crate::error::Result;
 use crate::types::RequestData;
 use async_trait::async_trait;
+use opentelemetry::trace::TraceContextExt;
 use std::time::Duration;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Response from an HTTP request.
 /// TODO: How will we deal with streaming responses? Right now we buffer the whole response before
@@ -83,7 +85,15 @@ impl Default for ReqwestHttpClient {
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
     // TODO: document
-    #[tracing::instrument(skip(self, request, api_key), fields(request_id = %request.id, method = %request.method, model = %request.model))]
+    #[tracing::instrument(skip(self, request, api_key), fields(
+        otel.kind = "Client",
+        otel.name = %format!("{} {}", request.method, request.path),
+        http.request.method = %request.method,
+        url.full,
+        url.path = %request.path,
+        request_id = %request.id,
+        model = %request.model
+    ))]
     async fn execute(
         &self,
         request: &RequestData,
@@ -91,9 +101,10 @@ impl HttpClient for ReqwestHttpClient {
         timeout_ms: u64,
     ) -> Result<HttpResponse> {
         let url = format!("{}{}", request.endpoint, request.path);
+        tracing::Span::current().record("url.full", &url);
 
         tracing::debug!(
-            url = %url,
+            url.full = %url,
             timeout_ms = timeout_ms,
             "Executing HTTP request"
         );
@@ -133,6 +144,22 @@ impl HttpClient for ReqwestHttpClient {
             tracing::trace!(request_id = %request.id, custom_id = %custom_id, "Added X-Fusillade-Custom-Id header");
         }
 
+        // Inject OpenTelemetry trace context for distributed tracing
+        // This allows the downstream service to continue the same trace
+        let ctx = tracing::Span::current().context();
+        let span_ref = ctx.span();
+        let span_ctx = span_ref.span_context();
+        if span_ctx.is_valid() {
+            let traceparent = format!(
+                "00-{}-{}-{:02x}",
+                span_ctx.trace_id(),
+                span_ctx.span_id(),
+                span_ctx.trace_flags().to_u8()
+            );
+            req = req.header("traceparent", &traceparent);
+            tracing::trace!(request_id = %request.id, traceparent = %traceparent, "Added traceparent header for distributed tracing");
+        }
+
         // Only add body and Content-Type for methods that support a body
         let method_upper = request.method.to_uppercase();
         if method_upper != "GET"
@@ -154,7 +181,7 @@ impl HttpClient for ReqwestHttpClient {
             if e.is_builder() {
                 tracing::error!(
                     request_id = %request.id,
-                    url = %url,
+                    url.full = %url,
                     error = %e,
                     custom_id = ?request.custom_id,
                     batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
@@ -163,7 +190,7 @@ impl HttpClient for ReqwestHttpClient {
             } else {
                 tracing::error!(
                     request_id = %request.id,
-                    url = %url,
+                    url.full = %url,
                     error = %e,
                     "HTTP request failed"
                 );
