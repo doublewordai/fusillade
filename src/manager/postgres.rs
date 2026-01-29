@@ -246,9 +246,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// Tuple of (where_clause, failed_count):
     /// - where_clause: Additional WHERE condition for stream filtering (empty when not hiding)
     /// - failed_count: COUNT expression with CASE for per-batch SLA filtering
-    fn error_filter_sql_fragments(
-        hide_retriable_before_sla: bool,
-    ) -> (&'static str, &'static str) {
+    fn error_filter_sql_fragments(hide_retriable_before_sla: bool) -> (&'static str, &'static str) {
         if hide_retriable_before_sla {
             (
                 // For stream filtering: check batch SLA and apply filter
@@ -1596,8 +1594,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     async fn get_file_content(&self, file_id: FileId) -> Result<Vec<FileContentItem>> {
-        let mut stream =
-            self.get_file_content_stream(file_id, 0, None, false);
+        let mut stream = self.get_file_content_stream(file_id, 0, None, false);
         let mut items = Vec::new();
 
         while let Some(result) = stream.next().await {
@@ -1685,7 +1682,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     Self::stream_batch_output(pool, file_id, offset, search, tx).await;
                 }
                 Some("batch_error") => {
-                    Self::stream_batch_error(pool, file_id, offset, search, hide_retriable_before_sla, tx).await;
+                    Self::stream_batch_error(
+                        pool,
+                        file_id,
+                        offset,
+                        search,
+                        hide_retriable_before_sla,
+                        tx,
+                    )
+                    .await;
                 }
                 _ => {
                     // Regular file or purpose='batch': stream request templates
@@ -2129,19 +2134,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // isolation levels (READ COMMITTED or REPEATABLE READ). Querying from the read pool
         // immediately after committing on the write pool can result in "Batch not found" if
         // the read connection's snapshot predates the write commit.
-        self.get_batch_from_pool(
-            BatchId(batch_id),
-            false,
-            self.pools.write(),
-        )
-        .await
+        self.get_batch_from_pool(BatchId(batch_id), false, self.pools.write())
+            .await
     }
 
-    async fn get_batch(
-        &self,
-        batch_id: BatchId,
-        hide_retriable_before_sla: bool,
-    ) -> Result<Batch> {
+    async fn get_batch(&self, batch_id: BatchId, hide_retriable_before_sla: bool) -> Result<Batch> {
         self.get_batch_from_pool(batch_id, hide_retriable_before_sla, self.pools.read())
             .await
     }
@@ -2811,8 +2808,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let offset = offset as i64;
 
         tokio::spawn(async move {
-            Self::stream_batch_results(pool, batch_id, offset, search, status, hide_retriable_before_sla, tx)
-                .await;
+            Self::stream_batch_results(
+                pool,
+                batch_id,
+                offset,
+                search,
+                status,
+                hide_retriable_before_sla,
+                tx,
+            )
+            .await;
         });
 
         Box::pin(ReceiverStream::new(rx))
@@ -4734,10 +4739,7 @@ mod tests {
         assert_eq!(claimed2.len(), 2);
 
         // Verify batch status shows claimed requests
-        let status = manager
-            .get_batch_status(batch.id, false)
-            .await
-            .unwrap();
+        let status = manager.get_batch_status(batch.id, false).await.unwrap();
         assert_eq!(status.total_requests, 5);
         assert_eq!(status.pending_requests, 0);
         assert_eq!(status.in_progress_requests, 5); // All claimed
@@ -4783,10 +4785,7 @@ mod tests {
             .unwrap();
 
         // Verify all are pending
-        let status_before = manager
-            .get_batch_status(batch.id, false)
-            .await
-            .unwrap();
+        let status_before = manager.get_batch_status(batch.id, false).await.unwrap();
         assert_eq!(status_before.pending_requests, 3);
         assert_eq!(status_before.canceled_requests, 0);
 
@@ -4794,10 +4793,7 @@ mod tests {
         manager.cancel_batch(batch.id).await.unwrap();
 
         // Verify all are canceled
-        let status_after = manager
-            .get_batch_status(batch.id, false)
-            .await
-            .unwrap();
+        let status_after = manager.get_batch_status(batch.id, false).await.unwrap();
         assert_eq!(status_after.pending_requests, 0);
         assert_eq!(status_after.canceled_requests, 3);
 
@@ -4860,9 +4856,7 @@ mod tests {
             .unwrap();
 
         // Verify batch exists
-        let batch_before = manager
-            .get_batch(batch.id, false)
-            .await;
+        let batch_before = manager.get_batch(batch.id, false).await;
         assert!(batch_before.is_ok());
 
         // Verify requests exist
@@ -4873,9 +4867,7 @@ mod tests {
         manager.delete_batch(batch.id).await.unwrap();
 
         // Verify batch is gone
-        let batch_after = manager
-            .get_batch(batch.id, false)
-            .await;
+        let batch_after = manager.get_batch(batch.id, false).await;
         assert!(batch_after.is_err());
 
         // Verify requests are not returned (orphaned with batch_id = NULL, filtered by view)
@@ -4946,10 +4938,7 @@ mod tests {
         }
 
         // Verify batch status
-        let status = manager
-            .get_batch_status(batch.id, false)
-            .await
-            .unwrap();
+        let status = manager.get_batch_status(batch.id, false).await.unwrap();
         assert_eq!(status.pending_requests, 2);
         assert_eq!(status.canceled_requests, 3);
 
@@ -5070,10 +5059,7 @@ mod tests {
             .unwrap();
 
         // List batches for this file
-        let batches = manager
-            .list_file_batches(file_id, false)
-            .await
-            .unwrap();
+        let batches = manager.list_file_batches(file_id, false).await.unwrap();
 
         assert_eq!(batches.len(), 3);
 
@@ -5140,10 +5126,7 @@ mod tests {
             .unwrap();
 
         // Verify the batch exists with file_id set
-        let batch_before = manager
-            .get_batch(batch.id, false)
-            .await
-            .unwrap();
+        let batch_before = manager.get_batch(batch.id, false).await.unwrap();
         assert_eq!(batch_before.file_id, Some(file_id));
         assert!(batch_before.cancelling_at.is_none());
         assert!(batch_before.cancelled_at.is_none());
@@ -5161,10 +5144,7 @@ mod tests {
         assert!(file_result.is_err());
 
         // Verify batch still exists but file_id is NULL and batch is cancelled
-        let batch_after = manager
-            .get_batch(batch.id, false)
-            .await
-            .unwrap();
+        let batch_after = manager.get_batch(batch.id, false).await.unwrap();
         assert_eq!(batch_after.file_id, None);
         assert!(batch_after.cancelling_at.is_some());
         assert!(batch_after.cancelled_at.is_some());
@@ -5255,10 +5235,7 @@ mod tests {
         assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
 
         // Verify the request is now claimed by daemon2
-        let status = manager
-            .get_batch_status(batch.id, false)
-            .await
-            .unwrap();
+        let status = manager.get_batch_status(batch.id, false).await.unwrap();
         assert_eq!(status.in_progress_requests, 1);
     }
 
@@ -5331,10 +5308,7 @@ mod tests {
         .unwrap();
 
         // Verify it's in processing state
-        let status_before = manager
-            .get_batch_status(batch.id, false)
-            .await
-            .unwrap();
+        let status_before = manager.get_batch_status(batch.id, false).await.unwrap();
         assert_eq!(status_before.in_progress_requests, 1);
 
         // Now daemon2 tries to claim - should unclaim the stale processing request
@@ -5652,12 +5626,7 @@ mod tests {
         .expect("Failed to mark request as failed");
 
         // Stream the output file - should contain 2 completed requests
-        let output_stream = manager.get_file_content_stream(
-            output_file_id,
-            0,
-            None,
-            false,
-        );
+        let output_stream = manager.get_file_content_stream(output_file_id, 0, None, false);
         let output_items: Vec<_> = output_stream.collect().await;
 
         assert_eq!(output_items.len(), 2, "Should have 2 output items");
@@ -5691,8 +5660,7 @@ mod tests {
         );
 
         // Stream the error file - should contain 1 failed request
-        let error_stream =
-            manager.get_file_content_stream(error_file_id, 0, None, false);
+        let error_stream = manager.get_file_content_stream(error_file_id, 0, None, false);
         let error_items: Vec<_> = error_stream.collect().await;
 
         assert_eq!(error_items.len(), 1, "Should have 1 error item");
@@ -5712,8 +5680,7 @@ mod tests {
         }
 
         // Verify that streaming a regular input file still works
-        let input_stream =
-            manager.get_file_content_stream(file_id, 0, None, false);
+        let input_stream = manager.get_file_content_stream(file_id, 0, None, false);
         let input_items: Vec<_> = input_stream.collect().await;
 
         assert_eq!(input_items.len(), 3, "Input file should have 3 templates");
@@ -6241,9 +6208,7 @@ mod tests {
 
         // Try to get a batch that doesn't exist
         let fake_batch_id = BatchId(Uuid::new_v4());
-        let result = manager
-            .get_batch(fake_batch_id, false)
-            .await;
+        let result = manager.get_batch(fake_batch_id, false).await;
 
         // Should return an error
         assert!(result.is_err());
@@ -6315,10 +6280,7 @@ mod tests {
         .unwrap();
 
         // Get the batch and verify progress
-        let retrieved = manager
-            .get_batch(batch.id, false)
-            .await
-            .unwrap();
+        let retrieved = manager.get_batch(batch.id, false).await.unwrap();
         assert_eq!(retrieved.total_requests, 5);
         assert_eq!(retrieved.pending_requests, 3);
         assert_eq!(retrieved.in_progress_requests, 1); // Still claimed
@@ -6385,10 +6347,7 @@ mod tests {
 
         // Call get_batch() - this should trigger lazy finalization UPDATE
         // If the UPDATE incorrectly used .read() pool, this would fail with TestDbPools
-        let retrieved = manager
-            .get_batch(batch.id, false)
-            .await
-            .unwrap();
+        let retrieved = manager.get_batch(batch.id, false).await.unwrap();
 
         // Verify the batch is marked as completed
         assert_eq!(retrieved.total_requests, 3);
@@ -6411,10 +6370,7 @@ mod tests {
         );
 
         // Call get_batch again - should not trigger UPDATE again (idempotent)
-        let retrieved_again = manager
-            .get_batch(batch.id, false)
-            .await
-            .unwrap();
+        let retrieved_again = manager.get_batch(batch.id, false).await.unwrap();
 
         // Compare timestamps with microsecond precision (PostgreSQL limitation)
         // Truncate nanoseconds to avoid precision mismatch
@@ -7077,10 +7033,7 @@ mod tests {
         let manager_clone = manager.clone();
         let batch_shows_canceled = wait_for(
             || async {
-                if let Ok(status) = manager_clone
-                    .get_batch_status(batch_id, false)
-                    .await
-                {
+                if let Ok(status) = manager_clone.get_batch_status(batch_id, false).await {
                     // Both requests should be counted as canceled (not in_progress)
                     // when batch has cancelling_at set
                     return status.canceled_requests == 2 && status.in_progress_requests == 0;

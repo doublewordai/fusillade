@@ -103,11 +103,7 @@ pub trait Storage: Send + Sync {
     /// # Arguments
     /// * `batch_id` - The batch ID to retrieve
     /// * `hide_retriable_before_sla` - If true, hide retriable errors for batches before SLA expiry
-    async fn get_batch(
-        &self,
-        batch_id: BatchId,
-        hide_retriable_before_sla: bool,
-    ) -> Result<Batch>;
+    async fn get_batch(&self, batch_id: BatchId, hide_retriable_before_sla: bool) -> Result<Batch>;
 
     /// Get batch status.
     ///

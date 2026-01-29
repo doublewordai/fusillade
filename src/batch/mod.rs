@@ -107,7 +107,6 @@ pub enum OutputFileType {
     Error,
 }
 
-
 impl fmt::Display for Purpose {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
