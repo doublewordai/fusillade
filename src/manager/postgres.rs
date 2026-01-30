@@ -13,8 +13,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::Stream;
-use sqlx::Row;
-use sqlx::postgres::{PgListener, PgPool};
+use sqlx::{Acquire, Row};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -286,7 +285,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 }
 
 // Additional methods for PostgresRequestManager (not part of Storage trait)
-impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
+impl<P: PoolProvider + Clone, H: HttpClient + 'static> PostgresRequestManager<P, H>
+where
+    for<'c> &'c P::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+    for<'c> &'c P::Pool: sqlx::Acquire<'c, Database = sqlx::Postgres>,
+{
     /// Unclaim stale requests that have been stuck in "claimed" or "processing" states
     /// for longer than the configured timeouts. This handles daemon crashes.
     ///
@@ -455,79 +458,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         terminal_count == batch.total_requests && batch.total_requests > 0
     }
 
-    /// Finalize a virtual file's size in the database.
-    /// Uses an advisory lock to prevent concurrent finalization.
-    /// Returns whether the finalization was performed.
-    async fn finalize_file_size(
-        pool: &PgPool,
-        file_id: FileId,
-        estimated_size: i64,
-    ) -> Result<bool> {
-        let lock_key = Self::file_lock_key(file_id);
-
-        // Try to acquire advisory lock (non-blocking)
-        let lock_acquired = match sqlx::query_scalar!("SELECT pg_try_advisory_lock($1)", lock_key)
-            .fetch_one(pool)
-            .await
-        {
-            Ok(Some(acquired)) => acquired,
-            Ok(None) => {
-                // Unexpected - pg_try_advisory_lock shouldn't return NULL
-                tracing::warn!(
-                    file_id = %file_id,
-                    "Advisory lock query returned NULL unexpectedly"
-                );
-                false
-            }
-            Err(e) => {
-                // Database error - this IS a problem
-                tracing::error!(
-                    file_id = %file_id,
-                    error = %e,
-                    "Database error while trying to acquire advisory lock"
-                );
-                return Err(FusilladeError::Other(anyhow!(
-                    "Failed to acquire lock: {}",
-                    e
-                )));
-            }
-        };
-
-        if !lock_acquired {
-            // Another process is finalizing
-            return Ok(false);
-        }
-
-        // We have the lock - finalize the file
-        let result = sqlx::query!(
-            r#"
-            UPDATE files
-            SET size_bytes = $2, size_finalized = TRUE
-            WHERE id = $1 AND size_finalized = FALSE
-            "#,
-            *file_id as Uuid,
-            estimated_size,
-        )
-        .execute(pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file size: {}", e)));
-
-        // Release the lock - only log if release fails (which is unusual)
-        if let Err(e) = sqlx::query_scalar!("SELECT pg_advisory_unlock($1)", lock_key)
-            .fetch_one(pool)
-            .await
-        {
-            tracing::warn!(
-                file_id = %file_id,
-                error = %e,
-                "Failed to release advisory lock (will be released on connection return to pool)"
-            );
-        }
-
-        result?;
-        Ok(true)
-    }
-
     /// Spawn a background task to finalize a completed batch's virtual file.
     /// Returns immediately - finalization happens asynchronously.
     fn spawn_finalize_if_complete(
@@ -630,7 +560,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// Accepts a pool parameter to control read-after-write consistency.
     /// Typically used with the primary pool for immediate reads after writes,
     /// or replica pools for normal reads.
-    async fn get_file_from_pool(&self, file_id: FileId, pool: &PgPool) -> Result<File> {
+    async fn get_file_from_pool<'e, E>(&self, file_id: FileId, pool: E) -> Result<File>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         let row = sqlx::query!(
             r#"
             SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
@@ -677,7 +610,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
 // Implement Storage trait directly (no delegation)
 #[async_trait]
-impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManager<P, H> {
+impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManager<P, H>
+where
+    for<'c> &'c P::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+    for<'c> &'c P::Pool: sqlx::Acquire<'c, Database = sqlx::Postgres>,
+{
     async fn claim_requests(
         &self,
         limit: usize,
@@ -2779,7 +2716,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 }
 
 // Helper methods for file streaming and virtual file creation
-impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
+impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H>
+where
+    for<'c> &'c P::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+{
     /// Internal helper to fetch a batch from a specific pool.
     ///
     /// This is used when we require read-after-write consistency and must query
@@ -2790,7 +2730,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// # Arguments
     /// * `batch_id` - The ID of the batch to fetch
     /// * `pool` - The specific pool to query from (typically write pool after commit)
-    async fn get_batch_from_pool(&self, batch_id: BatchId, pool: &PgPool) -> Result<Batch> {
+    async fn get_batch_from_pool<'e, E>(&self, batch_id: BatchId, pool: E) -> Result<Batch>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         let row = sqlx::query!(
             r#"
             SELECT
@@ -2963,7 +2906,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         offset: i64,
         search: Option<String>,
         tx: mpsc::Sender<Result<FileContentItem>>,
-    ) {
+    ) where
+        for<'c> &'c Pools::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+    {
         const BATCH_SIZE: i64 = 1000;
         let mut last_line_number: i32 = -1;
         let mut is_first_batch = true;
@@ -3051,7 +2996,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         offset: i64,
         search: Option<String>,
         tx: mpsc::Sender<Result<FileContentItem>>,
-    ) {
+    ) where
+        for<'c> &'c Pools::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+    {
         // First, find the batch that owns this output file
         // Note: We allow streaming even for soft-deleted batches since the output file
         // represents completed work that users should be able to download
@@ -3181,7 +3128,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         offset: i64,
         search: Option<String>,
         tx: mpsc::Sender<Result<FileContentItem>>,
-    ) {
+    ) where
+        for<'c> &'c Pools::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+    {
         // First, find the batch that owns this error file
         // Note: We allow streaming even for soft-deleted batches since the error file
         // represents completed work that users should be able to download
@@ -3301,7 +3250,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         search: Option<String>,
         status: Option<String>,
         tx: mpsc::Sender<Result<crate::batch::BatchResultItem>>,
-    ) {
+    ) where
+        for<'c> &'c Pools::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+    {
         use crate::batch::{BatchResultItem, BatchResultStatus};
 
         // First, get the file_id from the batch
@@ -3510,7 +3461,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
 // Implement DaemonStorage trait
 #[async_trait]
-impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P, H> {
+impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P, H>
+where
+    for<'c> &'c P::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+{
     async fn persist_daemon<T: DaemonState + Clone>(&self, record: &DaemonRecord<T>) -> Result<()>
     where
         AnyDaemonRecord: From<DaemonRecord<T>>,
@@ -3775,7 +3729,11 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
 
 // Implement DaemonExecutor trait
 #[async_trait]
-impl<P: PoolProvider, H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<P, H> {
+impl<P: PoolProvider, H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<P, H>
+where
+    for<'c> &'c P::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+    for<'c> &'c P::Pool: sqlx::Acquire<'c, Database = sqlx::Postgres>,
+{
     fn http_client(&self) -> &Arc<H> {
         &self.http_client
     }
