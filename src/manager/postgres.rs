@@ -2900,15 +2900,13 @@ where
     }
 
     /// Stream request templates from a regular file
-    async fn stream_request_templates<Pool>(
-        pool: Pool,
+    async fn stream_request_templates(
+        pool: P::Pool,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
         tx: mpsc::Sender<Result<FileContentItem>>,
-    ) where
-        for<'c> &'c Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
-    {
+    ) {
         const BATCH_SIZE: i64 = 1000;
         let mut last_line_number: i32 = -1;
         let mut is_first_batch = true;
@@ -2990,15 +2988,13 @@ where
     }
 
     /// Stream batch output (completed requests) for a virtual output file
-    async fn stream_batch_output<Pool>(
-        pool: Pool,
+    async fn stream_batch_output(
+        pool: P::Pool,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
         tx: mpsc::Sender<Result<FileContentItem>>,
-    ) where
-        for<'c> &'c Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
-    {
+    ) {
         // First, find the batch that owns this output file
         // Note: We allow streaming even for soft-deleted batches since the output file
         // represents completed work that users should be able to download
@@ -3122,15 +3118,13 @@ where
     }
 
     /// Stream batch errors (failed requests) for a virtual error file
-    async fn stream_batch_error<Pool>(
-        pool: Pool,
+    async fn stream_batch_error(
+        pool: P::Pool,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
         tx: mpsc::Sender<Result<FileContentItem>>,
-    ) where
-        for<'c> &'c Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
-    {
+    ) {
         // First, find the batch that owns this error file
         // Note: We allow streaming even for soft-deleted batches since the error file
         // represents completed work that users should be able to download
@@ -3243,16 +3237,14 @@ where
 
     /// Stream batch results with merged input/output data for the Results view.
     /// This joins requests with their templates to provide input body alongside response/error.
-    async fn stream_batch_results<Pool>(
-        pool: Pool,
+    async fn stream_batch_results(
+        pool: P::Pool,
         batch_id: BatchId,
         offset: i64,
         search: Option<String>,
         status: Option<String>,
         tx: mpsc::Sender<Result<crate::batch::BatchResultItem>>,
-    ) where
-        for<'c> &'c Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
-    {
+    ) {
         use crate::batch::{BatchResultItem, BatchResultStatus};
 
         // First, get the file_id from the batch
