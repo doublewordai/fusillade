@@ -285,7 +285,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 }
 
 // Additional methods for PostgresRequestManager (not part of Storage trait)
-impl<P: PoolProvider + Clone, H: HttpClient + 'static> PostgresRequestManager<P, H>
+impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H>
 where
     for<'c> &'c P::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
     for<'c> &'c P::Pool: sqlx::Acquire<'c, Database = sqlx::Postgres>,
@@ -481,11 +481,11 @@ where
 
             if is_complete {
                 // Spawn background finalization - don't block listing
-                let pools = self.pools.clone();
+                let pool = self.pools.write().clone();
 
                 tokio::spawn(async move {
                     if let Err(e) =
-                        finalize_file_size_with_pool(pools.write(), file_id, estimated_size).await
+                        finalize_file_size_with_pool(&pool, file_id, estimated_size).await
                     {
                         tracing::warn!("Failed to finalize file size for {}: {}", file_id, e);
                     }
@@ -1575,7 +1575,7 @@ where
         offset: usize,
         search: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
-        let pools = self.pools.clone();
+        let pool = self.pools.read().clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
@@ -1589,7 +1589,7 @@ where
                 "#,
                 *file_id as Uuid,
             )
-            .fetch_one(pools.read())
+            .fetch_one(&pool)
             .await;
 
             let purpose = match file_result {
@@ -1608,14 +1608,14 @@ where
             // Route to appropriate streaming logic based on purpose
             match purpose.as_deref() {
                 Some("batch_output") => {
-                    Self::stream_batch_output(pools, file_id, offset, search, tx).await;
+                    Self::stream_batch_output(pool, file_id, offset, search, tx).await;
                 }
                 Some("batch_error") => {
-                    Self::stream_batch_error(pools, file_id, offset, search, tx).await;
+                    Self::stream_batch_error(pool, file_id, offset, search, tx).await;
                 }
                 _ => {
                     // Regular file or purpose='batch': stream request templates
-                    Self::stream_request_templates(pools, file_id, offset, search, tx).await;
+                    Self::stream_request_templates(pool, file_id, offset, search, tx).await;
                 }
             }
         });
@@ -2703,12 +2703,12 @@ where
         search: Option<String>,
         status: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>> {
-        let pools = self.pools.clone();
+        let pool = self.pools.read().clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
         tokio::spawn(async move {
-            Self::stream_batch_results(pools, batch_id, offset, search, status, tx).await;
+            Self::stream_batch_results(pool, batch_id, offset, search, status, tx).await;
         });
 
         Box::pin(ReceiverStream::new(rx))
@@ -2900,14 +2900,14 @@ where
     }
 
     /// Stream request templates from a regular file
-    async fn stream_request_templates<Pools: PoolProvider>(
-        pools: Pools,
+    async fn stream_request_templates<Pool>(
+        pool: Pool,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) where
-        for<'c> &'c Pools::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+        for<'c> &'c Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
     {
         const BATCH_SIZE: i64 = 1000;
         let mut last_line_number: i32 = -1;
@@ -2939,7 +2939,7 @@ where
                 BATCH_SIZE,
                 search_pattern.as_deref(),
             )
-            .fetch_all(pools.read())
+            .fetch_all(&pool)
             .await;
 
             match template_batch {
@@ -2990,14 +2990,14 @@ where
     }
 
     /// Stream batch output (completed requests) for a virtual output file
-    async fn stream_batch_output<Pools: PoolProvider>(
-        pools: Pools,
+    async fn stream_batch_output<Pool>(
+        pool: Pool,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) where
-        for<'c> &'c Pools::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+        for<'c> &'c Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
     {
         // First, find the batch that owns this output file
         // Note: We allow streaming even for soft-deleted batches since the output file
@@ -3010,7 +3010,7 @@ where
             "#,
             *file_id as Uuid,
         )
-        .fetch_one(pools.read())
+        .fetch_one(&pool)
         .await;
 
         let batch_id = match batch_result {
@@ -3062,7 +3062,7 @@ where
                 BATCH_SIZE,
                 search_pattern.as_deref(),
             )
-            .fetch_all(pools.read())
+            .fetch_all(&pool)
             .await;
 
             match request_batch {
@@ -3122,14 +3122,14 @@ where
     }
 
     /// Stream batch errors (failed requests) for a virtual error file
-    async fn stream_batch_error<Pools: PoolProvider>(
-        pools: Pools,
+    async fn stream_batch_error<Pool>(
+        pool: Pool,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) where
-        for<'c> &'c Pools::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+        for<'c> &'c Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
     {
         // First, find the batch that owns this error file
         // Note: We allow streaming even for soft-deleted batches since the error file
@@ -3142,7 +3142,7 @@ where
             "#,
             *file_id as Uuid,
         )
-        .fetch_one(pools.read())
+        .fetch_one(&pool)
         .await;
 
         let batch_id = match batch_result {
@@ -3194,7 +3194,7 @@ where
                 BATCH_SIZE,
                 search_pattern.as_deref(),
             )
-            .fetch_all(pools.read())
+            .fetch_all(&pool)
             .await;
 
             match request_batch {
@@ -3243,15 +3243,15 @@ where
 
     /// Stream batch results with merged input/output data for the Results view.
     /// This joins requests with their templates to provide input body alongside response/error.
-    async fn stream_batch_results<Pools: PoolProvider>(
-        pools: Pools,
+    async fn stream_batch_results<Pool>(
+        pool: Pool,
         batch_id: BatchId,
         offset: i64,
         search: Option<String>,
         status: Option<String>,
         tx: mpsc::Sender<Result<crate::batch::BatchResultItem>>,
     ) where
-        for<'c> &'c Pools::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
+        for<'c> &'c Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
     {
         use crate::batch::{BatchResultItem, BatchResultStatus};
 
@@ -3261,7 +3261,7 @@ where
             r#"SELECT file_id FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
             *batch_id as Uuid,
         )
-        .fetch_optional(pools.read())
+        .fetch_optional(&pool)
         .await
         {
             Ok(Some(Some(fid))) => fid,
@@ -3342,7 +3342,7 @@ where
                 search_pattern.as_deref(),
                 state_filter.as_deref(),
             )
-            .fetch_all(pools.read())
+            .fetch_all(&pool)
             .await;
 
             match request_batch {
