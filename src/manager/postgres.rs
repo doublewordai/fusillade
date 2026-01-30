@@ -2143,11 +2143,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .await
     }
 
+    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
     async fn get_batch(&self, batch_id: BatchId, hide_retriable_before_sla: bool) -> Result<Batch> {
         self.get_batch_from_pool(batch_id, hide_retriable_before_sla, self.pools.read())
             .await
     }
 
+    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
     async fn get_batch_status(
         &self,
         batch_id: BatchId,
