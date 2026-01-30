@@ -38,7 +38,12 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 metrics = "0.24"
 test-log = "0.2.18"
 rand = "0.9"
-sqlx-pool-router = "0.2.0"
+sqlx-pool-router = { version = "0.3.0", features = ["sqlx-tracing"] }
+sqlx-tracing = { version = "0.1", features = ["postgres"] }
+
+[patch.crates-io]
+sqlx-pool-router = { path = "../sqlx-pool-router" }
+sqlx-tracing = { path = "../sqlx-tracing" }
 
 [dev-dependencies]
 tokio-test = "0.4"
