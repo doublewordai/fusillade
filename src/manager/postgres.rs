@@ -222,26 +222,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         self.batch_insert_strategy = strategy;
         self
     }
-
-    /// Get the connection pool.
-    /// Get the primary connection pool for write operations.
-    ///
-    /// For backward compatibility, this returns the write pool (primary).
-    /// Use the pool provider's `.read()` and `.write()` methods directly
-    /// for explicit read/write routing.
-    pub fn pool(&self) -> &PgPool {
-        self.pools.write()
-    }
-
-    /// Create a listener for real-time request updates.
-    ///
-    /// This returns a PgListener that can be used to receive notifications
-    /// when requests are updated. Uses the write pool (primary) for consistency.
-    pub async fn create_listener(&self) -> Result<PgListener> {
-        PgListener::connect_with(self.pools.write())
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e)))
-    }
 }
 
 // Additional methods for PostgresRequestManager (not part of Storage trait)
