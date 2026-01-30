@@ -1638,7 +1638,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         offset: usize,
         search: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
-        let pool = self.pools.read().clone();
+        let pools = self.pools.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
@@ -1652,7 +1652,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 "#,
                 *file_id as Uuid,
             )
-            .fetch_one(&pool)
+            .fetch_one(pools.read())
             .await;
 
             let purpose = match file_result {
@@ -1671,14 +1671,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             // Route to appropriate streaming logic based on purpose
             match purpose.as_deref() {
                 Some("batch_output") => {
-                    Self::stream_batch_output(pool, file_id, offset, search, tx).await;
+                    Self::stream_batch_output(pools, file_id, offset, search, tx).await;
                 }
                 Some("batch_error") => {
-                    Self::stream_batch_error(pool, file_id, offset, search, tx).await;
+                    Self::stream_batch_error(pools, file_id, offset, search, tx).await;
                 }
                 _ => {
                     // Regular file or purpose='batch': stream request templates
-                    Self::stream_request_templates(pool, file_id, offset, search, tx).await;
+                    Self::stream_request_templates(pools, file_id, offset, search, tx).await;
                 }
             }
         });
@@ -2766,12 +2766,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         search: Option<String>,
         status: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>> {
-        let pool = self.pools.read().clone();
+        let pools = self.pools.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
         tokio::spawn(async move {
-            Self::stream_batch_results(pool, batch_id, offset, search, status, tx).await;
+            Self::stream_batch_results(pools, batch_id, offset, search, status, tx).await;
         });
 
         Box::pin(ReceiverStream::new(rx))
@@ -2957,8 +2957,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     }
 
     /// Stream request templates from a regular file
-    async fn stream_request_templates(
-        pool: sqlx::PgPool,
+    async fn stream_request_templates<Pools: PoolProvider>(
+        pools: Pools,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -2994,7 +2994,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 BATCH_SIZE,
                 search_pattern.as_deref(),
             )
-            .fetch_all(&pool)
+            .fetch_all(pools.read())
             .await;
 
             match template_batch {
@@ -3045,8 +3045,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     }
 
     /// Stream batch output (completed requests) for a virtual output file
-    async fn stream_batch_output(
-        pool: sqlx::PgPool,
+    async fn stream_batch_output<Pools: PoolProvider>(
+        pools: Pools,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -3063,7 +3063,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             "#,
             *file_id as Uuid,
         )
-        .fetch_one(&pool)
+        .fetch_one(pools.read())
         .await;
 
         let batch_id = match batch_result {
@@ -3115,7 +3115,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 BATCH_SIZE,
                 search_pattern.as_deref(),
             )
-            .fetch_all(&pool)
+            .fetch_all(pools.read())
             .await;
 
             match request_batch {
@@ -3175,8 +3175,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     }
 
     /// Stream batch errors (failed requests) for a virtual error file
-    async fn stream_batch_error(
-        pool: sqlx::PgPool,
+    async fn stream_batch_error<Pools: PoolProvider>(
+        pools: Pools,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -3193,7 +3193,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             "#,
             *file_id as Uuid,
         )
-        .fetch_one(&pool)
+        .fetch_one(pools.read())
         .await;
 
         let batch_id = match batch_result {
@@ -3245,7 +3245,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 BATCH_SIZE,
                 search_pattern.as_deref(),
             )
-            .fetch_all(&pool)
+            .fetch_all(pools.read())
             .await;
 
             match request_batch {
@@ -3294,8 +3294,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
     /// Stream batch results with merged input/output data for the Results view.
     /// This joins requests with their templates to provide input body alongside response/error.
-    async fn stream_batch_results(
-        pool: sqlx::PgPool,
+    async fn stream_batch_results<Pools: PoolProvider>(
+        pools: Pools,
         batch_id: BatchId,
         offset: i64,
         search: Option<String>,
@@ -3310,7 +3310,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             r#"SELECT file_id FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
             *batch_id as Uuid,
         )
-        .fetch_optional(&pool)
+        .fetch_optional(pools.read())
         .await
         {
             Ok(Some(Some(fid))) => fid,
@@ -3391,7 +3391,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 search_pattern.as_deref(),
                 state_filter.as_deref(),
             )
-            .fetch_all(&pool)
+            .fetch_all(pools.read())
             .await;
 
             match request_batch {
