@@ -231,6 +231,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     ///
     /// Returns the number of requests that were unclaimed. Limited by `unclaim_batch_size`
     /// to prevent unbounded database load when many requests become stale simultaneously.
+    #[tracing::instrument(skip(self))]
     async fn unclaim_stale_requests(&self) -> Result<usize> {
         let claim_timeout_ms = self.config.claim_timeout_ms as i64;
         let processing_timeout_ms = self.config.processing_timeout_ms as i64;
@@ -620,6 +621,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 // Implement Storage trait directly (no delegation)
 #[async_trait]
 impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManager<P, H> {
+    #[tracing::instrument(skip(self), fields(limit, daemon_id = %daemon_id))]
     async fn claim_requests(
         &self,
         limit: usize,
@@ -863,6 +865,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(all_claimed)
     }
 
+    #[tracing::instrument(skip(self, request), fields(request_id = %request.data.id))]
     async fn persist<T: RequestState + Clone>(
         &self,
         request: &Request<T>,
@@ -1048,6 +1051,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(None)
     }
 
+    #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]
     async fn get_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<AnyRequest>>> {
         let uuid_ids: Vec<Uuid> = ids.iter().map(|id| **id).collect();
 
@@ -1932,6 +1936,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, input), fields(file_id = ?input.file_id, endpoint = %input.endpoint))]
     async fn create_batch(&self, input: BatchInput) -> Result<Batch> {
         let mut tx =
             self.pools.write().begin().await.map_err(|e| {
@@ -2064,10 +2069,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .await
     }
 
+    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
     async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
         self.get_batch_from_pool(batch_id, self.pools.read()).await
     }
 
+    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
     async fn get_batch_status(&self, batch_id: BatchId) -> Result<BatchStatus> {
         let row = sqlx::query!(
             r#"
@@ -2208,6 +2215,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         }
     }
 
+    #[tracing::instrument(skip(self), fields(created_by = ?created_by, limit))]
     async fn list_batches(
         &self,
         created_by: Option<String>,
@@ -2341,6 +2349,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .collect())
     }
 
+    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
         let now = Utc::now();
 
@@ -2495,6 +2504,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(count)
     }
 
+    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>> {
         let rows = sqlx::query!(
             r#"
