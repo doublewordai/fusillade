@@ -43,6 +43,67 @@ use super::utils::{
     estimate_output_file_size,
 };
 
+/// Standalone helper for file size finalization that can be called from spawned tasks.
+/// Uses an advisory lock to prevent concurrent finalization.
+async fn finalize_file_size_with_pool<'e, E>(
+    pool: E,
+    file_id: FileId,
+    estimated_size: i64,
+) -> Result<bool>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres> + Copy,
+{
+    let lock_key = file_id.0.as_u128() as u64 as i64;
+
+    // Try to acquire advisory lock (non-blocking)
+    let lock_acquired = match sqlx::query_scalar!("SELECT pg_try_advisory_lock($1)", lock_key)
+        .fetch_one(pool)
+        .await
+    {
+        Ok(Some(acquired)) => acquired,
+        Ok(None) => {
+            tracing::warn!(file_id = %file_id, "Advisory lock query returned NULL unexpectedly");
+            false
+        }
+        Err(e) => {
+            tracing::error!(file_id = %file_id, error = %e, "Database error while trying to acquire advisory lock");
+            return Err(FusilladeError::Other(anyhow!(
+                "Failed to acquire lock: {}",
+                e
+            )));
+        }
+    };
+
+    if !lock_acquired {
+        return Ok(false);
+    }
+
+    // We have the lock - finalize the file
+    let result = sqlx::query!(
+        r#"
+        UPDATE files
+        SET size_bytes = $2, size_finalized = TRUE
+        WHERE id = $1 AND size_finalized = FALSE
+        "#,
+        *file_id as Uuid,
+        estimated_size,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file size: {}", e)));
+
+    // Release the lock
+    if let Err(e) = sqlx::query_scalar!("SELECT pg_advisory_unlock($1)", lock_key)
+        .fetch_one(pool)
+        .await
+    {
+        tracing::warn!(file_id = %file_id, error = %e, "Failed to release advisory lock");
+    }
+
+    result?;
+    Ok(true)
+}
+
 /// PostgreSQL implementation of the Storage and DaemonExecutor traits.
 ///
 /// This manager uses PostgreSQL for persistent storage and runs a daemon for processing requests.
@@ -495,10 +556,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
             if is_complete {
                 // Spawn background finalization - don't block listing
-                let pool = self.pools.write().clone();
+                let pools = self.pools.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = Self::finalize_file_size(&pool, file_id, estimated_size).await {
+                    if let Err(e) =
+                        finalize_file_size_with_pool(pools.write(), file_id, estimated_size).await
+                    {
                         tracing::warn!("Failed to finalize file size for {}: {}", file_id, e);
                     }
                 });
@@ -558,7 +621,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
         // Batch is complete - try to finalize this file
         let finalized =
-            Self::finalize_file_size(self.pools.write(), file.id, estimated_size).await?;
+            finalize_file_size_with_pool(self.pools.write(), file.id, estimated_size).await?;
 
         if finalized {
             file.size_finalized = true;
