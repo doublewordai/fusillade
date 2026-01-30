@@ -5,7 +5,8 @@
 
 use crate::request::AnyRequest;
 use futures::StreamExt;
-pub use sqlx_pool_router::{PoolProvider, TestDbPools};
+pub use sqlx_pool_router::TracedDbPools;
+use sqlx_pool_router::PoolProvider;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::Stream;
-use sqlx::{Acquire, Row};
+use sqlx::Row;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -112,9 +113,12 @@ where
 /// ```ignore
 /// use fusillade::PostgresRequestManager;
 /// use sqlx::PgPool;
+/// use sqlx_pool_router::TracedDbPools;
 ///
 /// let pool = PgPool::connect("postgresql://localhost/fusillade").await?;
-/// let manager = Arc::new(PostgresRequestManager::new(TestDbPools::new(pool).await.unwrap()));
+/// let traced_pool = sqlx_tracing::Pool::from(pool);
+/// let pools = TracedDbPools::new(traced_pool);
+/// let manager = Arc::new(PostgresRequestManager::new(pools));
 ///
 /// // Start processing
 /// let handle = manager.clone().run()?;
@@ -138,8 +142,8 @@ impl Default for BatchInsertStrategy {
     }
 }
 
-pub struct PostgresRequestManager<P: PoolProvider, H: HttpClient> {
-    pools: P,
+pub struct PostgresRequestManager<H: HttpClient> {
+    pools: TracedDbPools,
     http_client: Arc<H>,
     config: DaemonConfig,
     download_buffer_size: usize,
@@ -187,7 +191,7 @@ macro_rules! batch_from_row {
     };
 }
 
-impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> {
+impl PostgresRequestManager<crate::http::ReqwestHttpClient> {
     /// Create a new PostgreSQL request manager with default settings.
     ///
     /// Uses the default Reqwest HTTP client and default daemon configuration.
@@ -195,13 +199,15 @@ impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> 
     ///
     /// # Example
     /// ```ignore
-    /// use fusillade::{PostgresRequestManager, SinglePool};
+    /// use fusillade::PostgresRequestManager;
+    /// use sqlx_pool_router::TracedDbPools;
     ///
-    /// let pools = TestDbPools::new(pool).await.unwrap();
+    /// let traced_pool = sqlx_tracing::Pool::from(pool);
+    /// let pools = TracedDbPools::new(traced_pool);
     /// let manager = PostgresRequestManager::new(pools)
     ///     .with_config(my_config);
     /// ```
-    pub fn new(pools: P) -> Self {
+    pub fn new(pools: TracedDbPools) -> Self {
         Self {
             pools,
             http_client: Arc::new(crate::http::ReqwestHttpClient::default()),
@@ -212,20 +218,21 @@ impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> 
     }
 }
 
-impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
+impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     /// Create a PostgreSQL request manager with a custom HTTP client.
     ///
     /// Uses the default daemon configuration. Customize with `.with_config()` if needed.
     ///
     /// # Example
     /// ```ignore
-    /// use fusillade::SinglePool;
+    /// use sqlx_pool_router::TracedDbPools;
     ///
-    /// let pools = TestDbPools::new(pool).await.unwrap();
+    /// let traced_pool = sqlx_tracing::Pool::from(pool);
+    /// let pools = TracedDbPools::new(traced_pool);
     /// let manager = PostgresRequestManager::with_client(pools, Arc::new(my_client))
     ///     .with_config(my_config);
     /// ```
-    pub fn with_client(pools: P, http_client: Arc<H>) -> Self {
+    pub fn with_client(pools: TracedDbPools, http_client: Arc<H>) -> Self {
         Self {
             pools,
             http_client,
@@ -285,11 +292,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 }
 
 // Additional methods for PostgresRequestManager (not part of Storage trait)
-impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H>
-where
-    for<'c> &'c P::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
-    for<'c> &'c P::Pool: sqlx::Acquire<'c, Database = sqlx::Postgres>,
-{
+impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     /// Unclaim stale requests that have been stuck in "claimed" or "processing" states
     /// for longer than the configured timeouts. This handles daemon crashes.
     ///
@@ -610,11 +613,7 @@ where
 
 // Implement Storage trait directly (no delegation)
 #[async_trait]
-impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManager<P, H>
-where
-    for<'c> &'c P::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
-    for<'c> &'c P::Pool: sqlx::Acquire<'c, Database = sqlx::Postgres>,
-{
+impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     async fn claim_requests(
         &self,
         limit: usize,
@@ -2716,10 +2715,7 @@ where
 }
 
 // Helper methods for file streaming and virtual file creation
-impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H>
-where
-    for<'c> &'c P::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
-{
+impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     /// Internal helper to fetch a batch from a specific pool.
     ///
     /// This is used when we require read-after-write consistency and must query
@@ -2849,7 +2845,7 @@ where
     /// Insert a batch of templates using PostgreSQL UNNEST for bulk insertion.
     /// This is significantly faster than individual INSERTs for large template counts.
     async fn insert_template_batch(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &mut sqlx_tracing::Transaction<'_, sqlx::Postgres>,
         file_id: Uuid,
         templates: &[(RequestTemplateInput, i32)],
     ) -> Result<()> {
@@ -2901,7 +2897,7 @@ where
 
     /// Stream request templates from a regular file
     async fn stream_request_templates(
-        pool: P::Pool,
+        pool: sqlx_tracing::Pool<sqlx::Postgres>,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -2989,7 +2985,7 @@ where
 
     /// Stream batch output (completed requests) for a virtual output file
     async fn stream_batch_output(
-        pool: P::Pool,
+        pool: sqlx_tracing::Pool<sqlx::Postgres>,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -3119,7 +3115,7 @@ where
 
     /// Stream batch errors (failed requests) for a virtual error file
     async fn stream_batch_error(
-        pool: P::Pool,
+        pool: sqlx_tracing::Pool<sqlx::Postgres>,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -3238,7 +3234,7 @@ where
     /// Stream batch results with merged input/output data for the Results view.
     /// This joins requests with their templates to provide input body alongside response/error.
     async fn stream_batch_results(
-        pool: P::Pool,
+        pool: sqlx_tracing::Pool<sqlx::Postgres>,
         batch_id: BatchId,
         offset: i64,
         search: Option<String>,
@@ -3399,7 +3395,7 @@ where
     /// Create a virtual output file for a batch (stores no data, streams from requests table)
     async fn create_virtual_output_file(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &mut sqlx_tracing::Transaction<'_, sqlx::Postgres>,
         batch_id: Uuid,
         created_by: &Option<String>,
     ) -> Result<Uuid> {
@@ -3426,7 +3422,7 @@ where
     /// Create a virtual error file for a batch (stores no data, streams from requests table)
     async fn create_virtual_error_file(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &mut sqlx_tracing::Transaction<'_, sqlx::Postgres>,
         batch_id: Uuid,
         created_by: &Option<String>,
     ) -> Result<Uuid> {
@@ -3453,10 +3449,7 @@ where
 
 // Implement DaemonStorage trait
 #[async_trait]
-impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P, H>
-where
-    for<'c> &'c P::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
-{
+impl<H: HttpClient> DaemonStorage for PostgresRequestManager<H> {
     async fn persist_daemon<T: DaemonState + Clone>(&self, record: &DaemonRecord<T>) -> Result<()>
     where
         AnyDaemonRecord: From<DaemonRecord<T>>,
@@ -3721,11 +3714,7 @@ where
 
 // Implement DaemonExecutor trait
 #[async_trait]
-impl<P: PoolProvider, H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<P, H>
-where
-    for<'c> &'c P::Pool: sqlx::Executor<'c, Database = sqlx::Postgres>,
-    for<'c> &'c P::Pool: sqlx::Acquire<'c, Database = sqlx::Postgres>,
-{
+impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
     fn http_client(&self) -> &Arc<H> {
         &self.http_client
     }
@@ -3761,13 +3750,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestDbPools;
     use crate::daemon::{
         AnyDaemonRecord, DaemonData, DaemonRecord, DaemonStats, DaemonStatus, Dead, Initializing,
         Running,
     };
     use crate::http::MockHttpClient;
     use chrono::Timelike;
+
+    /// Helper to create TracedDbPools from a test PgPool
+    fn traced_pools(pool: sqlx::PgPool) -> TracedDbPools {
+        TracedDbPools::new(sqlx_tracing::Pool::from(pool))
+    }
 
     // =========================================================================
     // FILE OPERATIONS
@@ -3779,7 +3772,7 @@ mod tests {
     async fn test_create_and_get_file(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -3845,7 +3838,7 @@ mod tests {
     async fn test_batched_insert_small_file(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -3895,7 +3888,7 @@ mod tests {
     async fn test_batched_insert_large_file(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -3962,7 +3955,7 @@ mod tests {
     async fn test_batched_insert_preserves_line_numbers(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         )
         .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 50 });
@@ -4022,7 +4015,7 @@ mod tests {
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -4091,7 +4084,7 @@ mod tests {
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -4132,7 +4125,7 @@ mod tests {
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -4196,7 +4189,7 @@ mod tests {
     async fn test_batched_insert_body_byte_size_calculation(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -4265,7 +4258,7 @@ mod tests {
 
         // Test with batched strategy (default)
         let manager_batched = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client.clone(),
         );
 
@@ -4315,7 +4308,7 @@ mod tests {
     async fn test_batched_insert_rejects_zero_batch_size(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let _manager =
-            PostgresRequestManager::with_client(TestDbPools::new(pool).await.unwrap(), http_client)
+            PostgresRequestManager::with_client(traced_pools(pool), http_client)
                 .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 0 });
     }
 
@@ -4325,7 +4318,7 @@ mod tests {
 
         // Test batch_size = 1
         let manager1 = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client.clone(),
         )
         .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 1 });
@@ -4362,7 +4355,7 @@ mod tests {
 
         // Test batch_size = 100
         let manager100 = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client.clone(),
         )
         .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 100 });
@@ -4384,7 +4377,7 @@ mod tests {
 
         // Test batch_size = 5000 (default)
         let manager5000 =
-            PostgresRequestManager::with_client(TestDbPools::new(pool).await.unwrap(), http_client)
+            PostgresRequestManager::with_client(traced_pools(pool), http_client)
                 .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 5000 });
 
         let file_id5000 = manager5000
@@ -4413,7 +4406,7 @@ mod tests {
     async fn test_create_batch_and_get_status(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -4503,7 +4496,7 @@ mod tests {
     async fn test_claim_requests(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -4571,7 +4564,7 @@ mod tests {
     async fn test_cancel_batch(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -4632,7 +4625,7 @@ mod tests {
     async fn test_delete_batch(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -4709,7 +4702,7 @@ mod tests {
     async fn test_cancel_individual_requests(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -4777,7 +4770,7 @@ mod tests {
     async fn test_list_files(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -4826,7 +4819,7 @@ mod tests {
     async fn test_list_file_batches(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -4902,7 +4895,7 @@ mod tests {
     async fn test_delete_file_cascade(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -4998,7 +4991,7 @@ mod tests {
         };
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client,
             )
             .with_config(config),
@@ -5073,7 +5066,7 @@ mod tests {
         };
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client,
             )
             .with_config(config),
@@ -5154,7 +5147,7 @@ mod tests {
         };
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client,
             )
             .with_config(config),
@@ -5237,7 +5230,7 @@ mod tests {
         };
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client,
             )
             .with_config(config),
@@ -5313,7 +5306,7 @@ mod tests {
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -5530,7 +5523,7 @@ mod tests {
     async fn test_daemon_persist_and_get(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -5620,7 +5613,7 @@ mod tests {
     async fn test_daemon_list_all(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -5697,7 +5690,7 @@ mod tests {
     async fn test_daemon_heartbeat_updates(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -5771,7 +5764,7 @@ mod tests {
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -5852,7 +5845,7 @@ mod tests {
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -5912,7 +5905,7 @@ mod tests {
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -5965,7 +5958,7 @@ mod tests {
     async fn test_get_batch(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -6024,7 +6017,7 @@ mod tests {
     async fn test_get_batch_not_found(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -6046,7 +6039,7 @@ mod tests {
     async fn test_get_batch_with_progress(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -6115,7 +6108,7 @@ mod tests {
     async fn test_get_batch_lazy_finalization(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -6214,7 +6207,7 @@ mod tests {
     async fn test_get_requests_various_states(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -6322,7 +6315,7 @@ mod tests {
     async fn test_get_requests_preserves_custom_ids(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -6392,7 +6385,7 @@ mod tests {
     async fn test_get_requests_with_nonexistent_ids(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -6467,7 +6460,7 @@ mod tests {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client,
             )
             .with_config(config),
@@ -6560,7 +6553,7 @@ mod tests {
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -6622,7 +6615,7 @@ mod tests {
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -6674,7 +6667,7 @@ mod tests {
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -6726,7 +6719,7 @@ mod tests {
 
         let http_client = Arc::new(MockHttpClient::new());
         let manager = Arc::new(PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client.clone(),
         ));
 
@@ -6893,7 +6886,7 @@ mod tests {
     async fn test_virtual_files_lazy_finalized_via_get_file(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -7043,7 +7036,7 @@ mod tests {
     async fn test_virtual_files_lazy_finalized_via_list_files(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -7126,7 +7119,7 @@ mod tests {
     async fn test_list_files_respects_pagination_only_updates_current_page(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -7257,7 +7250,7 @@ mod tests {
     async fn test_incomplete_batch_gives_estimate_not_finalized(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -7369,7 +7362,7 @@ mod tests {
     async fn test_finalized_file_uses_cached_value_no_recomputation(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -7467,7 +7460,7 @@ mod tests {
     async fn test_normal_files_finalized_immediately_no_calculation(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -7539,7 +7532,7 @@ mod tests {
     async fn test_sla_based_claim_priority(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -7706,7 +7699,7 @@ mod tests {
     async fn test_empty_virtual_files_finalized_at_zero(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         );
 
@@ -7793,7 +7786,7 @@ mod tests {
     async fn test_retry_failed_requests_for_batch(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = Arc::new(PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         ));
 

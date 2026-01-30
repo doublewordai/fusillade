@@ -766,10 +766,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestDbPools;
+    use crate::TracedDbPools;
     use crate::http::{HttpResponse, MockHttpClient};
     use crate::manager::{DaemonExecutor, postgres::PostgresRequestManager};
     use std::time::Duration;
+
+    /// Helper to create TracedDbPools from a test PgPool
+    fn traced_pools(pool: sqlx::PgPool) -> TracedDbPools {
+        TracedDbPools::new(sqlx_tracing::Pool::from(pool))
+    }
 
     #[sqlx::test]
     #[test_log::test]
@@ -809,7 +814,7 @@ mod tests {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client.clone(),
             )
             .with_config(config),
@@ -977,7 +982,7 @@ mod tests {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client.clone(),
             )
             .with_config(config),
@@ -1203,7 +1208,7 @@ mod tests {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client.clone(),
             )
             .with_config(config),
@@ -1338,7 +1343,7 @@ mod tests {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client.clone(),
             )
             .with_config(config),
@@ -1508,7 +1513,7 @@ mod tests {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client.clone(),
             )
             .with_config(config),
@@ -1662,7 +1667,7 @@ mod tests {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client.clone(),
             )
             .with_config(config),
@@ -1821,7 +1826,7 @@ mod tests {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 Arc::new(http_client.clone()),
             )
             .with_config(config),
@@ -1975,7 +1980,7 @@ mod tests {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 Arc::new(http_client.clone()),
             )
             .with_config(config),

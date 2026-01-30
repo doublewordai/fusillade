@@ -39,7 +39,7 @@ metrics = "0.24"
 test-log = "0.2.18"
 rand = "0.9"
 sqlx-pool-router = { version = "0.3.0", features = ["sqlx-tracing"] }
-sqlx-tracing = { version = "0.1", features = ["postgres"] }
+sqlx-tracing = { version = "0.2", features = ["postgres"] }
 
 [patch.crates-io]
 sqlx-pool-router = { path = "../sqlx-pool-router" }

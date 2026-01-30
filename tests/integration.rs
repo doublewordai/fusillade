@@ -1,4 +1,4 @@
-use fusillade::TestDbPools;
+use fusillade::TracedDbPools;
 use fusillade::batch::{BatchInput, RequestTemplateInput};
 use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retry};
 use fusillade::http::{HttpResponse, MockHttpClient};
@@ -6,6 +6,11 @@ use fusillade::manager::postgres::PostgresRequestManager;
 use fusillade::manager::{DaemonExecutor, Storage};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Helper to create TracedDbPools from a test PgPool
+fn traced_pools(pool: sqlx::PgPool) -> TracedDbPools {
+    TracedDbPools::new(sqlx_tracing::Pool::from(pool))
+}
 
 #[sqlx::test]
 #[test_log::test]
@@ -43,7 +48,7 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
 
     let manager = Arc::new(
         PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client.clone(),
         )
         .with_config(config),
@@ -209,7 +214,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
 
     let manager = Arc::new(
         PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client.clone(),
         )
         .with_config(config),
@@ -443,7 +448,7 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
 
     let manager = Arc::new(
         PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client.clone(),
         )
         .with_config(config),
@@ -576,7 +581,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
 
     let manager = Arc::new(
         PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client.clone(),
         )
         .with_config(config),
@@ -740,7 +745,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
 
     let manager = Arc::new(
         PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client.clone(),
         )
         .with_config(config),
@@ -905,7 +910,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
 
     let manager = Arc::new(
         PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client.clone(),
         )
         .with_config(config),
@@ -1085,7 +1090,7 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
 
     let manager = Arc::new(
         PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client.clone(),
         )
         .with_config(config),
@@ -1232,7 +1237,7 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
 
     let manager = Arc::new(
         PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client.clone(),
         )
         .with_config(config),
@@ -1323,7 +1328,7 @@ mod batch_results_stream {
 
     /// Helper to collect all results from a batch results stream
     async fn collect_batch_results(
-        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        manager: &PostgresRequestManager<MockHttpClient>,
         batch_id: fusillade::batch::BatchId,
     ) -> Vec<fusillade::batch::BatchResultItem> {
         let stream = manager.get_batch_results_stream(batch_id, 0, None, None);
@@ -1361,7 +1366,7 @@ mod batch_results_stream {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client.clone(),
             )
             .with_config(config),
@@ -1459,7 +1464,7 @@ mod batch_results_stream {
         let http_client = Arc::new(MockHttpClient::new());
 
         let manager = Arc::new(PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
+            traced_pools(pool.clone()),
             http_client,
         ));
 
@@ -1541,7 +1546,7 @@ mod batch_results_stream {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client.clone(),
             )
             .with_config(config),
@@ -1658,7 +1663,7 @@ mod batch_results_stream {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client.clone(),
             )
             .with_config(config),
@@ -1777,7 +1782,7 @@ mod batch_results_stream {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client.clone(),
             )
             .with_config(config),
@@ -1882,7 +1887,7 @@ mod batch_results_stream {
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
+                traced_pools(pool.clone()),
                 http_client.clone(),
             )
             .with_config(config),
