@@ -189,7 +189,7 @@ pub enum FailureReason {
     /// These are transient errors that may succeed on retry.
     RetriableHttpStatus { status: u16, body: String },
 
-    /// HTTP request returned a client error status code that should not be retried (e.g., 400, 404).
+    /// HTTP request returned a client error status code that should not be retried (e.g., 400).
     /// These indicate problems with the request itself that won't be fixed by retrying.
     NonRetriableHttpStatus { status: u16, body: String },
 

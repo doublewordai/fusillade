@@ -1,5 +1,16 @@
 # Changelog
 
+## [4.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v3.0.1...fusillade-v4.0.0) (2026-01-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* Boolean parameter (`hide_retriable_before_sla`) across all Storage trait methods to ignore retryable errors before sla completion.
+
+### Features
+
+* add error filtering into fusillade batch methods ([#102](https://github.com/doublewordai/fusillade/issues/102)) ([ec454ba](https://github.com/doublewordai/fusillade/commit/ec454baaf41433e08689d125dc60dbee4b10b2c0))
+
 ## [3.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v3.0.0...fusillade-v3.0.1) (2026-01-28)
 
 

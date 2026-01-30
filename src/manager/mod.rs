@@ -68,13 +68,17 @@ pub trait Storage: Send + Sync {
     /// - Batch output files (purpose='batch_output'): BatchOutputItem
     /// - Batch error files (purpose='batch_error'): BatchErrorItem
     ///
-    /// The offset parameter allows skipping the first N lines (0-indexed).
-    /// The search parameter filters results by custom_id (case-insensitive substring match).
+    /// # Arguments
+    /// * `file_id` - The file ID to stream content from
+    /// * `offset` - Number of lines to skip (0-indexed)
+    /// * `search` - Optional filter by custom_id (case-insensitive substring match)
+    /// * `hide_retriable_before_sla` - If true, hide retriable errors before SLA expiry (only applies to error files)
     fn get_file_content_stream(
         &self,
         file_id: FileId,
         offset: usize,
         search: Option<String>,
+        hide_retriable_before_sla: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>>;
 
     /// Get aggregated statistics for request templates grouped by model.
@@ -95,23 +99,51 @@ pub trait Storage: Send + Sync {
     async fn create_batch(&self, input: BatchInput) -> Result<Batch>;
 
     /// Get a batch by ID.
-    async fn get_batch(&self, batch_id: BatchId) -> Result<Batch>;
+    ///
+    /// # Arguments
+    /// * `batch_id` - The batch ID to retrieve
+    /// * `hide_retriable_before_sla` - If true, hide retriable errors for batches before SLA expiry
+    async fn get_batch(&self, batch_id: BatchId, hide_retriable_before_sla: bool) -> Result<Batch>;
 
     /// Get batch status.
-    async fn get_batch_status(&self, batch_id: BatchId) -> Result<BatchStatus>;
+    ///
+    /// # Arguments
+    /// * `batch_id` - The batch ID to retrieve status for
+    /// * `hide_retriable_before_sla` - If true, hide retriable errors for batches before SLA expiry
+    async fn get_batch_status(
+        &self,
+        batch_id: BatchId,
+        hide_retriable_before_sla: bool,
+    ) -> Result<BatchStatus>;
 
     /// List all batches for a file.
-    async fn list_file_batches(&self, file_id: FileId) -> Result<Vec<BatchStatus>>;
+    ///
+    /// # Arguments
+    /// * `file_id` - The file ID to list batches for
+    /// * `hide_retriable_before_sla` - If true, hide retriable errors for batches before SLA expiry
+    async fn list_file_batches(
+        &self,
+        file_id: FileId,
+        hide_retriable_before_sla: bool,
+    ) -> Result<Vec<BatchStatus>>;
 
     /// List batches with optional filtering by creator and cursor-based pagination.
     /// Returns batches sorted by created_at DESC.
     /// The `after` parameter is a cursor for pagination (returns batches created before this ID).
+    ///
+    /// # Arguments
+    /// * `created_by` - Optional filter by batch creator
+    /// * `search` - Optional search query
+    /// * `after` - Optional cursor for pagination
+    /// * `limit` - Maximum number of batches to return
+    /// * `hide_retriable_before_sla` - If true, hide retriable errors for batches before SLA expiry
     async fn list_batches(
         &self,
         created_by: Option<String>,
         search: Option<String>,
         after: Option<BatchId>,
         limit: i64,
+        hide_retriable_before_sla: bool,
     ) -> Result<Vec<Batch>>;
 
     /// Get a batch by its output or error file ID.
@@ -133,16 +165,18 @@ pub trait Storage: Send + Sync {
     /// - The current status
     ///
     /// # Arguments
-    /// - `batch_id`: The batch to get results for
-    /// - `offset`: Number of results to skip (for pagination)
-    /// - `search`: Optional custom_id filter (case-insensitive substring match)
-    /// - `status`: Optional status filter (completed, failed, pending, in_progress)
+    /// * `batch_id` - The batch to get results for
+    /// * `offset` - Number of results to skip (for pagination)
+    /// * `search` - Optional custom_id filter (case-insensitive substring match)
+    /// * `status` - Optional status filter (completed, failed, pending, in_progress)
+    /// * `hide_retriable_before_sla` - If true, hide retriable errors for batches before SLA expiry
     fn get_batch_results_stream(
         &self,
         batch_id: BatchId,
         offset: usize,
         search: Option<String>,
         status: Option<String>,
+        hide_retriable_before_sla: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>>;
 
     /// Cancel all pending/in-progress requests for a batch.
