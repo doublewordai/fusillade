@@ -371,11 +371,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         Ok(false)
     }
 
-    /// Generate a consistent advisory lock key for a file
-    fn file_lock_key(file_id: FileId) -> i64 {
-        file_id.0.as_u128() as u64 as i64
-    }
-
     /// Calculate the estimated file size for a virtual batch file.
     /// Returns None if this isn't a virtual file or calculation isn't possible.
     fn calculate_virtual_file_size_from_batch(
