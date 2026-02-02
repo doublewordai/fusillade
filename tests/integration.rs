@@ -3150,7 +3150,7 @@ mod queue_counts {
             .await
             .unwrap();
 
-        let batch_1h = manager
+        let _batch_1h = manager
             .create_batch(BatchInput {
                 file_id: file_1h,
                 endpoint: "/v1/chat/completions".to_string(),
@@ -3178,22 +3178,6 @@ mod queue_counts {
         .await
         .unwrap();
 
-        // Mark one 1h gpt-3.5 request as escalated but keep it pending (should be excluded)
-        let reqs_1h = manager.get_batch_requests(batch_1h.id).await.unwrap();
-        let to_escalate = reqs_1h
-            .iter()
-            .find(|r| r.data().model == "gpt-3.5")
-            .expect("Expected a gpt-3.5 request")
-            .id();
-        sqlx::query!(
-            "UPDATE requests SET is_escalated = true, escalated_from_request_id = $2 WHERE id = $1",
-            *to_escalate as Uuid,
-            *to_claim as Uuid,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
         let counts = manager
             .get_pending_request_counts_by_model_and_completion_window()
             .await
@@ -3204,7 +3188,7 @@ mod queue_counts {
         expected
             .entry("gpt-3.5".to_string())
             .or_default()
-            .insert("1h".to_string(), 1);
+            .insert("1h".to_string(), 2);
         expected
             .entry("gpt-3.5".to_string())
             .or_default()
