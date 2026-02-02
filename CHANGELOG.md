@@ -1,5 +1,12 @@
 # Changelog
 
+## [4.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v4.0.0...fusillade-v4.1.0) (2026-02-02)
+
+
+### Features
+
+* standardised tracing names ([a5334d0](https://github.com/doublewordai/fusillade/commit/a5334d0e97776897e48c0e7fff65c9be2700ec45))
+
 ## [4.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v3.0.1...fusillade-v4.0.0) (2026-01-29)
 
 
