@@ -699,6 +699,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
 // Implement Storage trait directly (no delegation)
 #[async_trait]
+/// Returns counts of **claimable** pending requests grouped by model and completion window.
+///
+/// This intentionally excludes:
+/// - Requests without a template (`template_id IS NULL`), which are not claimable.
+/// - Requests from batches that are being cancelled (`b.cancelling_at IS NOT NULL`).
+///
+/// If you need counts of all pending requests regardless of claimability, adjust the query
+/// to remove these filters.
 impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManager<P, H> {
     async fn get_pending_request_counts_by_model_and_completion_window(
         &self,
