@@ -3191,18 +3191,20 @@ mod queue_counts {
             .entry("gpt-3.5".to_string())
             .or_default()
             .insert("1h".to_string(), 2);
+        // the 2x1hr requests and the 1x24h request will finish in the next 24h
         expected
             .entry("gpt-3.5".to_string())
             .or_default()
-            .insert("24h".to_string(), 1);
+            .insert("24h".to_string(), 3);
         expected
             .entry("gpt-4".to_string())
             .or_default()
             .insert("1h".to_string(), 1);
+        // both the 1hr and 24hr request will finish in the next 24h
         expected
             .entry("gpt-4".to_string())
             .or_default()
-            .insert("24h".to_string(), 1);
+            .insert("24h".to_string(), 2);
 
         assert_eq!(counts, expected);
     }
