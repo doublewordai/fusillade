@@ -13,6 +13,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
+use std::collections::HashMap;
 use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::postgres::{PgListener, PgPool};
@@ -700,7 +701,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
             WHERE r.state = 'pending'
-              AND r.is_escalated = false
               AND r.template_id IS NOT NULL
               AND b.cancelling_at IS NULL
             GROUP BY r.model, b.completion_window

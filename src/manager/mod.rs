@@ -16,6 +16,7 @@ use futures::stream::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use std::collections::HashMap;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
