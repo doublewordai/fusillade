@@ -17,7 +17,7 @@ postgres = ["sqlx"]
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 tracing = "0.1"
-tracing-opentelemetry = "0.30"
+tracing-opentelemetry = "0.32"
 opentelemetry = "0.29"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
