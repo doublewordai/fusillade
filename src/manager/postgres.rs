@@ -716,7 +716,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
               AND r.template_id IS NOT NULL
               AND b.cancelling_at IS NULL
             GROUP BY r.model, b.completion_window
-            ORDER BY r.model ASC, b.completion_window ASC
             "#
         )
         .fetch_all(self.pools.read())
