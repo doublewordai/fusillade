@@ -680,7 +680,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
 // Implement Storage trait directly (no delegation)
 #[async_trait]
-/// Returns counts of **claimable** pending requests grouped by model and completion window.
+/// Returns counts of **claimable** pending requests grouped by model and expiry window.
 ///
 /// This intentionally excludes:
 /// - Requests without a template (`template_id IS NULL`), which are not claimable.
@@ -694,16 +694,24 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     ) -> Result<HashMap<String, HashMap<String, i64>>> {
         let rows = sqlx::query!(
             r#"
+            WITH windows(label, window_interval) AS (
+                VALUES
+                    ('1h', INTERVAL '1 hour'),
+                    ('24h', INTERVAL '24 hours')
+            )
             SELECT
                 r.model as "model!",
-                b.completion_window as "completion_window!",
-                COUNT(*)::BIGINT as "count!"
+                w.label as "completion_window!",
+                COUNT(*) FILTER (
+                    WHERE b.expires_at <= NOW() + w.window_interval
+                )::BIGINT as "count!"
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
+            CROSS JOIN windows w
             WHERE r.state = 'pending'
               AND r.template_id IS NOT NULL
               AND b.cancelling_at IS NULL
-            GROUP BY r.model, b.completion_window
+            GROUP BY r.model, w.label
             "#
         )
         .fetch_all(self.pools.read())
