@@ -3183,8 +3183,10 @@ mod queue_counts {
             .await
             .unwrap();
 
-        let mut expected: std::collections::HashMap<String, std::collections::HashMap<String, i64>> =
-            std::collections::HashMap::new();
+        let mut expected: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, i64>,
+        > = std::collections::HashMap::new();
         expected
             .entry("gpt-3.5".to_string())
             .or_default()

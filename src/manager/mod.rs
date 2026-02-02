@@ -13,10 +13,10 @@ use crate::http::HttpClient;
 use crate::request::{AnyRequest, Claimed, DaemonId, Request, RequestId, RequestState};
 use async_trait::async_trait;
 use futures::stream::Stream;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use std::collections::HashMap;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
