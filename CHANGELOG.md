@@ -1,5 +1,16 @@
 # Changelog
 
+## [5.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v4.1.0...fusillade-v5.0.0) (2026-02-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* add method to get pending request counts by model and completion window ([#111](https://github.com/doublewordai/fusillade/issues/111))
+
+### Features
+
+* add method to get pending request counts by model and completion window ([#111](https://github.com/doublewordai/fusillade/issues/111)) ([a05018c](https://github.com/doublewordai/fusillade/commit/a05018c8441249bbe3321171563bea11d2ca5ab9))
+
 ## [4.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v4.0.0...fusillade-v4.1.0) (2026-02-02)
 
 
