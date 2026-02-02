@@ -16,6 +16,7 @@ use futures::stream::Stream;
 use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::postgres::{PgListener, PgPool};
+use std::collections::HashMap;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -680,7 +681,60 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
 // Implement Storage trait directly (no delegation)
 #[async_trait]
+/// Returns counts of **claimable** pending requests grouped by model and expiry window.
+///
+/// This intentionally excludes:
+/// - Requests without a template (`template_id IS NULL`), which are not claimable.
+/// - Requests from batches that are being cancelled (`b.cancelling_at IS NOT NULL`).
+///
+/// If you need counts of all pending requests regardless of claimability, adjust the query
+/// to remove these filters.
 impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManager<P, H> {
+    async fn get_pending_request_counts_by_model_and_completion_window(
+        &self,
+    ) -> Result<HashMap<String, HashMap<String, i64>>> {
+        let rows = sqlx::query!(
+            r#"
+            WITH windows(label, window_interval) AS (
+                VALUES
+                    ('1h', INTERVAL '1 hour'),
+                    ('24h', INTERVAL '24 hours')
+            )
+            SELECT
+                r.model as "model!",
+                w.label as "completion_window!",
+                COUNT(*) FILTER (
+                    WHERE b.expires_at <= NOW() + w.window_interval
+                )::BIGINT as "count!"
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            CROSS JOIN windows w
+            WHERE r.state = 'pending'
+              AND r.template_id IS NOT NULL
+              AND b.cancelling_at IS NULL
+            GROUP BY r.model, w.label
+            "#
+        )
+        .fetch_all(self.pools.read())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to get pending request counts by model and completion window: {}",
+                e
+            ))
+        })?;
+
+        let mut result: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        for row in rows {
+            result
+                .entry(row.model)
+                .or_default()
+                .insert(row.completion_window, row.count);
+        }
+
+        Ok(result)
+    }
+
     #[tracing::instrument(skip(self), fields(limit, daemon_id = %daemon_id))]
     async fn claim_requests(
         &self,

@@ -3049,3 +3049,163 @@ mod batch_results_stream {
         assert_eq!(status_after.failed_requests, 0, "No failed requests remain");
     }
 }
+
+mod queue_counts {
+    use super::*;
+    use fusillade::request::DaemonId;
+    use uuid::Uuid;
+
+    #[sqlx::test]
+    async fn test_pending_queue_counts_by_model_and_completion_window(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        ));
+
+        // Batch 1: completion_window=24h, models: gpt-4 x2, gpt-3.5 x1
+        let file_24h = manager
+            .create_file(
+                "file-24h".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "gpt-3.5".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch_24h = manager
+            .create_batch(BatchInput {
+                file_id: file_24h,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Batch 2: completion_window=1h, models: gpt-4 x1, gpt-3.5 x2
+        let file_1h = manager
+            .create_file(
+                "file-1h".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "gpt-3.5".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "gpt-3.5".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let _batch_1h = manager
+            .create_batch(BatchInput {
+                file_id: file_1h,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Move one 24h gpt-4 request out of pending
+        let reqs_24h = manager.get_batch_requests(batch_24h.id).await.unwrap();
+        let to_claim = reqs_24h
+            .iter()
+            .find(|r| r.data().model == "gpt-4")
+            .expect("Expected a gpt-4 request")
+            .id();
+        let daemon_id = DaemonId(Uuid::new_v4());
+        sqlx::query!(
+            "UPDATE requests SET state = 'claimed', daemon_id = $2, claimed_at = NOW() WHERE id = $1",
+            *to_claim as Uuid,
+            *daemon_id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let counts = manager
+            .get_pending_request_counts_by_model_and_completion_window()
+            .await
+            .unwrap();
+
+        let mut expected: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, i64>,
+        > = std::collections::HashMap::new();
+        expected
+            .entry("gpt-3.5".to_string())
+            .or_default()
+            .insert("1h".to_string(), 2);
+        // the 2x1hr requests and the 1x24h request will finish in the next 24h
+        expected
+            .entry("gpt-3.5".to_string())
+            .or_default()
+            .insert("24h".to_string(), 3);
+        expected
+            .entry("gpt-4".to_string())
+            .or_default()
+            .insert("1h".to_string(), 1);
+        // both the 1hr and 24hr request will finish in the next 24h
+        expected
+            .entry("gpt-4".to_string())
+            .or_default()
+            .insert("24h".to_string(), 2);
+
+        assert_eq!(counts, expected);
+    }
+}
