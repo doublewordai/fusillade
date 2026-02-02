@@ -217,7 +217,6 @@ pub trait Storage: Send + Sync {
 
     /// The following methods are defined specifically for requests - i.e. independent of the
     /// files/batches they belong to.
-
     /// Get pending request counts grouped by model and completion window.
     ///
     /// This excludes escalated racing requests (`is_escalated = true`).
