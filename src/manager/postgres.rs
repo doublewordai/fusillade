@@ -3045,6 +3045,96 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         })
     }
 
+    /// Find terminal batches that need notification, finalize if needed, and claim atomically.
+    ///
+    /// Handles both batches already finalized by `get_batch()` API calls and batches that
+    /// are terminal by count but not yet finalized. Sets `notification_sent_at` atomically
+    /// to prevent duplicate notifications across replicas polling concurrently.
+    ///
+    /// Request counts (completed, failed, etc.) are computed here via LATERAL JOIN for the
+    /// notification email body but are not persisted — they'll be recomputed on subsequent
+    /// reads. This is acceptable because the counts are cheap to compute (indexed on
+    /// `batch_id` + `state`), the values are immutable once finalized, and storing them
+    /// would add schema complexity and staleness risk for marginal gain.
+    pub async fn poll_completed_batches(
+        &self,
+        hide_retriable_before_sla: bool,
+    ) -> Result<Vec<Batch>> {
+        let (_, failed_count) = Self::error_filter_sql_fragments(hide_retriable_before_sla);
+
+        let mut query_builder = QueryBuilder::new(
+            r#"
+            WITH candidates AS (
+                SELECT b.id,
+                       COALESCE(counts.completed, 0)::BIGINT as completed_requests,
+                       COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                       COALESCE(counts.canceled, 0)::BIGINT as canceled_requests,
+                       COALESCE(counts.pending, 0)::BIGINT as pending_requests,
+                       COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests
+                FROM batches b
+                LEFT JOIN LATERAL (
+                    SELECT
+                        COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                        "#,
+        );
+        query_builder.push(failed_count);
+        query_builder.push(
+            r#" as failed,
+                        COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled,
+                        COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
+                        COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress
+                    FROM requests WHERE batch_id = b.id
+                ) counts ON TRUE
+                WHERE b.notification_sent_at IS NULL
+                  AND b.deleted_at IS NULL
+                  AND b.total_requests > 0
+                  AND (
+                      -- Already finalized by get_batch()
+                      (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                      OR
+                      -- Terminal by count but not yet finalized
+                      (COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0) = b.total_requests)
+                  )
+            ),
+            updated AS (
+                UPDATE batches b
+                SET notification_sent_at = NOW(),
+                    finalizing_at = COALESCE(b.finalizing_at, NOW()),
+                    completed_at = COALESCE(b.completed_at,
+                        CASE WHEN c.completed_requests > 0 THEN NOW() END),
+                    failed_at = COALESCE(b.failed_at,
+                        CASE WHEN c.completed_requests = 0 AND c.canceled_requests < b.total_requests THEN NOW() END),
+                    cancelled_at = COALESCE(b.cancelled_at,
+                        CASE WHEN c.canceled_requests = b.total_requests THEN NOW() END)
+                FROM candidates c
+                WHERE b.id = c.id
+                  AND b.notification_sent_at IS NULL
+                RETURNING b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                          b.output_file_id, b.error_file_id, b.created_by, b.created_at,
+                          b.expires_at, b.cancelling_at, b.errors, b.total_requests,
+                          b.requests_started_at, b.finalizing_at, b.completed_at,
+                          b.failed_at, b.cancelled_at, b.deleted_at, b.notification_sent_at,
+                          c.completed_requests, c.failed_requests, c.canceled_requests,
+                          c.pending_requests, c.in_progress_requests
+            )
+            SELECT * FROM updated
+            "#,
+        );
+
+        let rows = query_builder
+            .build()
+            .fetch_all(self.pools.write())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to poll completed batches: {}", e))
+            })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| batch_from_dynamic_row!(row))
+            .collect())
+    }
+
     /// Insert a batch of templates using PostgreSQL UNNEST for bulk insertion.
     /// This is significantly faster than individual INSERTs for large template counts.
     async fn insert_template_batch(
