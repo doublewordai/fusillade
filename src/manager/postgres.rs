@@ -736,7 +736,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(result)
     }
 
-    #[tracing::instrument(skip(self), fields(limit, daemon_id = %daemon_id))]
+    #[tracing::instrument(skip(self), fields(limit))]
     async fn claim_requests(
         &self,
         limit: usize,
