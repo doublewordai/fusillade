@@ -119,6 +119,7 @@ macro_rules! batch_from_dynamic_row {
             completed_requests: $row.get("completed_requests"),
             failed_requests: $row.get("failed_requests"),
             canceled_requests: $row.get("canceled_requests"),
+            notification_sent_at: $row.get("notification_sent_at"),
         }
     };
 }
@@ -2278,6 +2279,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         b.failed_at,
                         b.cancelled_at,
                         b.deleted_at,
+                        b.notification_sent_at,
                         COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                         COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                         COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -2384,6 +2386,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.failed_at,
                 b.cancelled_at,
                 b.deleted_at,
+                b.notification_sent_at,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -2922,6 +2925,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 b.failed_at,
                 b.cancelled_at,
                 b.deleted_at,
+                b.notification_sent_at,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -3037,6 +3041,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             failed_at,
             cancelled_at,
             deleted_at: row.get("deleted_at"),
+            notification_sent_at: row.get("notification_sent_at"),
         })
     }
 

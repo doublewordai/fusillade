@@ -418,6 +418,9 @@ pub struct Batch {
 
     /// When batch was soft-deleted. NULL means active.
     pub deleted_at: Option<DateTime<Utc>>,
+
+    /// When batch completion notification was sent. NULL means not yet notified.
+    pub notification_sent_at: Option<DateTime<Utc>>,
 }
 
 /// Status information for a batch, computed from its executions.
