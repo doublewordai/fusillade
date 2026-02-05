@@ -3056,6 +3056,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// reads. This is acceptable because the counts are cheap to compute (indexed on
     /// `batch_id` + `state`), the values are immutable once finalized, and storing them
     /// would add schema complexity and staleness risk for marginal gain.
+    /// Finds terminal batches that haven't had notifications sent yet, atomically
+    /// marks them as notified, and returns them for processing.
+    ///
+    /// Also writes terminal timestamps (completed_at/failed_at/cancelled_at) via
+    /// COALESCE. Currently these are almost always already set by get_batch()'s
+    /// lazy finalization (triggered as a side-effect of the daemon's cancellation
+    /// poller), but the finalization logic is kept here so this poller remains
+    /// self-contained and correct regardless of how callers of get_batch() change.
     pub async fn poll_completed_batches(
         &self,
         hide_retriable_before_sla: bool,
