@@ -3963,6 +3963,62 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
 
         Ok(daemons)
     }
+
+    async fn get_sla_near_misses(&self, threshold_seconds: f64) -> Result<Vec<(BatchId, i64)>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                r.batch_id as "batch_id!",
+                COUNT(*) as "count!"
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            WHERE b.expires_at < NOW() + make_interval(secs => $1)
+                AND b.expires_at >= NOW()
+                AND b.completed_at IS NULL
+                AND b.failed_at IS NULL
+                AND b.cancelled_at IS NULL
+                AND b.cancelling_at IS NULL
+                AND r.state IN ('pending', 'claimed', 'processing')
+            GROUP BY r.batch_id
+            "#,
+            threshold_seconds as f64,
+        )
+        .fetch_all(self.pools.read())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to get SLA near misses: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (BatchId(row.batch_id), row.count))
+            .collect())
+    }
+
+    async fn get_sla_misses(&self) -> Result<Vec<(BatchId, i64)>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                r.batch_id as "batch_id!",
+                COUNT(*) as "count!"
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            WHERE b.expires_at < NOW()
+                AND b.completed_at IS NULL
+                AND b.failed_at IS NULL
+                AND b.cancelled_at IS NULL
+                AND b.cancelling_at IS NULL
+                AND r.state IN ('pending', 'claimed', 'processing')
+            GROUP BY r.batch_id
+            "#,
+        )
+        .fetch_all(self.pools.read())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to get SLA misses: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (BatchId(row.batch_id), row.count))
+            .collect())
+    }
 }
 
 // Implement DaemonExecutor trait

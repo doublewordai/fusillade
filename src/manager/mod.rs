@@ -328,6 +328,24 @@ pub trait DaemonStorage: Send + Sync {
         &self,
         status_filter: Option<DaemonStatus>,
     ) -> Result<Vec<AnyDaemonRecord>>;
+
+    /// Get batches approaching SLA deadline with pending/processing request counts.
+    ///
+    /// Returns a list of (batch_id, request_count) tuples for batches that:
+    /// - Have not yet expired
+    /// - Are expiring within `threshold_seconds`
+    /// - Have pending or processing requests
+    ///
+    /// # Arguments
+    /// * `threshold_seconds` - Time window in seconds before expiry
+    async fn get_sla_near_misses(&self, threshold_seconds: f64) -> Result<Vec<(BatchId, i64)>>;
+
+    /// Get batches that have missed their SLA deadline with pending/processing request counts.
+    ///
+    /// Returns a list of (batch_id, request_count) tuples for batches that:
+    /// - Have already expired
+    /// - Have incomplete requests (pending, claimed, or processing state)
+    async fn get_sla_misses(&self) -> Result<Vec<(BatchId, i64)>>;
 }
 
 /// Daemon executor trait for runtime orchestration.

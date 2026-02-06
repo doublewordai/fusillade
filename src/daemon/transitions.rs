@@ -123,6 +123,19 @@ mod tests {
                 .cloned()
                 .collect())
         }
+
+        async fn get_sla_near_misses(
+            &self,
+            _threshold_seconds: f64,
+        ) -> Result<Vec<(crate::batch::BatchId, i64)>> {
+            // Mock implementation - returns empty list
+            Ok(vec![])
+        }
+
+        async fn get_sla_misses(&self) -> Result<Vec<(crate::batch::BatchId, i64)>> {
+            // Mock implementation - returns empty list
+            Ok(vec![])
+        }
     }
 
     fn test_daemon_data() -> DaemonData {

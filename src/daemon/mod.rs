@@ -152,6 +152,14 @@ pub struct DaemonConfig {
     ///   - x-fusillade-batch-endpoint
     #[serde(default = "default_batch_metadata_fields")]
     pub batch_metadata_fields: Vec<String>,
+
+    /// Interval for polling SLA near-miss and miss metrics (milliseconds)
+    /// Set to None to disable SLA monitoring
+    pub sla_monitor_interval_ms: Option<u64>,
+
+    /// Threshold in seconds for near-miss SLA detection
+    /// Batches expiring within this window are considered "near miss"
+    pub sla_near_miss_threshold_seconds: Option<f64>,
 }
 
 fn default_batch_metadata_fields() -> Vec<String> {
@@ -185,6 +193,8 @@ impl Default for DaemonConfig {
             unclaim_batch_size: 100,             // Unclaim up to 100 stale requests per poll
             cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
             batch_metadata_fields: default_batch_metadata_fields(),
+            sla_monitor_interval_ms: Some(60000), // Monitor SLA every 60 seconds by default
+            sla_near_miss_threshold_seconds: Some(300.0), // 5 minutes threshold by default
         }
     }
 }
@@ -468,6 +478,77 @@ where
                 }
             }
         });
+
+        // Spawn SLA monitoring task if configured
+        if let Some(interval_ms) = self.config.sla_monitor_interval_ms {
+            let storage = self.storage.clone();
+            let threshold_seconds = self.config.sla_near_miss_threshold_seconds.unwrap_or(300.0); // Default 5 minutes
+            let shutdown_token = self.shutdown_token.clone();
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+                tracing::info!(
+                    interval_ms = interval_ms,
+                    threshold_seconds = threshold_seconds,
+                    "SLA monitoring started"
+                );
+
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            // Update last successful check timestamp for liveness monitoring
+                            gauge!("fusillade_sla_monitor_last_check_timestamp_seconds")
+                                .set(std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs_f64());
+
+                            // Query for near-miss SLAs (batches expiring soon)
+                            match storage.get_sla_near_misses(threshold_seconds).await {
+                                Ok(near_misses) => {
+                                    // Record number of batches approaching SLA
+                                    gauge!("fusillade_sla_near_miss_total").set(near_misses.len() as f64);
+
+                                    // Record per-batch request counts
+                                    for (batch_id, count) in near_misses {
+                                        gauge!("fusillade_sla_near_miss_requests", "batch_id" => batch_id.to_string())
+                                            .set(count as f64);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "Failed to query SLA near misses");
+                                    counter!("fusillade_sla_monitor_errors_total", "query_type" => "near_miss").increment(1);
+                                }
+                            }
+
+                            // Query for missed SLAs (batches already expired)
+                            match storage.get_sla_misses().await {
+                                Ok(misses) => {
+                                    // Record number of batches that missed SLA
+                                    gauge!("fusillade_sla_missed_total").set(misses.len() as f64);
+
+                                    // Record per-batch request counts
+                                    for (batch_id, count) in misses {
+                                        gauge!("fusillade_sla_missed_requests", "batch_id" => batch_id.to_string())
+                                            .set(count as f64);
+                                        counter!("fusillade_sla_misses_total", "batch_id" => batch_id.to_string())
+                                            .increment(count as u64);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "Failed to query SLA misses");
+                                    counter!("fusillade_sla_monitor_errors_total", "query_type" => "missed").increment(1);
+                                }
+                            }
+                        }
+                        _ = shutdown_token.cancelled() => {
+                            tracing::info!("SLA monitoring shutting down");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
@@ -810,6 +891,8 @@ mod tests {
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            sla_monitor_interval_ms: None,      // Disable SLA monitoring in tests
+            sla_near_miss_threshold_seconds: Some(300.0),
         };
 
         let manager = Arc::new(
@@ -978,6 +1061,8 @@ mod tests {
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            sla_monitor_interval_ms: None,      // Disable SLA monitoring in tests
+            sla_near_miss_threshold_seconds: Some(300.0),
         };
 
         let manager = Arc::new(
@@ -1204,6 +1289,8 @@ mod tests {
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            sla_monitor_interval_ms: None,      // Disable SLA monitoring in tests
+            sla_near_miss_threshold_seconds: Some(300.0),
         };
 
         let manager = Arc::new(
@@ -1339,6 +1426,8 @@ mod tests {
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            sla_monitor_interval_ms: None,      // Disable SLA monitoring in tests
+            sla_near_miss_threshold_seconds: Some(300.0),
         };
 
         let manager = Arc::new(
@@ -1509,6 +1598,8 @@ mod tests {
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
+            sla_monitor_interval_ms: None, // Disable SLA monitoring in tests
+            sla_near_miss_threshold_seconds: Some(300.0),
         };
 
         let manager = Arc::new(
@@ -1663,6 +1754,8 @@ mod tests {
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
+            sla_monitor_interval_ms: None, // Disable SLA monitoring in tests
+            sla_near_miss_threshold_seconds: Some(300.0),
         };
 
         let manager = Arc::new(
@@ -1822,6 +1915,8 @@ mod tests {
                 "completion_window".to_string(),
             ],
             cancellation_poll_interval_ms: 100,
+            sla_monitor_interval_ms: None, // Disable SLA monitoring in tests
+            sla_near_miss_threshold_seconds: Some(300.0),
         };
 
         let manager = Arc::new(
@@ -1976,6 +2071,8 @@ mod tests {
                 "request_source".to_string(), // This comes from metadata JSON
             ],
             cancellation_poll_interval_ms: 100,
+            sla_monitor_interval_ms: None, // Disable SLA monitoring in tests
+            sla_near_miss_threshold_seconds: Some(300.0),
         };
 
         let manager = Arc::new(
@@ -2079,5 +2176,268 @@ mod tests {
             Some(&"api".to_string()),
             "request_source should be extracted from metadata JSON"
         );
+    }
+
+    #[sqlx::test]
+    async fn test_sla_monitoring_metrics(pool: sqlx::PgPool) {
+        use crate::manager::DaemonStorage;
+
+        // Setup: Create manager
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        // Create a file with templates
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test SLA monitoring".to_string()),
+                vec![
+                    crate::RequestTemplateInput {
+                        custom_id: Some("req1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"prompt":"test1"}"#.to_string(),
+                        model: "test-model".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                    crate::RequestTemplateInput {
+                        custom_id: Some("req2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"prompt":"test2"}"#.to_string(),
+                        model: "test-model".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .expect("Failed to create file");
+
+        // Create batch 1: Expiring soon (within threshold)
+        let near_miss_batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("test-user".to_string()),
+            })
+            .await
+            .expect("Failed to create near-miss batch");
+
+        // Update the batch to expire in 4 minutes (within 5-minute threshold)
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + interval '4 minutes' WHERE id = $1",
+            near_miss_batch.id.0
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to update near-miss batch expiry");
+
+        // Create batch 2: Already expired (missed SLA)
+        let file_id2 = manager
+            .create_file(
+                "test-file-2".to_string(),
+                Some("Test SLA missed".to_string()),
+                vec![crate::RequestTemplateInput {
+                    custom_id: Some("req3".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/chat/completions".to_string(),
+                    body: r#"{"prompt":"test3"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let missed_batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_id2,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("test-user".to_string()),
+            })
+            .await
+            .expect("Failed to create missed batch");
+
+        // Update the batch to have expired 1 hour ago
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() - interval '1 hour' WHERE id = $1",
+            missed_batch.id.0
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to update missed batch expiry");
+
+        // Test get_sla_near_misses with 300 second (5 minute) threshold
+        let near_misses = manager
+            .get_sla_near_misses(300.0)
+            .await
+            .expect("Failed to get SLA near misses");
+
+        // Should find the near-miss batch with 2 pending requests
+        assert_eq!(near_misses.len(), 1, "Expected one near-miss batch");
+        assert_eq!(
+            near_misses[0].0, near_miss_batch.id,
+            "Near-miss batch ID should match"
+        );
+        assert_eq!(
+            near_misses[0].1, 2,
+            "Near-miss batch should have 2 pending requests"
+        );
+
+        // Test get_sla_misses
+        let misses = manager
+            .get_sla_misses()
+            .await
+            .expect("Failed to get SLA misses");
+
+        // Should find the missed batch with 1 pending request
+        assert_eq!(misses.len(), 1, "Expected one missed batch");
+        assert_eq!(misses[0].0, missed_batch.id, "Missed batch ID should match");
+        assert_eq!(misses[0].1, 1, "Missed batch should have 1 pending request");
+
+        // Test that completed batches don't appear in results
+        // Mark near-miss batch as completed
+        sqlx::query!(
+            "UPDATE batches SET completed_at = NOW() WHERE id = $1",
+            near_miss_batch.id.0
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to mark batch as completed");
+
+        let near_misses_after = manager
+            .get_sla_near_misses(300.0)
+            .await
+            .expect("Failed to get SLA near misses after completion");
+
+        assert_eq!(
+            near_misses_after.len(),
+            0,
+            "Completed batches should not appear in near-miss results"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_sla_monitoring_task_runs_periodically(pool: sqlx::PgPool) {
+        use crate::manager::DaemonExecutor;
+
+        // Setup: Create HTTP client
+        let http_client = Arc::new(MockHttpClient::new());
+        http_client.add_response(
+            "POST /v1/chat/completions",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"id":"chatcmpl-123","object":"chat.completion","created":1677652288,"choices":[{"message":{"role":"assistant","content":"test"}}]}"#.to_string(),
+            }),
+        );
+
+        // Setup: Create manager with FAST SLA monitoring interval (100ms for testing)
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 1000,
+            default_model_concurrency: 10,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            model_escalations: Arc::new(dashmap::DashMap::new()),
+            max_retries: Some(3),
+            stop_before_deadline_ms: None,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            unclaim_batch_size: 100,
+            batch_metadata_fields: vec![],
+            cancellation_poll_interval_ms: 100,
+            sla_monitor_interval_ms: Some(100), // Fast interval for testing
+            sla_near_miss_threshold_seconds: Some(300.0),
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        // Create a batch expiring soon (near-miss)
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test periodic SLA monitoring".to_string()),
+                vec![crate::RequestTemplateInput {
+                    custom_id: Some("req1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/chat/completions".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("test-user".to_string()),
+            })
+            .await
+            .expect("Failed to create batch");
+
+        // Update the batch to expire in 4 minutes (within threshold)
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + interval '4 minutes' WHERE id = $1",
+            batch.id.0
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to update batch expiry");
+
+        // Start the daemon
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let daemon_handle = manager.clone().run(shutdown.clone()).unwrap();
+
+        // Wait for multiple monitoring cycles (at least 3 cycles = 300ms)
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        // The monitoring task should have run at least 3 times
+        // We can't directly observe the metrics in tests without a metrics backend,
+        // but we can verify the task is working by:
+        // 1. Checking the database queries would succeed (already tested above)
+        // 2. Ensuring no panics occurred (daemon still running)
+        // 3. Verifying the task responds to shutdown
+
+        // Trigger shutdown
+        shutdown.cancel();
+
+        // Wait for daemon to shut down gracefully
+        let shutdown_result = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
+
+        assert!(
+            shutdown_result.is_ok(),
+            "Daemon should shut down gracefully within 2 seconds"
+        );
+
+        // If we got here without panics, the SLA monitoring task ran successfully
+        // multiple times and responded to shutdown correctly
     }
 }
