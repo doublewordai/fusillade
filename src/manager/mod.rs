@@ -329,18 +329,18 @@ pub trait DaemonStorage: Send + Sync {
         status_filter: Option<DaemonStatus>,
     ) -> Result<Vec<AnyDaemonRecord>>;
 
-    /// Get batches approaching SLA deadline with pending/processing request counts.
+    /// Get batches approaching SLA deadline with incomplete request counts.
     ///
     /// Returns a list of (batch_id, request_count) tuples for batches that:
     /// - Have not yet expired
     /// - Are expiring within `threshold_seconds`
-    /// - Have pending or processing requests
+    /// - Have incomplete requests (pending, claimed, or processing state)
     ///
     /// # Arguments
     /// * `threshold_seconds` - Time window in seconds before expiry
     async fn get_sla_near_misses(&self, threshold_seconds: f64) -> Result<Vec<(BatchId, i64)>>;
 
-    /// Get batches that have missed their SLA deadline with pending/processing request counts.
+    /// Get batches that have missed their SLA deadline with incomplete request counts.
     ///
     /// Returns a list of (batch_id, request_count) tuples for batches that:
     /// - Have already expired
