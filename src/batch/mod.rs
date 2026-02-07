@@ -451,6 +451,16 @@ impl Batch {
     }
 }
 
+/// A batch with extra context for notification emails (file metadata, model names).
+/// Returned by `poll_completed_batches` which joins the files and requests tables.
+#[derive(Debug, Clone)]
+pub struct BatchNotification {
+    pub batch: Batch,
+    pub model: String,
+    pub input_file_name: Option<String>,
+    pub input_file_description: Option<String>,
+}
+
 /// Status information for a batch, computed from its executions.
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchStatus {

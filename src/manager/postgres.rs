@@ -24,9 +24,9 @@ use uuid::Uuid;
 
 use super::{DaemonStorage, Storage};
 use crate::batch::{
-    Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchOutputItem,
-    BatchResponseDetails, BatchStatus, File, FileContentItem, FileId, FileMetadata, FileStreamItem,
-    OutputFileType, RequestTemplateInput, TemplateId,
+    Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchNotification,
+    BatchOutputItem, BatchResponseDetails, BatchStatus, File, FileContentItem, FileId,
+    FileMetadata, FileStreamItem, OutputFileType, RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{
     AnyDaemonRecord, Daemon, DaemonConfig, DaemonData, DaemonRecord, DaemonState, DaemonStatus,
@@ -3064,7 +3064,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// lazy finalization (triggered as a side-effect of the daemon's cancellation
     /// poller), but the finalization logic is kept here so this poller remains
     /// self-contained and correct regardless of how callers of get_batch() change.
-    pub async fn poll_completed_batches(&self) -> Result<Vec<Batch>> {
+    pub async fn poll_completed_batches(&self) -> Result<Vec<BatchNotification>> {
         let rows = sqlx::query!(
             r#"
             -- Step 1: Find candidate batches that need notification
@@ -3125,7 +3125,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                           c.completed_requests, c.failed_requests, c.canceled_requests,
                           c.pending_requests, c.in_progress_requests
             )
-            SELECT * FROM updated
+            SELECT u.*,
+                   f.name as input_file_name,
+                   f.description as input_file_description,
+                   (SELECT string_agg(DISTINCT r.model, ', ') FROM requests r WHERE r.batch_id = u.id) as model
+            FROM updated u
+            LEFT JOIN files f ON f.id = u.file_id
             "#
         )
         .fetch_all(self.pools.write())
@@ -3136,32 +3141,37 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
         Ok(rows
             .into_iter()
-            .map(|row| Batch {
-                id: BatchId(row.id),
-                file_id: row.file_id.map(FileId),
-                endpoint: row.endpoint,
-                completion_window: row.completion_window,
-                metadata: row.metadata,
-                output_file_id: row.output_file_id.map(FileId),
-                error_file_id: row.error_file_id.map(FileId),
-                created_by: row.created_by,
-                created_at: row.created_at,
-                expires_at: row.expires_at,
-                cancelling_at: row.cancelling_at,
-                errors: row.errors,
-                total_requests: row.total_requests,
-                requests_started_at: row.requests_started_at,
-                finalizing_at: row.finalizing_at,
-                completed_at: row.completed_at,
-                failed_at: row.failed_at,
-                cancelled_at: row.cancelled_at,
-                deleted_at: row.deleted_at,
-                notification_sent_at: row.notification_sent_at,
-                pending_requests: row.pending_requests.unwrap_or(0),
-                in_progress_requests: row.in_progress_requests.unwrap_or(0),
-                completed_requests: row.completed_requests.unwrap_or(0),
-                failed_requests: row.failed_requests.unwrap_or(0),
-                canceled_requests: row.canceled_requests.unwrap_or(0),
+            .map(|row| BatchNotification {
+                batch: Batch {
+                    id: BatchId(row.id),
+                    file_id: row.file_id.map(FileId),
+                    endpoint: row.endpoint,
+                    completion_window: row.completion_window,
+                    metadata: row.metadata,
+                    output_file_id: row.output_file_id.map(FileId),
+                    error_file_id: row.error_file_id.map(FileId),
+                    created_by: row.created_by,
+                    created_at: row.created_at,
+                    expires_at: row.expires_at,
+                    cancelling_at: row.cancelling_at,
+                    errors: row.errors,
+                    total_requests: row.total_requests,
+                    requests_started_at: row.requests_started_at,
+                    finalizing_at: row.finalizing_at,
+                    completed_at: row.completed_at,
+                    failed_at: row.failed_at,
+                    cancelled_at: row.cancelled_at,
+                    deleted_at: row.deleted_at,
+                    notification_sent_at: row.notification_sent_at,
+                    pending_requests: row.pending_requests.unwrap_or(0),
+                    in_progress_requests: row.in_progress_requests.unwrap_or(0),
+                    completed_requests: row.completed_requests.unwrap_or(0),
+                    failed_requests: row.failed_requests.unwrap_or(0),
+                    canceled_requests: row.canceled_requests.unwrap_or(0),
+                },
+                model: row.model.unwrap_or_default(),
+                input_file_name: row.input_file_name,
+                input_file_description: row.input_file_description,
             })
             .collect())
     }
