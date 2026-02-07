@@ -418,6 +418,47 @@ pub struct Batch {
 
     /// When batch was soft-deleted. NULL means active.
     pub deleted_at: Option<DateTime<Utc>>,
+
+    /// When batch completion notification was sent. NULL means not yet notified.
+    pub notification_sent_at: Option<DateTime<Utc>>,
+}
+
+/// Outcome of a completed batch for notification purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOutcome {
+    /// All requests completed successfully
+    Completed,
+    /// Some requests completed, some failed
+    PartiallyCompleted,
+    /// All requests failed
+    Failed,
+}
+
+impl Batch {
+    /// Returns the outcome of this batch, if it's terminal.
+    /// Returns None if the batch is still in progress or was canceled.
+    pub fn outcome(&self) -> Option<BatchOutcome> {
+        if self.completed_at.is_none() && self.failed_at.is_none() {
+            return None;
+        }
+        Some(if self.failed_requests == 0 {
+            BatchOutcome::Completed
+        } else if self.completed_requests == 0 {
+            BatchOutcome::Failed
+        } else {
+            BatchOutcome::PartiallyCompleted
+        })
+    }
+}
+
+/// A batch with extra context for notification emails (file metadata, model names).
+/// Returned by `poll_completed_batches` which joins the files and requests tables.
+#[derive(Debug, Clone)]
+pub struct BatchNotification {
+    pub batch: Batch,
+    pub model: String,
+    pub input_file_name: Option<String>,
+    pub input_file_description: Option<String>,
 }
 
 /// Status information for a batch, computed from its executions.
