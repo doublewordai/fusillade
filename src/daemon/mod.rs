@@ -99,9 +99,13 @@ pub struct DaemonConfig {
     pub max_retries: Option<u32>,
 
     /// Stop retrying this many milliseconds before the batch expires.
-    /// Positive values stop before the deadline (safety buffer).
-    /// Negative values allow retrying after the deadline.
-    /// If None, retries are not deadline-aware.
+    ///
+    /// - **Negative** (e.g., -300000 = -5 min): Retry for a buffer window AFTER SLA deadline (recommended)
+    /// - **Zero**: Stop exactly at SLA deadline
+    /// - **Positive**: Stop BEFORE SLA deadline (creates dead requests, avoid!)
+    /// - **None**: No deadline awareness
+    ///
+    /// Default: -300000 (retry 5 min past expiry to maximize completion chances)
     pub stop_before_deadline_ms: Option<i64>,
 
     /// Base backoff duration in milliseconds (will be exponentially increased)
@@ -140,9 +144,25 @@ pub struct DaemonConfig {
     /// Limits database load when many requests become stale simultaneously (e.g., daemon crash).
     pub unclaim_batch_size: usize,
 
-    /// Interval for polling database to check for cancelled batches (milliseconds)
-    /// Determines how quickly in-flight requests are aborted when their batch is cancelled
-    pub cancellation_poll_interval_ms: u64,
+    /// Interval for polling batches to perform finalization and check for cancellations (milliseconds).
+    ///
+    /// This polling loop serves two purposes:
+    /// 1. **Batch Finalization**: Fetches active batches and triggers lazy finalization
+    ///    (computing completion timestamps when all requests reach terminal states)
+    /// 2. **Cancellation Detection**: Checks if any active batches have been cancelled
+    ///    and aborts their in-flight requests
+    ///
+    #[serde(default = "default_batch_poll_interval_ms")]
+    pub batch_poll_interval_ms: u64,
+
+    /// DEPRECATED: Use `batch_poll_interval_ms` instead.
+    ///
+    /// This field is maintained for backwards compatibility. If provided, the effective
+    /// batch poll interval will be the minimum of `batch_poll_interval_ms` and this value.
+    ///
+    /// Will be removed in a future version.
+    #[serde(default)]
+    pub cancellation_poll_interval_ms: Option<u64>,
 
     /// Batch table column names to include as request headers.
     /// These values are sent as `x-fusillade-batch-{column}` headers with each request.
@@ -161,6 +181,10 @@ fn default_batch_metadata_fields() -> Vec<String> {
         "created_at".to_string(),
         "completion_window".to_string(),
     ]
+}
+
+fn default_batch_poll_interval_ms() -> u64 {
+    5000
 }
 
 impl Default for DaemonConfig {
@@ -183,7 +207,8 @@ impl Default for DaemonConfig {
             claim_timeout_ms: 60000,             // 1 minute
             processing_timeout_ms: 600000,       // 10 minutes
             unclaim_batch_size: 100,             // Unclaim up to 100 stale requests per poll
-            cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
+            batch_poll_interval_ms: 5000,        // Poll every 5 seconds by default
+            cancellation_poll_interval_ms: None, // Deprecated
             batch_metadata_fields: default_batch_metadata_fields(),
         }
     }
@@ -417,17 +442,27 @@ where
             });
         }
 
-        // Spawn periodic task to poll for cancelled batches and abort in-flight requests
+        // Spawn periodic batch polling task for finalization and cancellation detection
+        // This serves two purposes in one efficient loop:
+        // 1. Triggers lazy finalization by fetching batches (computes completion timestamps)
+        // 2. Detects cancelled batches and aborts their in-flight requests
         let cancellation_tokens = self.cancellation_tokens.clone();
         let storage = self.storage.clone();
         let shutdown_token = self.shutdown_token.clone();
-        let cancellation_poll_interval_ms = self.config.cancellation_poll_interval_ms;
+
+        // Determine effective poll interval (backwards compatibility)
+        let batch_poll_interval_ms =
+            if let Some(legacy_interval) = self.config.cancellation_poll_interval_ms {
+                self.config.batch_poll_interval_ms.min(legacy_interval)
+            } else {
+                self.config.batch_poll_interval_ms
+            };
+
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_millis(cancellation_poll_interval_ms));
+            let mut interval = tokio::time::interval(Duration::from_millis(batch_poll_interval_ms));
             tracing::info!(
-                interval_ms = cancellation_poll_interval_ms,
-                "Batch cancellation polling started"
+                interval_ms = batch_poll_interval_ms,
+                "Batch polling started (finalization + cancellation detection)"
             );
 
             loop {
@@ -443,26 +478,34 @@ where
                             continue;
                         }
 
-                        // Query database to check which of these batches have been cancelled
-                        // Note: DaemonStorage doesn't have a method for this, so we'll check via the batch
-                        // For now, we'll check each batch individually
+                        // Fetch batches once for both finalization and cancellation check
                         for batch_id in active_batch_ids {
-                            // Try to get the batch - if it has cancelling_at set, cancel the token
-                            if let Ok(batch) = storage
-                                .get_batch(batch_id, false)
-                                .await
-                                && batch.cancelling_at.is_some()
-                                    && let Some(entry) = cancellation_tokens.get(&batch_id) {
-                                        entry.value().cancel();
-                                        tracing::info!(batch_id = %batch_id, "Cancelled all requests in batch");
-                                        // Remove from map so we don't keep checking it
-                                        drop(entry);
-                                        cancellation_tokens.remove(&batch_id);
+                            match storage.get_batch(batch_id).await {
+                                Ok(batch) => {
+                                    // Lazy finalization happens as side effect of get_batch()
+
+                                    // Check if batch is being cancelled
+                                    if batch.cancelling_at.is_some() {
+                                        if let Some(entry) = cancellation_tokens.get(&batch_id) {
+                                            entry.value().cancel();
+                                            tracing::info!(batch_id = %batch_id, "Cancelled all requests in batch");
+                                            drop(entry);
+                                            cancellation_tokens.remove(&batch_id);
+                                        }
                                     }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        batch_id = %batch_id,
+                                        error = %e,
+                                        "Failed to fetch batch"
+                                    );
+                                }
+                            }
                         }
                     }
                     _ = shutdown_token.cancelled() => {
-                        tracing::info!("Shutting down cancellation polling");
+                        tracing::info!("Shutting down batch polling");
                         break;
                     }
                 }
@@ -809,7 +852,8 @@ mod tests {
             processing_timeout_ms: 600000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100, // Fast polling for tests
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None, // Fast polling for tests
         };
 
         let manager = Arc::new(
@@ -977,7 +1021,8 @@ mod tests {
             processing_timeout_ms: 600000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100, // Fast polling for tests
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None, // Fast polling for tests
         };
 
         let manager = Arc::new(
@@ -1131,7 +1176,7 @@ mod tests {
 
         while start.elapsed() < timeout {
             let status = manager
-                .get_batch_status(batch.id, false)
+                .get_batch_status(batch.id)
                 .await
                 .expect("Failed to get batch status");
 
@@ -1203,7 +1248,8 @@ mod tests {
             processing_timeout_ms: 600000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100, // Fast polling for tests
+            batch_poll_interval_ms: 100, // Fast polling for tests
+            cancellation_poll_interval_ms: None,
         };
 
         let manager = Arc::new(
@@ -1338,7 +1384,8 @@ mod tests {
             processing_timeout_ms: 600000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100, // Fast polling for tests
+            batch_poll_interval_ms: 100, // Fast polling for tests
+            cancellation_poll_interval_ms: None,
         };
 
         let manager = Arc::new(
@@ -1454,7 +1501,7 @@ mod tests {
 
         while start.elapsed() < timeout {
             let status = manager
-                .get_batch_status(batch.id, false)
+                .get_batch_status(batch.id)
                 .await
                 .expect("Failed to get batch status");
 
@@ -1508,7 +1555,8 @@ mod tests {
             processing_timeout_ms: 600000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100,
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None,
         };
 
         let manager = Arc::new(
@@ -1662,7 +1710,8 @@ mod tests {
             processing_timeout_ms: 600000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100,
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None,
         };
 
         let manager = Arc::new(
@@ -1821,7 +1870,8 @@ mod tests {
                 "created_at".to_string(),
                 "completion_window".to_string(),
             ],
-            cancellation_poll_interval_ms: 100,
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None,
         };
 
         let manager = Arc::new(
@@ -1975,7 +2025,8 @@ mod tests {
                 "completion_window".to_string(),
                 "request_source".to_string(), // This comes from metadata JSON
             ],
-            cancellation_poll_interval_ms: 100,
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None,
         };
 
         let manager = Arc::new(

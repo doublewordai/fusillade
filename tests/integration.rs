@@ -37,7 +37,8 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
         processing_timeout_ms: 600000,
-        cancellation_poll_interval_ms: 100, // Fast polling for tests
+        batch_poll_interval_ms: 100,
+        cancellation_poll_interval_ms: None, // Fast polling for tests
         ..Default::default()
     };
 
@@ -203,7 +204,8 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
         processing_timeout_ms: 600000,
-        cancellation_poll_interval_ms: 100, // Fast polling for tests
+        batch_poll_interval_ms: 100,
+        cancellation_poll_interval_ms: None, // Fast polling for tests
         ..Default::default()
     };
 
@@ -368,7 +370,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
 
     while start.elapsed() < timeout {
         let status = manager
-            .get_batch_status(batch.id, false)
+            .get_batch_status(batch.id)
             .await
             .expect("Failed to get batch status");
 
@@ -437,7 +439,8 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
         processing_timeout_ms: 600000,
-        cancellation_poll_interval_ms: 100, // Fast polling for tests
+        batch_poll_interval_ms: 100, // Fast polling for tests
+        cancellation_poll_interval_ms: None,
         ..Default::default()
     };
 
@@ -570,7 +573,8 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
         processing_timeout_ms: 600000,
-        cancellation_poll_interval_ms: 100, // Fast polling for tests
+        batch_poll_interval_ms: 100, // Fast polling for tests
+        cancellation_poll_interval_ms: None,
         ..Default::default()
     };
 
@@ -683,7 +687,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
 
     while start.elapsed() < timeout {
         let status = manager
-            .get_batch_status(batch.id, false)
+            .get_batch_status(batch.id)
             .await
             .expect("Failed to get batch status");
 
@@ -734,7 +738,8 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
         processing_timeout_ms: 600000,
-        cancellation_poll_interval_ms: 100,
+        batch_poll_interval_ms: 100,
+        cancellation_poll_interval_ms: None,
         ..Default::default()
     };
 
@@ -899,7 +904,8 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
         processing_timeout_ms: 600000,
-        cancellation_poll_interval_ms: 100,
+        batch_poll_interval_ms: 100,
+        cancellation_poll_interval_ms: None,
         ..Default::default()
     };
 
@@ -1079,7 +1085,8 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
         processing_timeout_ms: 600000,
-        cancellation_poll_interval_ms: 100,
+        batch_poll_interval_ms: 100,
+        cancellation_poll_interval_ms: None,
         ..Default::default()
     };
 
@@ -1226,7 +1233,8 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
         processing_timeout_ms: 600000,
-        cancellation_poll_interval_ms: 100,
+        batch_poll_interval_ms: 100,
+        cancellation_poll_interval_ms: None,
         ..Default::default()
     };
 
@@ -1326,7 +1334,7 @@ mod batch_results_stream {
         manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
         batch_id: fusillade::batch::BatchId,
     ) -> Vec<fusillade::batch::BatchResultItem> {
-        let stream = manager.get_batch_results_stream(batch_id, 0, None, None, false);
+        let stream = manager.get_batch_results_stream(batch_id, 0, None, None);
         stream
             .filter_map(|r| async { r.ok() })
             .collect::<Vec<_>>()
@@ -1501,7 +1509,7 @@ mod batch_results_stream {
         .expect("Failed to clear file_id");
 
         // Try to get results - should get an error
-        let stream = manager.get_batch_results_stream(batch.id, 0, None, None, false);
+        let stream = manager.get_batch_results_stream(batch.id, 0, None, None);
         let results: Vec<_> = stream.collect().await;
 
         // Should have one error result
@@ -1585,10 +1593,7 @@ mod batch_results_stream {
         // Wait for completion
         let start = tokio::time::Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
-            let b = manager
-                .get_batch(batch.id, false)
-                .await
-                .expect("get_batch failed");
+            let b = manager.get_batch(batch.id).await.expect("get_batch failed");
             if b.completed_requests == 1 {
                 break;
             }
@@ -1597,10 +1602,7 @@ mod batch_results_stream {
         shutdown_token.cancel();
 
         // Get the output file ID
-        let batch = manager
-            .get_batch(batch.id, false)
-            .await
-            .expect("get_batch failed");
+        let batch = manager.get_batch(batch.id).await.expect("get_batch failed");
         let output_file_id = batch
             .output_file_id
             .expect("Batch should have output_file_id");
@@ -1622,7 +1624,7 @@ mod batch_results_stream {
             .expect("delete_batch failed");
 
         // Verify batch is no longer accessible
-        let batch_result = manager.get_batch(batch.id, false).await;
+        let batch_result = manager.get_batch(batch.id).await;
         assert!(
             batch_result.is_err(),
             "Batch should not be found after deletion"
@@ -1726,7 +1728,7 @@ mod batch_results_stream {
         assert_eq!(all_results.len(), 5, "Should have 5 results");
 
         // Get with offset 2
-        let stream = manager.get_batch_results_stream(batch.id, 2, None, None, false);
+        let stream = manager.get_batch_results_stream(batch.id, 2, None, None);
         let offset_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(
@@ -1839,13 +1841,8 @@ mod batch_results_stream {
         shutdown_token.cancel();
 
         // Filter by completed
-        let stream = manager.get_batch_results_stream(
-            batch.id,
-            0,
-            None,
-            Some("completed".to_string()),
-            false,
-        );
+        let stream =
+            manager.get_batch_results_stream(batch.id, 0, None, Some("completed".to_string()));
         let completed_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(
@@ -1859,7 +1856,7 @@ mod batch_results_stream {
 
         // Filter by failed
         let stream =
-            manager.get_batch_results_stream(batch.id, 0, None, Some("failed".to_string()), false);
+            manager.get_batch_results_stream(batch.id, 0, None, Some("failed".to_string()));
         let failed_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(failed_results.len(), 1, "Should have 1 failed result");
@@ -1970,7 +1967,7 @@ mod batch_results_stream {
 
         // Search for "request" (case-insensitive)
         let stream =
-            manager.get_batch_results_stream(batch.id, 0, Some("request".to_string()), None, false);
+            manager.get_batch_results_stream(batch.id, 0, Some("request".to_string()), None);
         let search_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(
@@ -1987,8 +1984,7 @@ mod batch_results_stream {
         assert!(custom_ids.contains(&&"Beta-Request".to_string()));
 
         // Search for "ALPHA" (case-insensitive)
-        let stream =
-            manager.get_batch_results_stream(batch.id, 0, Some("ALPHA".to_string()), None, false);
+        let stream = manager.get_batch_results_stream(batch.id, 0, Some("ALPHA".to_string()), None);
         let alpha_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         assert_eq!(alpha_results.len(), 1, "Should find 1 result for 'ALPHA'");
@@ -2051,7 +2047,8 @@ mod batch_results_stream {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
-            cancellation_poll_interval_ms: 100,
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None,
             ..Default::default()
         };
 
@@ -2128,7 +2125,7 @@ mod batch_results_stream {
         let start = tokio::time::Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             let status = manager
-                .get_batch_status(batch.id, false)
+                .get_batch_status(batch.id)
                 .await
                 .expect("Failed to get batch status");
             if status.failed_requests == 4 {
@@ -2142,7 +2139,7 @@ mod batch_results_stream {
         // Test 1: Query with hide_retriable_before_sla = true (before SLA expiry)
         // Should only show non-retriable failures (400)
         let batch_filtered = manager
-            .get_batch(batch.id, true)
+            .get_batch(batch.id)
             .await
             .expect("Failed to get batch");
         assert_eq!(
@@ -2153,7 +2150,7 @@ mod batch_results_stream {
         // Test 2: Query with hide_retriable_before_sla = false
         // Should show all failures
         let batch_unfiltered = manager
-            .get_batch(batch.id, false)
+            .get_batch(batch.id)
             .await
             .expect("Failed to get batch");
         assert_eq!(
@@ -2165,7 +2162,7 @@ mod batch_results_stream {
         let error_file_id = batch_filtered
             .error_file_id
             .expect("Should have error file");
-        let stream = manager.get_file_content_stream(error_file_id, 0, None, true);
+        let stream = manager.get_file_content_stream(error_file_id, 0, None);
         let errors: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
         assert_eq!(
             errors.len(),
@@ -2174,7 +2171,7 @@ mod batch_results_stream {
         );
 
         // Test 4: Error file stream without filtering
-        let stream = manager.get_file_content_stream(error_file_id, 0, None, false);
+        let stream = manager.get_file_content_stream(error_file_id, 0, None);
         let all_errors: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
         assert_eq!(
             all_errors.len(),
@@ -2226,7 +2223,8 @@ mod batch_results_stream {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
-            cancellation_poll_interval_ms: 100,
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None,
             ..Default::default()
         };
 
@@ -2276,7 +2274,7 @@ mod batch_results_stream {
         let start = tokio::time::Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             let status = manager
-                .get_batch_status(batch.id, false)
+                .get_batch_status(batch.id)
                 .await
                 .expect("Failed to get batch status");
             if status.failed_requests == 4 {
@@ -2293,7 +2291,7 @@ mod batch_results_stream {
         // Query with hide_retriable_before_sla = true AFTER SLA expiry
         // Should show ALL failures because SLA has expired
         let batch_after_expiry = manager
-            .get_batch(batch.id, true)
+            .get_batch(batch.id)
             .await
             .expect("Failed to get batch");
         assert_eq!(
@@ -2352,7 +2350,8 @@ mod batch_results_stream {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
-            cancellation_poll_interval_ms: 100,
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None,
             ..Default::default()
         };
 
@@ -2414,14 +2413,14 @@ mod batch_results_stream {
         shutdown_token.cancel();
 
         // Test 1: Stream all results with hide_retriable_before_sla = false
-        let stream = manager.get_batch_results_stream(batch.id, 0, None, None, false);
+        let stream = manager.get_batch_results_stream(batch.id, 0, None, None);
         let all_results: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
         assert_eq!(all_results.len(), 5, "Should stream all 5 results");
 
         // Test 2: Stream failed results with hide_retriable_before_sla = true (before SLA)
         // Should only show non-retriable failures
         let stream =
-            manager.get_batch_results_stream(batch.id, 0, None, Some("failed".to_string()), true);
+            manager.get_batch_results_stream(batch.id, 0, None, Some("failed".to_string()));
         let filtered_failures: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
         assert_eq!(
             filtered_failures.len(),
@@ -2431,7 +2430,7 @@ mod batch_results_stream {
 
         // Test 3: Stream failed results without filtering
         let stream =
-            manager.get_batch_results_stream(batch.id, 0, None, Some("failed".to_string()), false);
+            manager.get_batch_results_stream(batch.id, 0, None, Some("failed".to_string()));
         let all_failures: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
         assert_eq!(
             all_failures.len(),
@@ -2440,13 +2439,8 @@ mod batch_results_stream {
         );
 
         // Test 4: Completed results should not be affected by filtering
-        let stream = manager.get_batch_results_stream(
-            batch.id,
-            0,
-            None,
-            Some("completed".to_string()),
-            true,
-        );
+        let stream =
+            manager.get_batch_results_stream(batch.id, 0, None, Some("completed".to_string()));
         let completed: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
         assert_eq!(
             completed.len(),
@@ -2498,7 +2492,8 @@ mod batch_results_stream {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
-            cancellation_poll_interval_ms: 100,
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None,
             ..Default::default()
         };
 
@@ -2548,7 +2543,7 @@ mod batch_results_stream {
         let start = tokio::time::Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             let status = manager
-                .get_batch_status(batch.id, false)
+                .get_batch_status(batch.id)
                 .await
                 .expect("Failed to get status");
             if status.failed_requests == 5 {
@@ -2561,7 +2556,7 @@ mod batch_results_stream {
 
         // Test with hide_retriable_before_sla = true
         let status_filtered = manager
-            .get_batch_status(batch.id, true)
+            .get_batch_status(batch.id)
             .await
             .expect("Failed to get batch status");
         assert_eq!(
@@ -2572,7 +2567,7 @@ mod batch_results_stream {
 
         // Test with hide_retriable_before_sla = false
         let status_unfiltered = manager
-            .get_batch_status(batch.id, false)
+            .get_batch_status(batch.id)
             .await
             .expect("Failed to get batch status");
         assert_eq!(
@@ -2640,7 +2635,8 @@ mod batch_results_stream {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
-            cancellation_poll_interval_ms: 100,
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None,
             ..Default::default()
         };
 
@@ -2703,11 +2699,11 @@ mod batch_results_stream {
         let start = tokio::time::Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             let status1 = manager
-                .get_batch_status(batch1.id, false)
+                .get_batch_status(batch1.id)
                 .await
                 .expect("Failed to get status");
             let status2 = manager
-                .get_batch_status(batch2.id, false)
+                .get_batch_status(batch2.id)
                 .await
                 .expect("Failed to get status");
             if status1.failed_requests == 4 && status2.failed_requests == 4 {
@@ -2720,7 +2716,7 @@ mod batch_results_stream {
 
         // Test list_file_batches with hide_retriable_before_sla = true
         let batches_filtered = manager
-            .list_file_batches(file_id, true)
+            .list_file_batches(file_id)
             .await
             .expect("Failed to list batches");
         assert_eq!(batches_filtered.len(), 2);
@@ -2733,7 +2729,7 @@ mod batch_results_stream {
 
         // Test list_file_batches with hide_retriable_before_sla = false
         let batches_unfiltered = manager
-            .list_file_batches(file_id, false)
+            .list_file_batches(file_id)
             .await
             .expect("Failed to list batches");
         assert_eq!(batches_unfiltered.len(), 2);
@@ -2794,7 +2790,8 @@ mod batch_results_stream {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
-            cancellation_poll_interval_ms: 100,
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None,
             ..Default::default()
         };
 
@@ -2852,7 +2849,7 @@ mod batch_results_stream {
             let mut all_failed = true;
             for batch_id in &batch_ids {
                 let status = manager
-                    .get_batch_status(*batch_id, false)
+                    .get_batch_status(*batch_id)
                     .await
                     .expect("Failed to get status");
                 if status.failed_requests != 3 {
@@ -2870,7 +2867,7 @@ mod batch_results_stream {
 
         // Test list_batches with hide_retriable_before_sla = true
         let batches_filtered = manager
-            .list_batches(Some("test-user".to_string()), None, None, 10, true)
+            .list_batches(Some("test-user".to_string()), None, None, 10)
             .await
             .expect("Failed to list batches");
         assert_eq!(batches_filtered.len(), 3);
@@ -2883,7 +2880,7 @@ mod batch_results_stream {
 
         // Test list_batches with hide_retriable_before_sla = false
         let batches_unfiltered = manager
-            .list_batches(Some("test-user".to_string()), None, None, 10, false)
+            .list_batches(Some("test-user".to_string()), None, None, 10)
             .await
             .expect("Failed to list batches");
         assert_eq!(batches_unfiltered.len(), 3);
@@ -2949,7 +2946,8 @@ mod batch_results_stream {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
-            cancellation_poll_interval_ms: 100,
+            batch_poll_interval_ms: 100,
+            cancellation_poll_interval_ms: None,
             ..Default::default()
         };
 
@@ -2999,7 +2997,7 @@ mod batch_results_stream {
         let start = tokio::time::Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             let status = manager
-                .get_batch_status(batch.id, false)
+                .get_batch_status(batch.id)
                 .await
                 .expect("Failed to get status");
             if status.failed_requests == 4 {
@@ -3010,7 +3008,7 @@ mod batch_results_stream {
 
         // Verify we have 4 failed requests (2 retriable + 2 non-retriable)
         let status_before = manager
-            .get_batch_status(batch.id, false)
+            .get_batch_status(batch.id)
             .await
             .expect("Failed to get status");
         assert_eq!(status_before.failed_requests, 4);
@@ -3026,7 +3024,7 @@ mod batch_results_stream {
         let start = tokio::time::Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             let status = manager
-                .get_batch_status(batch.id, false)
+                .get_batch_status(batch.id)
                 .await
                 .expect("Failed to get status");
             if status.completed_requests == 4 {
@@ -3039,7 +3037,7 @@ mod batch_results_stream {
 
         // Verify all requests completed successfully after retry
         let status_after = manager
-            .get_batch_status(batch.id, false)
+            .get_batch_status(batch.id)
             .await
             .expect("Failed to get status");
         assert_eq!(
