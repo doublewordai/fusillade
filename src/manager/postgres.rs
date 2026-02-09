@@ -24,9 +24,9 @@ use uuid::Uuid;
 
 use super::{DaemonStorage, Storage};
 use crate::batch::{
-    Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchOutputItem,
-    BatchResponseDetails, BatchStatus, File, FileContentItem, FileId, FileMetadata, FileStreamItem,
-    OutputFileType, RequestTemplateInput, TemplateId,
+    Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchNotification,
+    BatchOutputItem, BatchResponseDetails, BatchStatus, File, FileContentItem, FileId,
+    FileMetadata, FileStreamItem, OutputFileType, RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{
     AnyDaemonRecord, Daemon, DaemonConfig, DaemonData, DaemonRecord, DaemonState, DaemonStatus,
@@ -119,6 +119,7 @@ macro_rules! batch_from_dynamic_row {
             completed_requests: $row.get("completed_requests"),
             failed_requests: $row.get("failed_requests"),
             canceled_requests: $row.get("canceled_requests"),
+            notification_sent_at: $row.get("notification_sent_at"),
         }
     };
 }
@@ -735,7 +736,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(result)
     }
 
-    #[tracing::instrument(skip(self), fields(limit, daemon_id = %daemon_id))]
+    #[tracing::instrument(skip(self), fields(limit))]
     async fn claim_requests(
         &self,
         limit: usize,
@@ -2278,6 +2279,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         b.failed_at,
                         b.cancelled_at,
                         b.deleted_at,
+                        b.notification_sent_at,
                         COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                         COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                         COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -2384,6 +2386,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.failed_at,
                 b.cancelled_at,
                 b.deleted_at,
+                b.notification_sent_at,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -2922,6 +2925,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 b.failed_at,
                 b.cancelled_at,
                 b.deleted_at,
+                b.notification_sent_at,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -3037,7 +3041,139 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             failed_at,
             cancelled_at,
             deleted_at: row.get("deleted_at"),
+            notification_sent_at: row.get("notification_sent_at"),
         })
+    }
+
+    /// Find terminal batches that need notification, finalize if needed, and claim atomically.
+    ///
+    /// Handles both batches already finalized by `get_batch()` API calls and batches that
+    /// are terminal by count but not yet finalized. Sets `notification_sent_at` atomically
+    /// to prevent duplicate notifications across replicas polling concurrently.
+    ///
+    /// Request counts (completed, failed, etc.) are computed here via LATERAL JOIN for the
+    /// notification email body but are not persisted — they'll be recomputed on subsequent
+    /// reads. This is acceptable because the counts are cheap to compute (indexed on
+    /// `batch_id` + `state`), the values are immutable once finalized, and storing them
+    /// would add schema complexity and staleness risk for marginal gain.
+    /// Finds terminal batches that haven't had notifications sent yet, atomically
+    /// marks them as notified, and returns them for processing.
+    ///
+    /// Also writes terminal timestamps (completed_at/failed_at/cancelled_at) via
+    /// COALESCE. Currently these are almost always already set by get_batch()'s
+    /// lazy finalization (triggered as a side-effect of the daemon's cancellation
+    /// poller), but the finalization logic is kept here so this poller remains
+    /// self-contained and correct regardless of how callers of get_batch() change.
+    pub async fn poll_completed_batches(&self) -> Result<Vec<BatchNotification>> {
+        let rows = sqlx::query!(
+            r#"
+            -- Step 1: Find candidate batches that need notification
+            WITH candidates AS (
+                SELECT b.id,
+                       COALESCE(counts.completed, 0)::BIGINT as completed_requests,
+                       COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                       COALESCE(counts.canceled, 0)::BIGINT as canceled_requests,
+                       COALESCE(counts.pending, 0)::BIGINT as pending_requests,
+                       COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests
+                FROM batches b
+                -- Count requests by state for each batch
+                LEFT JOIN LATERAL (
+                    SELECT
+                        COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                        -- Hide retriable errors until SLA expires (expires_at <= NOW)
+                        -- so notification emails don't report failures that may still succeed
+                        CASE
+                            WHEN b.expires_at > NOW() THEN COUNT(*) FILTER (WHERE state = 'failed' AND (is_retriable_error = false OR is_retriable_error IS NULL))
+                            ELSE COUNT(*) FILTER (WHERE state = 'failed')
+                        END as failed,
+                        -- Canceled = explicitly canceled OR will be canceled (pending/in-progress with cancelling_at set)
+                        COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled,
+                        COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
+                        COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress
+                    FROM requests WHERE batch_id = b.id
+                ) counts ON TRUE
+                WHERE b.notification_sent_at IS NULL  -- Not yet notified
+                  AND b.deleted_at IS NULL            -- Not deleted
+                  AND b.cancelling_at IS NULL         -- Not canceled (don't email on user-canceled batches)
+                  AND b.total_requests > 0            -- Has requests
+                  AND (
+                      -- Already finalized by get_batch() lazy write
+                      (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL)
+                      OR
+                      -- Terminal by count: all requests are done (completed + failed = total, no cancels)
+                      (COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0) = b.total_requests)
+                  )
+            ),
+            -- Step 2: Atomically claim batches and set terminal timestamps
+            updated AS (
+                UPDATE batches b
+                SET notification_sent_at = NOW(),  -- Claim for notification (prevents duplicates)
+                    -- Set terminal timestamps via COALESCE (no-op if already set by get_batch)
+                    finalizing_at = COALESCE(b.finalizing_at, NOW()),
+                    completed_at = COALESCE(b.completed_at,
+                        CASE WHEN c.completed_requests > 0 THEN NOW() END),
+                    failed_at = COALESCE(b.failed_at,
+                        CASE WHEN c.completed_requests = 0 THEN NOW() END)
+                FROM candidates c
+                WHERE b.id = c.id
+                  AND b.notification_sent_at IS NULL  -- Re-check to handle concurrent pollers
+                RETURNING b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                          b.output_file_id, b.error_file_id, b.created_by, b.created_at,
+                          b.expires_at, b.cancelling_at, b.errors, b.total_requests,
+                          b.requests_started_at, b.finalizing_at, b.completed_at,
+                          b.failed_at, b.cancelled_at, b.deleted_at, b.notification_sent_at,
+                          c.completed_requests, c.failed_requests, c.canceled_requests,
+                          c.pending_requests, c.in_progress_requests
+            )
+            SELECT u.*,
+                   f.name as input_file_name,
+                   f.description as input_file_description,
+                   (SELECT string_agg(DISTINCT r.model, ', ') FROM requests r WHERE r.batch_id = u.id) as model
+            FROM updated u
+            LEFT JOIN files f ON f.id = u.file_id
+            "#
+        )
+        .fetch_all(self.pools.write())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to poll completed batches: {}", e))
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| BatchNotification {
+                batch: Batch {
+                    id: BatchId(row.id),
+                    file_id: row.file_id.map(FileId),
+                    endpoint: row.endpoint,
+                    completion_window: row.completion_window,
+                    metadata: row.metadata,
+                    output_file_id: row.output_file_id.map(FileId),
+                    error_file_id: row.error_file_id.map(FileId),
+                    created_by: row.created_by,
+                    created_at: row.created_at,
+                    expires_at: row.expires_at,
+                    cancelling_at: row.cancelling_at,
+                    errors: row.errors,
+                    total_requests: row.total_requests,
+                    requests_started_at: row.requests_started_at,
+                    finalizing_at: row.finalizing_at,
+                    completed_at: row.completed_at,
+                    failed_at: row.failed_at,
+                    cancelled_at: row.cancelled_at,
+                    deleted_at: row.deleted_at,
+                    notification_sent_at: row.notification_sent_at,
+                    pending_requests: row.pending_requests.unwrap_or(0),
+                    in_progress_requests: row.in_progress_requests.unwrap_or(0),
+                    completed_requests: row.completed_requests.unwrap_or(0),
+                    failed_requests: row.failed_requests.unwrap_or(0),
+                    canceled_requests: row.canceled_requests.unwrap_or(0),
+                },
+                model: row.model.unwrap_or_default(),
+                input_file_name: row.input_file_name,
+                input_file_description: row.input_file_description,
+            })
+            .collect())
     }
 
     /// Insert a batch of templates using PostgreSQL UNNEST for bulk insertion.
