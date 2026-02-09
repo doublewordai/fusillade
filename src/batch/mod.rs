@@ -423,7 +423,6 @@ pub struct Batch {
     pub notification_sent_at: Option<DateTime<Utc>>,
 }
 
-
 /// A batch with extra context for notification emails (file metadata, model names).
 /// Returned by `poll_completed_batches` which joins the files and requests tables.
 #[derive(Debug, Clone)]
