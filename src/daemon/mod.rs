@@ -652,7 +652,7 @@ where
                                 match processing.complete(storage.as_ref(), |response| {
                                     (should_retry)(response)
                                 }, cancellation).await {
-                                    Ok(RequestCompletionResult::Completed(_completed)) => {
+                                    Ok(RequestCompletionResult::Completed(completed)) => {
                                         requests_processed.fetch_add(1, Ordering::Relaxed);
                                         counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
                                         histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
@@ -662,8 +662,8 @@ where
                                             .record(retry_attempt_at_completion as f64);
 
                                         // Track requests completing after SLA
-                                        if chrono::Utc::now() > batch_expires_at {
-                                            counter!("fusillade_request_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success").increment(1);
+                                        if completed.state.completed_at > batch_expires_at {
+                                            counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success").increment(1);
                                             tracing::warn!(
                                                 request_id = %request_id,
                                                 batch_id = %batch_id,
@@ -710,8 +710,8 @@ where
                                                         .record(processing_start.elapsed().as_secs_f64());
 
                                                     // Track requests completing after SLA
-                                                    if chrono::Utc::now() > failed.state.batch_expires_at {
-                                                        counter!("fusillade_request_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                                    if failed.state.failed_at > batch_expires_at {
+                                                        counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
                                                         tracing::warn!(
                                                             request_id = %request_id,
                                                             batch_id = %batch_id,
@@ -733,8 +733,8 @@ where
                                                 .record(processing_start.elapsed().as_secs_f64());
 
                                             // Track requests completing after SLA
-                                            if chrono::Utc::now() > failed.state.batch_expires_at {
-                                                counter!("fusillade_request_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                            if failed.state.failed_at > batch_expires_at {
+                                                counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
                                                 tracing::warn!(
                                                     request_id = %request_id,
                                                     batch_id = %batch_id,
