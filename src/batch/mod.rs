@@ -423,33 +423,6 @@ pub struct Batch {
     pub notification_sent_at: Option<DateTime<Utc>>,
 }
 
-/// Outcome of a completed batch for notification purposes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchOutcome {
-    /// All requests completed successfully
-    Completed,
-    /// Some requests completed, some failed
-    PartiallyCompleted,
-    /// All requests failed
-    Failed,
-}
-
-impl Batch {
-    /// Returns the outcome of this batch, if it's terminal.
-    /// Returns None if the batch is still in progress or was canceled.
-    pub fn outcome(&self) -> Option<BatchOutcome> {
-        if self.completed_at.is_none() && self.failed_at.is_none() {
-            return None;
-        }
-        Some(if self.failed_requests == 0 {
-            BatchOutcome::Completed
-        } else if self.completed_requests == 0 {
-            BatchOutcome::Failed
-        } else {
-            BatchOutcome::PartiallyCompleted
-        })
-    }
-}
 
 /// A batch with extra context for notification emails (file metadata, model names).
 /// Returned by `poll_completed_batches` which joins the files and requests tables.
