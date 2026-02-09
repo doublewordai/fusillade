@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.1.0...fusillade-v5.2.0) (2026-02-09)
+
+
+### Features
+
+* Track when batches have been actioned/accepted as completed by the upstream. ([#120](https://github.com/doublewordai/fusillade/issues/120)) ([1cc6a14](https://github.com/doublewordai/fusillade/commit/1cc6a146ac9d9c6575530903acddac2f0d225973))
+
 ## [5.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.0.0...fusillade-v5.1.0) (2026-02-09)
 
 
