@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.0.0...fusillade-v5.1.0) (2026-02-09)
+
+
+### Features
+
+* add metric to track requests completing after SLA expiry ([#122](https://github.com/doublewordai/fusillade/issues/122)) ([b634064](https://github.com/doublewordai/fusillade/commit/b6340645925106feaac7f8c78d39d5c3e0782e8b))
+
 ## [5.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v4.1.0...fusillade-v5.0.0) (2026-02-02)
 
 
