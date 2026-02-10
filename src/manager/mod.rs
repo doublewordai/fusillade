@@ -328,6 +328,14 @@ pub trait DaemonStorage: Send + Sync {
         &self,
         status_filter: Option<DaemonStatus>,
     ) -> Result<Vec<AnyDaemonRecord>>;
+
+    /// Purge orphaned request_templates and requests whose parent (file or batch)
+    /// has been soft-deleted or whose FK is NULL.
+    ///
+    /// Deletes at most `batch_size` rows from each table per call.
+    /// Returns total rows deleted across both tables. Called periodically by
+    /// the daemon purge task for right-to-erasure compliance.
+    async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
 }
 
 /// Daemon executor trait for runtime orchestration.
