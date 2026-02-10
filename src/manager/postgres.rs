@@ -4104,8 +4104,11 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         // Step 1: Delete orphaned requests (batch_id IS NULL or parent batch soft-deleted).
         // Must run before template deletion to prevent ON DELETE SET NULL on
         // requests.template_id from corrupting live request data.
+<<<<<<< HEAD
         // FOR UPDATE SKIP LOCKED ensures multiple replicas partition work rather than
         // contending on the same rows — each replica deletes a disjoint batch.
+=======
+>>>>>>> e5e0a35 (feat: request & template deletion task)
         let requests_deleted = sqlx::query_scalar!(
             r#"
             WITH deleted AS (
@@ -4116,7 +4119,10 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
                     LEFT JOIN batches b ON r.batch_id = b.id
                     WHERE r.batch_id IS NULL OR b.deleted_at IS NOT NULL
                     LIMIT $1
+<<<<<<< HEAD
                     FOR UPDATE OF r SKIP LOCKED
+=======
+>>>>>>> e5e0a35 (feat: request & template deletion task)
                 )
                 RETURNING id
             )
@@ -4129,12 +4135,17 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge orphaned requests: {}", e)))?;
 
         // Step 2: Delete orphaned request_templates (file_id IS NULL or parent file soft-deleted).
+<<<<<<< HEAD
         // Note: delete_file already cancels dependent batches and unlinks them (sets
         // file_id = NULL on batches) without deleting the batches or their requests,
         // so users can still download results. Deleting templates will SET NULL on
         // requests.template_id via the FK, which is fine — requests are self-contained
         // once created (all template data is copied at claim time).
         // FOR UPDATE SKIP LOCKED for replica-safe parallel purging (same as step 1).
+=======
+        // Safety guard: NOT EXISTS ensures we only delete templates with no active request
+        // references, preventing ON DELETE SET NULL from nulling template_id on live requests.
+>>>>>>> e5e0a35 (feat: request & template deletion task)
         let templates_deleted = sqlx::query_scalar!(
             r#"
             WITH deleted AS (
@@ -4143,9 +4154,20 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
                     SELECT rt.id
                     FROM request_templates rt
                     LEFT JOIN files f ON rt.file_id = f.id
+<<<<<<< HEAD
                     WHERE rt.file_id IS NULL OR f.deleted_at IS NOT NULL
                     LIMIT $1
                     FOR UPDATE OF rt SKIP LOCKED
+=======
+                    WHERE (rt.file_id IS NULL OR f.deleted_at IS NOT NULL)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM requests r
+                        JOIN batches b ON r.batch_id = b.id
+                        WHERE r.template_id = rt.id
+                        AND b.deleted_at IS NULL
+                    )
+                    LIMIT $1
+>>>>>>> e5e0a35 (feat: request & template deletion task)
                 )
                 RETURNING id
             )
@@ -8664,6 +8686,7 @@ mod tests {
         let deleted_fifth = manager.purge_orphaned_rows(3).await.unwrap();
         assert_eq!(deleted_fifth, 0, "Nothing left to purge");
     }
+<<<<<<< HEAD
 
     #[sqlx::test]
     async fn test_purge_deletes_templates_after_file_delete_without_waiting_for_batch(
@@ -8837,4 +8860,6 @@ mod tests {
             "Should delete all 5 requests + 5 templates"
         );
     }
+=======
+>>>>>>> e5e0a35 (feat: request & template deletion task)
 }
