@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.2.1](https://github.com/doublewordai/fusillade/compare/fusillade-v5.2.0...fusillade-v5.2.1) (2026-02-10)
+
+
+### Bug Fixes
+
+* ensure we don't notify on existing batches ([#128](https://github.com/doublewordai/fusillade/issues/128)) ([33419a5](https://github.com/doublewordai/fusillade/commit/33419a558f0bef81bd269f7ebb562ff7fd93df10))
+
 ## [5.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.1.0...fusillade-v5.2.0) (2026-02-09)
 
 
