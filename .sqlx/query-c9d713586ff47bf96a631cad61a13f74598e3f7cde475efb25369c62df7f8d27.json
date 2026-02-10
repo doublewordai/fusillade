@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH deleted AS (\n                DELETE FROM request_templates\n                WHERE id IN (\n                    SELECT rt.id\n                    FROM request_templates rt\n                    LEFT JOIN files f ON rt.file_id = f.id\n                    WHERE (rt.file_id IS NULL OR f.deleted_at IS NOT NULL)\n                    AND NOT EXISTS (\n                        SELECT 1 FROM requests r\n                        JOIN batches b ON r.batch_id = b.id\n                        WHERE r.template_id = rt.id\n                        AND b.deleted_at IS NULL\n                    )\n                    LIMIT $1\n                )\n                RETURNING id\n            )\n            SELECT count(*) as \"count!\" FROM deleted\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "c9d713586ff47bf96a631cad61a13f74598e3f7cde475efb25369c62df7f8d27"
+}
