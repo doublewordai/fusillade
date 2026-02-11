@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE requests SET\n                        state = 'failed',\n                        retry_attempt = $2,\n                        error = $3,\n                        failed_at = $4,\n                        response_size = $5,\n                        routed_model = $6\n                    WHERE id = $1\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Text",
+        "Timestamptz",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1da4f494a594001b92a52264a70f0b69ac7eb52a3919f78979d20affd4a38b44"
+}
