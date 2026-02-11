@@ -1,5 +1,26 @@
 # Changelog
 
+## [5.2.1](https://github.com/doublewordai/fusillade/compare/fusillade-v5.2.0...fusillade-v5.2.1) (2026-02-10)
+
+
+### Bug Fixes
+
+* ensure we don't notify on existing batches ([#128](https://github.com/doublewordai/fusillade/issues/128)) ([33419a5](https://github.com/doublewordai/fusillade/commit/33419a558f0bef81bd269f7ebb562ff7fd93df10))
+
+## [5.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.1.0...fusillade-v5.2.0) (2026-02-09)
+
+
+### Features
+
+* Track when batches have been actioned/accepted as completed by the upstream. ([#120](https://github.com/doublewordai/fusillade/issues/120)) ([1cc6a14](https://github.com/doublewordai/fusillade/commit/1cc6a146ac9d9c6575530903acddac2f0d225973))
+
+## [5.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.0.0...fusillade-v5.1.0) (2026-02-09)
+
+
+### Features
+
+* add metric to track requests completing after SLA expiry ([#122](https://github.com/doublewordai/fusillade/issues/122)) ([b634064](https://github.com/doublewordai/fusillade/commit/b6340645925106feaac7f8c78d39d5c3e0782e8b))
+
 ## [5.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v4.1.0...fusillade-v5.0.0) (2026-02-02)
 
 

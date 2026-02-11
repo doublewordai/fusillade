@@ -676,6 +676,8 @@ where
 
                                 // Capture retry attempt count before completion (not preserved in Completed state)
                                 let retry_attempt_at_completion = processing.state.retry_attempt;
+                                // Capture batch expiry time for SLA missed completion tracking
+                                let batch_expires_at = processing.state.batch_expires_at;
 
                                 let cancellation = async {
                                     tokio::select! {
@@ -692,7 +694,7 @@ where
                                 match processing.complete(storage.as_ref(), |response| {
                                     (should_retry)(response)
                                 }, cancellation).await {
-                                    Ok(RequestCompletionResult::Completed(_completed)) => {
+                                    Ok(RequestCompletionResult::Completed(completed)) => {
                                         requests_processed.fetch_add(1, Ordering::Relaxed);
                                         counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
                                         histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
@@ -700,6 +702,17 @@ where
                                         // Record how many retries it took to succeed (0 = first attempt succeeded)
                                         histogram!("fusillade_retry_attempts_on_success", "model" => model_clone.clone())
                                             .record(retry_attempt_at_completion as f64);
+
+                                        // Track requests completing after SLA
+                                        if completed.state.completed_at > batch_expires_at {
+                                            counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success").increment(1);
+                                            tracing::warn!(
+                                                request_id = %request_id,
+                                                batch_id = %batch_id,
+                                                "Request completed successfully after SLA"
+                                            );
+                                        }
+
                                         tracing::info!(request_id = %request_id, retry_attempts = retry_attempt_at_completion, "Request completed successfully");
                                     }
                                     Ok(RequestCompletionResult::Failed(failed)) => {
@@ -737,6 +750,17 @@ where
                                                     counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
                                                     histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                                         .record(processing_start.elapsed().as_secs_f64());
+
+                                                    // Track requests completing after SLA
+                                                    if failed.state.failed_at > batch_expires_at {
+                                                        counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                                        tracing::warn!(
+                                                            request_id = %request_id,
+                                                            batch_id = %batch_id,
+                                                            "Request failed permanently after SLA"
+                                                        );
+                                                    }
+
                                                     tracing::warn!(
                                                         request_id = %request_id,
                                                         retry_attempt,
@@ -749,6 +773,17 @@ where
                                             counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
                                             histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                                 .record(processing_start.elapsed().as_secs_f64());
+
+                                            // Track requests completing after SLA
+                                            if failed.state.failed_at > batch_expires_at {
+                                                counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                                tracing::warn!(
+                                                    request_id = %request_id,
+                                                    batch_id = %batch_id,
+                                                    "Request failed with non-retriable error after SLA"
+                                                );
+                                            }
+
                                             tracing::warn!(
                                                 request_id = %request_id,
                                                 error = %failed.state.reason.to_error_message(),
