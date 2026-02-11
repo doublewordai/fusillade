@@ -485,13 +485,12 @@ where
                                     // Lazy finalization happens as side effect of get_batch()
 
                                     // Check if batch is being cancelled
-                                    if batch.cancelling_at.is_some() {
-                                        if let Some(entry) = cancellation_tokens.get(&batch_id) {
+                                    if batch.cancelling_at.is_some()
+                                        && let Some(entry) = cancellation_tokens.get(&batch_id) {
                                             entry.value().cancel();
                                             tracing::info!(batch_id = %batch_id, "Cancelled all requests in batch");
                                             drop(entry);
                                             cancellation_tokens.remove(&batch_id);
-                                        }
                                     }
                                 }
                                 Err(e) => {

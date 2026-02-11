@@ -1087,9 +1087,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 let response_size = calculate_error_message_size(&error_json)
                     .ok_or_else(|| FusilladeError::Other(anyhow!("Error message too large")))?;
 
-                // Determine if this is a retriable error
-                let is_retriable_error = req.state.reason.is_retriable();
-
                 let rows_affected = sqlx::query!(
                     r#"
                     UPDATE requests SET
@@ -1098,8 +1095,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         error = $3,
                         failed_at = $4,
                         response_size = $5,
-                        routed_model = $6,
-                        is_retriable_error = $7
+                        routed_model = $6
                     WHERE id = $1
                     "#,
                     *req.data.id as Uuid,
@@ -1108,7 +1104,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     req.state.failed_at,
                     response_size,
                     req.state.routed_model,
-                    is_retriable_error,
                 )
                 .execute(self.pools.write())
                 .await
@@ -3235,7 +3230,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         .fetch_one(&pool)
         .await;
 
-        let (batch_id, expires_at) = match batch_result {
+        let (batch_id, _expires_at) = match batch_result {
             Ok(row) => (row.id, row.expires_at),
             Err(e) => {
                 let _ = tx
@@ -3357,7 +3352,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         // First, get the file_id and expires_at from the batch
         // This allows us to query by file_id to avoid duplicates from SLA escalation
         // and to check if we should filter retriable errors
-        let (file_id, expires_at) = match sqlx::query!(
+        let (file_id, _expires_at) = match sqlx::query!(
             r#"SELECT file_id, expires_at FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
             *batch_id as Uuid,
         )
