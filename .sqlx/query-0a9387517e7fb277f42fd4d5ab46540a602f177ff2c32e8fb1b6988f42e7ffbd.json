@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH deleted AS (\n                DELETE FROM request_templates\n                WHERE id IN (\n                    SELECT rt.id\n                    FROM request_templates rt\n                    LEFT JOIN files f ON rt.file_id = f.id\n                    WHERE rt.file_id IS NULL OR f.deleted_at IS NOT NULL\n                    LIMIT $1\n                    FOR UPDATE OF rt SKIP LOCKED\n                )\n                RETURNING id\n            )\n            SELECT count(*) as \"count!\" FROM deleted\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "0a9387517e7fb277f42fd4d5ab46540a602f177ff2c32e8fb1b6988f42e7ffbd"
+}

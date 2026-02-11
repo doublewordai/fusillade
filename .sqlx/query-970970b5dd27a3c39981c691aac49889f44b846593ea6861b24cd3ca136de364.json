@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH deleted AS (\n                DELETE FROM requests\n                WHERE id IN (\n                    SELECT r.id\n                    FROM requests r\n                    LEFT JOIN batches b ON r.batch_id = b.id\n                    WHERE r.batch_id IS NULL OR b.deleted_at IS NOT NULL\n                    LIMIT $1\n                    FOR UPDATE OF r SKIP LOCKED\n                )\n                RETURNING id\n            )\n            SELECT count(*) as \"count!\" FROM deleted\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "970970b5dd27a3c39981c691aac49889f44b846593ea6861b24cd3ca136de364"
+}

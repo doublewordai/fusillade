@@ -152,6 +152,22 @@ pub struct DaemonConfig {
     ///   - x-fusillade-batch-endpoint
     #[serde(default = "default_batch_metadata_fields")]
     pub batch_metadata_fields: Vec<String>,
+
+    /// Interval for running the orphaned row purge task (milliseconds).
+    /// Deletes orphaned request_templates and requests whose parent file/batch
+    /// has been soft-deleted, for right-to-erasure compliance.
+    /// Set to 0 to disable purging. Default: 3,600,000 (1 hour).
+    pub purge_interval_ms: u64,
+
+    /// Maximum number of orphaned rows to delete per purge iteration.
+    /// Each iteration deletes up to this many requests and this many request_templates.
+    /// Default: 1000.
+    pub purge_batch_size: i64,
+
+    /// Throttle delay between consecutive purge batches within a single drain
+    /// cycle (milliseconds). Prevents sustained high DB load when many orphans
+    /// exist. Default: 100.
+    pub purge_throttle_ms: u64,
 }
 
 fn default_batch_metadata_fields() -> Vec<String> {
@@ -185,6 +201,9 @@ impl Default for DaemonConfig {
             unclaim_batch_size: 100,             // Unclaim up to 100 stale requests per poll
             cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
             batch_metadata_fields: default_batch_metadata_fields(),
+            purge_interval_ms: 600_000, // 10 minutes
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         }
     }
 }
@@ -468,6 +487,57 @@ where
                 }
             }
         });
+
+        // Spawn periodic purge task for orphaned rows (right-to-erasure compliance)
+        if self.config.purge_interval_ms > 0 {
+            let storage = self.storage.clone();
+            let shutdown_token = self.shutdown_token.clone();
+            let purge_interval_ms = self.config.purge_interval_ms;
+            let purge_batch_size = self.config.purge_batch_size;
+            let purge_throttle_ms = self.config.purge_throttle_ms;
+
+            tokio::spawn(async move {
+                tracing::info!(
+                    interval_ms = purge_interval_ms,
+                    batch_size = purge_batch_size,
+                    throttle_ms = purge_throttle_ms,
+                    "Orphaned row purge task started"
+                );
+
+                loop {
+                    // Sleep for the configured interval (interruptible by shutdown)
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(purge_interval_ms)) => {},
+                        _ = shutdown_token.cancelled() => {
+                            tracing::info!("Shutting down purge task");
+                            break;
+                        }
+                    }
+
+                    // Drain orphaned rows in batches
+                    loop {
+                        match storage.purge_orphaned_rows(purge_batch_size).await {
+                            Ok(0) => break,
+                            Ok(deleted) => {
+                                tracing::debug!(deleted, "Purged orphaned rows");
+                                // Throttle between batches to avoid sustained DB load
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_millis(purge_throttle_ms)) => {},
+                                    _ = shutdown_token.cancelled() => {
+                                        tracing::info!("Shutting down purge task during drain");
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to purge orphaned rows");
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
@@ -845,6 +915,9 @@ mod tests {
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            purge_interval_ms: 0,               // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -1013,6 +1086,9 @@ mod tests {
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            purge_interval_ms: 0,               // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -1239,6 +1315,9 @@ mod tests {
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            purge_interval_ms: 0,               // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -1374,6 +1453,9 @@ mod tests {
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
+            purge_interval_ms: 0,               // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -1544,6 +1626,9 @@ mod tests {
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
+            purge_interval_ms: 0, // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -1698,6 +1783,9 @@ mod tests {
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
+            purge_interval_ms: 0, // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -1857,6 +1945,9 @@ mod tests {
                 "completion_window".to_string(),
             ],
             cancellation_poll_interval_ms: 100,
+            purge_interval_ms: 0, // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -2011,6 +2102,9 @@ mod tests {
                 "request_source".to_string(), // This comes from metadata JSON
             ],
             cancellation_poll_interval_ms: 100,
+            purge_interval_ms: 0, // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
