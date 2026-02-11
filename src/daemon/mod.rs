@@ -98,14 +98,14 @@ pub struct DaemonConfig {
     /// Maximum number of retry attempts before giving up.
     pub max_retries: Option<u32>,
 
-    /// Stop retrying this many milliseconds before the batch expires.
+    /// Stop retrying (including escalations) this many milliseconds before the batch expires.
     ///
     /// - **Negative** (e.g., -300000 = -5 min): Retry for a buffer window AFTER SLA deadline (recommended)
     /// - **Zero**: Stop exactly at SLA deadline
-    /// - **Positive**: Stop BEFORE SLA deadline (creates dead requests, avoid!)
+    /// - **Positive**: Stop BEFORE SLA deadline (terminates retryable errors within the SLA deadline, avoid!)
     /// - **None**: No deadline awareness
     ///
-    /// Default: -300000 (retry 5 min past expiry to maximize completion chances)
+    /// Default: 0 (stop retrying/escalating on SLA deadline)
     pub stop_before_deadline_ms: Option<i64>,
 
     /// Base backoff duration in milliseconds (will be exponentially increased)
@@ -196,7 +196,7 @@ impl Default for DaemonConfig {
             model_escalations: default_model_escalations(),
             claim_interval_ms: 1000,
             max_retries: Some(1000),
-            stop_before_deadline_ms: Some(900_000),
+            stop_before_deadline_ms: Some(0),
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
