@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.3.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.2.1...fusillade-v5.3.0) (2026-02-11)
+
+
+### Features
+
+* periodic purge of orphaned request_templates and requests ([#127](https://github.com/doublewordai/fusillade/issues/127)) ([4ecda5f](https://github.com/doublewordai/fusillade/commit/4ecda5f6b8bddd05a613d2b0d92898ffcfd37a0e))
+
 ## [5.2.1](https://github.com/doublewordai/fusillade/compare/fusillade-v5.2.0...fusillade-v5.2.1) (2026-02-10)
 
 
