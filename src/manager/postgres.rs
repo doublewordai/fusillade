@@ -4104,6 +4104,8 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         // Step 1: Delete orphaned requests (batch_id IS NULL or parent batch soft-deleted).
         // Must run before template deletion to prevent ON DELETE SET NULL on
         // requests.template_id from corrupting live request data.
+        // FOR UPDATE SKIP LOCKED ensures multiple replicas partition work rather than
+        // contending on the same rows — each replica deletes a disjoint batch.
         let requests_deleted = sqlx::query_scalar!(
             r#"
             WITH deleted AS (
@@ -4114,6 +4116,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
                     LEFT JOIN batches b ON r.batch_id = b.id
                     WHERE r.batch_id IS NULL OR b.deleted_at IS NOT NULL
                     LIMIT $1
+                    FOR UPDATE OF r SKIP LOCKED
                 )
                 RETURNING id
             )
@@ -4128,6 +4131,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         // Step 2: Delete orphaned request_templates (file_id IS NULL or parent file soft-deleted).
         // Safety guard: NOT EXISTS ensures we only delete templates with no active request
         // references, preventing ON DELETE SET NULL from nulling template_id on live requests.
+        // FOR UPDATE SKIP LOCKED for replica-safe parallel purging (same as step 1).
         let templates_deleted = sqlx::query_scalar!(
             r#"
             WITH deleted AS (
@@ -4144,6 +4148,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
                         AND b.deleted_at IS NULL
                     )
                     LIMIT $1
+                    FOR UPDATE OF rt SKIP LOCKED
                 )
                 RETURNING id
             )
