@@ -42,17 +42,18 @@ DELETE FROM request_templates WHERE id IN (
     SELECT rt.id
     FROM request_templates rt
     LEFT JOIN files f ON rt.file_id = f.id
-    WHERE (rt.file_id IS NULL OR f.deleted_at IS NOT NULL)
-    AND NOT EXISTS (
-        SELECT 1 FROM requests r
-        JOIN batches b ON r.batch_id = b.id
-        WHERE r.template_id = rt.id
-        AND b.deleted_at IS NULL
-    )
+    WHERE rt.file_id IS NULL OR f.deleted_at IS NOT NULL
     LIMIT $1
     FOR UPDATE OF rt SKIP LOCKED  -- added
 )
 ```
+
+No `NOT EXISTS` guard is needed — `delete_file` already cancels dependent
+batches and unlinks them (`file_id = NULL` on batches) without deleting the
+batches or their requests, so users can still download results. Deleting
+templates triggers `ON DELETE SET NULL` on `requests.template_id`, which is
+harmless since requests are self-contained once created (all template data is
+copied at claim time).
 
 ### Behavior
 
@@ -107,6 +108,60 @@ The daemon's drain loop already limits purge throughput:
 
 These controls prevent any single replica from generating sustained DB load,
 and `SKIP LOCKED` ensures multiple replicas don't duplicate the same work.
+
+## Safety: File Deletion, Purging, and Claiming
+
+### No requests are claimed after their file is deleted
+
+`delete_file` runs as a **single atomic transaction** that:
+
+1. Sets `cancelling_at` on all non-terminal batches for the file
+2. Clears `output_file_id` / `error_file_id` references on batches
+3. Soft-deletes the file (`deleted_at = NOW()`)
+
+All three steps commit together. The claim query filters
+`WHERE b.cancelling_at IS NULL`, so once the transaction commits, no daemon
+can claim requests from those batches. The purge task only sees
+`f.deleted_at IS NOT NULL` *after* the same transaction has committed, so
+there is no window where templates could be purged before the batch is marked
+as cancelled.
+
+Ordering guarantee:
+
+```
+1. delete_file commits
+   → batches.cancelling_at set, files.deleted_at set (atomic)
+
+2. claim_requests sees cancelling_at
+   → stops claiming requests from those batches (immediate)
+
+3. Purge task (hours later) sees deleted_at
+   → deletes orphaned templates
+```
+
+### Batch results remain downloadable after file deletion
+
+`delete_file` cancels batches and sets `file_id = NULL` on them, but does
+**not** delete batches or their requests. This means:
+
+- **Batch is still queryable** — `get_batch()` returns the batch (cancelled,
+  `file_id = NULL`)
+- **Output file stream works** — `stream_batch_output` queries `requests`
+  directly by `batch_id` with no template join, so completed results are
+  fully accessible
+- **Error file stream works** — `stream_batch_error` also queries `requests`
+  directly by `batch_id`
+- **Input file is inaccessible** — `get_file_content_stream` checks
+  `WHERE deleted_at IS NULL`, so the soft-deleted input file returns an error
+- **Batch results stream is empty** — `stream_batch_results` joins on
+  `request_templates` (for the merged input+output view), which returns no
+  rows after templates are purged. This is expected — the input data has been
+  erased per the deletion request
+
+Template deletion triggers `ON DELETE SET NULL` on `requests.template_id`.
+This is harmless because requests are self-contained once created — all
+template data (endpoint, method, path, body, model, api_key) is copied onto
+the request row at claim time.
 
 ## Alternative Considered: Leader Election
 

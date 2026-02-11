@@ -4129,8 +4129,11 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge orphaned requests: {}", e)))?;
 
         // Step 2: Delete orphaned request_templates (file_id IS NULL or parent file soft-deleted).
-        // Safety guard: NOT EXISTS ensures we only delete templates with no active request
-        // references, preventing ON DELETE SET NULL from nulling template_id on live requests.
+        // Note: delete_file already cancels dependent batches and unlinks them (sets
+        // file_id = NULL on batches) without deleting the batches or their requests,
+        // so users can still download results. Deleting templates will SET NULL on
+        // requests.template_id via the FK, which is fine — requests are self-contained
+        // once created (all template data is copied at claim time).
         // FOR UPDATE SKIP LOCKED for replica-safe parallel purging (same as step 1).
         let templates_deleted = sqlx::query_scalar!(
             r#"
@@ -4140,13 +4143,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
                     SELECT rt.id
                     FROM request_templates rt
                     LEFT JOIN files f ON rt.file_id = f.id
-                    WHERE (rt.file_id IS NULL OR f.deleted_at IS NOT NULL)
-                    AND NOT EXISTS (
-                        SELECT 1 FROM requests r
-                        JOIN batches b ON r.batch_id = b.id
-                        WHERE r.template_id = rt.id
-                        AND b.deleted_at IS NULL
-                    )
+                    WHERE rt.file_id IS NULL OR f.deleted_at IS NOT NULL
                     LIMIT $1
                     FOR UPDATE OF rt SKIP LOCKED
                 )
@@ -8666,5 +8663,178 @@ mod tests {
 
         let deleted_fifth = manager.purge_orphaned_rows(3).await.unwrap();
         assert_eq!(deleted_fifth, 0, "Nothing left to purge");
+    }
+
+    #[sqlx::test]
+    async fn test_purge_deletes_templates_after_file_delete_without_waiting_for_batch(
+        pool: sqlx::PgPool,
+    ) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a file with a template
+        let file_id = manager
+            .create_file(
+                "purge-safety-guard-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"n":1}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Create a batch (spawns 1 request referencing the template)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Soft-delete the file — cancels the batch but does NOT delete it
+        manager.delete_file(file_id).await.unwrap();
+
+        // Purge should delete templates immediately even though requests still
+        // reference them — requests are self-contained (template data is copied
+        // at claim time) so ON DELETE SET NULL on template_id is harmless
+        let deleted = manager.purge_orphaned_rows(1000).await.unwrap();
+        assert!(deleted >= 1, "Should delete orphaned templates");
+
+        // Verify templates are gone
+        let template_count: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM request_templates WHERE file_id = $1",
+            *file_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(template_count, 0);
+
+        // Verify batch still exists and is queryable (user can download results)
+        // delete_file cancels the batch and unlinks it (file_id = NULL) but does
+        // NOT delete the batch or its requests
+        let batch_after = manager.get_batch(batch.id, false).await.unwrap();
+        assert!(
+            batch_after.cancelling_at.is_some(),
+            "Batch should be cancelled"
+        );
+        assert_eq!(
+            batch_after.file_id, None,
+            "Batch file_id should be NULL after file deletion"
+        );
+
+        // Verify requests still exist with template_id set to NULL by ON DELETE SET NULL
+        // Requests are self-contained — response_body, error, status etc. are all on
+        // the request row, so output/error file streams (which query requests directly
+        // by batch_id) remain fully functional
+        let request_count: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM requests WHERE batch_id = $1",
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(request_count, 1, "Request should still exist");
+
+        let null_template_count: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM requests WHERE batch_id = $1 AND template_id IS NULL",
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            null_template_count, 1,
+            "Request template_id should be NULL after template deletion"
+        );
+
+        // Verify input file is no longer accessible (soft-deleted)
+        let input_file = manager.get_file(file_id).await;
+        assert!(
+            input_file.is_err(),
+            "Input file should not be accessible after deletion"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_purge_batch_size_applies_independently_to_requests_and_templates(
+        pool: sqlx::PgPool,
+    ) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a file with 5 templates
+        let templates: Vec<RequestTemplateInput> = (0..5)
+            .map(|i| RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: format!(r#"{{"n":{}}}"#, i),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file("purge-independent-limit-test".to_string(), None, templates)
+            .await
+            .unwrap();
+
+        // Create a batch (spawns 5 requests)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Soft-delete both file and batch to orphan everything
+        manager.delete_batch(batch.id).await.unwrap();
+        manager.delete_file(file_id).await.unwrap();
+
+        // Purge with batch_size=3: should delete up to 3 requests AND up to 3 templates
+        // independently (i.e. total can be up to 6, not capped at 3 across both)
+        let deleted = manager.purge_orphaned_rows(3).await.unwrap();
+        assert!(
+            deleted > 3,
+            "batch_size should apply independently: expected >3, got {}",
+            deleted
+        );
+
+        // Drain remaining
+        let mut total_deleted = deleted;
+        loop {
+            let d = manager.purge_orphaned_rows(3).await.unwrap();
+            if d == 0 {
+                break;
+            }
+            total_deleted += d;
+        }
+        assert_eq!(
+            total_deleted, 10,
+            "Should delete all 5 requests + 5 templates"
+        );
     }
 }
