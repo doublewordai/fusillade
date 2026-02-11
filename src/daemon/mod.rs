@@ -201,7 +201,7 @@ impl Default for DaemonConfig {
             unclaim_batch_size: 100,             // Unclaim up to 100 stale requests per poll
             cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
             batch_metadata_fields: default_batch_metadata_fields(),
-            purge_interval_ms: 3_600_000, // 1 hour
+            purge_interval_ms: 600_000, // 10 minutes
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
         }
