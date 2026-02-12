@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH candidates AS (\n                SELECT id FROM requests WHERE batch_id IS NULL\n                UNION ALL\n                SELECT r.id FROM requests r\n                JOIN batches b ON r.batch_id = b.id\n                WHERE b.deleted_at IS NOT NULL\n            ),\n            deleted AS (\n                DELETE FROM requests\n                WHERE id IN (\n                    SELECT id FROM candidates LIMIT $1 FOR UPDATE SKIP LOCKED\n                )\n                RETURNING id\n            )\n            SELECT count(*) as \"count!\" FROM deleted\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "5b333fe5c94be34364796e35f58200ba2e2c9eb289f6926f8dd83b4be8015ea3"
+}
