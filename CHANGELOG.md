@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.3.1](https://github.com/doublewordai/fusillade/compare/fusillade-v5.3.0...fusillade-v5.3.1) (2026-02-12)
+
+
+### Bug Fixes
+
+* Purge query optimisation ([#132](https://github.com/doublewordai/fusillade/issues/132)) ([76f256b](https://github.com/doublewordai/fusillade/commit/76f256b275bf5a3b142b752db2a2e2bce8450c07))
+
 ## [5.3.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.2.1...fusillade-v5.3.0) (2026-02-11)
 
 
