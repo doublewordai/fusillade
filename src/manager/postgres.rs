@@ -4104,25 +4104,22 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         // Step 1: Delete orphaned requests (batch_id IS NULL or parent batch soft-deleted).
         // Must run before template deletion to prevent ON DELETE SET NULL on
         // requests.template_id from corrupting live request data.
-<<<<<<< HEAD
-        // FOR UPDATE SKIP LOCKED ensures multiple replicas partition work rather than
-        // contending on the same rows — each replica deletes a disjoint batch.
-=======
->>>>>>> e5e0a35 (feat: request & template deletion task)
+        // Uses UNION ALL to avoid LEFT JOIN scan — each branch targets a specific
+        // index path. FOR UPDATE SKIP LOCKED ensures multiple replicas partition
+        // work rather than contending on the same rows.
         let requests_deleted = sqlx::query_scalar!(
             r#"
-            WITH deleted AS (
+            WITH candidates AS (
+                SELECT id FROM requests WHERE batch_id IS NULL
+                UNION ALL
+                SELECT r.id FROM requests r
+                JOIN batches b ON r.batch_id = b.id
+                WHERE b.deleted_at IS NOT NULL
+            ),
+            deleted AS (
                 DELETE FROM requests
                 WHERE id IN (
-                    SELECT r.id
-                    FROM requests r
-                    LEFT JOIN batches b ON r.batch_id = b.id
-                    WHERE r.batch_id IS NULL OR b.deleted_at IS NOT NULL
-                    LIMIT $1
-<<<<<<< HEAD
-                    FOR UPDATE OF r SKIP LOCKED
-=======
->>>>>>> e5e0a35 (feat: request & template deletion task)
+                    SELECT id FROM candidates LIMIT $1 FOR UPDATE SKIP LOCKED
                 )
                 RETURNING id
             )
@@ -4140,18 +4137,20 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         // so users can still download results. Deleting templates will SET NULL on
         // requests.template_id via the FK, which is fine — requests are self-contained
         // once created (all template data is copied at claim time).
-        // FOR UPDATE SKIP LOCKED for replica-safe parallel purging (same as step 1).
+        // Same UNION ALL + FOR UPDATE SKIP LOCKED pattern as step 1.
         let templates_deleted = sqlx::query_scalar!(
             r#"
-            WITH deleted AS (
+            WITH candidates AS (
+                SELECT id FROM request_templates WHERE file_id IS NULL
+                UNION ALL
+                SELECT rt.id FROM request_templates rt
+                JOIN files f ON rt.file_id = f.id
+                WHERE f.deleted_at IS NOT NULL
+            ),
+            deleted AS (
                 DELETE FROM request_templates
                 WHERE id IN (
-                    SELECT rt.id
-                    FROM request_templates rt
-                    LEFT JOIN files f ON rt.file_id = f.id
-                    WHERE rt.file_id IS NULL OR f.deleted_at IS NOT NULL
-                    LIMIT $1
-                    FOR UPDATE OF rt SKIP LOCKED
+                    SELECT id FROM candidates LIMIT $1 FOR UPDATE SKIP LOCKED
                 )
                 RETURNING id
             )
@@ -8670,7 +8669,6 @@ mod tests {
         let deleted_fifth = manager.purge_orphaned_rows(3).await.unwrap();
         assert_eq!(deleted_fifth, 0, "Nothing left to purge");
     }
-<<<<<<< HEAD
 
     #[sqlx::test]
     async fn test_purge_deletes_templates_after_file_delete_without_waiting_for_batch(
@@ -8844,6 +8842,4 @@ mod tests {
             "Should delete all 5 requests + 5 templates"
         );
     }
-=======
->>>>>>> e5e0a35 (feat: request & template deletion task)
 }
