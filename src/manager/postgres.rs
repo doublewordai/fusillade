@@ -297,10 +297,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     async fn unclaim_stale_requests(&self) -> Result<usize> {
         let claim_timeout_ms = self.config.claim_timeout_ms as i64;
         let processing_timeout_ms = self.config.processing_timeout_ms as i64;
+        let stale_daemon_threshold_ms = self.config.stale_daemon_threshold_ms as i64;
         let limit = self.config.unclaim_batch_size as i64;
 
         // Unclaim requests that are stuck in claimed or processing states.
-        // Uses a subquery with LIMIT to bound the number of rows updated per poll cycle.
+        // Three reclaim paths, from fastest to slowest:
+        //   1. Daemon marked itself dead (graceful shutdown) — immediate
+        //   2. Daemon's heartbeat went stale (SIGKILL/OOM) — stale_daemon_threshold_ms
+        //   3. Time-based fallback (any cause) — claim_timeout_ms / processing_timeout_ms
+        //
+        // Uses UNION (not OR) so the planner can optimize each branch independently.
+        // With OR, Postgres falls into a bitmap heap scan of all in-progress rows (~50K)
+        // to evaluate the EXISTS subquery. With UNION, each branch uses its optimal
+        // index scan: ~4ms total vs ~1s with OR on a 14.5M row table.
         let result = sqlx::query!(
             r#"
             UPDATE requests
@@ -310,16 +319,30 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 claimed_at = NULL,
                 started_at = NULL
             WHERE id IN (
-                SELECT id FROM requests
-                WHERE
-                    (state = 'claimed' AND claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL)
-                    OR
-                    (state = 'processing' AND started_at < NOW() - ($2 || ' milliseconds')::INTERVAL)
-                LIMIT $3
+                SELECT id FROM (
+                    -- Time-based fallback: request stuck too long regardless of daemon state
+                    SELECT r.id FROM requests r
+                    WHERE
+                        (r.state = 'claimed' AND r.claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL)
+                        OR
+                        (r.state = 'processing' AND r.started_at < NOW() - ($2 || ' milliseconds')::INTERVAL)
+                    UNION
+                    -- Daemon-aware reclaim: daemon is dead or its heartbeat went stale
+                    SELECT r.id FROM requests r
+                    WHERE
+                        r.state IN ('claimed', 'processing')
+                        AND r.daemon_id IN (
+                            SELECT d.id FROM daemons d
+                            WHERE d.status = 'dead'
+                               OR d.last_heartbeat < NOW() - ($3 || ' milliseconds')::INTERVAL
+                        )
+                ) sub
+                LIMIT $4
             )
             "#,
             claim_timeout_ms.to_string(),
             processing_timeout_ms.to_string(),
+            stale_daemon_threshold_ms.to_string(),
             limit,
         )
         .execute(self.pools.write())
@@ -333,7 +356,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 count = count,
                 claim_timeout_ms,
                 processing_timeout_ms,
-                "Unclaimed stale requests (likely due to daemon crash)"
+                stale_daemon_threshold_ms,
+                "Unclaimed stale requests (likely due to daemon crash or shutdown)"
             );
         }
 
@@ -5605,6 +5629,313 @@ mod tests {
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].data.id, request_id);
         assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
+    }
+
+    #[sqlx::test]
+    async fn test_unclaim_requests_from_dead_daemon(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Long time-based timeouts so only the daemon-aware path triggers
+        let config = crate::daemon::DaemonConfig {
+            claim_timeout_ms: 600000,
+            processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 1000, // 1 second for testing
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client,
+            )
+            .with_config(config),
+        );
+
+        // Create a file and batch
+        let file_id = manager
+            .create_file(
+                "dead-daemon-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Register daemon1 and mark it dead (simulating graceful shutdown)
+        let daemon1_id = DaemonId::from(Uuid::new_v4());
+        let daemon1 = DaemonRecord {
+            data: DaemonData {
+                id: daemon1_id,
+                hostname: "test-host".to_string(),
+                pid: 1234,
+                version: "test".to_string(),
+                config_snapshot: serde_json::json!({}),
+            },
+            state: Dead {
+                started_at: Utc::now() - chrono::Duration::minutes(10),
+                stopped_at: Utc::now(),
+                final_stats: DaemonStats::default(),
+            },
+        };
+        manager.persist_daemon(&daemon1).await.unwrap();
+
+        // Claim request as daemon1, then set to processing
+        let claimed = manager
+            .claim_requests(1, daemon1_id, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let request_id = claimed[0].data.id;
+
+        sqlx::query!(
+            "UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1",
+            *request_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Verify request is in processing
+        let status = manager.get_batch_status(batch.id, false).await.unwrap();
+        assert_eq!(status.in_progress_requests, 1);
+
+        // Daemon2 claims — should reclaim daemon1's request because daemon1 is dead
+        let daemon2_id = DaemonId::from(Uuid::new_v4());
+        let reclaimed = manager
+            .claim_requests(1, daemon2_id, &Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].data.id, request_id);
+        assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
+    }
+
+    #[sqlx::test]
+    async fn test_unclaim_requests_from_stale_heartbeat_daemon(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Long time-based timeouts so only the daemon-aware path triggers
+        let config = crate::daemon::DaemonConfig {
+            claim_timeout_ms: 600000,
+            processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 1000, // 1 second for testing
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client,
+            )
+            .with_config(config),
+        );
+
+        // Create a file and batch
+        let file_id = manager
+            .create_file(
+                "stale-heartbeat-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Register daemon1 as running but with a stale heartbeat (SIGKILL scenario)
+        let daemon1_id = DaemonId::from(Uuid::new_v4());
+        let daemon1 = DaemonRecord {
+            data: DaemonData {
+                id: daemon1_id,
+                hostname: "test-host".to_string(),
+                pid: 1234,
+                version: "test".to_string(),
+                config_snapshot: serde_json::json!({}),
+            },
+            state: Running {
+                started_at: Utc::now() - chrono::Duration::minutes(10),
+                last_heartbeat: Utc::now() - chrono::Duration::seconds(5), // 5s ago, past 1s threshold
+                stats: DaemonStats::default(),
+            },
+        };
+        manager.persist_daemon(&daemon1).await.unwrap();
+
+        // Claim request as daemon1, then set to processing
+        let claimed = manager
+            .claim_requests(1, daemon1_id, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let request_id = claimed[0].data.id;
+
+        sqlx::query!(
+            "UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1",
+            *request_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Verify request is in processing
+        let status = manager.get_batch_status(batch.id, false).await.unwrap();
+        assert_eq!(status.in_progress_requests, 1);
+
+        // Daemon2 claims — should reclaim because daemon1's heartbeat is stale
+        let daemon2_id = DaemonId::from(Uuid::new_v4());
+        let reclaimed = manager
+            .claim_requests(1, daemon2_id, &Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].data.id, request_id);
+        assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
+    }
+
+    #[sqlx::test]
+    async fn test_dont_unclaim_requests_from_healthy_daemon(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Long time-based timeouts so only the daemon-aware path could trigger
+        let config = crate::daemon::DaemonConfig {
+            claim_timeout_ms: 600000,
+            processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 60000, // 1 minute
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client,
+            )
+            .with_config(config),
+        );
+
+        // Create a file and batch with 2 templates
+        let file_id = manager
+            .create_file(
+                "healthy-daemon-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":1}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":2}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Register daemon1 as running with a fresh heartbeat
+        let daemon1_id = DaemonId::from(Uuid::new_v4());
+        let daemon1 = DaemonRecord {
+            data: DaemonData {
+                id: daemon1_id,
+                hostname: "test-host".to_string(),
+                pid: 1234,
+                version: "test".to_string(),
+                config_snapshot: serde_json::json!({}),
+            },
+            state: Running {
+                started_at: Utc::now() - chrono::Duration::minutes(10),
+                last_heartbeat: Utc::now(), // fresh heartbeat
+                stats: DaemonStats::default(),
+            },
+        };
+        manager.persist_daemon(&daemon1).await.unwrap();
+
+        // Daemon1 claims first request and sets to processing
+        let claimed = manager
+            .claim_requests(1, daemon1_id, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let request_id = claimed[0].data.id;
+
+        sqlx::query!(
+            "UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1",
+            *request_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Daemon2 claims — should get the second request, NOT steal from healthy daemon1
+        let daemon2_id = DaemonId::from(Uuid::new_v4());
+        let claimed2 = manager
+            .claim_requests(1, daemon2_id, &Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(claimed2.len(), 1);
+        assert_ne!(claimed2[0].data.id, request_id);
+
+        // Verify daemon1's request is still processing (not stolen)
+        let results = manager.get_requests(vec![request_id]).await.unwrap();
+        assert!(
+            matches!(&results[0], Ok(crate::AnyRequest::Processing(_))),
+            "Request should still be in processing state"
+        );
     }
 
     #[sqlx::test]
