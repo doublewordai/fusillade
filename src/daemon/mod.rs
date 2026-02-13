@@ -136,6 +136,13 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution.
     pub processing_timeout_ms: u64,
 
+    /// Time after a daemon's last heartbeat before its requests are considered
+    /// orphaned and returned to pending (milliseconds). Should be significantly
+    /// larger than `heartbeat_interval_ms` to avoid reclaiming from live daemons
+    /// that are merely slow. Also reclaims from daemons explicitly marked dead.
+    /// Default: 30,000 (30 seconds, 6× the default heartbeat interval).
+    pub stale_daemon_threshold_ms: u64,
+
     /// Maximum number of stale requests to unclaim in a single poll cycle.
     /// Limits database load when many requests become stale simultaneously (e.g., daemon crash).
     pub unclaim_batch_size: usize,
@@ -194,10 +201,11 @@ impl Default for DaemonConfig {
             max_backoff_ms: 10000,
             timeout_ms: 600000,
             status_log_interval_ms: Some(2000), // Log every 2 seconds by default
-            heartbeat_interval_ms: 10000,       // Heartbeat every 10 seconds by default
+            heartbeat_interval_ms: 5000,        // Heartbeat every 5 seconds by default
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,             // 1 minute
             processing_timeout_ms: 600000,       // 10 minutes
+            stale_daemon_threshold_ms: 30_000,   // 30 seconds (6× heartbeat interval)
             unclaim_batch_size: 100,             // Unclaim up to 100 stale requests per poll
             cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
             batch_metadata_fields: default_batch_metadata_fields(),
@@ -923,10 +931,11 @@ mod tests {
             max_backoff_ms: 1000,
             timeout_ms: 5000,
             status_log_interval_ms: None, // Disable status logging in tests
-            heartbeat_interval_ms: 10000, // 10 seconds
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
@@ -1095,10 +1104,11 @@ mod tests {
             max_backoff_ms: 1000,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
@@ -1325,10 +1335,11 @@ mod tests {
             max_backoff_ms: 100,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
@@ -1464,10 +1475,11 @@ mod tests {
             max_backoff_ms: 1000,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
@@ -1638,10 +1650,11 @@ mod tests {
             max_backoff_ms: 200,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
@@ -1796,10 +1809,11 @@ mod tests {
             max_backoff_ms: 200,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
@@ -1954,10 +1968,11 @@ mod tests {
             max_backoff_ms: 1000,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![
                 "id".to_string(),
@@ -2112,10 +2127,11 @@ mod tests {
             max_backoff_ms: 1000,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![
                 "id".to_string(),
