@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.4.1](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.0...fusillade-v5.4.1) (2026-02-13)
+
+
+### Bug Fixes
+
+* reclaim requests from dead or stale-heartbeat daemons ([#136](https://github.com/doublewordai/fusillade/issues/136)) ([53c0391](https://github.com/doublewordai/fusillade/commit/53c0391591d74909f550b620003477e597c3099f))
+
 ## [5.4.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.3.1...fusillade-v5.4.0) (2026-02-13)
 
 
