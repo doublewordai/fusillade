@@ -1,5 +1,17 @@
 # Changelog
 
+## [5.4.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.3.1...fusillade-v5.4.0) (2026-02-13)
+
+
+### Features
+
+* make concurrency limit per-daemon instead of global ([#134](https://github.com/doublewordai/fusillade/issues/134)) ([2f4f66d](https://github.com/doublewordai/fusillade/commit/2f4f66dfd62e1eed1576002623d3233996ae9dbc))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate rand to 0.10 ([#124](https://github.com/doublewordai/fusillade/issues/124)) ([4e877c0](https://github.com/doublewordai/fusillade/commit/4e877c024cad71035504ab5dcefb1423d826f4c6))
+
 ## [5.3.1](https://github.com/doublewordai/fusillade/compare/fusillade-v5.3.0...fusillade-v5.3.1) (2026-02-12)
 
 
