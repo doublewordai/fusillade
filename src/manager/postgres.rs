@@ -736,11 +736,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(result)
     }
 
-    #[tracing::instrument(skip(self), fields(limit))]
+    #[tracing::instrument(skip(self, available_capacity), fields(limit))]
     async fn claim_requests(
         &self,
         limit: usize,
         daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
     ) -> Result<Vec<Request<Claimed>>> {
         // First, unclaim any stale requests (self-healing for daemon crashes)
         let unclaimed_count = self.unclaim_stale_requests().await?;
@@ -794,6 +795,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 break;
             }
 
+            // Use available capacity from the daemon's semaphore state if known,
+            // otherwise fall back to the configured model limit (for new models
+            // the daemon hasn't seen yet).
             let model_limit = self
                 .config
                 .model_concurrency_limits
@@ -801,20 +805,21 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 .map(|entry| *entry.value())
                 .unwrap_or(self.config.default_model_concurrency);
 
-            // Atomically count in-progress requests and claim available slots in a single query
-            // This ensures the count and claim are consistent (no race condition)
+            let available = available_capacity
+                .get(&model)
+                .copied()
+                .unwrap_or(model_limit);
+
+            if available == 0 {
+                tracing::trace!(model = %model, "Skipping model with no available capacity");
+                continue;
+            }
+
+            // Claim pending requests for this model, capped by this daemon's
+            // available semaphore permits. No cross-daemon coordination.
             let rows = sqlx::query!(
                 r#"
-                WITH in_progress_count AS (
-                    SELECT COUNT(*)::BIGINT as count
-                    FROM active_requests r
-                    WHERE r.model = $4
-                        AND r.state IN ('claimed', 'processing')
-                ),
-                available_slots AS (
-                    SELECT GREATEST(0, $2::BIGINT - (SELECT count FROM in_progress_count)) as slots
-                ),
-                to_claim AS (
+                WITH to_claim AS (
                     SELECT r.id, r.template_id, r.batch_id,
                            b.id::TEXT as batch_id_str,
                            b.file_id::TEXT as batch_file_id,
@@ -831,16 +836,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                            b.total_requests::TEXT as batch_total_requests
                     FROM requests r
                     JOIN batches b ON r.batch_id = b.id
-                    CROSS JOIN available_slots
                     WHERE r.state = 'pending'
                         AND r.model = $4
                         AND r.template_id IS NOT NULL
                         AND (r.not_before IS NULL OR r.not_before <= $3)
                         AND b.cancelling_at IS NULL
                         AND b.deleted_at IS NULL
-                        AND available_slots.slots > 0
                     ORDER BY b.expires_at ASC
-                    LIMIT LEAST($5, (SELECT slots FROM available_slots))
+                    LIMIT LEAST($5::BIGINT, $2::BIGINT)
                     FOR UPDATE OF r SKIP LOCKED
                 )
                 UPDATE requests r
@@ -871,7 +874,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                           tc.batch_total_requests as "batch_total_requests!"
                 "#,
                 *daemon_id as Uuid,
-                model_limit as i64,
+                available as i64,
                 now,
                 &model,
                 remaining_limit as i64,
@@ -4992,7 +4995,7 @@ mod tests {
 
         // Claim 3 requests
         let claimed = manager
-            .claim_requests(3, daemon_id)
+            .claim_requests(3, daemon_id, &Default::default())
             .await
             .expect("Failed to claim requests");
 
@@ -5004,7 +5007,7 @@ mod tests {
 
         // Try to claim again - should get the remaining 2
         let claimed2 = manager
-            .claim_requests(10, daemon_id)
+            .claim_requests(10, daemon_id, &Default::default())
             .await
             .expect("Failed to claim requests");
 
@@ -5485,7 +5488,10 @@ mod tests {
 
         // Claim the request with daemon1
         let daemon1_id = DaemonId::from(Uuid::new_v4());
-        let claimed = manager.claim_requests(1, daemon1_id).await.unwrap();
+        let claimed = manager
+            .claim_requests(1, daemon1_id, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(claimed.len(), 1);
         let request_id = claimed[0].data.id;
 
@@ -5500,7 +5506,10 @@ mod tests {
 
         // Now daemon2 tries to claim - should unclaim the stale request and re-claim it
         let daemon2_id = DaemonId::from(Uuid::new_v4());
-        let reclaimed = manager.claim_requests(1, daemon2_id).await.unwrap();
+        let reclaimed = manager
+            .claim_requests(1, daemon2_id, &Default::default())
+            .await
+            .unwrap();
 
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].data.id, request_id);
@@ -5560,7 +5569,10 @@ mod tests {
 
         // Claim and manually set to processing state
         let daemon1_id = DaemonId::from(Uuid::new_v4());
-        let claimed = manager.claim_requests(1, daemon1_id).await.unwrap();
+        let claimed = manager
+            .claim_requests(1, daemon1_id, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(claimed.len(), 1);
         let request_id = claimed[0].data.id;
 
@@ -5585,7 +5597,10 @@ mod tests {
 
         // Now daemon2 tries to claim - should unclaim the stale processing request
         let daemon2_id = DaemonId::from(Uuid::new_v4());
-        let reclaimed = manager.claim_requests(1, daemon2_id).await.unwrap();
+        let reclaimed = manager
+            .claim_requests(1, daemon2_id, &Default::default())
+            .await
+            .unwrap();
 
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].data.id, request_id);
@@ -5652,12 +5667,18 @@ mod tests {
 
         // Daemon1 claims first request
         let daemon1_id = DaemonId::from(Uuid::new_v4());
-        let claimed1 = manager.claim_requests(1, daemon1_id).await.unwrap();
+        let claimed1 = manager
+            .claim_requests(1, daemon1_id, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(claimed1.len(), 1);
 
         // Daemon2 immediately tries to claim - should get the second request, not steal the first
         let daemon2_id = DaemonId::from(Uuid::new_v4());
-        let claimed2 = manager.claim_requests(1, daemon2_id).await.unwrap();
+        let claimed2 = manager
+            .claim_requests(1, daemon2_id, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(claimed2.len(), 1);
 
         // Verify they got different requests
@@ -5742,7 +5763,10 @@ mod tests {
 
         // Claim should unclaim the stale request and reclaim it
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let claimed = manager.claim_requests(1, daemon_id).await.unwrap();
+        let claimed = manager
+            .claim_requests(1, daemon_id, &Default::default())
+            .await
+            .unwrap();
 
         assert_eq!(claimed.len(), 1);
         // Verify retry_attempt is preserved
@@ -6533,7 +6557,10 @@ mod tests {
 
         // Claim and complete some requests
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let claimed = manager.claim_requests(2, daemon_id).await.unwrap();
+        let claimed = manager
+            .claim_requests(2, daemon_id, &Default::default())
+            .await
+            .unwrap();
 
         // Mark one as completed
         sqlx::query!(
@@ -6704,7 +6731,10 @@ mod tests {
 
         // Put requests in different states
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let claimed = manager.claim_requests(2, daemon_id).await.unwrap();
+        let claimed = manager
+            .claim_requests(2, daemon_id, &Default::default())
+            .await
+            .unwrap();
         let claimed_ids: Vec<_> = claimed.iter().map(|r| r.data.id).collect();
 
         // Mark first claimed as completed (needs started_at for Processing->Completed transition)
@@ -6896,14 +6926,14 @@ mod tests {
     }
 
     // =========================================================================
-    // CONCURRENCY & GLOBAL LIMITS
+    // CONCURRENCY & PER-DAEMON LIMITS
     // =========================================================================
     // Tests for per-model concurrency limits:
-    // - Global per-model limits enforced across daemons
-    // - Request claiming respects concurrent processing limits
+    // - Per-daemon limits: each daemon independently enforces its own limit
+    // - Request claiming respects the daemon's available capacity
 
     #[sqlx::test]
-    async fn test_global_per_model_limit_enforced_across_daemons(pool: sqlx::PgPool) {
+    async fn test_per_daemon_limit_allows_independent_claiming(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
 
         // Set up manager with per-model limit of 3
@@ -6955,42 +6985,57 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate 3 daemons claiming simultaneously
+        // Simulate 3 daemons claiming — each has full capacity (3 per model)
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let daemon3_id = DaemonId::from(Uuid::new_v4());
 
-        // Each daemon tries to claim 10 requests (more than available per model)
-        let claimed1 = manager.claim_requests(10, daemon1_id).await.unwrap();
-        let claimed2 = manager.claim_requests(10, daemon2_id).await.unwrap();
-        let claimed3 = manager.claim_requests(10, daemon3_id).await.unwrap();
+        let full_capacity: std::collections::HashMap<String, usize> =
+            [("model-a".to_string(), 3), ("model-b".to_string(), 3)].into();
 
-        // Count requests per model across all daemons
-        let mut model_counts = std::collections::HashMap::new();
+        let claimed1 = manager
+            .claim_requests(10, daemon1_id, &full_capacity)
+            .await
+            .unwrap();
+        let claimed2 = manager
+            .claim_requests(10, daemon2_id, &full_capacity)
+            .await
+            .unwrap();
+        let claimed3 = manager
+            .claim_requests(10, daemon3_id, &full_capacity)
+            .await
+            .unwrap();
+
+        // Each daemon should claim up to 3 per model (its own limit),
+        // for a total of up to 9 per model across 3 daemons
+        let mut per_daemon_model_counts: Vec<std::collections::HashMap<String, i32>> = Vec::new();
         for claimed in [&claimed1, &claimed2, &claimed3] {
+            let mut counts = std::collections::HashMap::new();
             for request in claimed {
-                *model_counts.entry(request.data.model.clone()).or_insert(0) += 1;
+                *counts.entry(request.data.model.clone()).or_insert(0) += 1;
+            }
+            per_daemon_model_counts.push(counts);
+        }
+
+        // Verify each daemon respects its own per-model limit of 3
+        for (i, counts) in per_daemon_model_counts.iter().enumerate() {
+            for (model, count) in counts {
+                assert!(
+                    *count <= 3,
+                    "Daemon {} claimed {} requests for {}, exceeding per-daemon limit of 3",
+                    i + 1,
+                    count,
+                    model,
+                );
             }
         }
 
-        // Verify global per-model limits are enforced
+        // Total across all daemons should be up to 9 per model (3 daemons × 3 limit)
+        let total = claimed1.len() + claimed2.len() + claimed3.len();
         assert!(
-            *model_counts.get("model-a").unwrap_or(&0) <= 3,
-            "model-a should not exceed limit of 3 across all daemons, got {}",
-            model_counts.get("model-a").unwrap_or(&0)
-        );
-        assert!(
-            *model_counts.get("model-b").unwrap_or(&0) <= 3,
-            "model-b should not exceed limit of 3 across all daemons, got {}",
-            model_counts.get("model-b").unwrap_or(&0)
-        );
-
-        // Total claimed should be at most 6 (3 per model × 2 models)
-        let total: i32 = model_counts.values().sum();
-        assert!(
-            total <= 6,
-            "Total claimed should not exceed 6 (respecting per-model limits), got {}",
-            total
+            total <= 18,
+            "Total claimed should not exceed 18 (3 per model × 2 models × 3 daemons), got {}",
+            total,
         );
     }
 
@@ -8114,7 +8159,7 @@ mod tests {
 
         // Claim 1 request - should get the most urgent one (batch1, 30 min)
         let claimed = manager
-            .claim_requests(1, daemon_id)
+            .claim_requests(1, daemon_id, &Default::default())
             .await
             .expect("Failed to claim requests");
 
@@ -8127,7 +8172,7 @@ mod tests {
 
         // Claim another - should get medium priority (batch2, 2 hours)
         let claimed2 = manager
-            .claim_requests(1, daemon_id)
+            .claim_requests(1, daemon_id, &Default::default())
             .await
             .expect("Failed to claim requests");
 
@@ -8140,7 +8185,7 @@ mod tests {
 
         // Claim last one - should get no-SLA batch (batch3)
         let claimed3 = manager
-            .claim_requests(1, daemon_id)
+            .claim_requests(1, daemon_id, &Default::default())
             .await
             .expect("Failed to claim requests");
 

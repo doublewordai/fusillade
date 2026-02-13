@@ -284,10 +284,15 @@ pub trait Storage: Send + Sync {
     // states as they iterate through them
 
     /// Atomically claim pending requests for processing.
+    ///
+    /// `available_capacity` maps model names to the number of permits available
+    /// on this daemon's semaphores. Models not present in the map use the
+    /// configured default limit. Models with zero capacity are skipped.
     async fn claim_requests(
         &self,
         limit: usize,
         daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
     ) -> Result<Vec<Request<Claimed>>>;
 
     /// Update an existing request's state in storage.

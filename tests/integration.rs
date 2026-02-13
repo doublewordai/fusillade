@@ -26,6 +26,7 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
         claim_interval_ms: 10, // Very fast for testing
         default_model_concurrency: 10,
         model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
         max_retries: Some(3),
         stop_before_deadline_ms: None,
         backoff_ms: 100,
@@ -192,6 +193,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
         claim_interval_ms: 10,
         default_model_concurrency: 10,
         model_concurrency_limits,
+
         max_retries: Some(3),
         stop_before_deadline_ms: None,
         backoff_ms: 100,
@@ -426,6 +428,7 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
         claim_interval_ms: 10,
         default_model_concurrency: 10,
         model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
         max_retries: Some(5),
         stop_before_deadline_ms: None,
         backoff_ms: 10, // Very fast backoff for testing
@@ -723,6 +726,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
         claim_interval_ms: 10,
         default_model_concurrency: 10,
         model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
         max_retries: Some(10_000),
         stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
         backoff_ms: 50,
@@ -888,6 +892,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
         claim_interval_ms: 10,
         default_model_concurrency: 10,
         model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
         max_retries: None,             // No retry limit
         stop_before_deadline_ms: None, // No buffer - should retry until deadline
         backoff_ms: 50,
@@ -1067,6 +1072,7 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
         claim_interval_ms: 10,
         default_model_concurrency: 10,
         model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
         model_escalations,
         max_retries: Some(3),
         stop_before_deadline_ms: None,
@@ -1214,6 +1220,7 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
         claim_interval_ms: 10,
         default_model_concurrency: 10,
         model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
         model_escalations,
         max_retries: Some(3),
         stop_before_deadline_ms: None,
@@ -2040,6 +2047,7 @@ mod batch_results_stream {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             max_retries: Some(0), // No retries - fail immediately
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -2215,6 +2223,7 @@ mod batch_results_stream {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             max_retries: Some(0), // No retries - fail immediately
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -2341,6 +2350,7 @@ mod batch_results_stream {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             max_retries: Some(0), // No retries
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -2487,6 +2497,7 @@ mod batch_results_stream {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             max_retries: Some(0), // No retries
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -2629,6 +2640,7 @@ mod batch_results_stream {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             max_retries: Some(0),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -2783,6 +2795,7 @@ mod batch_results_stream {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             max_retries: Some(0),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -2938,6 +2951,7 @@ mod batch_results_stream {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             max_retries: Some(0), // No automatic retries
             stop_before_deadline_ms: None,
             backoff_ms: 100,

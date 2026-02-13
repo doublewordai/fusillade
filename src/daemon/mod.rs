@@ -571,10 +571,24 @@ where
                     break Ok(());
                 }
             }
+            // Snapshot available semaphore permits per model so claim_requests
+            // only claims what this daemon can actually process.
+            let available_capacity: std::collections::HashMap<String, usize> = {
+                let semaphores = self.semaphores.read().await;
+                semaphores
+                    .iter()
+                    .map(|(model, (sem, _))| (model.clone(), sem.available_permits()))
+                    .collect()
+            };
+
             // Claim a batch of pending requests
             let mut claimed = self
                 .storage
-                .claim_requests(self.config.claim_batch_size, self.daemon_id)
+                .claim_requests(
+                    self.config.claim_batch_size,
+                    self.daemon_id,
+                    &available_capacity,
+                )
                 .await?;
 
             // Record claim metrics
@@ -900,6 +914,7 @@ mod tests {
             claim_interval_ms: 10, // Very fast for testing
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
@@ -1071,6 +1086,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits,
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
@@ -1300,6 +1316,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(5),
             stop_before_deadline_ms: None,
@@ -1438,6 +1455,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
@@ -1611,6 +1629,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(10_000),
             stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
@@ -1768,6 +1787,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: None,             // No retry limit
             stop_before_deadline_ms: None, // No buffer - should retry until deadline
@@ -1925,6 +1945,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
@@ -2082,6 +2103,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
