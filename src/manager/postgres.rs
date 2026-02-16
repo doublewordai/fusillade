@@ -4128,35 +4128,27 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
     }
 
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64> {
-        // Step 1: Delete orphaned requests (batch_id IS NULL or parent batch soft-deleted).
+        // Step 1: Delete requests whose parent batch has been soft-deleted.
         // Must run before template deletion to prevent ON DELETE SET NULL on
         // requests.template_id from corrupting live request data.
         //
-        // Uses UNION ALL with FOR UPDATE OF <table> SKIP LOCKED inside each
-        // branch so that:
-        //   - Row locks are acquired on the real base table (not a CTE),
-        //     enabling replicas to partition work via SKIP LOCKED.
-        //   - LIMIT is pushed down into each branch, so the scan stops early
-        //     instead of materialising the entire candidate set.
-        // The outer LIMIT caps the total rows deleted per call.
+        // Uses LATERAL so Postgres resolves the small set of soft-deleted
+        // batch IDs first, then does an index lookup into requests per batch
+        // via idx_requests_batch_id — avoiding a seq scan of the (potentially
+        // huge) requests table. FOR UPDATE SKIP LOCKED enables concurrent
+        // daemons to partition work without blocking.
         let requests_deleted = sqlx::query!(
             r#"
             DELETE FROM requests
             WHERE id IN (
-                SELECT id FROM (
-                    SELECT r.id FROM requests r
-                    WHERE r.batch_id IS NULL
+                SELECT r.id
+                FROM (SELECT id FROM batches WHERE deleted_at IS NOT NULL) b,
+                LATERAL (
+                    SELECT id FROM requests
+                    WHERE batch_id = b.id
                     LIMIT $1
-                    FOR UPDATE OF r SKIP LOCKED
-                ) a
-                UNION ALL
-                SELECT id FROM (
-                    SELECT r.id FROM requests r
-                    JOIN batches b ON r.batch_id = b.id
-                    WHERE b.deleted_at IS NOT NULL
-                    LIMIT $1
-                    FOR UPDATE OF r SKIP LOCKED
-                ) b
+                    FOR UPDATE SKIP LOCKED
+                ) r
                 LIMIT $1
             )
             "#,
@@ -4167,31 +4159,25 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge orphaned requests: {}", e)))?
         .rows_affected() as i64;
 
-        // Step 2: Delete orphaned request_templates (file_id IS NULL or parent file soft-deleted).
+        // Step 2: Delete request_templates whose parent file has been soft-deleted.
         // Note: delete_file already cancels dependent batches and unlinks them (sets
         // file_id = NULL on batches) without deleting the batches or their requests,
         // so users can still download results. Deleting templates will SET NULL on
         // requests.template_id via the FK, which is fine — requests are self-contained
         // once created (all template data is copied at claim time).
-        // Same UNION ALL + FOR UPDATE pattern as step 1.
+        // Same LATERAL pattern as step 1.
         let templates_deleted = sqlx::query!(
             r#"
             DELETE FROM request_templates
             WHERE id IN (
-                SELECT id FROM (
-                    SELECT rt.id FROM request_templates rt
-                    WHERE rt.file_id IS NULL
+                SELECT rt.id
+                FROM (SELECT id FROM files WHERE deleted_at IS NOT NULL) f,
+                LATERAL (
+                    SELECT id FROM request_templates
+                    WHERE file_id = f.id
                     LIMIT $1
-                    FOR UPDATE OF rt SKIP LOCKED
-                ) a
-                UNION ALL
-                SELECT id FROM (
-                    SELECT rt.id FROM request_templates rt
-                    JOIN files f ON rt.file_id = f.id
-                    WHERE f.deleted_at IS NOT NULL
-                    LIMIT $1
-                    FOR UPDATE OF rt SKIP LOCKED
-                ) b
+                    FOR UPDATE SKIP LOCKED
+                ) rt
                 LIMIT $1
             )
             "#,
