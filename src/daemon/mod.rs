@@ -8,6 +8,10 @@ use metrics::{counter, gauge, histogram};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
 
+use opentelemetry::trace::TraceContextExt;
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
 use crate::FusilladeError;
 use crate::batch::BatchId;
 use crate::error::Result;
@@ -701,7 +705,26 @@ where
                             gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
                                 .increment(1.0);
 
+                            let process_span = tracing::info_span!(
+                                "process_request",
+                                trace_id = tracing::field::Empty,
+                                otel.name = "process_request",
+                                request_id = %request_id,
+                                batch_id = %batch_id,
+                                model = %model,
+                            );
+                            // Start a new trace root so process_request isn't
+                            // parented under the claim_requests span.
+                            let _ = process_span.set_parent(opentelemetry::Context::new());
+
                             join_set.spawn(async move {
+                                // Record trace_id from OTel context
+                                let span = tracing::Span::current();
+                                let sc = span.context().span().span_context().clone();
+                                if sc.is_valid() {
+                                    span.record("trace_id", tracing::field::display(sc.trace_id()));
+                                }
+
                                 // Permit is held for the duration of this task
                                 let _permit = permit;
 
@@ -861,7 +884,7 @@ where
                                 // up when the daemon shuts down or batch completes.
 
                                 Ok(())
-                            });
+                            }.instrument(process_span));
                         }
                         None => {
                             tracing::debug!(

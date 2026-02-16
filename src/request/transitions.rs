@@ -106,6 +106,7 @@ use std::sync::Arc;
 
 use metrics::counter;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 use crate::{
     FusilladeError,
@@ -195,13 +196,18 @@ impl Request<Claimed> {
         // Create a channel for the HTTP result
         let (tx, rx) = tokio::sync::mpsc::channel(1);
 
-        // Spawn the HTTP request as an async task
-        let task_handle = tokio::spawn(async move {
-            let result = http_client
-                .execute(&request_data, &request_data.api_key, timeout_ms)
-                .await;
-            let _ = tx.send(result).await; // Ignore send errors (receiver dropped)
-        });
+        // Spawn the HTTP request as an async task, propagating the current
+        // span so that the execute span becomes a child of process_request.
+        let current_span = tracing::Span::current();
+        let task_handle = tokio::spawn(
+            async move {
+                let result = http_client
+                    .execute(&request_data, &request_data.api_key, timeout_ms)
+                    .await;
+                let _ = tx.send(result).await; // Ignore send errors (receiver dropped)
+            }
+            .instrument(current_span),
+        );
 
         let processing_state = Processing {
             daemon_id: self.state.daemon_id,

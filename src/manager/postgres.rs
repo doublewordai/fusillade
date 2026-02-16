@@ -1007,7 +1007,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(all_claimed)
     }
 
-    #[tracing::instrument(skip(self, request), fields(request_id = %request.data.id))]
     async fn persist<T: RequestState + Clone>(
         &self,
         request: &Request<T>,
@@ -1015,6 +1014,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     where
         AnyRequest: From<Request<T>>,
     {
+        tracing::debug!(request_id = %request.data.id, "Persisting request state");
         let any_request = AnyRequest::from(request.clone());
 
         match any_request {
