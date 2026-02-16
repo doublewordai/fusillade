@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.4.3](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.2...fusillade-v5.4.3) (2026-02-16)
+
+
+### Bug Fixes
+
+* consolidate batch request traces into single trace trees ([#140](https://github.com/doublewordai/fusillade/issues/140)) ([6d5a197](https://github.com/doublewordai/fusillade/commit/6d5a197a759d1cd5a326bbf15bdf8db485dca87c))
+
 ## [5.4.2](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.1...fusillade-v5.4.2) (2026-02-16)
 
 
