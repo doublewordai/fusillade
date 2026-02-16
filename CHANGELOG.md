@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.4.2](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.1...fusillade-v5.4.2) (2026-02-16)
+
+
+### Bug Fixes
+
+* avoid full scans and ensure safe concurrency in purge queries ([#138](https://github.com/doublewordai/fusillade/issues/138)) ([3c41a15](https://github.com/doublewordai/fusillade/commit/3c41a15bb7aa7d452e59b41eccc5a4439719bacd))
+
 ## [5.4.1](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.0...fusillade-v5.4.1) (2026-02-13)
 
 
