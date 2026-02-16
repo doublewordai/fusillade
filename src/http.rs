@@ -86,12 +86,10 @@ impl Default for ReqwestHttpClient {
 impl HttpClient for ReqwestHttpClient {
     // TODO: document
     #[tracing::instrument(skip(self, request, api_key), fields(
-        otel.kind = "Client",
+        trace_id = tracing::field::Empty,
         otel.name = %format!("{} {}", request.method, request.path),
-        http.request.method = %request.method,
-        url.full,
-        url.path = %request.path,
         request_id = %request.id,
+        batch_id = %request.batch_id,
         model = %request.model
     ))]
     async fn execute(
@@ -101,7 +99,15 @@ impl HttpClient for ReqwestHttpClient {
         timeout_ms: u64,
     ) -> Result<HttpResponse> {
         let url = format!("{}{}", request.endpoint, request.path);
-        tracing::Span::current().record("url.full", &url);
+        let span = tracing::Span::current();
+        let sc = span.context().span().span_context().clone();
+        if sc.is_valid() {
+            span.record("trace_id", tracing::field::display(sc.trace_id()));
+        }
+        span.set_attribute("otel.kind", "Client");
+        span.set_attribute("http.request.method", request.method.clone());
+        span.set_attribute("url.path", request.path.clone());
+        span.set_attribute("url.full", url.clone());
 
         tracing::debug!(
             url.full = %url,
@@ -144,8 +150,9 @@ impl HttpClient for ReqwestHttpClient {
             tracing::trace!(request_id = %request.id, custom_id = %custom_id, "Added X-Fusillade-Custom-Id header");
         }
 
-        // Inject OpenTelemetry trace context for distributed tracing
-        // This allows the downstream service to continue the same trace
+        // Inject W3C traceparent header for distributed tracing.
+        // dwctl extracts this in its TraceLayer to parent its request span
+        // under this execute span, producing one continuous trace.
         let ctx = tracing::Span::current().context();
         let span_ref = ctx.span();
         let span_ctx = span_ref.span_context();
