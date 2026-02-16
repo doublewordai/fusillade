@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.4.4](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.3...fusillade-v5.4.4) (2026-02-16)
+
+
+### Bug Fixes
+
+* optimise deletion (again) ([#142](https://github.com/doublewordai/fusillade/issues/142)) ([35089c7](https://github.com/doublewordai/fusillade/commit/35089c7efed12d67ebac43c746e64342661712ed))
+
 ## [5.4.3](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.2...fusillade-v5.4.3) (2026-02-16)
 
 
