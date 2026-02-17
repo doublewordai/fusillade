@@ -164,7 +164,6 @@ pub struct DaemonConfig {
     ///    and aborts their in-flight requests
     ///
     /// Default: 5000ms (5 seconds)
-    #[serde(default = "default_cancellation_poll_interval_ms")]
     pub cancellation_poll_interval_ms: u64,
 
     /// Batch table column names to include as request headers.
@@ -200,10 +199,6 @@ fn default_batch_metadata_fields() -> Vec<String> {
         "created_at".to_string(),
         "completion_window".to_string(),
     ]
-}
-
-fn default_cancellation_poll_interval_ms() -> u64 {
-    5000
 }
 
 impl Default for DaemonConfig {
@@ -505,6 +500,8 @@ where
                             .set(active_batch_ids.len() as f64);
 
                         // Fetch batches once for both finalization and cancellation check
+                        // Note: DaemonStorage doesn't have a method for this, so we'll check via the batch
+                        // For now, we'll check each batch individually
                         for batch_id in active_batch_ids {
                             match storage.get_batch(batch_id).await {
                                 Ok(batch) => {
