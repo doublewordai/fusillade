@@ -284,6 +284,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         // With OR, Postgres falls into a bitmap heap scan of all in-progress rows (~50K)
         // to evaluate the EXISTS subquery. With UNION, each branch uses its optimal
         // index scan: ~4ms total vs ~1s with OR on a 14.5M row table.
+        let unclaim_start = std::time::Instant::now();
         let result = sqlx::query!(
             r#"
             UPDATE requests
@@ -322,10 +323,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         .execute(self.pools.write())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to unclaim stale requests: {}", e)))?;
+        metrics::histogram!("fusillade_unclaim_stale_duration_seconds")
+            .record(unclaim_start.elapsed().as_secs_f64());
 
         let count = result.rows_affected() as usize;
 
         if count > 0 {
+            metrics::counter!("fusillade_stale_requests_reclaimed_total").increment(count as u64);
             tracing::warn!(
                 count = count,
                 claim_timeout_ms,

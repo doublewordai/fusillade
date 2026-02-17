@@ -421,8 +421,11 @@ where
 
                         // Clone the record so we preserve it if heartbeat fails
                         let current = daemon_record.clone();
+                        let heartbeat_start = std::time::Instant::now();
                         match current.heartbeat(stats, storage.as_ref()).await {
                             Ok(updated) => {
+                                histogram!("fusillade_heartbeat_duration_seconds")
+                                    .record(heartbeat_start.elapsed().as_secs_f64());
                                 daemon_record = updated;
                                 tracing::trace!(
                                     daemon_id = %daemon_id,
@@ -430,6 +433,9 @@ where
                                 );
                             }
                             Err(e) => {
+                                histogram!("fusillade_heartbeat_duration_seconds")
+                                    .record(heartbeat_start.elapsed().as_secs_f64());
+                                counter!("fusillade_heartbeat_failures_total").increment(1);
                                 tracing::error!(
                                     daemon_id = %daemon_id,
                                     error = %e,
@@ -509,6 +515,10 @@ where
                             continue;
                         }
 
+                        let poll_start = std::time::Instant::now();
+                        gauge!("fusillade_cancellation_poll_batches_checked")
+                            .set(active_batch_ids.len() as f64);
+
                         // Fetch batches once for both finalization and cancellation check
                         for batch_id in active_batch_ids {
                             match storage.get_batch(batch_id).await {
@@ -519,20 +529,25 @@ where
                                     if batch.cancelling_at.is_some()
                                         && let Some(entry) = cancellation_tokens.get(&batch_id) {
                                             entry.value().cancel();
+                                            counter!("fusillade_batches_cancelled_total").increment(1);
                                             tracing::info!(batch_id = %batch_id, "Cancelled all requests in batch");
                                             drop(entry);
                                             cancellation_tokens.remove(&batch_id);
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::debug!(
+                                    counter!("fusillade_cancellation_poll_errors_total").increment(1);
+                                    tracing::warn!(
                                         batch_id = %batch_id,
                                         error = %e,
-                                        "Failed to fetch batch"
+                                        "Failed to fetch batch during cancellation poll"
                                     );
                                 }
                             }
                         }
+
+                        histogram!("fusillade_cancellation_poll_duration_seconds")
+                            .record(poll_start.elapsed().as_secs_f64());
                     }
                     _ = shutdown_token.cancelled() => {
                         tracing::info!("Shutting down batch polling");
@@ -573,6 +588,7 @@ where
                         match storage.purge_orphaned_rows(purge_batch_size).await {
                             Ok(0) => break,
                             Ok(deleted) => {
+                                counter!("fusillade_rows_purged_total").increment(deleted);
                                 tracing::debug!(deleted, "Purged orphaned rows");
                                 // Throttle between batches to avoid sustained DB load
                                 tokio::select! {
@@ -584,6 +600,7 @@ where
                                 }
                             }
                             Err(e) => {
+                                counter!("fusillade_purge_errors_total").increment(1);
                                 tracing::error!(error = %e, "Failed to purge orphaned rows");
                                 break;
                             }
@@ -612,6 +629,7 @@ where
                         tracing::error!(error = %e, "Task failed");
                     }
                     Err(join_error) => {
+                        counter!("fusillade_task_panics_total").increment(1);
                         tracing::error!(error = %join_error, "Task panicked");
                     }
                 }
@@ -635,7 +653,12 @@ where
                     .collect()
             };
 
+            // Record available capacity before claiming
+            let total_capacity: usize = available_capacity.values().sum();
+            gauge!("fusillade_claim_capacity").set(total_capacity as f64);
+
             // Claim a batch of pending requests
+            let claim_start = std::time::Instant::now();
             let mut claimed = self
                 .storage
                 .claim_requests(
@@ -644,9 +667,11 @@ where
                     &available_capacity,
                 )
                 .await?;
+            histogram!("fusillade_claim_duration_seconds")
+                .record(claim_start.elapsed().as_secs_f64());
 
             // Record claim metrics
-            counter!("fusillade_claims_total").increment(claimed.len() as u64);
+            histogram!("fusillade_claim_size").record(claimed.len() as f64);
 
             tracing::debug!(
                 claimed_count = claimed.len(),
@@ -862,7 +887,7 @@ where
                                                     // No retries left - persist as Failed (terminal)
                                                     storage.persist(&*failed).await?;
                                                     requests_failed.fetch_add(1, Ordering::Relaxed);
-                                                    counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                                    counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
                                                     histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                                         .record(processing_start.elapsed().as_secs_f64());
 
@@ -885,7 +910,7 @@ where
                                             }
                                         } else {
                                             requests_failed.fetch_add(1, Ordering::Relaxed);
-                                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
                                             histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                                 .record(processing_start.elapsed().as_secs_f64());
 
@@ -929,6 +954,7 @@ where
                             }.instrument(process_span));
                         }
                         None => {
+                            counter!("fusillade_requests_unclaimed_no_capacity_total", "model" => model.clone()).increment(1);
                             tracing::debug!(
                                 request_id = %request_id,
                                 model = %model,
@@ -938,6 +964,7 @@ where
                             // No capacity for this model - unclaim the request
                             let storage = self.storage.clone();
                             if let Err(e) = request.unclaim(storage.as_ref()).await {
+                                counter!("fusillade_unclaim_errors_total").increment(1);
                                 tracing::error!(
                                     request_id = %request_id,
                                     error = %e,

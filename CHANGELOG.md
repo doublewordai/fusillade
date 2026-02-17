@@ -1,5 +1,13 @@
 # Changelog
 
+## [5.5.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.4...fusillade-v5.5.0) (2026-02-17)
+
+
+### Features
+
+* add comprehensive daemon loop metrics ([#144](https://github.com/doublewordai/fusillade/issues/144)) ([efd0e65](https://github.com/doublewordai/fusillade/commit/efd0e65ba4470f6db1d322b0062f09d023111d37))
+* add Timeout variant to FailureReason ([#146](https://github.com/doublewordai/fusillade/issues/146)) ([03e3f9c](https://github.com/doublewordai/fusillade/commit/03e3f9cb3e3d82a3bed72800b7890709c396983f))
+
 ## [5.4.4](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.3...fusillade-v5.4.4) (2026-02-16)
 
 

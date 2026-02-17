@@ -512,6 +512,11 @@ impl Request<Processing> {
                             error: reqwest_err.to_string(),
                         }
                     }
+                    FusilladeError::HttpClient(reqwest_err) if reqwest_err.is_timeout() => {
+                        FailureReason::Timeout {
+                            error: reqwest_err.to_string(),
+                        }
+                    }
                     _ => FailureReason::NetworkError {
                         error: crate::error::error_serialization::serialize_error(&e.into()),
                     },

@@ -193,9 +193,13 @@ pub enum FailureReason {
     /// These indicate problems with the request itself that won't be fixed by retrying.
     NonRetriableHttpStatus { status: u16, body: String },
 
-    /// Network error, timeout, or other transport-level failure.
+    /// Network error or other transport-level failure (excluding timeouts).
     /// These are transient infrastructure issues that should be retried.
     NetworkError { error: String },
+
+    /// Request timed out before receiving a response.
+    /// These are transient and should be retried.
+    Timeout { error: String },
 
     /// The HTTP task terminated unexpectedly (panic or crash).
     /// This should be retried as it may be a transient issue.
@@ -214,8 +218,30 @@ impl FailureReason {
             FailureReason::RetriableHttpStatus { .. } => true,
             FailureReason::NonRetriableHttpStatus { .. } => false,
             FailureReason::NetworkError { .. } => true,
+            FailureReason::Timeout { .. } => true,
             FailureReason::TaskTerminated => true,
             FailureReason::RequestBuilderError { .. } => false,
+        }
+    }
+
+    /// Returns a short, stable label for use in metrics.
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            FailureReason::RetriableHttpStatus { .. } => "retriable_http_status",
+            FailureReason::NonRetriableHttpStatus { .. } => "non_retriable_http_status",
+            FailureReason::NetworkError { .. } => "network_error",
+            FailureReason::Timeout { .. } => "timeout",
+            FailureReason::TaskTerminated => "task_terminated",
+            FailureReason::RequestBuilderError { .. } => "builder_error",
+        }
+    }
+
+    /// Returns the HTTP status code as a string for metrics, or empty for non-HTTP failures.
+    pub fn status_code_label(&self) -> String {
+        match self {
+            FailureReason::RetriableHttpStatus { status, .. }
+            | FailureReason::NonRetriableHttpStatus { status, .. } => status.to_string(),
+            _ => String::new(),
         }
     }
 
@@ -236,6 +262,9 @@ impl FailureReason {
             }
             FailureReason::NetworkError { error } => {
                 format!("Network error: {}", error)
+            }
+            FailureReason::Timeout { error } => {
+                format!("Request timed out: {}", error)
             }
             FailureReason::TaskTerminated => "HTTP task terminated unexpectedly".to_string(),
             FailureReason::RequestBuilderError { error } => {
