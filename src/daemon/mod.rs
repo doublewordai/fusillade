@@ -163,17 +163,9 @@ pub struct DaemonConfig {
     /// 2. **Cancellation Detection**: Checks if any active batches have been cancelled
     ///    and aborts their in-flight requests
     ///
-    #[serde(default = "default_batch_poll_interval_ms")]
-    pub batch_poll_interval_ms: u64,
-
-    /// DEPRECATED: Use `batch_poll_interval_ms` instead.
-    ///
-    /// This field is maintained for backwards compatibility. If provided, the effective
-    /// batch poll interval will be the minimum of `batch_poll_interval_ms` and this value.
-    ///
-    /// Will be removed in a future version.
-    #[serde(default)]
-    pub cancellation_poll_interval_ms: Option<u64>,
+    /// Default: 5000ms (5 seconds)
+    #[serde(default = "default_cancellation_poll_interval_ms")]
+    pub cancellation_poll_interval_ms: u64,
 
     /// Batch table column names to include as request headers.
     /// These values are sent as `x-fusillade-batch-{column}` headers with each request.
@@ -210,7 +202,7 @@ fn default_batch_metadata_fields() -> Vec<String> {
     ]
 }
 
-fn default_batch_poll_interval_ms() -> u64 {
+fn default_cancellation_poll_interval_ms() -> u64 {
     5000
 }
 
@@ -235,8 +227,7 @@ impl Default for DaemonConfig {
             processing_timeout_ms: 600000,       // 10 minutes
             stale_daemon_threshold_ms: 30_000,   // 30 seconds (6× heartbeat interval)
             unclaim_batch_size: 100,             // Unclaim up to 100 stale requests per poll
-            batch_poll_interval_ms: 5000,        // Poll every 5 seconds by default
-            cancellation_poll_interval_ms: None, // Deprecated
+            cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
             batch_metadata_fields: default_batch_metadata_fields(),
             purge_interval_ms: 600_000, // 10 minutes
             purge_batch_size: 1000,
@@ -486,19 +477,13 @@ where
         let cancellation_tokens = self.cancellation_tokens.clone();
         let storage = self.storage.clone();
         let shutdown_token = self.shutdown_token.clone();
-
-        // Determine effective poll interval (backwards compatibility)
-        let batch_poll_interval_ms =
-            if let Some(legacy_interval) = self.config.cancellation_poll_interval_ms {
-                self.config.batch_poll_interval_ms.min(legacy_interval)
-            } else {
-                self.config.batch_poll_interval_ms
-            };
+        let cancellation_poll_interval_ms = self.config.cancellation_poll_interval_ms;
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(batch_poll_interval_ms));
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(cancellation_poll_interval_ms));
             tracing::info!(
-                interval_ms = batch_poll_interval_ms,
+                interval_ms = cancellation_poll_interval_ms,
                 "Batch polling started (finalization + cancellation detection)"
             );
 
@@ -1030,9 +1015,8 @@ mod tests {
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            batch_poll_interval_ms: 100,
-            cancellation_poll_interval_ms: None, // Fast polling for tests
-            purge_interval_ms: 0,                // Disabled in tests
+            cancellation_poll_interval_ms: 100, // Fast polling for tests
+            purge_interval_ms: 0,               // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
         };
@@ -1204,9 +1188,8 @@ mod tests {
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            batch_poll_interval_ms: 100,
-            cancellation_poll_interval_ms: None, // Fast polling for tests
-            purge_interval_ms: 0,                // Disabled in tests
+            cancellation_poll_interval_ms: 100, // Fast polling for tests
+            purge_interval_ms: 0,               // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
         };
@@ -1436,8 +1419,7 @@ mod tests {
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            batch_poll_interval_ms: 100, // Fast polling for tests
-            cancellation_poll_interval_ms: None,
+            cancellation_poll_interval_ms: 100,
             purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
@@ -1577,8 +1559,7 @@ mod tests {
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            batch_poll_interval_ms: 100, // Fast polling for tests
-            cancellation_poll_interval_ms: None,
+            cancellation_poll_interval_ms: 100,
             purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
@@ -1753,8 +1734,7 @@ mod tests {
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            batch_poll_interval_ms: 100,
-            cancellation_poll_interval_ms: None,
+            cancellation_poll_interval_ms: 100,
             purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
@@ -1913,8 +1893,7 @@ mod tests {
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            batch_poll_interval_ms: 100,
-            cancellation_poll_interval_ms: None,
+            cancellation_poll_interval_ms: 100,
             purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
@@ -2078,8 +2057,7 @@ mod tests {
                 "created_at".to_string(),
                 "completion_window".to_string(),
             ],
-            batch_poll_interval_ms: 100,
-            cancellation_poll_interval_ms: None,
+            cancellation_poll_interval_ms: 100,
             purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
@@ -2238,8 +2216,7 @@ mod tests {
                 "completion_window".to_string(),
                 "request_source".to_string(), // This comes from metadata JSON
             ],
-            batch_poll_interval_ms: 100,
-            cancellation_poll_interval_ms: None,
+            cancellation_poll_interval_ms: 100,
             purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,

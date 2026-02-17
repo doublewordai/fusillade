@@ -7500,7 +7500,6 @@ mod tests {
             should_retry: Arc::new(|_| false),
             claim_timeout_ms: 5000,
             processing_timeout_ms: 10000,
-            batch_poll_interval_ms: 100, // Fast polling for tests
             ..Default::default()
         };
 
