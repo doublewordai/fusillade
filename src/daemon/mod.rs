@@ -102,10 +102,14 @@ pub struct DaemonConfig {
     /// Maximum number of retry attempts before giving up.
     pub max_retries: Option<u32>,
 
-    /// Stop retrying this many milliseconds before the batch expires.
-    /// Positive values stop before the deadline (safety buffer).
-    /// Negative values allow retrying after the deadline.
-    /// If None, retries are not deadline-aware.
+    /// Stop retrying (including escalations) this many milliseconds before the batch expires.
+    ///
+    /// - **Negative** (e.g., -300000 = -5 min): Retry for a buffer window AFTER SLA deadline (recommended)
+    /// - **Zero**: Stop exactly at SLA deadline
+    /// - **Positive**: Stop BEFORE SLA deadline (terminates retryable errors within the SLA deadline, avoid!)
+    /// - **None**: No deadline awareness
+    ///
+    /// Default: 0 (stop retrying/escalating on SLA deadline)
     pub stop_before_deadline_ms: Option<i64>,
 
     /// Base backoff duration in milliseconds (will be exponentially increased)
@@ -151,8 +155,15 @@ pub struct DaemonConfig {
     /// Limits database load when many requests become stale simultaneously (e.g., daemon crash).
     pub unclaim_batch_size: usize,
 
-    /// Interval for polling database to check for cancelled batches (milliseconds)
-    /// Determines how quickly in-flight requests are aborted when their batch is cancelled
+    /// Interval for polling batches to perform finalization and check for cancellations (milliseconds).
+    ///
+    /// This polling loop serves two purposes:
+    /// 1. **Batch Finalization**: Fetches active batches and triggers lazy finalization
+    ///    (computing completion timestamps when all requests reach terminal states)
+    /// 2. **Cancellation Detection**: Checks if any active batches have been cancelled
+    ///    and aborts their in-flight requests
+    ///
+    /// Default: 5000ms (5 seconds)
     pub cancellation_poll_interval_ms: u64,
 
     /// Batch table column names to include as request headers.
@@ -199,7 +210,7 @@ impl Default for DaemonConfig {
             model_escalations: default_model_escalations(),
             claim_interval_ms: 1000,
             max_retries: Some(1000),
-            stop_before_deadline_ms: Some(900_000),
+            stop_before_deadline_ms: Some(0),
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
@@ -454,17 +465,21 @@ where
             });
         }
 
-        // Spawn periodic task to poll for cancelled batches and abort in-flight requests
+        // Spawn periodic batch polling task for finalization and cancellation detection
+        // This serves two purposes in one efficient loop:
+        // 1. Triggers lazy finalization by fetching batches (computes completion timestamps)
+        // 2. Detects cancelled batches and aborts their in-flight requests
         let cancellation_tokens = self.cancellation_tokens.clone();
         let storage = self.storage.clone();
         let shutdown_token = self.shutdown_token.clone();
         let cancellation_poll_interval_ms = self.config.cancellation_poll_interval_ms;
+
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_millis(cancellation_poll_interval_ms));
             tracing::info!(
                 interval_ms = cancellation_poll_interval_ms,
-                "Batch cancellation polling started"
+                "Batch polling started (finalization + cancellation detection)"
             );
 
             loop {
@@ -484,29 +499,30 @@ where
                         gauge!("fusillade_cancellation_poll_batches_checked")
                             .set(active_batch_ids.len() as f64);
 
-                        // Query database to check which of these batches have been cancelled
+                        // Fetch batches once for both finalization and cancellation check
                         // Note: DaemonStorage doesn't have a method for this, so we'll check via the batch
                         // For now, we'll check each batch individually
                         for batch_id in active_batch_ids {
-                            // Try to get the batch - if it has cancelling_at set, cancel the token
-                            match storage.get_batch(batch_id, false).await {
-                                Ok(batch) if batch.cancelling_at.is_some() => {
-                                    if let Some(entry) = cancellation_tokens.get(&batch_id) {
-                                        entry.value().cancel();
-                                        counter!("fusillade_batches_cancelled_total").increment(1);
-                                        tracing::info!(batch_id = %batch_id, "Cancelled all requests in batch");
-                                        // Remove from map so we don't keep checking it
-                                        drop(entry);
-                                        cancellation_tokens.remove(&batch_id);
+                            match storage.get_batch(batch_id).await {
+                                Ok(batch) => {
+                                    // Lazy finalization happens as side effect of get_batch()
+
+                                    // Check if batch is being cancelled
+                                    if batch.cancelling_at.is_some()
+                                        && let Some(entry) = cancellation_tokens.get(&batch_id) {
+                                            entry.value().cancel();
+                                            counter!("fusillade_batches_cancelled_total").increment(1);
+                                            tracing::info!(batch_id = %batch_id, "Cancelled all requests in batch");
+                                            drop(entry);
+                                            cancellation_tokens.remove(&batch_id);
                                     }
                                 }
-                                Ok(_) => {}
                                 Err(e) => {
                                     counter!("fusillade_cancellation_poll_errors_total").increment(1);
                                     tracing::warn!(
                                         batch_id = %batch_id,
                                         error = %e,
-                                        "Failed to check batch cancellation status"
+                                        "Failed to fetch batch during cancellation poll"
                                     );
                                 }
                             }
@@ -516,7 +532,7 @@ where
                             .record(poll_start.elapsed().as_secs_f64());
                     }
                     _ = shutdown_token.cancelled() => {
-                        tracing::info!("Shutting down cancellation polling");
+                        tracing::info!("Shutting down batch polling");
                         break;
                     }
                 }
@@ -1326,7 +1342,7 @@ mod tests {
 
         while start.elapsed() < timeout {
             let status = manager
-                .get_batch_status(batch.id, false)
+                .get_batch_status(batch.id)
                 .await
                 .expect("Failed to get batch status");
 
@@ -1400,8 +1416,8 @@ mod tests {
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100, // Fast polling for tests
-            purge_interval_ms: 0,               // Disabled in tests
+            cancellation_poll_interval_ms: 100,
+            purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
         };
@@ -1540,8 +1556,8 @@ mod tests {
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100, // Fast polling for tests
-            purge_interval_ms: 0,               // Disabled in tests
+            cancellation_poll_interval_ms: 100,
+            purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
         };
@@ -1659,7 +1675,7 @@ mod tests {
 
         while start.elapsed() < timeout {
             let status = manager
-                .get_batch_status(batch.id, false)
+                .get_batch_status(batch.id)
                 .await
                 .expect("Failed to get batch status");
 
