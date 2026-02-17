@@ -1,5 +1,16 @@
 # Changelog
 
+## [6.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.5.0...fusillade-v6.0.0) (2026-02-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove hiding of retriable errors ([#130](https://github.com/doublewordai/fusillade/issues/130))
+
+### Features
+
+* remove hiding of retriable errors ([#130](https://github.com/doublewordai/fusillade/issues/130)) ([1717596](https://github.com/doublewordai/fusillade/commit/17175964f98d5e2dd24bb7cfe912b3246c74fc27))
+
 ## [5.5.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.4...fusillade-v5.5.0) (2026-02-17)
 
 
