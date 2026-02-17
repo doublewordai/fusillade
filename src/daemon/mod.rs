@@ -136,10 +136,6 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes.
     pub claim_timeout_ms: u64,
 
-    /// Maximum time a request can stay in "processing" state before being unclaimed
-    /// and returned to pending (milliseconds). This handles daemon crashes during execution.
-    pub processing_timeout_ms: u64,
-
     /// Time after a daemon's last heartbeat before its requests are considered
     /// orphaned and returned to pending (milliseconds). Should be significantly
     /// larger than `heartbeat_interval_ms` to avoid reclaiming from live daemons
@@ -208,7 +204,6 @@ impl Default for DaemonConfig {
             heartbeat_interval_ms: 5000,        // Heartbeat every 5 seconds by default
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,             // 1 minute
-            processing_timeout_ms: 600000,       // 10 minutes
             stale_daemon_threshold_ms: 30_000,   // 30 seconds (6× heartbeat interval)
             unclaim_batch_size: 100,             // Unclaim up to 100 stale requests per poll
             cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
@@ -906,7 +901,9 @@ where
                                         // Don't count as failed - request will be reclaimed
                                     }
                                     Err(e) => {
-                                        // Unexpected error
+                                        // Unexpected error (most commonly a persist() failure,
+                                        // which leaves the request orphaned in 'processing' state)
+                                        counter!("fusillade_request_task_error_total", "model" => model_clone.clone()).increment(1);
                                         tracing::error!(request_id = %request_id, error = %e, "Unexpected error processing request");
                                         return Err(e);
                                     }
@@ -992,7 +989,7 @@ mod tests {
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
+
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -1165,7 +1162,7 @@ mod tests {
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
+
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -1396,7 +1393,7 @@ mod tests {
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
+
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -1536,7 +1533,7 @@ mod tests {
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
+
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -1711,7 +1708,7 @@ mod tests {
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
+
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -1870,7 +1867,7 @@ mod tests {
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
+
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -2029,7 +2026,7 @@ mod tests {
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
+
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![
@@ -2188,7 +2185,7 @@ mod tests {
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
+
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![

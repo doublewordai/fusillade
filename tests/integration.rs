@@ -37,7 +37,6 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
         heartbeat_interval_ms: 10000, // 10 seconds
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
-        processing_timeout_ms: 600000,
         cancellation_poll_interval_ms: 100, // Fast polling for tests
         ..Default::default()
     };
@@ -204,7 +203,6 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
         heartbeat_interval_ms: 10000,
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
-        processing_timeout_ms: 600000,
         cancellation_poll_interval_ms: 100, // Fast polling for tests
         ..Default::default()
     };
@@ -439,7 +437,6 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
         heartbeat_interval_ms: 10000,
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
-        processing_timeout_ms: 600000,
         cancellation_poll_interval_ms: 100, // Fast polling for tests
         ..Default::default()
     };
@@ -572,7 +569,6 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
         heartbeat_interval_ms: 10000,
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
-        processing_timeout_ms: 600000,
         cancellation_poll_interval_ms: 100, // Fast polling for tests
         ..Default::default()
     };
@@ -737,7 +733,6 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
         heartbeat_interval_ms: 10000,
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
-        processing_timeout_ms: 600000,
         cancellation_poll_interval_ms: 100,
         ..Default::default()
     };
@@ -903,7 +898,6 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
         heartbeat_interval_ms: 10000,
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
-        processing_timeout_ms: 600000,
         cancellation_poll_interval_ms: 100,
         ..Default::default()
     };
@@ -1084,7 +1078,6 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
         heartbeat_interval_ms: 10000,
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
-        processing_timeout_ms: 600000,
         cancellation_poll_interval_ms: 100,
         ..Default::default()
     };
@@ -1232,7 +1225,6 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
         heartbeat_interval_ms: 10000,
         should_retry: Arc::new(default_should_retry),
         claim_timeout_ms: 60000,
-        processing_timeout_ms: 600000,
         cancellation_poll_interval_ms: 100,
         ..Default::default()
     };
@@ -2058,7 +2050,6 @@ mod batch_results_stream {
             heartbeat_interval_ms: 10000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100,
             ..Default::default()
         };
@@ -2234,7 +2225,6 @@ mod batch_results_stream {
             heartbeat_interval_ms: 10000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100,
             ..Default::default()
         };
@@ -2361,7 +2351,6 @@ mod batch_results_stream {
             heartbeat_interval_ms: 10000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100,
             ..Default::default()
         };
@@ -2508,7 +2497,6 @@ mod batch_results_stream {
             heartbeat_interval_ms: 10000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100,
             ..Default::default()
         };
@@ -2651,7 +2639,6 @@ mod batch_results_stream {
             heartbeat_interval_ms: 10000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100,
             ..Default::default()
         };
@@ -2806,7 +2793,6 @@ mod batch_results_stream {
             heartbeat_interval_ms: 10000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100,
             ..Default::default()
         };
@@ -2962,7 +2948,6 @@ mod batch_results_stream {
             heartbeat_interval_ms: 10000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
             cancellation_poll_interval_ms: 100,
             ..Default::default()
         };

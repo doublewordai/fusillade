@@ -296,15 +296,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     #[tracing::instrument(skip(self))]
     async fn unclaim_stale_requests(&self) -> Result<usize> {
         let claim_timeout_ms = self.config.claim_timeout_ms as i64;
-        let processing_timeout_ms = self.config.processing_timeout_ms as i64;
         let stale_daemon_threshold_ms = self.config.stale_daemon_threshold_ms as i64;
         let limit = self.config.unclaim_batch_size as i64;
 
         // Unclaim requests that are stuck in claimed or processing states.
-        // Three reclaim paths, from fastest to slowest:
-        //   1. Daemon marked itself dead (graceful shutdown) — immediate
-        //   2. Daemon's heartbeat went stale (SIGKILL/OOM) — stale_daemon_threshold_ms
-        //   3. Time-based fallback (any cause) — claim_timeout_ms / processing_timeout_ms
+        // Two reclaim paths:
+        //   1. Daemon marked itself dead (graceful shutdown) or heartbeat went stale
+        //      (SIGKILL/OOM) — reclaims both claimed and processing requests immediately
+        //   2. Time-based fallback for claimed state only — claim_timeout_ms
+        //
+        // Processing requests are NOT reclaimed by time. Only the owning daemon
+        // (via HTTP timeout) or confirmed daemon death (via heartbeat) can release
+        // a processing request. This prevents duplicate downstream requests that
+        // occur when a time-based reclaim races with the HTTP client timeout.
         //
         // Uses UNION (not OR) so the planner can optimize each branch independently.
         // With OR, Postgres falls into a bitmap heap scan of all in-progress rows (~50K)
@@ -321,12 +325,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 started_at = NULL
             WHERE id IN (
                 SELECT id FROM (
-                    -- Time-based fallback: request stuck too long regardless of daemon state
+                    -- Time-based fallback: claimed request stuck too long (daemon may have
+                    -- crashed between claim and process start)
                     SELECT r.id FROM requests r
-                    WHERE
-                        (r.state = 'claimed' AND r.claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL)
-                        OR
-                        (r.state = 'processing' AND r.started_at < NOW() - ($2 || ' milliseconds')::INTERVAL)
+                    WHERE r.state = 'claimed'
+                      AND r.claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL
                     UNION
                     -- Daemon-aware reclaim: daemon is dead or its heartbeat went stale
                     SELECT r.id FROM requests r
@@ -335,14 +338,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                         AND r.daemon_id IN (
                             SELECT d.id FROM daemons d
                             WHERE d.status = 'dead'
-                               OR d.last_heartbeat < NOW() - ($3 || ' milliseconds')::INTERVAL
+                               OR d.last_heartbeat < NOW() - ($2 || ' milliseconds')::INTERVAL
                         )
                 ) sub
-                LIMIT $4
+                LIMIT $3
             )
             "#,
             claim_timeout_ms.to_string(),
-            processing_timeout_ms.to_string(),
             stale_daemon_threshold_ms.to_string(),
             limit,
         )
@@ -359,7 +361,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             tracing::warn!(
                 count = count,
                 claim_timeout_ms,
-                processing_timeout_ms,
                 stale_daemon_threshold_ms,
                 "Unclaimed stale requests (likely due to daemon crash or shutdown)"
             );
@@ -5472,8 +5473,7 @@ mod tests {
 
         // Create manager with 1-second claim timeout for testing
         let config = crate::daemon::DaemonConfig {
-            claim_timeout_ms: 1000,       // 1 second
-            processing_timeout_ms: 60000, // 1 minute
+            claim_timeout_ms: 1000, // 1 second
             ..Default::default()
         };
         let manager = Arc::new(
@@ -5553,8 +5553,7 @@ mod tests {
 
         // Create manager with 1-second processing timeout for testing
         let config = crate::daemon::DaemonConfig {
-            claim_timeout_ms: 60000,     // 1 minute
-            processing_timeout_ms: 1000, // 1 second
+            claim_timeout_ms: 60000, // 1 minute
             ..Default::default()
         };
         let manager = Arc::new(
@@ -5641,7 +5640,6 @@ mod tests {
         // Long time-based timeouts so only the daemon-aware path triggers
         let config = crate::daemon::DaemonConfig {
             claim_timeout_ms: 600000,
-            processing_timeout_ms: 600000,
             stale_daemon_threshold_ms: 1000, // 1 second for testing
             ..Default::default()
         };
@@ -5739,7 +5737,6 @@ mod tests {
         // Long time-based timeouts so only the daemon-aware path triggers
         let config = crate::daemon::DaemonConfig {
             claim_timeout_ms: 600000,
-            processing_timeout_ms: 600000,
             stale_daemon_threshold_ms: 1000, // 1 second for testing
             ..Default::default()
         };
@@ -5837,7 +5834,6 @@ mod tests {
         // Long time-based timeouts so only the daemon-aware path could trigger
         let config = crate::daemon::DaemonConfig {
             claim_timeout_ms: 600000,
-            processing_timeout_ms: 600000,
             stale_daemon_threshold_ms: 60000, // 1 minute
             ..Default::default()
         };
@@ -5947,8 +5943,7 @@ mod tests {
 
         // Create manager with long timeouts
         let config = crate::daemon::DaemonConfig {
-            claim_timeout_ms: 60000,       // 1 minute
-            processing_timeout_ms: 600000, // 10 minutes
+            claim_timeout_ms: 60000, // 1 minute
             ..Default::default()
         };
         let manager = Arc::new(
@@ -6037,7 +6032,6 @@ mod tests {
         // Create manager with 1-second claim timeout
         let config = crate::daemon::DaemonConfig {
             claim_timeout_ms: 1000,
-            processing_timeout_ms: 60000,
             ..Default::default()
         };
         let manager = Arc::new(
@@ -7634,7 +7628,6 @@ mod tests {
             heartbeat_interval_ms: 1000,
             should_retry: Arc::new(|_| false),
             claim_timeout_ms: 5000,
-            processing_timeout_ms: 10000,
             cancellation_poll_interval_ms: 100, // Fast polling for tests
             ..Default::default()
         };

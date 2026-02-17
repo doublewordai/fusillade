@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests\n            SET\n                state = 'pending',\n                daemon_id = NULL,\n                claimed_at = NULL,\n                started_at = NULL\n            WHERE id IN (\n                SELECT id FROM (\n                    -- Time-based fallback: claimed request stuck too long (daemon may have\n                    -- crashed between claim and process start)\n                    SELECT r.id FROM requests r\n                    WHERE r.state = 'claimed'\n                      AND r.claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL\n                    UNION\n                    -- Daemon-aware reclaim: daemon is dead or its heartbeat went stale\n                    SELECT r.id FROM requests r\n                    WHERE\n                        r.state IN ('claimed', 'processing')\n                        AND r.daemon_id IN (\n                            SELECT d.id FROM daemons d\n                            WHERE d.status = 'dead'\n                               OR d.last_heartbeat < NOW() - ($2 || ' milliseconds')::INTERVAL\n                        )\n                ) sub\n                LIMIT $3\n            )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b96f91c5284afdf4f69f4160cbd72f7fb4e76659f9e26fb0162370d56c9046bf"
+}
