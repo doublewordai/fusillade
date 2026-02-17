@@ -1032,7 +1032,7 @@ mod tests {
             batch_metadata_fields: vec![],
             batch_poll_interval_ms: 100,
             cancellation_poll_interval_ms: None, // Fast polling for tests
-            purge_interval_ms: 0,               // Disabled in tests
+            purge_interval_ms: 0,                // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
         };
@@ -1206,7 +1206,7 @@ mod tests {
             batch_metadata_fields: vec![],
             batch_poll_interval_ms: 100,
             cancellation_poll_interval_ms: None, // Fast polling for tests
-            purge_interval_ms: 0,               // Disabled in tests
+            purge_interval_ms: 0,                // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
         };
@@ -1438,7 +1438,7 @@ mod tests {
             batch_metadata_fields: vec![],
             batch_poll_interval_ms: 100, // Fast polling for tests
             cancellation_poll_interval_ms: None,
-            purge_interval_ms: 0,               // Disabled in tests
+            purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
         };
@@ -1579,7 +1579,7 @@ mod tests {
             batch_metadata_fields: vec![],
             batch_poll_interval_ms: 100, // Fast polling for tests
             cancellation_poll_interval_ms: None,
-            purge_interval_ms: 0,               // Disabled in tests
+            purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
         };

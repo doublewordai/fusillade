@@ -2995,7 +2995,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     pub async fn poll_completed_batches(&self) -> Result<Vec<BatchNotification>> {
         let rows = sqlx::query!(
             r#"
-            -- Step 1: Find candidate batches that need notification
+            -- Step 1: Find candidate batches that are terminal by count
             WITH candidates AS (
                 SELECT b.id,
                        COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -3020,17 +3020,23 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                   AND b.cancelling_at IS NULL         -- Not canceled (don't email on user-canceled batches)
                   AND b.total_requests > 0            -- Has requests
                   AND (
-                      -- Only notify after batch is finalized elsewhere
-                      (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL)
+                      -- Terminal by count: all requests reached terminal state
+                      COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0) = b.total_requests
                   )
             ),
-            -- Step 2: Atomically claim batches for notification (no finalization here)
+            -- Step 2: Atomically claim batches and set terminal timestamps
             updated AS (
                 UPDATE batches b
-                SET notification_sent_at = NOW()
+                SET notification_sent_at = NOW(),  -- Claim for notification (prevents duplicates)
+                    -- Set terminal timestamps via COALESCE (no-op if already set by get_batch)
+                    finalizing_at = COALESCE(b.finalizing_at, NOW()),
+                    completed_at = COALESCE(b.completed_at,
+                        CASE WHEN c.completed_requests > 0 THEN NOW() END),
+                    failed_at = COALESCE(b.failed_at,
+                        CASE WHEN c.completed_requests = 0 THEN NOW() END)
                 FROM candidates c
                 WHERE b.id = c.id
-                  AND b.notification_sent_at IS NULL
+                  AND b.notification_sent_at IS NULL  -- Re-check to handle concurrent pollers
                 RETURNING b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
                           b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                           b.expires_at, b.cancelling_at, b.errors, b.total_requests,
@@ -5576,7 +5582,7 @@ mod tests {
         .unwrap();
 
         // Verify request is in processing
-        let status = manager.get_batch_status(batch.id, false).await.unwrap();
+        let status = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status.in_progress_requests, 1);
 
         // Daemon2 claims — should reclaim daemon1's request because daemon1 is dead
@@ -5674,7 +5680,7 @@ mod tests {
         .unwrap();
 
         // Verify request is in processing
-        let status = manager.get_batch_status(batch.id, false).await.unwrap();
+        let status = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status.in_progress_requests, 1);
 
         // Daemon2 claims — should reclaim because daemon1's heartbeat is stale
@@ -8970,7 +8976,7 @@ mod tests {
         // Verify batch still exists and is queryable (user can download results)
         // delete_file cancels the batch and unlinks it (file_id = NULL) but does
         // NOT delete the batch or its requests
-        let batch_after = manager.get_batch(batch.id, false).await.unwrap();
+        let batch_after = manager.get_batch(batch.id).await.unwrap();
         assert!(
             batch_after.cancelling_at.is_some(),
             "Batch should be cancelled"
