@@ -1,5 +1,59 @@
 # Changelog
 
+## [5.4.4](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.3...fusillade-v5.4.4) (2026-02-16)
+
+
+### Bug Fixes
+
+* optimise deletion (again) ([#142](https://github.com/doublewordai/fusillade/issues/142)) ([35089c7](https://github.com/doublewordai/fusillade/commit/35089c7efed12d67ebac43c746e64342661712ed))
+
+## [5.4.3](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.2...fusillade-v5.4.3) (2026-02-16)
+
+
+### Bug Fixes
+
+* consolidate batch request traces into single trace trees ([#140](https://github.com/doublewordai/fusillade/issues/140)) ([6d5a197](https://github.com/doublewordai/fusillade/commit/6d5a197a759d1cd5a326bbf15bdf8db485dca87c))
+
+## [5.4.2](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.1...fusillade-v5.4.2) (2026-02-16)
+
+
+### Bug Fixes
+
+* avoid full scans and ensure safe concurrency in purge queries ([#138](https://github.com/doublewordai/fusillade/issues/138)) ([3c41a15](https://github.com/doublewordai/fusillade/commit/3c41a15bb7aa7d452e59b41eccc5a4439719bacd))
+
+## [5.4.1](https://github.com/doublewordai/fusillade/compare/fusillade-v5.4.0...fusillade-v5.4.1) (2026-02-13)
+
+
+### Bug Fixes
+
+* reclaim requests from dead or stale-heartbeat daemons ([#136](https://github.com/doublewordai/fusillade/issues/136)) ([53c0391](https://github.com/doublewordai/fusillade/commit/53c0391591d74909f550b620003477e597c3099f))
+
+## [5.4.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.3.1...fusillade-v5.4.0) (2026-02-13)
+
+
+### Features
+
+* make concurrency limit per-daemon instead of global ([#134](https://github.com/doublewordai/fusillade/issues/134)) ([2f4f66d](https://github.com/doublewordai/fusillade/commit/2f4f66dfd62e1eed1576002623d3233996ae9dbc))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate rand to 0.10 ([#124](https://github.com/doublewordai/fusillade/issues/124)) ([4e877c0](https://github.com/doublewordai/fusillade/commit/4e877c024cad71035504ab5dcefb1423d826f4c6))
+
+## [5.3.1](https://github.com/doublewordai/fusillade/compare/fusillade-v5.3.0...fusillade-v5.3.1) (2026-02-12)
+
+
+### Bug Fixes
+
+* Purge query optimisation ([#132](https://github.com/doublewordai/fusillade/issues/132)) ([76f256b](https://github.com/doublewordai/fusillade/commit/76f256b275bf5a3b142b752db2a2e2bce8450c07))
+
+## [5.3.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.2.1...fusillade-v5.3.0) (2026-02-11)
+
+
+### Features
+
+* periodic purge of orphaned request_templates and requests ([#127](https://github.com/doublewordai/fusillade/issues/127)) ([4ecda5f](https://github.com/doublewordai/fusillade/commit/4ecda5f6b8bddd05a613d2b0d92898ffcfd37a0e))
+
 ## [5.2.1](https://github.com/doublewordai/fusillade/compare/fusillade-v5.2.0...fusillade-v5.2.1) (2026-02-10)
 
 

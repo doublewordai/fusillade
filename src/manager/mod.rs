@@ -267,10 +267,15 @@ pub trait Storage: Send + Sync {
     // states as they iterate through them
 
     /// Atomically claim pending requests for processing.
+    ///
+    /// `available_capacity` maps model names to the number of permits available
+    /// on this daemon's semaphores. Models not present in the map use the
+    /// configured default limit. Models with zero capacity are skipped.
     async fn claim_requests(
         &self,
         limit: usize,
         daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
     ) -> Result<Vec<Request<Claimed>>>;
 
     /// Update an existing request's state in storage.
@@ -311,6 +316,14 @@ pub trait DaemonStorage: Send + Sync {
         &self,
         status_filter: Option<DaemonStatus>,
     ) -> Result<Vec<AnyDaemonRecord>>;
+
+    /// Purge orphaned request_templates and requests whose parent (file or batch)
+    /// has been soft-deleted or whose FK is NULL.
+    ///
+    /// Deletes at most `batch_size` rows from each table per call.
+    /// Returns total rows deleted across both tables. Called periodically by
+    /// the daemon purge task for right-to-erasure compliance.
+    async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
 }
 
 /// Daemon executor trait for runtime orchestration.

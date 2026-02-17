@@ -271,10 +271,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     async fn unclaim_stale_requests(&self) -> Result<usize> {
         let claim_timeout_ms = self.config.claim_timeout_ms as i64;
         let processing_timeout_ms = self.config.processing_timeout_ms as i64;
+        let stale_daemon_threshold_ms = self.config.stale_daemon_threshold_ms as i64;
         let limit = self.config.unclaim_batch_size as i64;
 
         // Unclaim requests that are stuck in claimed or processing states.
-        // Uses a subquery with LIMIT to bound the number of rows updated per poll cycle.
+        // Three reclaim paths, from fastest to slowest:
+        //   1. Daemon marked itself dead (graceful shutdown) — immediate
+        //   2. Daemon's heartbeat went stale (SIGKILL/OOM) — stale_daemon_threshold_ms
+        //   3. Time-based fallback (any cause) — claim_timeout_ms / processing_timeout_ms
+        //
+        // Uses UNION (not OR) so the planner can optimize each branch independently.
+        // With OR, Postgres falls into a bitmap heap scan of all in-progress rows (~50K)
+        // to evaluate the EXISTS subquery. With UNION, each branch uses its optimal
+        // index scan: ~4ms total vs ~1s with OR on a 14.5M row table.
         let result = sqlx::query!(
             r#"
             UPDATE requests
@@ -284,16 +293,30 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 claimed_at = NULL,
                 started_at = NULL
             WHERE id IN (
-                SELECT id FROM requests
-                WHERE
-                    (state = 'claimed' AND claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL)
-                    OR
-                    (state = 'processing' AND started_at < NOW() - ($2 || ' milliseconds')::INTERVAL)
-                LIMIT $3
+                SELECT id FROM (
+                    -- Time-based fallback: request stuck too long regardless of daemon state
+                    SELECT r.id FROM requests r
+                    WHERE
+                        (r.state = 'claimed' AND r.claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL)
+                        OR
+                        (r.state = 'processing' AND r.started_at < NOW() - ($2 || ' milliseconds')::INTERVAL)
+                    UNION
+                    -- Daemon-aware reclaim: daemon is dead or its heartbeat went stale
+                    SELECT r.id FROM requests r
+                    WHERE
+                        r.state IN ('claimed', 'processing')
+                        AND r.daemon_id IN (
+                            SELECT d.id FROM daemons d
+                            WHERE d.status = 'dead'
+                               OR d.last_heartbeat < NOW() - ($3 || ' milliseconds')::INTERVAL
+                        )
+                ) sub
+                LIMIT $4
             )
             "#,
             claim_timeout_ms.to_string(),
             processing_timeout_ms.to_string(),
+            stale_daemon_threshold_ms.to_string(),
             limit,
         )
         .execute(self.pools.write())
@@ -307,7 +330,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 count = count,
                 claim_timeout_ms,
                 processing_timeout_ms,
-                "Unclaimed stale requests (likely due to daemon crash)"
+                stale_daemon_threshold_ms,
+                "Unclaimed stale requests (likely due to daemon crash or shutdown)"
             );
         }
 
@@ -710,11 +734,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(result)
     }
 
-    #[tracing::instrument(skip(self), fields(limit))]
+    #[tracing::instrument(skip(self, available_capacity), fields(limit))]
     async fn claim_requests(
         &self,
         limit: usize,
         daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
     ) -> Result<Vec<Request<Claimed>>> {
         // First, unclaim any stale requests (self-healing for daemon crashes)
         let unclaimed_count = self.unclaim_stale_requests().await?;
@@ -768,6 +793,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 break;
             }
 
+            // Use available capacity from the daemon's semaphore state if known,
+            // otherwise fall back to the configured model limit (for new models
+            // the daemon hasn't seen yet).
             let model_limit = self
                 .config
                 .model_concurrency_limits
@@ -775,20 +803,21 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 .map(|entry| *entry.value())
                 .unwrap_or(self.config.default_model_concurrency);
 
-            // Atomically count in-progress requests and claim available slots in a single query
-            // This ensures the count and claim are consistent (no race condition)
+            let available = available_capacity
+                .get(&model)
+                .copied()
+                .unwrap_or(model_limit);
+
+            if available == 0 {
+                tracing::trace!(model = %model, "Skipping model with no available capacity");
+                continue;
+            }
+
+            // Claim pending requests for this model, capped by this daemon's
+            // available semaphore permits. No cross-daemon coordination.
             let rows = sqlx::query!(
                 r#"
-                WITH in_progress_count AS (
-                    SELECT COUNT(*)::BIGINT as count
-                    FROM active_requests r
-                    WHERE r.model = $4
-                        AND r.state IN ('claimed', 'processing')
-                ),
-                available_slots AS (
-                    SELECT GREATEST(0, $2::BIGINT - (SELECT count FROM in_progress_count)) as slots
-                ),
-                to_claim AS (
+                WITH to_claim AS (
                     SELECT r.id, r.template_id, r.batch_id,
                            b.id::TEXT as batch_id_str,
                            b.file_id::TEXT as batch_file_id,
@@ -805,16 +834,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                            b.total_requests::TEXT as batch_total_requests
                     FROM requests r
                     JOIN batches b ON r.batch_id = b.id
-                    CROSS JOIN available_slots
                     WHERE r.state = 'pending'
                         AND r.model = $4
                         AND r.template_id IS NOT NULL
                         AND (r.not_before IS NULL OR r.not_before <= $3)
                         AND b.cancelling_at IS NULL
                         AND b.deleted_at IS NULL
-                        AND available_slots.slots > 0
                     ORDER BY b.expires_at ASC
-                    LIMIT LEAST($5, (SELECT slots FROM available_slots))
+                    LIMIT LEAST($5::BIGINT, $2::BIGINT)
                     FOR UPDATE OF r SKIP LOCKED
                 )
                 UPDATE requests r
@@ -845,7 +872,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                           tc.batch_total_requests as "batch_total_requests!"
                 "#,
                 *daemon_id as Uuid,
-                model_limit as i64,
+                available as i64,
                 now,
                 &model,
                 remaining_limit as i64,
@@ -954,7 +981,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(all_claimed)
     }
 
-    #[tracing::instrument(skip(self, request), fields(request_id = %request.data.id))]
     async fn persist<T: RequestState + Clone>(
         &self,
         request: &Request<T>,
@@ -962,6 +988,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     where
         AnyRequest: From<Request<T>>,
     {
+        tracing::debug!(request_id = %request.data.id, "Persisting request state");
         let any_request = AnyRequest::from(request.clone());
 
         match any_request {
@@ -3958,6 +3985,77 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
 
         Ok(daemons)
     }
+
+    async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64> {
+        // Step 1: Delete requests whose parent batch has been soft-deleted.
+        // Must run before template deletion to prevent ON DELETE SET NULL on
+        // requests.template_id from corrupting live request data.
+        //
+        // Uses LATERAL so Postgres resolves the small set of soft-deleted
+        // batch IDs first, then does an index lookup into requests per batch
+        // via idx_requests_batch_id — avoiding a seq scan of the (potentially
+        // huge) requests table. FOR UPDATE SKIP LOCKED enables concurrent
+        // daemons to partition work without blocking.
+        let requests_deleted = sqlx::query!(
+            r#"
+            DELETE FROM requests
+            WHERE id IN (
+                SELECT r.id
+                FROM (SELECT id FROM batches WHERE deleted_at IS NOT NULL) b,
+                LATERAL (
+                    SELECT id FROM requests
+                    WHERE batch_id = b.id
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                ) r
+                LIMIT $1
+            )
+            "#,
+            batch_size,
+        )
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge orphaned requests: {}", e)))?
+        .rows_affected() as i64;
+
+        // Step 2: Delete request_templates whose parent file has been soft-deleted.
+        // Note: delete_file already cancels dependent batches and unlinks them (sets
+        // file_id = NULL on batches) without deleting the batches or their requests,
+        // so users can still download results. Deleting templates will SET NULL on
+        // requests.template_id via the FK, which is fine — requests are self-contained
+        // once created (all template data is copied at claim time).
+        // Same LATERAL pattern as step 1.
+        let templates_deleted = sqlx::query!(
+            r#"
+            DELETE FROM request_templates
+            WHERE id IN (
+                SELECT rt.id
+                FROM (SELECT id FROM files WHERE deleted_at IS NOT NULL) f,
+                LATERAL (
+                    SELECT id FROM request_templates
+                    WHERE file_id = f.id
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                ) rt
+                LIMIT $1
+            )
+            "#,
+            batch_size,
+        )
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to purge orphaned request_templates: {}", e))
+        })?
+        .rows_affected() as i64;
+
+        let total = (requests_deleted + templates_deleted) as u64;
+        if total > 0 {
+            tracing::info!(requests_deleted, templates_deleted, "Purged orphaned rows");
+        }
+
+        Ok(total)
+    }
 }
 
 // Implement DaemonExecutor trait
@@ -4779,7 +4877,7 @@ mod tests {
 
         // Claim 3 requests
         let claimed = manager
-            .claim_requests(3, daemon_id)
+            .claim_requests(3, daemon_id, &Default::default())
             .await
             .expect("Failed to claim requests");
 
@@ -4791,7 +4889,7 @@ mod tests {
 
         // Try to claim again - should get the remaining 2
         let claimed2 = manager
-            .claim_requests(10, daemon_id)
+            .claim_requests(10, daemon_id, &Default::default())
             .await
             .expect("Failed to claim requests");
 
@@ -5272,7 +5370,10 @@ mod tests {
 
         // Claim the request with daemon1
         let daemon1_id = DaemonId::from(Uuid::new_v4());
-        let claimed = manager.claim_requests(1, daemon1_id).await.unwrap();
+        let claimed = manager
+            .claim_requests(1, daemon1_id, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(claimed.len(), 1);
         let request_id = claimed[0].data.id;
 
@@ -5287,7 +5388,10 @@ mod tests {
 
         // Now daemon2 tries to claim - should unclaim the stale request and re-claim it
         let daemon2_id = DaemonId::from(Uuid::new_v4());
-        let reclaimed = manager.claim_requests(1, daemon2_id).await.unwrap();
+        let reclaimed = manager
+            .claim_requests(1, daemon2_id, &Default::default())
+            .await
+            .unwrap();
 
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].data.id, request_id);
@@ -5347,7 +5451,10 @@ mod tests {
 
         // Claim and manually set to processing state
         let daemon1_id = DaemonId::from(Uuid::new_v4());
-        let claimed = manager.claim_requests(1, daemon1_id).await.unwrap();
+        let claimed = manager
+            .claim_requests(1, daemon1_id, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(claimed.len(), 1);
         let request_id = claimed[0].data.id;
 
@@ -5372,11 +5479,321 @@ mod tests {
 
         // Now daemon2 tries to claim - should unclaim the stale processing request
         let daemon2_id = DaemonId::from(Uuid::new_v4());
-        let reclaimed = manager.claim_requests(1, daemon2_id).await.unwrap();
+        let reclaimed = manager
+            .claim_requests(1, daemon2_id, &Default::default())
+            .await
+            .unwrap();
 
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].data.id, request_id);
         assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
+    }
+
+    #[sqlx::test]
+    async fn test_unclaim_requests_from_dead_daemon(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Long time-based timeouts so only the daemon-aware path triggers
+        let config = crate::daemon::DaemonConfig {
+            claim_timeout_ms: 600000,
+            processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 1000, // 1 second for testing
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client,
+            )
+            .with_config(config),
+        );
+
+        // Create a file and batch
+        let file_id = manager
+            .create_file(
+                "dead-daemon-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Register daemon1 and mark it dead (simulating graceful shutdown)
+        let daemon1_id = DaemonId::from(Uuid::new_v4());
+        let daemon1 = DaemonRecord {
+            data: DaemonData {
+                id: daemon1_id,
+                hostname: "test-host".to_string(),
+                pid: 1234,
+                version: "test".to_string(),
+                config_snapshot: serde_json::json!({}),
+            },
+            state: Dead {
+                started_at: Utc::now() - chrono::Duration::minutes(10),
+                stopped_at: Utc::now(),
+                final_stats: DaemonStats::default(),
+            },
+        };
+        manager.persist_daemon(&daemon1).await.unwrap();
+
+        // Claim request as daemon1, then set to processing
+        let claimed = manager
+            .claim_requests(1, daemon1_id, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let request_id = claimed[0].data.id;
+
+        sqlx::query!(
+            "UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1",
+            *request_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Verify request is in processing
+        let status = manager.get_batch_status(batch.id, false).await.unwrap();
+        assert_eq!(status.in_progress_requests, 1);
+
+        // Daemon2 claims — should reclaim daemon1's request because daemon1 is dead
+        let daemon2_id = DaemonId::from(Uuid::new_v4());
+        let reclaimed = manager
+            .claim_requests(1, daemon2_id, &Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].data.id, request_id);
+        assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
+    }
+
+    #[sqlx::test]
+    async fn test_unclaim_requests_from_stale_heartbeat_daemon(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Long time-based timeouts so only the daemon-aware path triggers
+        let config = crate::daemon::DaemonConfig {
+            claim_timeout_ms: 600000,
+            processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 1000, // 1 second for testing
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client,
+            )
+            .with_config(config),
+        );
+
+        // Create a file and batch
+        let file_id = manager
+            .create_file(
+                "stale-heartbeat-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Register daemon1 as running but with a stale heartbeat (SIGKILL scenario)
+        let daemon1_id = DaemonId::from(Uuid::new_v4());
+        let daemon1 = DaemonRecord {
+            data: DaemonData {
+                id: daemon1_id,
+                hostname: "test-host".to_string(),
+                pid: 1234,
+                version: "test".to_string(),
+                config_snapshot: serde_json::json!({}),
+            },
+            state: Running {
+                started_at: Utc::now() - chrono::Duration::minutes(10),
+                last_heartbeat: Utc::now() - chrono::Duration::seconds(5), // 5s ago, past 1s threshold
+                stats: DaemonStats::default(),
+            },
+        };
+        manager.persist_daemon(&daemon1).await.unwrap();
+
+        // Claim request as daemon1, then set to processing
+        let claimed = manager
+            .claim_requests(1, daemon1_id, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let request_id = claimed[0].data.id;
+
+        sqlx::query!(
+            "UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1",
+            *request_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Verify request is in processing
+        let status = manager.get_batch_status(batch.id, false).await.unwrap();
+        assert_eq!(status.in_progress_requests, 1);
+
+        // Daemon2 claims — should reclaim because daemon1's heartbeat is stale
+        let daemon2_id = DaemonId::from(Uuid::new_v4());
+        let reclaimed = manager
+            .claim_requests(1, daemon2_id, &Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].data.id, request_id);
+        assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
+    }
+
+    #[sqlx::test]
+    async fn test_dont_unclaim_requests_from_healthy_daemon(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Long time-based timeouts so only the daemon-aware path could trigger
+        let config = crate::daemon::DaemonConfig {
+            claim_timeout_ms: 600000,
+            processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 60000, // 1 minute
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client,
+            )
+            .with_config(config),
+        );
+
+        // Create a file and batch with 2 templates
+        let file_id = manager
+            .create_file(
+                "healthy-daemon-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":1}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":2}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Register daemon1 as running with a fresh heartbeat
+        let daemon1_id = DaemonId::from(Uuid::new_v4());
+        let daemon1 = DaemonRecord {
+            data: DaemonData {
+                id: daemon1_id,
+                hostname: "test-host".to_string(),
+                pid: 1234,
+                version: "test".to_string(),
+                config_snapshot: serde_json::json!({}),
+            },
+            state: Running {
+                started_at: Utc::now() - chrono::Duration::minutes(10),
+                last_heartbeat: Utc::now(), // fresh heartbeat
+                stats: DaemonStats::default(),
+            },
+        };
+        manager.persist_daemon(&daemon1).await.unwrap();
+
+        // Daemon1 claims first request and sets to processing
+        let claimed = manager
+            .claim_requests(1, daemon1_id, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let request_id = claimed[0].data.id;
+
+        sqlx::query!(
+            "UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1",
+            *request_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Daemon2 claims — should get the second request, NOT steal from healthy daemon1
+        let daemon2_id = DaemonId::from(Uuid::new_v4());
+        let claimed2 = manager
+            .claim_requests(1, daemon2_id, &Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(claimed2.len(), 1);
+        assert_ne!(claimed2[0].data.id, request_id);
+
+        // Verify daemon1's request is still processing (not stolen)
+        let results = manager.get_requests(vec![request_id]).await.unwrap();
+        assert!(
+            matches!(&results[0], Ok(crate::AnyRequest::Processing(_))),
+            "Request should still be in processing state"
+        );
     }
 
     #[sqlx::test]
@@ -5439,12 +5856,18 @@ mod tests {
 
         // Daemon1 claims first request
         let daemon1_id = DaemonId::from(Uuid::new_v4());
-        let claimed1 = manager.claim_requests(1, daemon1_id).await.unwrap();
+        let claimed1 = manager
+            .claim_requests(1, daemon1_id, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(claimed1.len(), 1);
 
         // Daemon2 immediately tries to claim - should get the second request, not steal the first
         let daemon2_id = DaemonId::from(Uuid::new_v4());
-        let claimed2 = manager.claim_requests(1, daemon2_id).await.unwrap();
+        let claimed2 = manager
+            .claim_requests(1, daemon2_id, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(claimed2.len(), 1);
 
         // Verify they got different requests
@@ -5529,7 +5952,10 @@ mod tests {
 
         // Claim should unclaim the stale request and reclaim it
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let claimed = manager.claim_requests(1, daemon_id).await.unwrap();
+        let claimed = manager
+            .claim_requests(1, daemon_id, &Default::default())
+            .await
+            .unwrap();
 
         assert_eq!(claimed.len(), 1);
         // Verify retry_attempt is preserved
@@ -6320,7 +6746,10 @@ mod tests {
 
         // Claim and complete some requests
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let claimed = manager.claim_requests(2, daemon_id).await.unwrap();
+        let claimed = manager
+            .claim_requests(2, daemon_id, &Default::default())
+            .await
+            .unwrap();
 
         // Mark one as completed
         sqlx::query!(
@@ -6491,7 +6920,10 @@ mod tests {
 
         // Put requests in different states
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let claimed = manager.claim_requests(2, daemon_id).await.unwrap();
+        let claimed = manager
+            .claim_requests(2, daemon_id, &Default::default())
+            .await
+            .unwrap();
         let claimed_ids: Vec<_> = claimed.iter().map(|r| r.data.id).collect();
 
         // Mark first claimed as completed (needs started_at for Processing->Completed transition)
@@ -6683,14 +7115,14 @@ mod tests {
     }
 
     // =========================================================================
-    // CONCURRENCY & GLOBAL LIMITS
+    // CONCURRENCY & PER-DAEMON LIMITS
     // =========================================================================
     // Tests for per-model concurrency limits:
-    // - Global per-model limits enforced across daemons
-    // - Request claiming respects concurrent processing limits
+    // - Per-daemon limits: each daemon independently enforces its own limit
+    // - Request claiming respects the daemon's available capacity
 
     #[sqlx::test]
-    async fn test_global_per_model_limit_enforced_across_daemons(pool: sqlx::PgPool) {
+    async fn test_per_daemon_limit_allows_independent_claiming(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
 
         // Set up manager with per-model limit of 3
@@ -6742,42 +7174,57 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate 3 daemons claiming simultaneously
+        // Simulate 3 daemons claiming — each has full capacity (3 per model)
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let daemon3_id = DaemonId::from(Uuid::new_v4());
 
-        // Each daemon tries to claim 10 requests (more than available per model)
-        let claimed1 = manager.claim_requests(10, daemon1_id).await.unwrap();
-        let claimed2 = manager.claim_requests(10, daemon2_id).await.unwrap();
-        let claimed3 = manager.claim_requests(10, daemon3_id).await.unwrap();
+        let full_capacity: std::collections::HashMap<String, usize> =
+            [("model-a".to_string(), 3), ("model-b".to_string(), 3)].into();
 
-        // Count requests per model across all daemons
-        let mut model_counts = std::collections::HashMap::new();
+        let claimed1 = manager
+            .claim_requests(10, daemon1_id, &full_capacity)
+            .await
+            .unwrap();
+        let claimed2 = manager
+            .claim_requests(10, daemon2_id, &full_capacity)
+            .await
+            .unwrap();
+        let claimed3 = manager
+            .claim_requests(10, daemon3_id, &full_capacity)
+            .await
+            .unwrap();
+
+        // Each daemon should claim up to 3 per model (its own limit),
+        // for a total of up to 9 per model across 3 daemons
+        let mut per_daemon_model_counts: Vec<std::collections::HashMap<String, i32>> = Vec::new();
         for claimed in [&claimed1, &claimed2, &claimed3] {
+            let mut counts = std::collections::HashMap::new();
             for request in claimed {
-                *model_counts.entry(request.data.model.clone()).or_insert(0) += 1;
+                *counts.entry(request.data.model.clone()).or_insert(0) += 1;
+            }
+            per_daemon_model_counts.push(counts);
+        }
+
+        // Verify each daemon respects its own per-model limit of 3
+        for (i, counts) in per_daemon_model_counts.iter().enumerate() {
+            for (model, count) in counts {
+                assert!(
+                    *count <= 3,
+                    "Daemon {} claimed {} requests for {}, exceeding per-daemon limit of 3",
+                    i + 1,
+                    count,
+                    model,
+                );
             }
         }
 
-        // Verify global per-model limits are enforced
+        // Total across all daemons should be up to 9 per model (3 daemons × 3 limit)
+        let total = claimed1.len() + claimed2.len() + claimed3.len();
         assert!(
-            *model_counts.get("model-a").unwrap_or(&0) <= 3,
-            "model-a should not exceed limit of 3 across all daemons, got {}",
-            model_counts.get("model-a").unwrap_or(&0)
-        );
-        assert!(
-            *model_counts.get("model-b").unwrap_or(&0) <= 3,
-            "model-b should not exceed limit of 3 across all daemons, got {}",
-            model_counts.get("model-b").unwrap_or(&0)
-        );
-
-        // Total claimed should be at most 6 (3 per model × 2 models)
-        let total: i32 = model_counts.values().sum();
-        assert!(
-            total <= 6,
-            "Total claimed should not exceed 6 (respecting per-model limits), got {}",
-            total
+            total <= 18,
+            "Total claimed should not exceed 18 (3 per model × 2 models × 3 daemons), got {}",
+            total,
         );
     }
 
@@ -7901,7 +8348,7 @@ mod tests {
 
         // Claim 1 request - should get the most urgent one (batch1, 30 min)
         let claimed = manager
-            .claim_requests(1, daemon_id)
+            .claim_requests(1, daemon_id, &Default::default())
             .await
             .expect("Failed to claim requests");
 
@@ -7914,7 +8361,7 @@ mod tests {
 
         // Claim another - should get medium priority (batch2, 2 hours)
         let claimed2 = manager
-            .claim_requests(1, daemon_id)
+            .claim_requests(1, daemon_id, &Default::default())
             .await
             .expect("Failed to claim requests");
 
@@ -7927,7 +8374,7 @@ mod tests {
 
         // Claim last one - should get no-SLA batch (batch3)
         let claimed3 = manager
-            .claim_requests(1, daemon_id)
+            .claim_requests(1, daemon_id, &Default::default())
             .await
             .expect("Failed to claim requests");
 
@@ -8171,5 +8618,462 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(retried_again, 0, "No failed requests to retry");
+    }
+
+    // =========================================================================
+    // ORPHANED ROW PURGE
+    // =========================================================================
+    // Tests for purge_orphaned_rows: right-to-erasure compliance by hard-deleting
+    // orphaned request_templates and requests after soft-deletion of files/batches.
+
+    #[sqlx::test]
+    async fn test_purge_orphaned_templates_after_file_delete(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a file with 2 templates
+        let file_id = manager
+            .create_file(
+                "purge-templates-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":1}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":2}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Verify templates exist
+        let count_before: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM request_templates WHERE file_id = $1",
+            *file_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count_before, 2);
+
+        // Delete the file (soft-delete, orphans templates)
+        manager.delete_file(file_id).await.unwrap();
+
+        // Purge should hard-delete the orphaned templates
+        let deleted = manager.purge_orphaned_rows(1000).await.unwrap();
+        assert!(deleted >= 2, "Should have deleted at least 2 templates");
+
+        // Verify templates are gone from the database entirely
+        let count_after: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM request_templates WHERE file_id = $1",
+            *file_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count_after, 0);
+
+        // Second purge should return 0
+        let deleted_again = manager.purge_orphaned_rows(1000).await.unwrap();
+        assert_eq!(deleted_again, 0);
+    }
+
+    #[sqlx::test]
+    async fn test_purge_orphaned_requests_after_batch_delete(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a file with templates
+        let file_id = manager
+            .create_file(
+                "purge-requests-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":1}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":2}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Create a batch (spawns 2 requests)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Verify requests exist
+        let count_before: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM requests WHERE batch_id = $1",
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count_before, 2);
+
+        // Delete the batch (soft-delete)
+        manager.delete_batch(batch.id).await.unwrap();
+
+        // Purge should hard-delete the orphaned requests
+        let deleted = manager.purge_orphaned_rows(1000).await.unwrap();
+        assert!(deleted >= 2, "Should have deleted at least 2 requests");
+
+        // Verify requests are gone from the database entirely
+        let count_after: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM requests WHERE batch_id = $1",
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count_after, 0);
+    }
+
+    #[sqlx::test]
+    async fn test_purge_does_not_delete_active_rows(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a file with templates
+        let file_id = manager
+            .create_file(
+                "purge-active-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"n":1}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Create a batch (spawns 1 request)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Do NOT delete file or batch — everything is active
+        let deleted = manager.purge_orphaned_rows(1000).await.unwrap();
+        assert_eq!(deleted, 0, "Should not delete any active rows");
+
+        // Verify data is intact
+        let template_count: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM request_templates WHERE file_id = $1",
+            *file_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(template_count, 1);
+
+        let request_count: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM requests WHERE batch_id = $1",
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(request_count, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_purge_returns_zero_when_empty(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let deleted = manager.purge_orphaned_rows(1000).await.unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[sqlx::test]
+    async fn test_purge_respects_batch_size(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a file with 10 templates
+        let templates: Vec<RequestTemplateInput> = (0..10)
+            .map(|i| RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: format!(r#"{{"n":{}}}"#, i),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file("purge-batch-size-test".to_string(), None, templates)
+            .await
+            .unwrap();
+
+        // Delete the file (soft-delete)
+        manager.delete_file(file_id).await.unwrap();
+
+        // Purge with batch_size=3 should delete at most 3 templates per call
+        let deleted_first = manager.purge_orphaned_rows(3).await.unwrap();
+        assert_eq!(deleted_first, 3, "Should delete exactly 3 templates");
+
+        // Verify 7 remain
+        let remaining: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM request_templates WHERE file_id = $1",
+            *file_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 7);
+
+        // Purge again — another 3
+        let deleted_second = manager.purge_orphaned_rows(3).await.unwrap();
+        assert_eq!(deleted_second, 3);
+
+        // Purge until drained
+        let deleted_third = manager.purge_orphaned_rows(3).await.unwrap();
+        assert_eq!(deleted_third, 3);
+
+        let deleted_fourth = manager.purge_orphaned_rows(3).await.unwrap();
+        assert_eq!(deleted_fourth, 1, "Only 1 remaining");
+
+        let deleted_fifth = manager.purge_orphaned_rows(3).await.unwrap();
+        assert_eq!(deleted_fifth, 0, "Nothing left to purge");
+    }
+
+    #[sqlx::test]
+    async fn test_purge_deletes_templates_after_file_delete_without_waiting_for_batch(
+        pool: sqlx::PgPool,
+    ) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a file with a template
+        let file_id = manager
+            .create_file(
+                "purge-safety-guard-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"n":1}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Create a batch (spawns 1 request referencing the template)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Soft-delete the file — cancels the batch but does NOT delete it
+        manager.delete_file(file_id).await.unwrap();
+
+        // Purge should delete templates immediately even though requests still
+        // reference them — requests are self-contained (template data is copied
+        // at claim time) so ON DELETE SET NULL on template_id is harmless
+        let deleted = manager.purge_orphaned_rows(1000).await.unwrap();
+        assert!(deleted >= 1, "Should delete orphaned templates");
+
+        // Verify templates are gone
+        let template_count: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM request_templates WHERE file_id = $1",
+            *file_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(template_count, 0);
+
+        // Verify batch still exists and is queryable (user can download results)
+        // delete_file cancels the batch and unlinks it (file_id = NULL) but does
+        // NOT delete the batch or its requests
+        let batch_after = manager.get_batch(batch.id, false).await.unwrap();
+        assert!(
+            batch_after.cancelling_at.is_some(),
+            "Batch should be cancelled"
+        );
+        assert_eq!(
+            batch_after.file_id, None,
+            "Batch file_id should be NULL after file deletion"
+        );
+
+        // Verify requests still exist with template_id set to NULL by ON DELETE SET NULL
+        // Requests are self-contained — response_body, error, status etc. are all on
+        // the request row, so output/error file streams (which query requests directly
+        // by batch_id) remain fully functional
+        let request_count: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM requests WHERE batch_id = $1",
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(request_count, 1, "Request should still exist");
+
+        let null_template_count: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM requests WHERE batch_id = $1 AND template_id IS NULL",
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            null_template_count, 1,
+            "Request template_id should be NULL after template deletion"
+        );
+
+        // Verify input file is no longer accessible (soft-deleted)
+        let input_file = manager.get_file(file_id).await;
+        assert!(
+            input_file.is_err(),
+            "Input file should not be accessible after deletion"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_purge_batch_size_applies_independently_to_requests_and_templates(
+        pool: sqlx::PgPool,
+    ) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a file with 5 templates
+        let templates: Vec<RequestTemplateInput> = (0..5)
+            .map(|i| RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: format!(r#"{{"n":{}}}"#, i),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file("purge-independent-limit-test".to_string(), None, templates)
+            .await
+            .unwrap();
+
+        // Create a batch (spawns 5 requests)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Soft-delete both file and batch to orphan everything
+        manager.delete_batch(batch.id).await.unwrap();
+        manager.delete_file(file_id).await.unwrap();
+
+        // Purge with batch_size=3: should delete up to 3 requests AND up to 3 templates
+        // independently (i.e. total can be up to 6, not capped at 3 across both)
+        let deleted = manager.purge_orphaned_rows(3).await.unwrap();
+        assert!(
+            deleted > 3,
+            "batch_size should apply independently: expected >3, got {}",
+            deleted
+        );
+
+        // Drain remaining
+        let mut total_deleted = deleted;
+        loop {
+            let d = manager.purge_orphaned_rows(3).await.unwrap();
+            if d == 0 {
+                break;
+            }
+            total_deleted += d;
+        }
+        assert_eq!(
+            total_deleted, 10,
+            "Should delete all 5 requests + 5 templates"
+        );
     }
 }

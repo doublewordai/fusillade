@@ -8,6 +8,10 @@ use metrics::{counter, gauge, histogram};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
 
+use opentelemetry::trace::TraceContextExt;
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
 use crate::FusilladeError;
 use crate::batch::BatchId;
 use crate::error::Result;
@@ -140,6 +144,13 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution.
     pub processing_timeout_ms: u64,
 
+    /// Time after a daemon's last heartbeat before its requests are considered
+    /// orphaned and returned to pending (milliseconds). Should be significantly
+    /// larger than `heartbeat_interval_ms` to avoid reclaiming from live daemons
+    /// that are merely slow. Also reclaims from daemons explicitly marked dead.
+    /// Default: 30,000 (30 seconds, 6× the default heartbeat interval).
+    pub stale_daemon_threshold_ms: u64,
+
     /// Maximum number of stale requests to unclaim in a single poll cycle.
     /// Limits database load when many requests become stale simultaneously (e.g., daemon crash).
     pub unclaim_batch_size: usize,
@@ -172,6 +183,22 @@ pub struct DaemonConfig {
     ///   - x-fusillade-batch-endpoint
     #[serde(default = "default_batch_metadata_fields")]
     pub batch_metadata_fields: Vec<String>,
+
+    /// Interval for running the orphaned row purge task (milliseconds).
+    /// Deletes orphaned request_templates and requests whose parent file/batch
+    /// has been soft-deleted, for right-to-erasure compliance.
+    /// Set to 0 to disable purging. Default: 3,600,000 (1 hour).
+    pub purge_interval_ms: u64,
+
+    /// Maximum number of orphaned rows to delete per purge iteration.
+    /// Each iteration deletes up to this many requests and this many request_templates.
+    /// Default: 1000.
+    pub purge_batch_size: i64,
+
+    /// Throttle delay between consecutive purge batches within a single drain
+    /// cycle (milliseconds). Prevents sustained high DB load when many orphans
+    /// exist. Default: 100.
+    pub purge_throttle_ms: u64,
 }
 
 fn default_batch_metadata_fields() -> Vec<String> {
@@ -202,14 +229,18 @@ impl Default for DaemonConfig {
             max_backoff_ms: 10000,
             timeout_ms: 600000,
             status_log_interval_ms: Some(2000), // Log every 2 seconds by default
-            heartbeat_interval_ms: 10000,       // Heartbeat every 10 seconds by default
+            heartbeat_interval_ms: 5000,        // Heartbeat every 5 seconds by default
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,             // 1 minute
             processing_timeout_ms: 600000,       // 10 minutes
+            stale_daemon_threshold_ms: 30_000,   // 30 seconds (6× heartbeat interval)
             unclaim_batch_size: 100,             // Unclaim up to 100 stale requests per poll
             batch_poll_interval_ms: 5000,        // Poll every 5 seconds by default
             cancellation_poll_interval_ms: None, // Deprecated
             batch_metadata_fields: default_batch_metadata_fields(),
+            purge_interval_ms: 600_000, // 10 minutes
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         }
     }
 }
@@ -511,6 +542,57 @@ where
             }
         });
 
+        // Spawn periodic purge task for orphaned rows (right-to-erasure compliance)
+        if self.config.purge_interval_ms > 0 {
+            let storage = self.storage.clone();
+            let shutdown_token = self.shutdown_token.clone();
+            let purge_interval_ms = self.config.purge_interval_ms;
+            let purge_batch_size = self.config.purge_batch_size;
+            let purge_throttle_ms = self.config.purge_throttle_ms;
+
+            tokio::spawn(async move {
+                tracing::info!(
+                    interval_ms = purge_interval_ms,
+                    batch_size = purge_batch_size,
+                    throttle_ms = purge_throttle_ms,
+                    "Orphaned row purge task started"
+                );
+
+                loop {
+                    // Sleep for the configured interval (interruptible by shutdown)
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(purge_interval_ms)) => {},
+                        _ = shutdown_token.cancelled() => {
+                            tracing::info!("Shutting down purge task");
+                            break;
+                        }
+                    }
+
+                    // Drain orphaned rows in batches
+                    loop {
+                        match storage.purge_orphaned_rows(purge_batch_size).await {
+                            Ok(0) => break,
+                            Ok(deleted) => {
+                                tracing::debug!(deleted, "Purged orphaned rows");
+                                // Throttle between batches to avoid sustained DB load
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_millis(purge_throttle_ms)) => {},
+                                    _ = shutdown_token.cancelled() => {
+                                        tracing::info!("Shutting down purge task during drain");
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to purge orphaned rows");
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
         let run_result = loop {
@@ -543,10 +625,24 @@ where
                     break Ok(());
                 }
             }
+            // Snapshot available semaphore permits per model so claim_requests
+            // only claims what this daemon can actually process.
+            let available_capacity: std::collections::HashMap<String, usize> = {
+                let semaphores = self.semaphores.read().await;
+                semaphores
+                    .iter()
+                    .map(|(model, (sem, _))| (model.clone(), sem.available_permits()))
+                    .collect()
+            };
+
             // Claim a batch of pending requests
             let mut claimed = self
                 .storage
-                .claim_requests(self.config.claim_batch_size, self.daemon_id)
+                .claim_requests(
+                    self.config.claim_batch_size,
+                    self.daemon_id,
+                    &available_capacity,
+                )
                 .await?;
 
             // Record claim metrics
@@ -651,7 +747,26 @@ where
                             gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
                                 .increment(1.0);
 
+                            let process_span = tracing::info_span!(
+                                "process_request",
+                                trace_id = tracing::field::Empty,
+                                otel.name = "process_request",
+                                request_id = %request_id,
+                                batch_id = %batch_id,
+                                model = %model,
+                            );
+                            // Start a new trace root so process_request isn't
+                            // parented under the claim_requests span.
+                            let _ = process_span.set_parent(opentelemetry::Context::new());
+
                             join_set.spawn(async move {
+                                // Record trace_id from OTel context
+                                let span = tracing::Span::current();
+                                let sc = span.context().span().span_context().clone();
+                                if sc.is_valid() {
+                                    span.record("trace_id", tracing::field::display(sc.trace_id()));
+                                }
+
                                 // Permit is held for the duration of this task
                                 let _permit = permit;
 
@@ -811,7 +926,7 @@ where
                                 // up when the daemon shuts down or batch completes.
 
                                 Ok(())
-                            });
+                            }.instrument(process_span));
                         }
                         None => {
                             tracing::debug!(
@@ -872,6 +987,7 @@ mod tests {
             claim_interval_ms: 10, // Very fast for testing
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
@@ -880,14 +996,18 @@ mod tests {
             max_backoff_ms: 1000,
             timeout_ms: 5000,
             status_log_interval_ms: None, // Disable status logging in tests
-            heartbeat_interval_ms: 10000, // 10 seconds
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             batch_poll_interval_ms: 100,
             cancellation_poll_interval_ms: None, // Fast polling for tests
+            purge_interval_ms: 0,               // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -1041,6 +1161,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits,
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
@@ -1049,14 +1170,18 @@ mod tests {
             max_backoff_ms: 1000,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             batch_poll_interval_ms: 100,
             cancellation_poll_interval_ms: None, // Fast polling for tests
+            purge_interval_ms: 0,               // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -1268,6 +1393,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(5),
             stop_before_deadline_ms: None,
@@ -1276,14 +1402,18 @@ mod tests {
             max_backoff_ms: 100,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             batch_poll_interval_ms: 100, // Fast polling for tests
             cancellation_poll_interval_ms: None,
+            purge_interval_ms: 0,               // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -1404,6 +1534,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
@@ -1412,14 +1543,18 @@ mod tests {
             max_backoff_ms: 1000,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             batch_poll_interval_ms: 100, // Fast polling for tests
             cancellation_poll_interval_ms: None,
+            purge_interval_ms: 0,               // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -1575,6 +1710,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(10_000),
             stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
@@ -1583,14 +1719,18 @@ mod tests {
             max_backoff_ms: 200,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             batch_poll_interval_ms: 100,
             cancellation_poll_interval_ms: None,
+            purge_interval_ms: 0, // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -1730,6 +1870,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: None,             // No retry limit
             stop_before_deadline_ms: None, // No buffer - should retry until deadline
@@ -1738,14 +1879,18 @@ mod tests {
             max_backoff_ms: 200,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
             batch_poll_interval_ms: 100,
             cancellation_poll_interval_ms: None,
+            purge_interval_ms: 0, // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -1885,6 +2030,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
@@ -1893,10 +2039,11 @@ mod tests {
             max_backoff_ms: 1000,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![
                 "id".to_string(),
@@ -1906,6 +2053,9 @@ mod tests {
             ],
             batch_poll_interval_ms: 100,
             cancellation_poll_interval_ms: None,
+            purge_interval_ms: 0, // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
@@ -2040,6 +2190,7 @@ mod tests {
             claim_interval_ms: 10,
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
             stop_before_deadline_ms: None,
@@ -2048,10 +2199,11 @@ mod tests {
             max_backoff_ms: 1000,
             timeout_ms: 5000,
             status_log_interval_ms: None,
-            heartbeat_interval_ms: 10000,
+            heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![
                 "id".to_string(),
@@ -2061,6 +2213,9 @@ mod tests {
             ],
             batch_poll_interval_ms: 100,
             cancellation_poll_interval_ms: None,
+            purge_interval_ms: 0, // Disabled in tests
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         };
 
         let manager = Arc::new(
