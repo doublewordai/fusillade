@@ -219,6 +219,26 @@ impl FailureReason {
         }
     }
 
+    /// Returns a short, stable label for use in metrics.
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            FailureReason::RetriableHttpStatus { .. } => "retriable_http_status",
+            FailureReason::NonRetriableHttpStatus { .. } => "non_retriable_http_status",
+            FailureReason::NetworkError { .. } => "network_error",
+            FailureReason::TaskTerminated => "task_terminated",
+            FailureReason::RequestBuilderError { .. } => "builder_error",
+        }
+    }
+
+    /// Returns the HTTP status code as a string for metrics, or empty for non-HTTP failures.
+    pub fn status_code_label(&self) -> String {
+        match self {
+            FailureReason::RetriableHttpStatus { status, .. }
+            | FailureReason::NonRetriableHttpStatus { status, .. } => status.to_string(),
+            _ => String::new(),
+        }
+    }
+
     /// Returns a human-readable error message for this failure reason.
     pub fn to_error_message(&self) -> String {
         match self {
