@@ -198,13 +198,22 @@ pub trait Storage: Send + Sync {
     /// The number of requests that were retried.
     async fn retry_failed_requests_for_batch(&self, batch_id: BatchId) -> Result<u64>;
 
-    /// The following methods are defined specifically for requests - i.e. independent of the
-    /// files/batches they belong to.
-    /// Get pending request counts grouped by model and completion window.
+    /// Get request counts grouped by model and completion window.
     ///
-    /// This excludes escalated racing requests (`is_escalated = true`).
+    /// - `windows`: Vec of (label, seconds)
+    /// - `states`: request states to include (e.g. ["pending"], or ["pending","claimed","processing"])
+    /// - `model_filter`: optional model whitelist (empty = all)
+    /// - `strict`: bool. For critical/sensitive operations, set 'true' to use the write pool and avoid read lags.
+    ///
+    /// This excludes:
+    /// - Requests without a template_id
+    /// - Requests in batches being cancelled
     async fn get_pending_request_counts_by_model_and_completion_window(
         &self,
+        windows: &[(String, i64)],
+        states: &[String],
+        model_filter: &[String],
+        strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>>;
     ///
     /// Cancel one or more individual pending or in-progress requests.
