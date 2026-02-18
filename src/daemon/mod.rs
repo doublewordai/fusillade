@@ -499,32 +499,25 @@ where
                         gauge!("fusillade_cancellation_poll_batches_checked")
                             .set(active_batch_ids.len() as f64);
 
-                        // Fetch batches once for both finalization and cancellation check
-                        // Note: DaemonStorage doesn't have a method for this, so we'll check via the batch
-                        // For now, we'll check each batch individually
-                        for batch_id in active_batch_ids {
-                            match storage.get_batch(batch_id).await {
-                                Ok(batch) => {
-                                    // Lazy finalization happens as side effect of get_batch()
-
-                                    // Check if batch is being cancelled
-                                    if batch.cancelling_at.is_some()
-                                        && let Some(entry) = cancellation_tokens.get(&batch_id) {
-                                            entry.value().cancel();
-                                            counter!("fusillade_batches_cancelled_total").increment(1);
-                                            tracing::info!(batch_id = %batch_id, "Cancelled all requests in batch");
-                                            drop(entry);
-                                            cancellation_tokens.remove(&batch_id);
+                        // Single bulk query to find which active batches have been cancelled
+                        match storage.get_cancelled_batch_ids(&active_batch_ids).await {
+                            Ok(cancelled_ids) => {
+                                for batch_id in cancelled_ids {
+                                    if let Some(entry) = cancellation_tokens.get(&batch_id) {
+                                        entry.value().cancel();
+                                        counter!("fusillade_batches_cancelled_total").increment(1);
+                                        tracing::info!(batch_id = %batch_id, "Cancelled all requests in batch");
+                                        drop(entry);
+                                        cancellation_tokens.remove(&batch_id);
                                     }
                                 }
-                                Err(e) => {
-                                    counter!("fusillade_cancellation_poll_errors_total").increment(1);
-                                    tracing::warn!(
-                                        batch_id = %batch_id,
-                                        error = %e,
-                                        "Failed to fetch batch during cancellation poll"
-                                    );
-                                }
+                            }
+                            Err(e) => {
+                                counter!("fusillade_cancellation_poll_errors_total").increment(1);
+                                tracing::warn!(
+                                    error = %e,
+                                    "Failed to check batch cancellation status"
+                                );
                             }
                         }
 

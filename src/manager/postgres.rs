@@ -2450,6 +2450,32 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .collect())
     }
 
+    async fn get_cancelled_batch_ids(&self, batch_ids: &[BatchId]) -> Result<Vec<BatchId>> {
+        if batch_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let uuids: Vec<Uuid> = batch_ids.iter().map(|id| **id).collect();
+
+        let rows = sqlx::query_scalar!(
+            r#"
+            SELECT id
+            FROM batches
+            WHERE id = ANY($1)
+              AND cancelling_at IS NOT NULL
+              AND deleted_at IS NULL
+            "#,
+            &uuids,
+        )
+        .fetch_all(self.pools.read())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to fetch cancelled batch IDs: {}", e))
+        })?;
+
+        Ok(rows.into_iter().map(BatchId::from).collect())
+    }
+
     #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
         let now = Utc::now();
