@@ -2278,7 +2278,12 @@ mod queue_counts {
         .unwrap();
 
         let counts = manager
-            .get_pending_request_counts_by_model_and_completion_window()
+            .get_pending_request_counts_by_model_and_completion_window(
+                &[("1h".to_string(), 3600), ("24h".to_string(), 24 * 3600)],
+                &["pending".to_string()],
+                &[],
+                false,
+            )
             .await
             .unwrap();
 

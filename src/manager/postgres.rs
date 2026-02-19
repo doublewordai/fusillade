@@ -695,30 +695,49 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManager<P, H> {
     async fn get_pending_request_counts_by_model_and_completion_window(
         &self,
+        windows: &[(String, i64)], // (label, seconds)
+        states: &[String],         // e.g. ["pending"] or ["pending","claimed","processing"]
+        model_filter: &[String],   // empty = all models
+        strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>> {
-        let rows = sqlx::query!(
+        if windows.is_empty() || states.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let (labels, seconds): (Vec<String>, Vec<i64>) = windows.iter().cloned().unzip();
+
+        let pool = if strict {
+            self.pools.write()
+        } else {
+            self.pools.read()
+        };
+
+        let rows = sqlx::query(
             r#"
-            WITH windows(label, window_interval) AS (
-                VALUES
-                    ('1h', INTERVAL '1 hour'),
-                    ('24h', INTERVAL '24 hours')
+            WITH windows(label, window_seconds) AS (
+                SELECT * FROM UNNEST($1::text[], $2::bigint[])
             )
             SELECT
-                r.model as "model!",
-                w.label as "completion_window!",
+                r.model as model,
+                w.label as completion_window,
                 COUNT(*) FILTER (
-                    WHERE b.expires_at <= NOW() + w.window_interval
-                )::BIGINT as "count!"
+                    WHERE b.expires_at <= NOW() + make_interval(secs => w.window_seconds)
+                )::BIGINT as count
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
             CROSS JOIN windows w
-            WHERE r.state = 'pending'
-              AND r.template_id IS NOT NULL
-              AND b.cancelling_at IS NULL
+            WHERE r.state = ANY($3)
+            AND r.template_id IS NOT NULL
+            AND b.cancelling_at IS NULL
+            AND (cardinality($4::text[]) = 0 OR r.model = ANY($4))
             GROUP BY r.model, w.label
-            "#
+            "#,
         )
-        .fetch_all(self.pools.read())
+        .bind(&labels)
+        .bind(&seconds)
+        .bind(states)
+        .bind(model_filter)
+        .fetch_all(pool)
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -729,10 +748,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let mut result: HashMap<String, HashMap<String, i64>> = HashMap::new();
         for row in rows {
+            let model: String = row
+                .try_get("model")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read model: {}", e)))?;
+            let completion_window: String = row.try_get("completion_window").map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to read completion_window: {}", e))
+            })?;
+            let count: i64 = row
+                .try_get("count")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read count: {}", e)))?;
             result
-                .entry(row.model)
+                .entry(model)
                 .or_default()
-                .insert(row.completion_window, row.count);
+                .insert(completion_window, count);
         }
 
         Ok(result)
@@ -9084,5 +9112,306 @@ mod tests {
             total_deleted, 10,
             "Should delete all 5 requests + 5 templates"
         );
+    }
+
+    // =========================================================================
+    // PENDING REQUEST COUNTS
+    // =========================================================================
+
+    #[sqlx::test]
+    async fn test_pending_request_counts_by_model_and_window_basic(pool: sqlx::PgPool) {
+        use chrono::Duration;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // File/batch for model-a (2 requests)
+        let file_id_a = manager
+            .create_file(
+                "file-a".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("a1".to_string()),
+                        endpoint: "/v1/chat/completions".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"input":"a1"}"#.to_string(),
+                        model: "model-a".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("a2".to_string()),
+                        endpoint: "/v1/chat/completions".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"input":"a2"}"#.to_string(),
+                        model: "model-a".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch_a = manager
+            .create_batch(BatchInput {
+                file_id: file_id_a,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // File/batch for model-b (2 requests)
+        let file_id_b = manager
+            .create_file(
+                "file-b".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("b1".to_string()),
+                        endpoint: "/v1/chat/completions".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"input":"b1"}"#.to_string(),
+                        model: "model-b".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("b2".to_string()),
+                        endpoint: "/v1/chat/completions".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"input":"b2"}"#.to_string(),
+                        model: "model-b".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch_b = manager
+            .create_batch(BatchInput {
+                file_id: file_id_b,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Set explicit expires_at for deterministic window tests
+        let now = Utc::now();
+        sqlx::query!(
+            "UPDATE batches SET expires_at = $1 WHERE id = $2",
+            now + Duration::minutes(30),
+            *batch_a.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = $1 WHERE id = $2",
+            now + Duration::hours(3),
+            *batch_b.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let windows = vec![("1h".to_string(), 3600), ("4h".to_string(), 14_400)];
+        let states = vec!["pending".to_string()];
+        let model_filter: Vec<String> = vec![];
+
+        let counts = manager
+            .get_pending_request_counts_by_model_and_completion_window(
+                &windows,
+                &states,
+                &model_filter,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // model-a: 2 requests within 1h and 4h windows
+        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 2);
+        assert_eq!(*counts.get("model-a").unwrap().get("4h").unwrap(), 2);
+
+        // model-b: 0 within 1h, 2 within 4h
+        assert_eq!(*counts.get("model-b").unwrap().get("1h").unwrap(), 0);
+        assert_eq!(*counts.get("model-b").unwrap().get("4h").unwrap(), 2);
+    }
+
+    #[sqlx::test]
+    async fn test_pending_request_counts_respects_states_models_and_cancelling(pool: sqlx::PgPool) {
+        use chrono::Duration;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // File/batch with mixed models
+        let file_id = manager
+            .create_file(
+                "file-mixed".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("a1".to_string()),
+                        endpoint: "/v1/chat/completions".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"input":"a1"}"#.to_string(),
+                        model: "model-a".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("b1".to_string()),
+                        endpoint: "/v1/chat/completions".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"input":"b1"}"#.to_string(),
+                        model: "model-b".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Make batch expire soon
+        let now = Utc::now();
+        sqlx::query!(
+            "UPDATE batches SET expires_at = $1 WHERE id = $2",
+            now + Duration::minutes(10),
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Move model-b request to claimed state
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'claimed',
+                daemon_id = $1,
+                claimed_at = NOW()
+            WHERE batch_id = $2 AND model = 'model-b'
+            "#,
+            Uuid::new_v4(),
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Window and model filter
+        let windows = vec![("15m".to_string(), 900)];
+        let states = vec!["pending".to_string()];
+        let model_filter = vec!["model-a".to_string()];
+
+        let counts = manager
+            .get_pending_request_counts_by_model_and_completion_window(
+                &windows,
+                &states,
+                &model_filter,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Only model-a pending should be counted
+        assert_eq!(*counts.get("model-a").unwrap().get("15m").unwrap(), 1);
+        assert!(counts.get("model-b").is_none());
+
+        // Now include claimed state and remove model filter
+        let states = vec!["pending".to_string(), "claimed".to_string()];
+        let model_filter: Vec<String> = vec![];
+
+        let counts_all = manager
+            .get_pending_request_counts_by_model_and_completion_window(
+                &windows,
+                &states,
+                &model_filter,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*counts_all.get("model-a").unwrap().get("15m").unwrap(), 1);
+        assert_eq!(*counts_all.get("model-b").unwrap().get("15m").unwrap(), 1);
+
+        // Mark batch as cancelling; all counts should drop to zero
+        sqlx::query!(
+            "UPDATE batches SET cancelling_at = NOW() WHERE id = $1",
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let counts_cancelled = manager
+            .get_pending_request_counts_by_model_and_completion_window(
+                &windows,
+                &states,
+                &model_filter,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(counts_cancelled.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn test_pending_request_counts_empty_inputs(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager =
+            PostgresRequestManager::with_client(TestDbPools::new(pool).await.unwrap(), http_client);
+
+        let counts = manager
+            .get_pending_request_counts_by_model_and_completion_window(
+                &[],
+                &["pending".to_string()],
+                &[],
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(counts.is_empty());
+
+        let counts = manager
+            .get_pending_request_counts_by_model_and_completion_window(
+                &[("1h".to_string(), 3600)],
+                &[],
+                &[],
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(counts.is_empty());
     }
 }
