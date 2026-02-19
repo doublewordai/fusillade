@@ -1,5 +1,16 @@
 # Changelog
 
+## [7.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v6.0.0...fusillade-v7.0.0) (2026-02-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* parameterise get pending counts  ([#150](https://github.com/doublewordai/fusillade/issues/150))
+
+### Features
+
+* parameterise get pending counts  ([#150](https://github.com/doublewordai/fusillade/issues/150)) ([a2c6f28](https://github.com/doublewordai/fusillade/commit/a2c6f28610310084b6ac4ccbe7350b9dff44e7f5))
+
 ## [6.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v5.5.0...fusillade-v6.0.0) (2026-02-17)
 
 
