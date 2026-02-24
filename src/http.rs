@@ -85,12 +85,8 @@ impl Default for ReqwestHttpClient {
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
     // TODO: document
-    #[tracing::instrument(skip(self, request, api_key), fields(
-        trace_id = tracing::field::Empty,
+    #[tracing::instrument(skip(self, request, api_key, timeout_ms), fields(
         otel.name = %format!("{} {}", request.method, request.path),
-        request_id = %request.id,
-        batch_id = %request.batch_id,
-        model = %request.model
     ))]
     async fn execute(
         &self,
@@ -100,10 +96,6 @@ impl HttpClient for ReqwestHttpClient {
     ) -> Result<HttpResponse> {
         let url = format!("{}{}", request.endpoint, request.path);
         let span = tracing::Span::current();
-        let sc = span.context().span().span_context().clone();
-        if sc.is_valid() {
-            span.record("trace_id", tracing::field::display(sc.trace_id()));
-        }
         span.set_attribute("otel.kind", "Client");
         span.set_attribute("http.request.method", request.method.clone());
         span.set_attribute("url.path", request.path.clone());
