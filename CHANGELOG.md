@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v7.0.0...fusillade-v7.0.1) (2026-02-24)
+
+
+### Bug Fixes
+
+* Tracing clean-up ([#152](https://github.com/doublewordai/fusillade/issues/152)) ([2d5855d](https://github.com/doublewordai/fusillade/commit/2d5855dbcb31765798d0b02198a14f7eb452f9df))
+
 ## [7.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v6.0.0...fusillade-v7.0.0) (2026-02-19)
 
 
