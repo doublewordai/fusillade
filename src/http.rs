@@ -200,7 +200,7 @@ impl HttpClient for ReqwestHttpClient {
         let status = response.status().as_u16();
         let body = response.text().await?;
 
-        tracing::info!(
+        tracing::debug!(
             request_id = %request.id,
             status = status,
             response_len = body.len(),

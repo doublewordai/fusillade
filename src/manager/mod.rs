@@ -229,7 +229,7 @@ pub trait Storage: Send + Sync {
     /// - Request is already in a terminal state (completed/failed)
     #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]
     async fn cancel_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
-        tracing::info!(count = ids.len(), "Cancelling requests");
+        tracing::debug!(count = ids.len(), "Cancelling requests");
 
         let mut results = Vec::new();
 

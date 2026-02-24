@@ -336,17 +336,10 @@ impl Request<Failed> {
         let time_until_deadline = effective_deadline - now;
         tracing::debug!(
             request_id = %self.data.id,
-            retry_attempt,
-            time_until_deadline_seconds = time_until_deadline.num_seconds(),
-            batch_expires_at = %self.state.batch_expires_at,
-            "Retrying (deadline-aware: time remaining)"
-        );
-
-        tracing::info!(
-            request_id = %self.data.id,
             retry_attempt = retry_attempt + 1,
             backoff_ms = backoff_duration,
             not_before = %not_before,
+            time_until_deadline_seconds = time_until_deadline.num_seconds(),
             batch_expires_at = %self.state.batch_expires_at,
             "Retrying failed request with exponential backoff"
         );

@@ -58,7 +58,7 @@ impl std::ops::Deref for BatchId {
 
 impl std::fmt::Display for BatchId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &self.0.to_string()[..8])
+        write!(f, "{}", self.0)
     }
 }
 
