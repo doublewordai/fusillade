@@ -1644,7 +1644,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
-        tracing::info!(
+        tracing::debug!(
             file_id = %fid,
             template_count = template_count,
             strategy = ?self.batch_insert_strategy,
@@ -2543,7 +2543,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
-        tracing::info!(count = ids.len(), "Retrying failed requests");
+        tracing::debug!(count = ids.len(), "Retrying failed requests");
 
         // Get all requests in a single bulk query to avoid N+1 problem
         let get_results = self.get_requests(ids.clone()).await?;
@@ -2606,7 +2606,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     async fn retry_failed_requests_for_batch(&self, batch_id: BatchId) -> Result<u64> {
-        tracing::info!(%batch_id, "Retrying all failed requests for batch");
+        tracing::debug!(%batch_id, "Retrying all failed requests for batch");
 
         let result = sqlx::query!(
             r#"
@@ -2628,7 +2628,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to retry failed requests: {}", e)))?;
 
         let count = result.rows_affected();
-        tracing::info!(%batch_id, count, "Retried failed requests for batch");
+        tracing::debug!(%batch_id, count, "Retried failed requests for batch");
 
         Ok(count)
     }

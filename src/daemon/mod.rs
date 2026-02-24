@@ -724,7 +724,7 @@ where
                     // Try to acquire a semaphore permit for this model
                     match self.try_acquire_permit(&model).await {
                         Some(permit) => {
-                            tracing::debug!(
+                            tracing::trace!(
                                 request_id = %request_id,
                                 batch_id = %batch_id,
                                 model = %model,
@@ -787,7 +787,7 @@ where
                                     gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
                                 });
 
-                                tracing::info!(request_id = %request_id, "Processing request");
+                                tracing::debug!("Sending batch request to inference endpoint");
 
                                 // Launch request processing (this goes on a background thread)
                                 let processing = request.process(
@@ -835,7 +835,7 @@ where
                                             );
                                         }
 
-                                        tracing::info!(request_id = %request_id, retry_attempts = retry_attempt_at_completion, "Request completed successfully");
+                                        tracing::debug!(request_id = %request_id, retry_attempts = retry_attempt_at_completion, "Request completed successfully");
                                     }
                                     Ok(RequestCompletionResult::Failed(failed)) => {
                                         let retry_attempt = failed.state.retry_attempt;
@@ -859,7 +859,7 @@ where
                                                         "model" => model_clone.clone(),
                                                         "attempt" => (retry_attempt + 1).to_string()
                                                     ).increment(1);
-                                                    tracing::info!(
+                                                    tracing::debug!(
                                                         request_id = %request_id,
                                                         retry_attempt = retry_attempt + 1,
                                                         "Request queued for retry"
