@@ -2628,6 +2628,32 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to retry failed requests: {}", e)))?;
 
         let count = result.rows_affected();
+
+        // Reset batch terminal timestamps so lazy finalization can re-evaluate
+        // once the retried requests complete. Without this, a stale failed_at
+        // blocks completed_at from ever being set.
+        if count > 0 {
+            sqlx::query!(
+                r#"
+                UPDATE batches
+                SET completed_at = NULL,
+                    failed_at = NULL,
+                    finalizing_at = NULL,
+                    notification_sent_at = NULL
+                WHERE id = $1
+                "#,
+                *batch_id as Uuid,
+            )
+            .execute(self.pools.write())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to reset batch terminal timestamps: {}",
+                    e
+                ))
+            })?;
+        }
+
         tracing::debug!(%batch_id, count, "Retried failed requests for batch");
 
         Ok(count)
