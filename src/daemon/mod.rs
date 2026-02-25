@@ -96,6 +96,11 @@ pub struct DaemonConfig {
     #[serde(skip, default = "default_model_escalations")]
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
 
+    /// Priority value injected as a top-level `"priority"` field into every request body.
+    /// Lower number = higher priority. If `None`, no priority field is added.
+    #[serde(default)]
+    pub request_priority: Option<i64>,
+
     /// How long to sleep between claim iterations
     pub claim_interval_ms: u64,
 
@@ -208,6 +213,7 @@ impl Default for DaemonConfig {
             default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             model_escalations: default_model_escalations(),
+            request_priority: None,
             claim_interval_ms: 1000,
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(0),
@@ -698,6 +704,22 @@ where
                         );
                     }
                 }
+
+                // Inject priority into request body if configured
+                if let Some(priority) = self.config.request_priority {
+                    if let Ok(mut json) =
+                        serde_json::from_str::<serde_json::Value>(&request.data.body)
+                        && let Some(obj) = json.as_object_mut()
+                    {
+                        obj.insert(
+                            "priority".to_string(),
+                            serde_json::Value::Number(priority.into()),
+                        );
+                        if let Ok(new_body) = serde_json::to_string(&json) {
+                            request.data.body = new_body;
+                        }
+                    }
+                }
             }
 
             // Group requests by model for better concurrency control visibility
@@ -998,6 +1020,7 @@ mod tests {
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            request_priority: None,
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -1171,6 +1194,7 @@ mod tests {
             model_concurrency_limits,
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            request_priority: None,
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -1402,6 +1426,7 @@ mod tests {
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            request_priority: None,
             max_retries: Some(5),
             stop_before_deadline_ms: None,
             backoff_ms: 10, // Very fast backoff for testing
@@ -1542,6 +1567,7 @@ mod tests {
             model_concurrency_limits: model_concurrency_limits.clone(),
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            request_priority: None,
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -1717,6 +1743,7 @@ mod tests {
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            request_priority: None,
             max_retries: Some(10_000),
             stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
             backoff_ms: 50,
@@ -1876,6 +1903,7 @@ mod tests {
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            request_priority: None,
             max_retries: None,             // No retry limit
             stop_before_deadline_ms: None, // No buffer - should retry until deadline
             backoff_ms: 50,
@@ -2035,6 +2063,7 @@ mod tests {
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            request_priority: None,
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -2194,6 +2223,7 @@ mod tests {
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            request_priority: None,
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
