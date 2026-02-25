@@ -2217,12 +2217,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .await
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
         self.get_batch_from_pool(batch_id, self.pools.read()).await
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn get_batch_status(&self, batch_id: BatchId) -> Result<BatchStatus> {
         let mut query_builder = QueryBuilder::new(
             r#"
@@ -2608,6 +2608,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     async fn retry_failed_requests_for_batch(&self, batch_id: BatchId) -> Result<u64> {
         tracing::debug!(%batch_id, "Retrying all failed requests for batch");
 
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
         let result = sqlx::query!(
             r#"
             UPDATE requests
@@ -2623,11 +2628,38 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             *batch_id as Uuid,
         )
-        .execute(self.pools.write())
+        .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to retry failed requests: {}", e)))?;
 
         let count = result.rows_affected();
+
+        // Reset batch terminal timestamps so lazy finalization can re-evaluate
+        // once the retried requests complete. Without this, a stale failed_at
+        // blocks completed_at from ever being set.
+        if count > 0 {
+            sqlx::query!(
+                r#"
+                UPDATE batches
+                SET completed_at = NULL,
+                    failed_at = NULL,
+                    finalizing_at = NULL,
+                    notification_sent_at = NULL
+                WHERE id = $1
+                "#,
+                *batch_id as Uuid,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to reset batch terminal timestamps: {}", e))
+            })?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+
         tracing::debug!(%batch_id, count, "Retried failed requests for batch");
 
         Ok(count)
@@ -8590,6 +8622,23 @@ mod tests {
         .await
         .unwrap();
 
+        // Set batch terminal timestamps to simulate lazy finalization having marked
+        // the batch as failed. This is the state that blocked re-evaluation before
+        // the fix — a stale failed_at prevented completed_at from being set.
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET failed_at = NOW(),
+                finalizing_at = NOW(),
+                notification_sent_at = NOW()
+            WHERE id = $1
+            "#,
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
         // Verify initial state: 2 failed, 1 pending
         let requests_before = manager.get_batch_requests(batch.id).await.unwrap();
         let failed_count = requests_before
@@ -8619,6 +8668,34 @@ mod tests {
         assert_eq!(
             pending_after, 3,
             "All requests should be pending after retry"
+        );
+
+        // Verify: batch terminal timestamps are cleared so lazy finalization can re-evaluate
+        let batch_after = sqlx::query!(
+            r#"
+            SELECT completed_at, failed_at, finalizing_at, notification_sent_at
+            FROM batches WHERE id = $1
+            "#,
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            batch_after.completed_at.is_none(),
+            "completed_at should be cleared after retry"
+        );
+        assert!(
+            batch_after.failed_at.is_none(),
+            "failed_at should be cleared after retry"
+        );
+        assert!(
+            batch_after.finalizing_at.is_none(),
+            "finalizing_at should be cleared after retry"
+        );
+        assert!(
+            batch_after.notification_sent_at.is_none(),
+            "notification_sent_at should be cleared after retry"
         );
 
         // Verify: retry_attempt is reset to 0
