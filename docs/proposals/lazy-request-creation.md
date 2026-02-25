@@ -72,13 +72,20 @@ Using `ON DELETE SET NULL` avoids blocking deletes — see [Orphan Cleanup](#orp
 
 ### Batch Creation
 
-Now O(1) — just create the batch row:
+Now O(1) — just create the batch row with a snapshot of the template count:
 
 ```sql
-INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6)
+WITH template_count AS (
+    SELECT COUNT(*) as total FROM request_templates WHERE file_id = $1
+)
+INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, total_requests)
+SELECT $1, $2, $3, $4, $5, $6, tc.total
+FROM template_count tc
 RETURNING *;
 ```
+
+The `total_requests` column (already exists on `batches`) is populated at
+creation time. This avoids expensive COUNT queries when computing batch status.
 
 No request rows are created. The "pending" work is implicit: all templates in
 the file that aren't in `batches_active_in` for this batch.
@@ -122,16 +129,18 @@ marked AS (
     RETURNING c.template_id, c.batch_id
 ),
 
--- Create request rows
+-- Create minimal request rows (template fields fetched via JOIN at execution)
 created AS (
-    INSERT INTO requests (batch_id, template_id, state, daemon_id, claimed_at, model)
-    SELECT m.batch_id, m.template_id, 'claimed', $4, $2, t.model
+    INSERT INTO requests (batch_id, template_id, state, daemon_id, claimed_at, model, custom_id)
+    SELECT m.batch_id, m.template_id, 'claimed', $4, $2, t.model, t.custom_id
     FROM marked m
     JOIN request_templates t ON t.id = m.template_id
-    RETURNING id
+    RETURNING id, batch_id, template_id, model, custom_id
 )
 
-SELECT * FROM created;
+SELECT c.*, t.endpoint, t.method, t.path, t.body, t.api_key
+FROM created c
+JOIN request_templates t ON t.id = c.template_id;
 ```
 
 **Parameters:**
@@ -140,6 +149,9 @@ SELECT * FROM created;
 - `$2` — now (TIMESTAMPTZ)
 - `$3` — limit (INTEGER)
 - `$4` — daemon_id (UUID)
+
+The INSERT creates minimal request rows. The final SELECT JOINs to templates to
+return all fields needed by the daemon — same pattern as current execution.
 
 ### Retry Handling
 
@@ -159,13 +171,14 @@ updated_template AS (
     WHERE t.id = d.template_id
 ),
 prev_attempt AS (
-    SELECT COALESCE(MAX(attempt), 0) as attempt
-    FROM retry_attempts ra, deleted d
-    WHERE ra.template_id = d.template_id AND ra.batch_id = d.batch_id
+    SELECT d.template_id, d.batch_id, COALESCE(MAX(ra.attempt), 0) as attempt
+    FROM deleted d
+    LEFT JOIN retry_attempts ra ON ra.template_id = d.template_id AND ra.batch_id = d.batch_id
+    GROUP BY d.template_id, d.batch_id
 )
 INSERT INTO retry_attempts (template_id, batch_id, attempt, error_code, not_before)
-SELECT d.template_id, d.batch_id, p.attempt + 1, $2, $3
-FROM deleted d, prev_attempt p;
+SELECT p.template_id, p.batch_id, p.attempt + 1, $2, $3
+FROM prev_attempt p;
 ```
 
 **Parameters:**
@@ -176,6 +189,9 @@ FROM deleted d, prev_attempt p;
 
 The template is now "inactive" for that batch and will be picked up by the
 claiming query once `not_before` has passed.
+
+Note: The `prev_attempt` CTE uses LEFT JOIN to handle the first retry (when no
+`retry_attempts` rows exist yet). The COALESCE ensures we get 0 in that case.
 
 ### Unclaiming
 
@@ -235,7 +251,7 @@ small and containing only genuinely in-flight requests.
 SELECT
     b.id as batch_id,
     b.cancelling_at,
-    (SELECT COUNT(*) FROM request_templates WHERE file_id = b.file_id) as total,
+    b.total_requests as total,  -- Stored at batch creation time
     COUNT(r.id) FILTER (WHERE r.state IN ('claimed', 'processing')) as in_progress,
     COUNT(r.id) FILTER (WHERE r.state = 'completed') as completed,
     COUNT(r.id) FILTER (WHERE r.state = 'failed') as failed
@@ -244,6 +260,10 @@ LEFT JOIN requests r ON r.batch_id = b.id
 WHERE b.id = $1
 GROUP BY b.id;
 ```
+
+Using `b.total_requests` (stored at creation) instead of counting templates
+makes status queries O(requests) instead of O(templates + requests). For large
+files with few completed requests, this is a significant improvement.
 
 Application logic derives pending/canceled based on batch state:
 
@@ -399,11 +419,15 @@ CREATE INDEX retry_attempts_latest
    DELETE FROM requests WHERE state = 'pending';
    ```
 
-4. **Delete canceled request rows** — These are now derived from `batch.cancelling_at`: TODO: Are we really confident these should be deleted? It does make sense they would be.
+4. **Delete canceled request rows** — These are now derived from `batch.cancelling_at`.
 
    ```sql
    DELETE FROM requests WHERE state = 'canceled';
    ```
+
+   This is safe because: (a) canceled count is derived from `total - completed - failed`
+   when `cancelling_at IS NOT NULL`, and (b) canceled requests have no useful response
+   data to preserve.
 
 5. **Deploy new application code** with all logic changes:
    - Batch creation: no longer inserts request rows
@@ -440,11 +464,22 @@ If issues are discovered after deployment:
 The `batches_active_in` column and `retry_attempts` table can remain — they're
 unused by old code but harmless.
 
-## Open Questions
+## Resolved Questions
 
 1. **Index on `batches_active_in`?**
    - A GIN index would speed up cleanup queries but isn't needed for claiming
-   - Recommend: Add later if cleanup becomes a bottleneck
+   - The `ANY()` check during claiming is O(k) per row where k = array length
+   - **Decision**: Skip initially. Add GIN index only if cleanup queries become slow:
+     ```sql
+     CREATE INDEX idx_templates_batches_active_gin
+         ON request_templates USING GIN (batches_active_in);
+     ```
+
+2. **Batch status trigger interaction?**
+   - The `update_batch_on_request_change()` trigger was removed in migration
+     `20250115000000_batch_events_wal.up.sql` in favor of on-demand counting
+   - **Decision**: No trigger changes needed. The system already uses on-demand
+     counting which aligns with this proposal.
 
 ## Deferred Work
 
