@@ -2608,6 +2608,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     async fn retry_failed_requests_for_batch(&self, batch_id: BatchId) -> Result<u64> {
         tracing::debug!(%batch_id, "Retrying all failed requests for batch");
 
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
         let result = sqlx::query!(
             r#"
             UPDATE requests
@@ -2623,7 +2628,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             *batch_id as Uuid,
         )
-        .execute(self.pools.write())
+        .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to retry failed requests: {}", e)))?;
 
@@ -2644,15 +2649,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 "#,
                 *batch_id as Uuid,
             )
-            .execute(self.pools.write())
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
-                FusilladeError::Other(anyhow!(
-                    "Failed to reset batch terminal timestamps: {}",
-                    e
-                ))
+                FusilladeError::Other(anyhow!("Failed to reset batch terminal timestamps: {}", e))
             })?;
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
         tracing::debug!(%batch_id, count, "Retried failed requests for batch");
 
