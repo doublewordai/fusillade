@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.0.2](https://github.com/doublewordai/fusillade/compare/fusillade-v7.0.1...fusillade-v7.0.2) (2026-02-25)
+
+
+### Bug Fixes
+
+* when a batch is retried, clear the status from the batch as well ([#154](https://github.com/doublewordai/fusillade/issues/154)) ([647cd04](https://github.com/doublewordai/fusillade/commit/647cd04c56e17ce9b88d4d904b0a685be9d97d79))
+
 ## [7.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v7.0.0...fusillade-v7.0.1) (2026-02-24)
 
 
