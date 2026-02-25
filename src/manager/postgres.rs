@@ -2217,12 +2217,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .await
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
         self.get_batch_from_pool(batch_id, self.pools.read()).await
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn get_batch_status(&self, batch_id: BatchId) -> Result<BatchStatus> {
         let mut query_builder = QueryBuilder::new(
             r#"
