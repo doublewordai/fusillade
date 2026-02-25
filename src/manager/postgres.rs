@@ -8616,6 +8616,23 @@ mod tests {
         .await
         .unwrap();
 
+        // Set batch terminal timestamps to simulate lazy finalization having marked
+        // the batch as failed. This is the state that blocked re-evaluation before
+        // the fix — a stale failed_at prevented completed_at from being set.
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET failed_at = NOW(),
+                finalizing_at = NOW(),
+                notification_sent_at = NOW()
+            WHERE id = $1
+            "#,
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
         // Verify initial state: 2 failed, 1 pending
         let requests_before = manager.get_batch_requests(batch.id).await.unwrap();
         let failed_count = requests_before
@@ -8645,6 +8662,34 @@ mod tests {
         assert_eq!(
             pending_after, 3,
             "All requests should be pending after retry"
+        );
+
+        // Verify: batch terminal timestamps are cleared so lazy finalization can re-evaluate
+        let batch_after = sqlx::query!(
+            r#"
+            SELECT completed_at, failed_at, finalizing_at, notification_sent_at
+            FROM batches WHERE id = $1
+            "#,
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            batch_after.completed_at.is_none(),
+            "completed_at should be cleared after retry"
+        );
+        assert!(
+            batch_after.failed_at.is_none(),
+            "failed_at should be cleared after retry"
+        );
+        assert!(
+            batch_after.finalizing_at.is_none(),
+            "finalizing_at should be cleared after retry"
+        );
+        assert!(
+            batch_after.notification_sent_at.is_none(),
+            "notification_sent_at should be cleared after retry"
         );
 
         // Verify: retry_attempt is reset to 0
