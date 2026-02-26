@@ -784,36 +784,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let now = Utc::now();
 
-        // Get all models with pending requests
-        // Exclude requests from cancelled or soft-deleted batches
-        let mut models = sqlx::query_scalar!(
-            r#"
-            SELECT DISTINCT r.model
-            FROM requests r
-            JOIN batches b ON r.batch_id = b.id
-            WHERE r.state = 'pending'
-                AND (r.not_before IS NULL OR r.not_before <= $1)
-                AND b.cancelling_at IS NULL
-                AND b.deleted_at IS NULL
-            "#,
-            now
-        )
-        .fetch_all(self.pools.write())
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to get models with pending requests: {}", e))
-        })?;
-
-        // Randomize model order to prevent starvation when hitting global limit
+        // Iterate only models the daemon has capacity for (backed by held permits).
+        // Randomize order to prevent starvation when hitting the global limit.
+        let mut models: Vec<_> = available_capacity.keys().cloned().collect();
         {
             use rand::seq::SliceRandom;
             let mut rng = rand::rng();
             models.shuffle(&mut rng);
-        } // Drop rng before async operations
+        }
 
         tracing::debug!(
             model_count = models.len(),
-            "Found models with pending requests"
+            "Claiming for models with available permits"
         );
 
         // Claim from models sequentially until we hit the global limit
@@ -825,20 +807,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 break;
             }
 
-            // Use available capacity from the daemon's semaphore state if known,
-            // otherwise fall back to the configured model limit (for new models
-            // the daemon hasn't seen yet).
-            let model_limit = self
-                .config
-                .model_concurrency_limits
-                .get(&model)
-                .map(|entry| *entry.value())
-                .unwrap_or(self.config.default_model_concurrency);
-
-            let available = available_capacity
-                .get(&model)
-                .copied()
-                .unwrap_or(model_limit);
+            let available = available_capacity[&model];
 
             if available == 0 {
                 tracing::trace!(model = %model, "Skipping model with no available capacity");
@@ -4946,8 +4915,9 @@ mod tests {
         let daemon_id = DaemonId::from(Uuid::new_v4());
 
         // Claim 3 requests
+        let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(3, daemon_id, &Default::default())
+            .claim_requests(3, daemon_id, &capacity)
             .await
             .expect("Failed to claim requests");
 
@@ -4959,7 +4929,7 @@ mod tests {
 
         // Try to claim again - should get the remaining 2
         let claimed2 = manager
-            .claim_requests(10, daemon_id, &Default::default())
+            .claim_requests(10, daemon_id, &capacity)
             .await
             .expect("Failed to claim requests");
 
@@ -5439,9 +5409,10 @@ mod tests {
             .unwrap();
 
         // Claim the request with daemon1
+        let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(1, daemon1_id, &Default::default())
+            .claim_requests(1, daemon1_id, &capacity)
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -5459,7 +5430,7 @@ mod tests {
         // Now daemon2 tries to claim - should unclaim the stale request and re-claim it
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &Default::default())
+            .claim_requests(1, daemon2_id, &capacity)
             .await
             .unwrap();
 
@@ -5520,9 +5491,10 @@ mod tests {
             .unwrap();
 
         // Claim and manually set to processing state
+        let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(1, daemon1_id, &Default::default())
+            .claim_requests(1, daemon1_id, &capacity)
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -5550,7 +5522,7 @@ mod tests {
         // Now daemon2 tries to claim - should unclaim the stale processing request
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &Default::default())
+            .claim_requests(1, daemon2_id, &capacity)
             .await
             .unwrap();
 
@@ -5626,8 +5598,9 @@ mod tests {
         manager.persist_daemon(&daemon1).await.unwrap();
 
         // Claim request as daemon1, then set to processing
+        let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(1, daemon1_id, &Default::default())
+            .claim_requests(1, daemon1_id, &capacity)
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -5648,7 +5621,7 @@ mod tests {
         // Daemon2 claims — should reclaim daemon1's request because daemon1 is dead
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &Default::default())
+            .claim_requests(1, daemon2_id, &capacity)
             .await
             .unwrap();
 
@@ -5724,8 +5697,9 @@ mod tests {
         manager.persist_daemon(&daemon1).await.unwrap();
 
         // Claim request as daemon1, then set to processing
+        let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(1, daemon1_id, &Default::default())
+            .claim_requests(1, daemon1_id, &capacity)
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -5746,7 +5720,7 @@ mod tests {
         // Daemon2 claims — should reclaim because daemon1's heartbeat is stale
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &Default::default())
+            .claim_requests(1, daemon2_id, &capacity)
             .await
             .unwrap();
 
@@ -5833,8 +5807,9 @@ mod tests {
         manager.persist_daemon(&daemon1).await.unwrap();
 
         // Daemon1 claims first request and sets to processing
+        let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(1, daemon1_id, &Default::default())
+            .claim_requests(1, daemon1_id, &capacity)
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -5851,7 +5826,7 @@ mod tests {
         // Daemon2 claims — should get the second request, NOT steal from healthy daemon1
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let claimed2 = manager
-            .claim_requests(1, daemon2_id, &Default::default())
+            .claim_requests(1, daemon2_id, &capacity)
             .await
             .unwrap();
 
@@ -5925,9 +5900,10 @@ mod tests {
             .unwrap();
 
         // Daemon1 claims first request
+        let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let claimed1 = manager
-            .claim_requests(1, daemon1_id, &Default::default())
+            .claim_requests(1, daemon1_id, &capacity)
             .await
             .unwrap();
         assert_eq!(claimed1.len(), 1);
@@ -5935,7 +5911,7 @@ mod tests {
         // Daemon2 immediately tries to claim - should get the second request, not steal the first
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let claimed2 = manager
-            .claim_requests(1, daemon2_id, &Default::default())
+            .claim_requests(1, daemon2_id, &capacity)
             .await
             .unwrap();
         assert_eq!(claimed2.len(), 1);
@@ -6021,9 +5997,10 @@ mod tests {
         .unwrap();
 
         // Claim should unclaim the stale request and reclaim it
+        let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(1, daemon_id, &Default::default())
+            .claim_requests(1, daemon_id, &capacity)
             .await
             .unwrap();
 
@@ -6815,9 +6792,10 @@ mod tests {
             .unwrap();
 
         // Claim and complete some requests
+        let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(2, daemon_id, &Default::default())
+            .claim_requests(2, daemon_id, &capacity)
             .await
             .unwrap();
 
@@ -6989,9 +6967,10 @@ mod tests {
         let request_ids: Vec<_> = all_requests.iter().map(|r| r.id()).collect();
 
         // Put requests in different states
+        let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(2, daemon_id, &Default::default())
+            .claim_requests(2, daemon_id, &capacity)
             .await
             .unwrap();
         let claimed_ids: Vec<_> = claimed.iter().map(|r| r.data.id).collect();
@@ -7544,10 +7523,11 @@ mod tests {
 
         // Start a daemon with the mock cancellation stream
         let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+        model_concurrency_limits.insert("model-a".to_string(), 5);
         let config = crate::daemon::DaemonConfig {
             claim_batch_size: 10,
-            default_model_concurrency: 5,
-            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            model_concurrency_limits,
             claim_interval_ms: 10,
             max_retries: Some(10_000),
             stop_before_deadline_ms: Some(900_000),
@@ -8414,10 +8394,11 @@ mod tests {
         .unwrap();
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("test".to_string(), 10)]);
 
         // Claim 1 request - should get the most urgent one (batch1, 30 min)
         let claimed = manager
-            .claim_requests(1, daemon_id, &Default::default())
+            .claim_requests(1, daemon_id, &capacity)
             .await
             .expect("Failed to claim requests");
 
@@ -8430,7 +8411,7 @@ mod tests {
 
         // Claim another - should get medium priority (batch2, 2 hours)
         let claimed2 = manager
-            .claim_requests(1, daemon_id, &Default::default())
+            .claim_requests(1, daemon_id, &capacity)
             .await
             .expect("Failed to claim requests");
 
@@ -8443,7 +8424,7 @@ mod tests {
 
         // Claim last one - should get no-SLA batch (batch3)
         let claimed3 = manager
-            .claim_requests(1, daemon_id, &Default::default())
+            .claim_requests(1, daemon_id, &capacity)
             .await
             .expect("Failed to claim requests");
 

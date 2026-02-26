@@ -277,9 +277,9 @@ pub trait Storage: Send + Sync {
 
     /// Atomically claim pending requests for processing.
     ///
-    /// `available_capacity` maps model names to the number of permits available
-    /// on this daemon's semaphores. Models not present in the map use the
-    /// configured default limit. Models with zero capacity are skipped.
+    /// `available_capacity` maps model names to the number of permits the daemon
+    /// is currently holding for that model. Only models present in this map will
+    /// be claimed — this is the authoritative set of models to process.
     async fn claim_requests(
         &self,
         limit: usize,
