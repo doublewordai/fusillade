@@ -84,10 +84,12 @@ pub struct DaemonConfig {
     /// Maximum number of requests to claim in each iteration
     pub claim_batch_size: usize,
 
-    /// Default concurrency limit per model
-    pub default_model_concurrency: usize,
-
-    /// Per-model concurrency overrides (shared, can be updated dynamically)
+    /// Per-model concurrency limits (shared, can be updated dynamically).
+    ///
+    /// This map is the authoritative set of models the daemon will process.
+    /// Models not present in this map will not be claimed. The caller (e.g.
+    /// the control layer) is responsible for populating this with all known
+    /// models and their concurrency limits.
     pub model_concurrency_limits: Arc<dashmap::DashMap<String, usize>>,
 
     /// Per-model escalation configurations for SLA-based model switching
@@ -205,7 +207,6 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             claim_batch_size: 100,
-            default_model_concurrency: 10,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             model_escalations: default_model_escalations(),
             claim_interval_ms: 1000,
@@ -282,17 +283,19 @@ where
 
     /// Get or create a semaphore for a model.
     ///
+    /// Returns `None` if the model is not in `model_concurrency_limits` — the daemon
+    /// will not process requests for unknown models.
+    ///
     /// Automatically adjusts the semaphore's permit count if the configured limit has changed.
     /// For limit increases, adds permits. For decreases, forgets permits (as many as possible).
     /// Note: When decreasing, we can only forget permits that aren't currently held, so the
     /// effective limit may temporarily remain higher until requests complete.
-    async fn get_semaphore(&self, model: &str) -> Arc<Semaphore> {
+    async fn get_semaphore(&self, model: &str) -> Option<Arc<Semaphore>> {
         let current_limit = self
             .config
             .model_concurrency_limits
             .get(model)
-            .map(|entry| *entry.value())
-            .unwrap_or(self.config.default_model_concurrency);
+            .map(|entry| *entry.value())?;
 
         let mut semaphores = self.semaphores.write().await;
 
@@ -346,13 +349,7 @@ where
             }
         }
 
-        semaphore.clone()
-    }
-
-    /// Try to acquire a permit for a model (non-blocking).
-    async fn try_acquire_permit(&self, model: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let semaphore = self.get_semaphore(model).await;
-        semaphore.clone().try_acquire_owned().ok()
+        Some(semaphore.clone())
     }
 
     /// Run the daemon loop.
@@ -625,21 +622,40 @@ where
                     break Ok(());
                 }
             }
-            // Snapshot available semaphore permits per model so claim_requests
-            // only claims what this daemon can actually process.
-            let available_capacity: std::collections::HashMap<String, usize> = {
-                let semaphores = self.semaphores.read().await;
-                semaphores
-                    .iter()
-                    .map(|(model, (sem, _))| (model.clone(), sem.available_permits()))
-                    .collect()
-            };
+            // Acquire permits greedily from all known models before claiming from DB.
+            // This ensures we never claim more than we can actually process, eliminating
+            // the need for unclaiming requests we can't handle.
+            let mut acquired_permits: HashMap<String, Vec<tokio::sync::OwnedSemaphorePermit>> =
+                HashMap::new();
+            for entry in self.config.model_concurrency_limits.iter() {
+                let model = entry.key().clone();
+                if let Some(semaphore) = self.get_semaphore(&model).await {
+                    let mut permits = Vec::new();
+                    while let Ok(p) = semaphore.clone().try_acquire_owned() {
+                        permits.push(p);
+                    }
+                    if !permits.is_empty() {
+                        acquired_permits.insert(model, permits);
+                    }
+                }
+            }
+
+            if acquired_permits.is_empty() {
+                tracing::trace!("No permits available for any model, skipping claim");
+                continue;
+            }
+
+            // Build available capacity from held permits
+            let available_capacity: HashMap<String, usize> = acquired_permits
+                .iter()
+                .map(|(model, permits)| (model.clone(), permits.len()))
+                .collect();
 
             // Record available capacity before claiming
             let total_capacity: usize = available_capacity.values().sum();
             gauge!("fusillade_claim_capacity").set(total_capacity as f64);
 
-            // Claim a batch of pending requests
+            // Claim a batch of pending requests (guaranteed ≤ held permits per model)
             let claim_start = std::time::Instant::now();
             let mut claimed = self
                 .storage
@@ -713,184 +729,169 @@ where
                 "Grouped requests by model"
             );
 
-            // Dispatch requests
+            // Dispatch requests, pairing each with a pre-acquired permit
             for (model, requests) in by_model {
                 tracing::debug!(model = %model, count = requests.len(), "Processing requests for model");
+
+                let mut model_permits = acquired_permits
+                    .remove(&model)
+                    .unwrap_or_default()
+                    .into_iter();
 
                 for request in requests {
                     let request_id = request.data.id;
                     let batch_id = request.data.batch_id;
 
-                    // Try to acquire a semaphore permit for this model
-                    match self.try_acquire_permit(&model).await {
-                        Some(permit) => {
-                            tracing::trace!(
-                                request_id = %request_id,
-                                batch_id = %batch_id,
-                                model = %model,
-                                "Acquired permit, spawning processing task"
-                            );
+                    // Take a permit from the pre-acquired pool.
+                    // claim_requests guarantees claimed ≤ held permits per model.
+                    let permit = model_permits
+                        .next()
+                        .expect("claim_requests returned more requests than held permits");
 
-                            // We have capacity - spawn a task
-                            let model_clone = model.clone(); // Clone model for the spawned task
-                            let storage = self.storage.clone();
-                            let http_client = (*self.http_client).clone();
-                            let timeout_ms = self.config.timeout_ms;
-                            let retry_config = (&self.config).into();
-                            let requests_in_flight = self.requests_in_flight.clone();
-                            let requests_processed = self.requests_processed.clone();
-                            let requests_failed = self.requests_failed.clone();
-                            let should_retry = self.config.should_retry.clone();
-                            let shutdown_token = self.shutdown_token.clone();
-                            let cancellation_tokens = self.cancellation_tokens.clone();
+                    tracing::trace!(
+                        request_id = %request_id,
+                        batch_id = %batch_id,
+                        model = %model,
+                        "Acquired permit, spawning processing task"
+                    );
 
-                            // Get or create a cancellation token for this batch
-                            // All requests in a batch share the same token
-                            let batch_cancellation_token =
-                                cancellation_tokens.entry(batch_id).or_default().clone();
+                    // Spawn a processing task
+                    let model_clone = model.clone();
+                    let storage = self.storage.clone();
+                    let http_client = (*self.http_client).clone();
+                    let timeout_ms = self.config.timeout_ms;
+                    let retry_config = (&self.config).into();
+                    let requests_in_flight = self.requests_in_flight.clone();
+                    let requests_processed = self.requests_processed.clone();
+                    let requests_failed = self.requests_failed.clone();
+                    let should_retry = self.config.should_retry.clone();
+                    let shutdown_token = self.shutdown_token.clone();
+                    let cancellation_tokens = self.cancellation_tokens.clone();
 
-                            // Increment in-flight counter and gauge
-                            requests_in_flight.fetch_add(1, Ordering::Relaxed);
-                            gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
-                                .increment(1.0);
+                    // Get or create a cancellation token for this batch
+                    // All requests in a batch share the same token
+                    let batch_cancellation_token =
+                        cancellation_tokens.entry(batch_id).or_default().clone();
 
-                            let process_span = tracing::info_span!(
-                                "process_request",
-                                trace_id = tracing::field::Empty,
-                                otel.name = "process_request",
-                                request_id = %request_id,
-                                batch_id = %batch_id,
-                                model = %model,
-                            );
-                            // Start a new trace root so process_request isn't
-                            // parented under the claim_requests span.
-                            let _ = process_span.set_parent(opentelemetry::Context::new());
+                    // Increment in-flight counter and gauge
+                    requests_in_flight.fetch_add(1, Ordering::Relaxed);
+                    gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
+                        .increment(1.0);
 
-                            join_set.spawn(async move {
-                                // Record trace_id from OTel context
-                                let span = tracing::Span::current();
-                                let sc = span.context().span().span_context().clone();
-                                if sc.is_valid() {
-                                    span.record("trace_id", tracing::field::display(sc.trace_id()));
+                    let process_span = tracing::info_span!(
+                        "process_request",
+                        trace_id = tracing::field::Empty,
+                        otel.name = "process_request",
+                        request_id = %request_id,
+                        batch_id = %batch_id,
+                        model = %model,
+                    );
+                    // Start a new trace root so process_request isn't
+                    // parented under the claim_requests span.
+                    let _ = process_span.set_parent(opentelemetry::Context::new());
+
+                    join_set.spawn(async move {
+                        // Record trace_id from OTel context
+                        let span = tracing::Span::current();
+                        let sc = span.context().span().span_context().clone();
+                        if sc.is_valid() {
+                            span.record("trace_id", tracing::field::display(sc.trace_id()));
+                        }
+
+                        // Permit is held for the duration of this task
+                        let _permit = permit;
+
+                        // Track processing start time for duration metrics
+                        let processing_start = std::time::Instant::now();
+
+                        // Ensure we decrement the counter when this task completes
+                        let model_for_guard = model_clone.clone();
+                        let _guard = scopeguard::guard((), move |_| {
+                            requests_in_flight.fetch_sub(1, Ordering::Relaxed);
+                            gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
+                        });
+
+                        tracing::debug!("Sending batch request to inference endpoint");
+
+                        // Launch request processing (this goes on a background thread)
+                        let processing = request.process(
+                            http_client,
+                            timeout_ms,
+                            storage.as_ref()
+                        ).await?;
+
+                        // Capture retry attempt count before completion (not preserved in Completed state)
+                        let retry_attempt_at_completion = processing.state.retry_attempt;
+                        // Capture batch expiry time for SLA missed completion tracking
+                        let batch_expires_at = processing.state.batch_expires_at;
+
+                        let cancellation = async {
+                            tokio::select! {
+                                _ = batch_cancellation_token.cancelled() => {
+                                    crate::request::transitions::CancellationReason::User
+                                }
+                                _ = shutdown_token.cancelled() => {
+                                    crate::request::transitions::CancellationReason::Shutdown
+                                }
+                            }
+                        };
+
+                        // Wait for completion
+                        match processing.complete(storage.as_ref(), |response| {
+                            (should_retry)(response)
+                        }, cancellation).await {
+                            Ok(RequestCompletionResult::Completed(completed)) => {
+                                requests_processed.fetch_add(1, Ordering::Relaxed);
+                                counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
+                                histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
+                                    .record(processing_start.elapsed().as_secs_f64());
+                                // Record how many retries it took to succeed (0 = first attempt succeeded)
+                                histogram!("fusillade_retry_attempts_on_success", "model" => model_clone.clone())
+                                    .record(retry_attempt_at_completion as f64);
+
+                                // Track requests completing after SLA
+                                if completed.state.completed_at > batch_expires_at {
+                                    counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success").increment(1);
+                                    tracing::warn!(
+                                        request_id = %request_id,
+                                        batch_id = %batch_id,
+                                        "Request completed successfully after SLA"
+                                    );
                                 }
 
-                                // Permit is held for the duration of this task
-                                let _permit = permit;
+                                tracing::debug!(request_id = %request_id, retry_attempts = retry_attempt_at_completion, "Request completed successfully");
+                            }
+                            Ok(RequestCompletionResult::Failed(failed)) => {
+                                let retry_attempt = failed.state.retry_attempt;
 
-                                // Track processing start time for duration metrics
-                                let processing_start = std::time::Instant::now();
+                                // Check if this is a retriable error using the FailureReason
+                                if failed.state.reason.is_retriable() {
+                                    tracing::warn!(
+                                        request_id = %request_id,
+                                        retry_attempt,
+                                        error = %failed.state.reason.to_error_message(),
+                                        "Request failed with retriable error, attempting retry"
+                                    );
 
-                                // Ensure we decrement the counter when this task completes
-                                let model_for_guard = model_clone.clone();
-                                let _guard = scopeguard::guard((), move |_| {
-                                    requests_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                    gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
-                                });
-
-                                tracing::debug!("Sending batch request to inference endpoint");
-
-                                // Launch request processing (this goes on a background thread)
-                                let processing = request.process(
-                                    http_client,
-                                    timeout_ms,
-                                    storage.as_ref()
-                                ).await?;
-
-                                // Capture retry attempt count before completion (not preserved in Completed state)
-                                let retry_attempt_at_completion = processing.state.retry_attempt;
-                                // Capture batch expiry time for SLA missed completion tracking
-                                let batch_expires_at = processing.state.batch_expires_at;
-
-                                let cancellation = async {
-                                    tokio::select! {
-                                        _ = batch_cancellation_token.cancelled() => {
-                                            crate::request::transitions::CancellationReason::User
-                                        }
-                                        _ = shutdown_token.cancelled() => {
-                                            crate::request::transitions::CancellationReason::Shutdown
-                                        }
-                                    }
-                                };
-
-                                // Wait for completion
-                                match processing.complete(storage.as_ref(), |response| {
-                                    (should_retry)(response)
-                                }, cancellation).await {
-                                    Ok(RequestCompletionResult::Completed(completed)) => {
-                                        requests_processed.fetch_add(1, Ordering::Relaxed);
-                                        counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
-                                        histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
-                                            .record(processing_start.elapsed().as_secs_f64());
-                                        // Record how many retries it took to succeed (0 = first attempt succeeded)
-                                        histogram!("fusillade_retry_attempts_on_success", "model" => model_clone.clone())
-                                            .record(retry_attempt_at_completion as f64);
-
-                                        // Track requests completing after SLA
-                                        if completed.state.completed_at > batch_expires_at {
-                                            counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success").increment(1);
-                                            tracing::warn!(
+                                    // Attempt to retry
+                                    match failed.can_retry(retry_attempt, retry_config) {
+                                        Ok(pending) => {
+                                            // Can retry - persist as Pending
+                                            storage.persist(&pending).await?;
+                                            counter!(
+                                                "fusillade_requests_retried_total",
+                                                "model" => model_clone.clone(),
+                                                "attempt" => (retry_attempt + 1).to_string()
+                                            ).increment(1);
+                                            tracing::debug!(
                                                 request_id = %request_id,
-                                                batch_id = %batch_id,
-                                                "Request completed successfully after SLA"
+                                                retry_attempt = retry_attempt + 1,
+                                                "Request queued for retry"
                                             );
                                         }
-
-                                        tracing::debug!(request_id = %request_id, retry_attempts = retry_attempt_at_completion, "Request completed successfully");
-                                    }
-                                    Ok(RequestCompletionResult::Failed(failed)) => {
-                                        let retry_attempt = failed.state.retry_attempt;
-
-                                        // Check if this is a retriable error using the FailureReason
-                                        if failed.state.reason.is_retriable() {
-                                            tracing::warn!(
-                                                request_id = %request_id,
-                                                retry_attempt,
-                                                error = %failed.state.reason.to_error_message(),
-                                                "Request failed with retriable error, attempting retry"
-                                            );
-
-                                            // Attempt to retry
-                                            match failed.can_retry(retry_attempt, retry_config) {
-                                                Ok(pending) => {
-                                                    // Can retry - persist as Pending
-                                                    storage.persist(&pending).await?;
-                                                    counter!(
-                                                        "fusillade_requests_retried_total",
-                                                        "model" => model_clone.clone(),
-                                                        "attempt" => (retry_attempt + 1).to_string()
-                                                    ).increment(1);
-                                                    tracing::debug!(
-                                                        request_id = %request_id,
-                                                        retry_attempt = retry_attempt + 1,
-                                                        "Request queued for retry"
-                                                    );
-                                                }
-                                                Err(failed) => {
-                                                    // No retries left - persist as Failed (terminal)
-                                                    storage.persist(&*failed).await?;
-                                                    requests_failed.fetch_add(1, Ordering::Relaxed);
-                                                    counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
-                                                    histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
-                                                        .record(processing_start.elapsed().as_secs_f64());
-
-                                                    // Track requests completing after SLA
-                                                    if failed.state.failed_at > batch_expires_at {
-                                                        counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
-                                                        tracing::warn!(
-                                                            request_id = %request_id,
-                                                            batch_id = %batch_id,
-                                                            "Request failed permanently after SLA"
-                                                        );
-                                                    }
-
-                                                    tracing::warn!(
-                                                        request_id = %request_id,
-                                                        retry_attempt,
-                                                        "Request failed permanently (no retries remaining)"
-                                                    );
-                                                }
-                                            }
-                                        } else {
+                                        Err(failed) => {
+                                            // No retries left - persist as Failed (terminal)
+                                            storage.persist(&*failed).await?;
                                             requests_failed.fetch_add(1, Ordering::Relaxed);
                                             counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
                                             histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
@@ -902,61 +903,67 @@ where
                                                 tracing::warn!(
                                                     request_id = %request_id,
                                                     batch_id = %batch_id,
-                                                    "Request failed with non-retriable error after SLA"
+                                                    "Request failed permanently after SLA"
                                                 );
                                             }
 
                                             tracing::warn!(
                                                 request_id = %request_id,
-                                                error = %failed.state.reason.to_error_message(),
-                                                "Request failed with non-retriable error, not retrying"
+                                                retry_attempt,
+                                                "Request failed permanently (no retries remaining)"
                                             );
                                         }
                                     }
-                                    Ok(RequestCompletionResult::Canceled(_canceled)) => {
-                                        counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled").increment(1);
-                                        tracing::debug!(request_id = %request_id, "Request canceled by user");
+                                } else {
+                                    requests_failed.fetch_add(1, Ordering::Relaxed);
+                                    counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
+                                    histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
+                                        .record(processing_start.elapsed().as_secs_f64());
+
+                                    // Track requests completing after SLA
+                                    if failed.state.failed_at > batch_expires_at {
+                                        counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                        tracing::warn!(
+                                            request_id = %request_id,
+                                            batch_id = %batch_id,
+                                            "Request failed with non-retriable error after SLA"
+                                        );
                                     }
-                                    Err(FusilladeError::Shutdown) => {
-                                        tracing::info!(request_id = %request_id, "Request aborted due to shutdown");
-                                        // Don't count as failed - request will be reclaimed
-                                    }
-                                    Err(e) => {
-                                        // Unexpected error
-                                        tracing::error!(request_id = %request_id, error = %e, "Unexpected error processing request");
-                                        return Err(e);
-                                    }
+
+                                    tracing::warn!(
+                                        request_id = %request_id,
+                                        error = %failed.state.reason.to_error_message(),
+                                        "Request failed with non-retriable error, not retrying"
+                                    );
                                 }
-
-                                // Note: We don't remove the batch cancellation token here since
-                                // multiple requests in the same batch share it. Tokens are cleaned
-                                // up when the daemon shuts down or batch completes.
-
-                                Ok(())
-                            }.instrument(process_span));
+                            }
+                            Ok(RequestCompletionResult::Canceled(_canceled)) => {
+                                counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled").increment(1);
+                                tracing::debug!(request_id = %request_id, "Request canceled by user");
+                            }
+                            Err(FusilladeError::Shutdown) => {
+                                tracing::info!(request_id = %request_id, "Request aborted due to shutdown");
+                                // Don't count as failed - request will be reclaimed
+                            }
+                            Err(e) => {
+                                // Unexpected error
+                                tracing::error!(request_id = %request_id, error = %e, "Unexpected error processing request");
+                                return Err(e);
+                            }
                         }
-                        None => {
-                            counter!("fusillade_requests_unclaimed_no_capacity_total", "model" => model.clone()).increment(1);
-                            tracing::debug!(
-                                request_id = %request_id,
-                                model = %model,
-                                "No capacity available, unclaiming request"
-                            );
 
-                            // No capacity for this model - unclaim the request
-                            let storage = self.storage.clone();
-                            if let Err(e) = request.unclaim(storage.as_ref()).await {
-                                counter!("fusillade_unclaim_errors_total").increment(1);
-                                tracing::error!(
-                                    request_id = %request_id,
-                                    error = %e,
-                                    "Failed to unclaim request"
-                                );
-                            };
-                        }
-                    }
+                        // Note: We don't remove the batch cancellation token here since
+                        // multiple requests in the same batch share it. Tokens are cleaned
+                        // up when the daemon shuts down or batch completes.
+
+                        Ok(())
+                    }.instrument(process_span));
                 }
             }
+
+            // Drop any unused permits (models where we acquired permits but
+            // claim_requests returned fewer requests than available capacity)
+            drop(acquired_permits);
         };
 
         // Wait for heartbeat task to complete (it will mark daemon as dead)
@@ -994,8 +1001,11 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10, // Very fast for testing
-            default_model_concurrency: 10,
-            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            model_concurrency_limits: {
+                let m = Arc::new(dashmap::DashMap::new());
+                m.insert("test-model".to_string(), 10);
+                m
+            },
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
@@ -1167,7 +1177,6 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
             model_concurrency_limits,
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
@@ -1398,8 +1407,11 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
-            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            model_concurrency_limits: {
+                let m = Arc::new(dashmap::DashMap::new());
+                m.insert("test-model".to_string(), 10);
+                m
+            },
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(5),
@@ -1538,7 +1550,6 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
@@ -1713,8 +1724,11 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
-            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            model_concurrency_limits: {
+                let m = Arc::new(dashmap::DashMap::new());
+                m.insert("test-model".to_string(), 10);
+                m
+            },
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(10_000),
@@ -1872,8 +1886,11 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
-            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            model_concurrency_limits: {
+                let m = Arc::new(dashmap::DashMap::new());
+                m.insert("test-model".to_string(), 10);
+                m
+            },
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: None,             // No retry limit
@@ -2031,8 +2048,11 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
-            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            model_concurrency_limits: {
+                let m = Arc::new(dashmap::DashMap::new());
+                m.insert("test-model".to_string(), 10);
+                m
+            },
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
@@ -2190,8 +2210,11 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
-            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            model_concurrency_limits: {
+                let m = Arc::new(dashmap::DashMap::new());
+                m.insert("test-model".to_string(), 10);
+                m
+            },
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
             max_retries: Some(3),
