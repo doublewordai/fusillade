@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use metrics::{counter, gauge, histogram};
-use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
 
 use opentelemetry::trace::TraceContextExt;
@@ -31,9 +30,6 @@ pub use types::{
 ///
 /// Takes an HTTP response and returns true if the request should be retried.
 pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
-
-/// Semaphore entry tracking both the semaphore and its configured limit.
-type SemaphoreEntry = (Arc<Semaphore>, usize);
 
 /// Default retry predicate: retry on server errors (5xx), rate limits (429), timeouts (408), and not found (404).
 pub fn default_should_retry(response: &HttpResponse) -> bool {
@@ -245,8 +241,7 @@ where
     storage: Arc<S>,
     http_client: Arc<H>,
     config: DaemonConfig,
-    semaphores: Arc<RwLock<HashMap<String, SemaphoreEntry>>>,
-    requests_in_flight: Arc<AtomicUsize>,
+    requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
     requests_processed: Arc<AtomicU64>,
     requests_failed: Arc<AtomicU64>,
     shutdown_token: tokio_util::sync::CancellationToken,
@@ -272,84 +267,12 @@ where
             storage,
             http_client,
             config,
-            semaphores: Arc::new(RwLock::new(HashMap::new())),
-            requests_in_flight: Arc::new(AtomicUsize::new(0)),
+            requests_in_flight: Arc::new(dashmap::DashMap::new()),
             requests_processed: Arc::new(AtomicU64::new(0)),
             requests_failed: Arc::new(AtomicU64::new(0)),
             shutdown_token,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
         }
-    }
-
-    /// Get or create a semaphore for a model.
-    ///
-    /// Returns `None` if the model is not in `model_concurrency_limits` — the daemon
-    /// will not process requests for unknown models.
-    ///
-    /// Automatically adjusts the semaphore's permit count if the configured limit has changed.
-    /// For limit increases, adds permits. For decreases, forgets permits (as many as possible).
-    /// Note: When decreasing, we can only forget permits that aren't currently held, so the
-    /// effective limit may temporarily remain higher until requests complete.
-    async fn get_semaphore(&self, model: &str) -> Option<Arc<Semaphore>> {
-        let current_limit = self
-            .config
-            .model_concurrency_limits
-            .get(model)
-            .map(|entry| *entry.value())?;
-
-        let mut semaphores = self.semaphores.write().await;
-
-        let entry = semaphores
-            .entry(model.to_string())
-            .or_insert_with(|| (Arc::new(Semaphore::new(current_limit)), current_limit));
-
-        let (semaphore, stored_limit) = entry;
-
-        // Check if the limit has changed
-        if *stored_limit != current_limit {
-            if current_limit > *stored_limit {
-                // Limit increased - add permits
-                let delta = current_limit - *stored_limit;
-                semaphore.add_permits(delta);
-                tracing::info!(
-                    model = %model,
-                    old_limit = *stored_limit,
-                    new_limit = current_limit,
-                    added_permits = delta,
-                    "Increased model concurrency limit"
-                );
-                *stored_limit = current_limit;
-            } else {
-                // Limit decreased - forget permits (as many as we can)
-                let desired_delta = *stored_limit - current_limit;
-                let actual_forgotten = semaphore.forget_permits(desired_delta);
-
-                if actual_forgotten < desired_delta {
-                    tracing::warn!(
-                        model = %model,
-                        old_limit = *stored_limit,
-                        target_limit = current_limit,
-                        desired_to_forget = desired_delta,
-                        actually_forgot = actual_forgotten,
-                        held_permits = desired_delta - actual_forgotten,
-                        "Decreased model concurrency limit (some permits still held by in-flight requests)"
-                    );
-                } else {
-                    tracing::info!(
-                        model = %model,
-                        old_limit = *stored_limit,
-                        new_limit = current_limit,
-                        forgot_permits = actual_forgotten,
-                        "Decreased model concurrency limit"
-                    );
-                }
-
-                // Update to the new effective limit (accounting for unforgettable permits)
-                *stored_limit = current_limit + (desired_delta - actual_forgotten);
-            }
-        }
-
-        Some(semaphore.clone())
     }
 
     /// Run the daemon loop.
@@ -399,7 +322,7 @@ where
                         let stats = DaemonStats {
                             requests_processed: requests_processed.load(Ordering::Relaxed),
                             requests_failed: requests_failed.load(Ordering::Relaxed),
-                            requests_in_flight: requests_in_flight.load(Ordering::Relaxed),
+                            requests_in_flight: requests_in_flight.iter().map(|e| e.value().load(Ordering::Relaxed)).sum(),
                         };
 
                         // Clone the record so we preserve it if heartbeat fails
@@ -452,7 +375,10 @@ where
                 let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
                 loop {
                     interval.tick().await;
-                    let count = requests_in_flight.load(Ordering::Relaxed);
+                    let count: usize = requests_in_flight
+                        .iter()
+                        .map(|e| e.value().load(Ordering::Relaxed))
+                        .sum();
                     tracing::debug!(
                         daemon_id = %daemon_id,
                         requests_in_flight = count,
@@ -622,34 +548,32 @@ where
                     break Ok(());
                 }
             }
-            // Acquire permits greedily from all known models before claiming from DB.
-            // This ensures we never claim more than we can actually process, eliminating
-            // the need for unclaiming requests we can't handle.
-            let mut acquired_permits: HashMap<String, Vec<tokio::sync::OwnedSemaphorePermit>> =
-                HashMap::new();
-            for entry in self.config.model_concurrency_limits.iter() {
-                let model = entry.key().clone();
-                if let Some(semaphore) = self.get_semaphore(&model).await {
-                    let mut permits = Vec::new();
-                    while let Ok(p) = semaphore.clone().try_acquire_owned() {
-                        permits.push(p);
+            // Compute available capacity per model: configured limit minus in-flight.
+            let available_capacity: HashMap<String, usize> = self
+                .config
+                .model_concurrency_limits
+                .iter()
+                .filter_map(|entry| {
+                    let model = entry.key().clone();
+                    let limit = *entry.value();
+                    let in_flight = self
+                        .requests_in_flight
+                        .get(&model)
+                        .map(|e| e.value().load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    let available = limit.saturating_sub(in_flight);
+                    if available > 0 {
+                        Some((model, available))
+                    } else {
+                        None
                     }
-                    if !permits.is_empty() {
-                        acquired_permits.insert(model, permits);
-                    }
-                }
-            }
+                })
+                .collect();
 
-            if acquired_permits.is_empty() {
-                tracing::trace!("No permits available for any model, skipping claim");
+            if available_capacity.is_empty() {
+                tracing::trace!("No capacity available for any model, skipping claim");
                 continue;
             }
-
-            // Build available capacity from held permits
-            let available_capacity: HashMap<String, usize> = acquired_permits
-                .iter()
-                .map(|(model, permits)| (model.clone(), permits.len()))
-                .collect();
 
             // Record available capacity before claiming
             let total_capacity: usize = available_capacity.values().sum();
@@ -729,30 +653,19 @@ where
                 "Grouped requests by model"
             );
 
-            // Dispatch requests, pairing each with a pre-acquired permit
+            // Dispatch requests
             for (model, requests) in by_model {
                 tracing::debug!(model = %model, count = requests.len(), "Processing requests for model");
-
-                let mut model_permits = acquired_permits
-                    .remove(&model)
-                    .unwrap_or_default()
-                    .into_iter();
 
                 for request in requests {
                     let request_id = request.data.id;
                     let batch_id = request.data.batch_id;
 
-                    // Take a permit from the pre-acquired pool.
-                    // claim_requests guarantees claimed ≤ held permits per model.
-                    let permit = model_permits
-                        .next()
-                        .expect("claim_requests returned more requests than held permits");
-
                     tracing::trace!(
                         request_id = %request_id,
                         batch_id = %batch_id,
                         model = %model,
-                        "Acquired permit, spawning processing task"
+                        "Spawning processing task"
                     );
 
                     // Spawn a processing task
@@ -773,8 +686,11 @@ where
                     let batch_cancellation_token =
                         cancellation_tokens.entry(batch_id).or_default().clone();
 
-                    // Increment in-flight counter and gauge
-                    requests_in_flight.fetch_add(1, Ordering::Relaxed);
+                    // Increment per-model in-flight counter and gauge
+                    requests_in_flight
+                        .entry(model_clone.clone())
+                        .or_default()
+                        .fetch_add(1, Ordering::Relaxed);
                     gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
                         .increment(1.0);
 
@@ -798,16 +714,16 @@ where
                             span.record("trace_id", tracing::field::display(sc.trace_id()));
                         }
 
-                        // Permit is held for the duration of this task
-                        let _permit = permit;
-
                         // Track processing start time for duration metrics
                         let processing_start = std::time::Instant::now();
 
-                        // Ensure we decrement the counter when this task completes
+                        // Ensure we decrement the per-model counter when this task completes
                         let model_for_guard = model_clone.clone();
+                        let in_flight_for_guard = requests_in_flight.clone();
                         let _guard = scopeguard::guard((), move |_| {
-                            requests_in_flight.fetch_sub(1, Ordering::Relaxed);
+                            if let Some(counter) = in_flight_for_guard.get(&model_for_guard) {
+                                counter.value().fetch_sub(1, Ordering::Relaxed);
+                            }
                             gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
                         });
 
@@ -960,10 +876,6 @@ where
                     }.instrument(process_span));
                 }
             }
-
-            // Drop any unused permits (models where we acquired permits but
-            // claim_requests returned fewer requests than available capacity)
-            drop(acquired_permits);
         };
 
         // Wait for heartbeat task to complete (it will mark daemon as dead)
