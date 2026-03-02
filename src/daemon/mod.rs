@@ -579,7 +579,7 @@ where
             let total_capacity: usize = available_capacity.values().sum();
             gauge!("fusillade_claim_capacity").set(total_capacity as f64);
 
-            // Claim a batch of pending requests (guaranteed ≤ held permits per model)
+            // Claim a batch of pending requests (guaranteed ≤ available capacity per model)
             let claim_start = std::time::Instant::now();
             let mut claimed = self
                 .storage

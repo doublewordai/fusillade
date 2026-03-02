@@ -807,7 +807,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 break;
             }
 
-            let available = available_capacity[&model];
+            let available = available_capacity.get(&model).copied().unwrap_or(0);
 
             if available == 0 {
                 tracing::trace!(model = %model, "Skipping model with no available capacity");
