@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v7.1.0...fusillade-v7.2.0) (2026-03-09)
+
+
+### Features
+
+* add error code label to retriable HTTP status metric ([#159](https://github.com/doublewordai/fusillade/issues/159)) ([1efbd3a](https://github.com/doublewordai/fusillade/commit/1efbd3a7893d1000230b786003455395a1f58fcc))
+
 ## [7.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v7.0.2...fusillade-v7.1.0) (2026-03-03)
 
 
