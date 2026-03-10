@@ -181,9 +181,74 @@ impl HttpClient for ReqwestHttpClient {
             );
         }
 
-        // first_chunk_timeout covers connect + send + response headers + first body chunk,
-        // i.e. time-to-first-token. This handles servers (like vLLM) that return
-        // headers immediately but queue the request before producing tokens.
+        if request.stream {
+            self.execute_streaming(request, req, &url).await
+        } else {
+            self.execute_non_streaming(request, req, &url).await
+        }
+    }
+}
+
+impl ReqwestHttpClient {
+    /// Execute a non-streaming request with a single overall timeout.
+    /// Uses first_chunk_timeout + body_timeout as the total allowed time,
+    /// since non-streaming responses return everything at once.
+    async fn execute_non_streaming(
+        &self,
+        request: &RequestData,
+        req: reqwest::RequestBuilder,
+        url: &str,
+    ) -> Result<HttpResponse> {
+        let total_timeout = self.first_chunk_timeout + self.body_timeout;
+        let response = req
+            .timeout(total_timeout)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_builder() {
+                    tracing::error!(
+                        request_id = %request.id,
+                        url.full = %url,
+                        error = %e.to_string(),
+                        custom_id = ?request.custom_id,
+                        batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
+                        "Failed to build HTTP request (not retriable) - likely invalid header value"
+                    );
+                } else {
+                    tracing::error!(
+                        request_id = %request.id,
+                        url.full = %url,
+                        error = %e,
+                        "HTTP request failed"
+                    );
+                }
+                e
+            })?;
+
+        let status = response.status().as_u16();
+        let body = response.text().await?;
+
+        tracing::debug!(
+            request_id = %request.id,
+            status = status,
+            response_len = body.len(),
+            "HTTP request completed"
+        );
+
+        Ok(HttpResponse { status, body })
+    }
+
+    /// Execute a streaming request with split timeouts:
+    /// - first_chunk_timeout: connect + headers + first body chunk (time-to-first-token).
+    ///   Handles servers (like vLLM) that return headers immediately but queue the request.
+    /// - chunk_timeout: max idle time between subsequent body chunks.
+    /// - body_timeout: max total time for the entire response body.
+    async fn execute_streaming(
+        &self,
+        request: &RequestData,
+        req: reqwest::RequestBuilder,
+        url: &str,
+    ) -> Result<HttpResponse> {
         let (mut response, status, first_chunk) = tokio::time::timeout(
             self.first_chunk_timeout,
             async {

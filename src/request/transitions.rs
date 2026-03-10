@@ -514,6 +514,11 @@ impl Request<Processing> {
                             error: reqwest_err.to_string(),
                         }
                     }
+                    FusilladeError::HttpClient(reqwest_err) if reqwest_err.is_timeout() => {
+                        FailureReason::Timeout {
+                            error: reqwest_err.to_string(),
+                        }
+                    }
                     FusilladeError::FirstChunkTimeout(msg) => {
                         FailureReason::Timeout { error: msg.clone() }
                     }

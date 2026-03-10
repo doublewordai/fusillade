@@ -34,15 +34,18 @@ pub enum FusilladeError {
     #[error("HTTP request failed: {0}")]
     HttpClient(#[from] reqwest::Error),
 
-    /// Timed out waiting for response headers (connect + time-to-first-token)
+    /// Timed out waiting for response headers + first body chunk (time-to-first-token).
+    /// Only used for streaming requests. Handles servers (like vLLM) that return
+    /// headers immediately but queue the request before producing tokens.
     #[error("First chunk timeout: {0}")]
     FirstChunkTimeout(String),
 
-    /// Timed out waiting for the next chunk of response body tokens
+    /// Timed out waiting for the next chunk of response body tokens (streaming only)
     #[error("Tokens timeout: {0}")]
     TokensTimeout(String),
 
-    /// Timed out waiting for the entire response body to complete
+    /// Timed out waiting for the entire response body to complete (streaming only).
+    /// Fires when the total body read exceeds body_timeout.
     #[error("Body timeout: {0}")]
     BodyTimeout(String),
 
