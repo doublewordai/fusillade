@@ -105,6 +105,7 @@
 use std::sync::Arc;
 
 use metrics::counter;
+use serde_json;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
@@ -436,11 +437,20 @@ impl Request<Processing> {
 
                 // Check if this response should be retried
                 if should_retry(&http_response) {
+                    // Extract error code from OpenAI-compatible error envelope
+                    // (e.g. {"error": {"code": "service_unavailable"}}) for metric labelling,
+                    // allowing alerts to distinguish upstream error classes.
+                    let error_code = serde_json::from_str::<serde_json::Value>(&http_response.body)
+                        .ok()
+                        .and_then(|v| v.get("error")?.get("code")?.as_str().map(String::from))
+                        .unwrap_or_default();
+
                     // Record retriable HTTP status for observability
                     counter!(
                         "fusillade_http_status_retriable_total",
                         "model" => self.data.model.clone(),
-                        "status" => http_response.status.to_string()
+                        "status" => http_response.status.to_string(),
+                        "code" => error_code,
                     )
                     .increment(1);
 

@@ -163,6 +163,9 @@ pub trait Storage: Send + Sync {
         status: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>>;
 
+    /// Given a list of batch IDs, return those that have been cancelled (cancelling_at IS NOT NULL).
+    async fn get_cancelled_batch_ids(&self, batch_ids: &[BatchId]) -> Result<Vec<BatchId>>;
+
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
 

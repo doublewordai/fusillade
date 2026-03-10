@@ -1,5 +1,19 @@
 # Changelog
 
+## [7.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v7.1.0...fusillade-v7.2.0) (2026-03-09)
+
+
+### Features
+
+* add error code label to retriable HTTP status metric ([#159](https://github.com/doublewordai/fusillade/issues/159)) ([1efbd3a](https://github.com/doublewordai/fusillade/commit/1efbd3a7893d1000230b786003455395a1f58fcc))
+
+## [7.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v7.0.2...fusillade-v7.1.0) (2026-03-03)
+
+
+### Features
+
+* bulk cancellation check query for daemon polling loop ([#149](https://github.com/doublewordai/fusillade/issues/149)) ([39da1fb](https://github.com/doublewordai/fusillade/commit/39da1fb104ea025b66ba209663a88827070425f6))
+
 ## [7.0.2](https://github.com/doublewordai/fusillade/compare/fusillade-v7.0.1...fusillade-v7.0.2) (2026-02-25)
 
 
