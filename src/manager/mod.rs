@@ -5,7 +5,7 @@
 
 use crate::batch::{
     Batch, BatchId, BatchInput, BatchStatus, File, FileContentItem, FileFilter, FileId,
-    FileStreamItem, OutputFileType, RequestTemplateInput,
+    FileStreamItem, ListBatchesFilter, OutputFileType, RequestTemplateInput,
 };
 use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
@@ -115,26 +115,9 @@ pub trait Storage: Send + Sync {
     /// * `file_id` - The file ID to list batches for
     async fn list_file_batches(&self, file_id: FileId) -> Result<Vec<BatchStatus>>;
 
-    /// List batches with optional filtering by creator and cursor-based pagination.
+    /// List batches with optional filtering and cursor-based pagination.
     /// Returns batches sorted by created_at DESC.
-    /// The `after` parameter is a cursor for pagination (returns batches created before this ID).
-    ///
-    /// # Arguments
-    /// * `created_by` - Optional filter by batch creator
-    /// * `search` - Optional search query
-    /// * `after` - Optional cursor for pagination
-    /// * `limit` - Maximum number of batches to return
-    async fn list_batches(
-        &self,
-        created_by: Option<String>,
-        search: Option<String>,
-        after: Option<BatchId>,
-        limit: i64,
-        api_key_id: Option<uuid::Uuid>,
-        status: Option<String>,
-        created_after: Option<chrono::DateTime<chrono::Utc>>,
-        created_before: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<Vec<Batch>>;
+    async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>>;
 
     /// Get a batch by its output or error file ID.
     async fn get_batch_by_output_file_id(

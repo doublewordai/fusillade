@@ -355,6 +355,27 @@ pub struct FileFilter {
     pub ascending: bool,
 }
 
+/// Filter parameters for listing batches
+#[derive(Debug, Clone, Default)]
+pub struct ListBatchesFilter {
+    /// Filter by batch creator
+    pub created_by: Option<String>,
+    /// Search query (matches endpoint, filename, or batch ID)
+    pub search: Option<String>,
+    /// Cursor for pagination (batch ID to start after)
+    pub after: Option<BatchId>,
+    /// Maximum number of batches to return
+    pub limit: i64,
+    /// Filter by API key UUID (for per-member attribution within orgs)
+    pub api_key_id: Option<uuid::Uuid>,
+    /// Filter by batch status (e.g. "completed", "in_progress", "failed")
+    pub status: Option<String>,
+    /// Only return batches created after this timestamp
+    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+    /// Only return batches created before this timestamp
+    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Items that can be yielded from a file upload stream
 #[derive(Debug, Clone, Serialize)]
 pub enum FileStreamItem {

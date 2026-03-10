@@ -26,7 +26,8 @@ use super::{DaemonStorage, Storage};
 use crate::batch::{
     Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchNotification,
     BatchOutputItem, BatchResponseDetails, BatchStatus, File, FileContentItem, FileId,
-    FileMetadata, FileStreamItem, OutputFileType, RequestTemplateInput, TemplateId,
+    FileMetadata, FileStreamItem, ListBatchesFilter, OutputFileType, RequestTemplateInput,
+    TemplateId,
 };
 use crate::daemon::{
     AnyDaemonRecord, Daemon, DaemonConfig, DaemonData, DaemonRecord, DaemonState, DaemonStatus,
@@ -2355,18 +2356,22 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         }
     }
 
-    #[tracing::instrument(skip(self), fields(created_by = ?created_by, limit))]
+    #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
     async fn list_batches(
         &self,
-        created_by: Option<String>,
-        search: Option<String>,
-        after: Option<BatchId>,
-        limit: i64,
-        api_key_id: Option<Uuid>,
-        status: Option<String>,
-        created_after: Option<chrono::DateTime<chrono::Utc>>,
-        created_before: Option<chrono::DateTime<chrono::Utc>>,
+        filter: ListBatchesFilter,
     ) -> Result<Vec<Batch>> {
+        let ListBatchesFilter {
+            created_by,
+            search,
+            after,
+            limit,
+            api_key_id,
+            status,
+            created_after,
+            created_before,
+        } = filter;
+
         // If after is provided, get the created_at timestamp of that batch for cursor-based pagination
         let (after_created_at, after_id) = if let Some(after_id) = after {
             let row = sqlx::query!(
