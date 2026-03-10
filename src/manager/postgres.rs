@@ -1004,6 +1004,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             body: row.body,
                             model: row.model,
                             api_key: row.api_key,
+                            stream: false,
                             batch_metadata,
                         },
                     }
@@ -1265,6 +1266,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     body,
                     model,
                     api_key,
+                    stream: false,
                     batch_metadata: std::collections::HashMap::new(),
                 },
                 _ => {
@@ -2754,6 +2756,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     body,
                     model,
                     api_key,
+                    stream: false,
                     batch_metadata: std::collections::HashMap::new(),
                 },
                 _ => {

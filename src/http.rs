@@ -500,6 +500,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -544,6 +545,7 @@ mod tests {
             body: "".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -571,6 +573,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -601,6 +604,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -654,6 +658,7 @@ mod tests {
             body: r#"{"key":"value"}"#.to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            stream: false,
             batch_metadata: batch_metadata.clone(),
         };
 
@@ -766,6 +771,7 @@ mod tests {
             body: r#"{"prompt":"test"}"#.to_string(),
             model: "test-model".to_string(),
             api_key: "test-api-key".to_string(),
+            stream: false,
             batch_metadata,
         };
 
@@ -817,6 +823,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -859,6 +866,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -921,6 +929,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -956,6 +965,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
