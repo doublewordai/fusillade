@@ -28,7 +28,7 @@ pub struct HttpResponse {
 ///
 /// # Example
 /// ```ignore
-/// let client = ReqwestHttpClient::new(Duration::from_secs(300), Duration::from_secs(120));
+/// let client = ReqwestHttpClient::new(Duration::from_secs(300), Duration::from_secs(30), Duration::from_secs(600));
 /// let response = client.execute(&request_data, "api-key").await?;
 /// println!("Status: {}, Body: {}", response.status, response.body);
 /// ```

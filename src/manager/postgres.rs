@@ -196,7 +196,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
     /// Set a custom daemon configuration.
     ///
-    /// This is a builder method that can be chained after `new()` or `with_client()`.
+    /// This is a builder method that can be chained after `with_client()`.
+    /// Note: timeout fields in the config do not affect the HTTP client, which
+    /// is fixed at construction. Use `new()` to build a default client with
+    /// timeouts derived from the config.
     pub fn with_config(mut self, config: DaemonConfig) -> Self {
         self.config = config;
         self
