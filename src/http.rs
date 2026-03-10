@@ -47,11 +47,7 @@ pub trait HttpClient: Send + Sync + Clone {
     /// - The request fails due to network issues
     /// - The request times out (either waiting for headers or between body chunks)
     /// - The URL is invalid
-    async fn execute(
-        &self,
-        request: &RequestData,
-        api_key: &str,
-    ) -> Result<HttpResponse>;
+    async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse>;
 }
 
 // ============================================================================
@@ -99,11 +95,7 @@ impl HttpClient for ReqwestHttpClient {
     #[tracing::instrument(skip(self, request, api_key), fields(
         otel.name = %format!("{} {}", request.method, request.path),
     ))]
-    async fn execute(
-        &self,
-        request: &RequestData,
-        api_key: &str,
-    ) -> Result<HttpResponse> {
+    async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse> {
         let url = format!("{}{}", request.endpoint, request.path);
         let span = tracing::Span::current();
         span.set_attribute("otel.kind", "Client");
@@ -119,15 +111,13 @@ impl HttpClient for ReqwestHttpClient {
             "Executing HTTP request"
         );
 
-        let mut req = self
-            .client
-            .request(
-                request.method.parse().map_err(|e| {
-                    tracing::error!(method = %request.method, error = %e, "Invalid HTTP method");
-                    anyhow::anyhow!("Invalid HTTP method '{}': {}", request.method, e)
-                })?,
-                &url,
-            );
+        let mut req = self.client.request(
+            request.method.parse().map_err(|e| {
+                tracing::error!(method = %request.method, error = %e, "Invalid HTTP method");
+                anyhow::anyhow!("Invalid HTTP method '{}': {}", request.method, e)
+            })?,
+            &url,
+        );
 
         // Only add Authorization header if api_key is not empty
         if !api_key.is_empty() {
@@ -189,20 +179,24 @@ impl HttpClient for ReqwestHttpClient {
 
         let mut response = tokio::time::timeout(self.header_timeout, req.send())
             .await
-            .map_err(|_| crate::error::FusilladeError::HeaderTimeout(
-                format!("No response headers from {} within {}ms", url, self.header_timeout.as_millis())
-            ))?
+            .map_err(|_| {
+                crate::error::FusilladeError::HeaderTimeout(format!(
+                    "No response headers from {} within {}ms",
+                    url,
+                    self.header_timeout.as_millis()
+                ))
+            })?
             .map_err(|e| -> crate::error::FusilladeError { e.into() })
-        .inspect_err(|e| {
-            tracing::error!(
-                request_id = %request.id,
-                url.full = %url,
-                error = %e,
-                custom_id = ?request.custom_id,
-                batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
-                "HTTP request failed"
-            );
-        })?;
+            .inspect_err(|e| {
+                tracing::error!(
+                    request_id = %request.id,
+                    url.full = %url,
+                    error = %e,
+                    custom_id = ?request.custom_id,
+                    batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
+                    "HTTP request failed"
+                );
+            })?;
 
         let status = response.status().as_u16();
 
@@ -213,17 +207,26 @@ impl HttpClient for ReqwestHttpClient {
                     Ok(Ok(Some(chunk))) => buf.extend_from_slice(&chunk),
                     Ok(Ok(None)) => break,
                     Ok(Err(e)) => return Err(e.into()),
-                    Err(_) => return Err(crate::error::FusilladeError::TokensTimeout(
-                        format!("Body read stalled from {} after {}ms ({} bytes received)", url, self.chunk_timeout.as_millis(), buf.len())
-                    )),
+                    Err(_) => {
+                        return Err(crate::error::FusilladeError::TokensTimeout(format!(
+                            "Body read stalled from {} after {}ms ({} bytes received)",
+                            url,
+                            self.chunk_timeout.as_millis(),
+                            buf.len()
+                        )));
+                    }
                 }
             }
             Ok(buf)
         })
-            .await
-            .map_err(|_| crate::error::FusilladeError::BodyTimeout(
-                format!("Total body read from {} exceeded {}ms", url, self.body_timeout.as_millis())
-            ))??;
+        .await
+        .map_err(|_| {
+            crate::error::FusilladeError::BodyTimeout(format!(
+                "Total body read from {} exceeded {}ms",
+                url,
+                self.body_timeout.as_millis()
+            ))
+        })??;
         let body = String::from_utf8(body_bytes)
             .map_err(|e| anyhow::anyhow!("Response body from {} is not valid UTF-8: {}", url, e))?;
 
@@ -379,11 +382,7 @@ impl Default for MockHttpClient {
 
 #[async_trait]
 impl HttpClient for MockHttpClient {
-    async fn execute(
-        &self,
-        request: &RequestData,
-        api_key: &str,
-    ) -> Result<HttpResponse> {
+    async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse> {
         // Increment in-flight counter
         self.in_flight.fetch_add(1, Ordering::SeqCst);
 
@@ -754,10 +753,7 @@ mod tests {
 
         // Use real HTTP client
         let client = ReqwestHttpClient::default();
-        let response = client
-            .execute(&request, "test-api-key")
-            .await
-            .unwrap();
+        let response = client.execute(&request, "test-api-key").await.unwrap();
 
         assert_eq!(response.status, 200);
         assert_eq!(response.body, r#"{"result":"ok"}"#);
@@ -876,8 +872,12 @@ mod tests {
                         return None;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    Some((Ok::<_, std::convert::Infallible>(format!("chunk-{i}").into_bytes()), i + 1))
-                }).boxed();
+                    Some((
+                        Ok::<_, std::convert::Infallible>(format!("chunk-{i}").into_bytes()),
+                        i + 1,
+                    ))
+                })
+                .boxed();
                 let body = axum::body::Body::from_stream(stream);
                 (StatusCode::OK, body)
             }),
@@ -907,7 +907,11 @@ mod tests {
         };
 
         // chunk_timeout=200ms (never trips), body_timeout=300ms (trips after ~6 chunks)
-        let client = ReqwestHttpClient::new(NO_TIMEOUT, Duration::from_millis(200), Duration::from_millis(300));
+        let client = ReqwestHttpClient::new(
+            NO_TIMEOUT,
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+        );
         let result = client.execute(&request, "").await;
         let err = result.expect_err("Expected BodyTimeout for slow-drip response");
 

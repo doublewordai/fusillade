@@ -514,15 +514,15 @@ impl Request<Processing> {
                             error: reqwest_err.to_string(),
                         }
                     }
-                    FusilladeError::HeaderTimeout(msg) => FailureReason::Timeout {
-                        error: msg.clone(),
-                    },
-                    FusilladeError::TokensTimeout(msg) => FailureReason::Timeout {
-                        error: msg.clone(),
-                    },
-                    FusilladeError::BodyTimeout(msg) => FailureReason::Timeout {
-                        error: msg.clone(),
-                    },
+                    FusilladeError::HeaderTimeout(msg) => {
+                        FailureReason::Timeout { error: msg.clone() }
+                    }
+                    FusilladeError::TokensTimeout(msg) => {
+                        FailureReason::Timeout { error: msg.clone() }
+                    }
+                    FusilladeError::BodyTimeout(msg) => {
+                        FailureReason::Timeout { error: msg.clone() }
+                    }
                     _ => FailureReason::NetworkError {
                         error: crate::error::error_serialization::serialize_error(&e.into()),
                     },

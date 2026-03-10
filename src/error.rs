@@ -46,7 +46,6 @@ pub enum FusilladeError {
     #[error("Body timeout: {0}")]
     BodyTimeout(String),
 
-
     /// Serialization/deserialization error
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
