@@ -200,30 +200,26 @@ impl ReqwestHttpClient {
         url: &str,
     ) -> Result<HttpResponse> {
         let total_timeout = self.first_chunk_timeout + self.body_timeout;
-        let response = req
-            .timeout(total_timeout)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_builder() {
-                    tracing::error!(
-                        request_id = %request.id,
-                        url.full = %url,
-                        error = %e.to_string(),
-                        custom_id = ?request.custom_id,
-                        batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
-                        "Failed to build HTTP request (not retriable) - likely invalid header value"
-                    );
-                } else {
-                    tracing::error!(
-                        request_id = %request.id,
-                        url.full = %url,
-                        error = %e,
-                        "HTTP request failed"
-                    );
-                }
-                e
-            })?;
+        let response = req.timeout(total_timeout).send().await.map_err(|e| {
+            if e.is_builder() {
+                tracing::error!(
+                    request_id = %request.id,
+                    url.full = %url,
+                    error = %e.to_string(),
+                    custom_id = ?request.custom_id,
+                    batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
+                    "Failed to build HTTP request (not retriable) - likely invalid header value"
+                );
+            } else {
+                tracing::error!(
+                    request_id = %request.id,
+                    url.full = %url,
+                    error = %e,
+                    "HTTP request failed"
+                );
+            }
+            e
+        })?;
 
         let status = response.status().as_u16();
         let body = response.text().await?;
