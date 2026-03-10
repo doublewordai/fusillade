@@ -364,16 +364,16 @@ pub struct ListBatchesFilter {
     pub search: Option<String>,
     /// Cursor for pagination (batch ID to start after)
     pub after: Option<BatchId>,
-    /// Maximum number of batches to return
-    pub limit: i64,
+    /// Maximum number of batches to return (defaults to 100 if not set)
+    pub limit: Option<i64>,
     /// Filter by API key UUID (for per-member attribution within orgs)
-    pub api_key_id: Option<uuid::Uuid>,
+    pub api_key_id: Option<Uuid>,
     /// Filter by batch status (e.g. "completed", "in_progress", "failed")
     pub status: Option<String>,
     /// Only return batches created after this timestamp
-    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_after: Option<DateTime<Utc>>,
     /// Only return batches created before this timestamp
-    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_before: Option<DateTime<Utc>>,
 }
 
 /// Items that can be yielded from a file upload stream

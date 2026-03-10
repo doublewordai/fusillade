@@ -2368,6 +2368,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             created_after,
             created_before,
         } = filter;
+        let limit = limit.unwrap_or(100);
 
         // If after is provided, get the created_at timestamp of that batch for cursor-based pagination
         let (after_created_at, after_id) = if let Some(after_id) = after {
@@ -2440,11 +2441,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         query_builder.push_bind(after_id);
         query_builder.push(")) AND (");
         query_builder.push_bind(&search_pattern);
-        query_builder.push("::TEXT IS NULL OR LOWER(b.metadata::text) LIKE ");
+        query_builder.push("::TEXT IS NULL OR LOWER(b.endpoint) LIKE ");
         query_builder.push_bind(&search_pattern);
         query_builder.push(" OR LOWER(f.name) LIKE ");
         query_builder.push_bind(&search_pattern);
         query_builder.push(" OR b.id::text LIKE ");
+        query_builder.push_bind(&search_pattern);
+        query_builder.push(" OR LOWER(b.metadata::text) LIKE ");
         query_builder.push_bind(&search_pattern);
         query_builder.push(")");
 
@@ -2486,8 +2489,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     query_builder.push(" AND b.total_requests = 0 AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL");
                 }
                 "finalizing" => {
-                    // Finalizing: all requests done but output files not yet written
-                    query_builder.push(" AND b.finalizing_at IS NOT NULL AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL");
+                    // Finalizing: 95%+ of requests in terminal state but not all done yet.
+                    // Mirrors the logic in BatchStatus::openai_status().
+                    query_builder.push(" AND b.total_requests > 0 AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL AND (COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0))::float / b.total_requests::float >= 0.95");
                 }
                 "expired" => {
                     query_builder.push(" AND b.expires_at IS NOT NULL AND b.expires_at < NOW()");
@@ -9723,7 +9727,7 @@ mod tests {
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 api_key_id: Some(key_a),
-                limit: 100,
+                limit: Some(100),
                 ..Default::default()
             })
             .await
@@ -9734,7 +9738,7 @@ mod tests {
         // No filter — should return all 3
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
-                limit: 100,
+                limit: Some(100),
                 ..Default::default()
             })
             .await
@@ -9785,7 +9789,7 @@ mod tests {
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 status: Some("completed".to_string()),
-                limit: 100,
+                limit: Some(100),
                 ..Default::default()
             })
             .await
@@ -9796,7 +9800,7 @@ mod tests {
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 status: Some("in_progress".to_string()),
-                limit: 100,
+                limit: Some(100),
                 ..Default::default()
             })
             .await
@@ -9815,7 +9819,7 @@ mod tests {
         let result = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 status: Some("nonexistent_status".to_string()),
-                limit: 100,
+                limit: Some(100),
                 ..Default::default()
             })
             .await;
@@ -9874,7 +9878,7 @@ mod tests {
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 created_after: Some(after_create + chrono::Duration::seconds(1)),
-                limit: 100,
+                limit: Some(100),
                 ..Default::default()
             })
             .await
@@ -9885,7 +9889,7 @@ mod tests {
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 created_before: Some(before_create - chrono::Duration::seconds(1)),
-                limit: 100,
+                limit: Some(100),
                 ..Default::default()
             })
             .await
@@ -9897,7 +9901,7 @@ mod tests {
             .list_batches(crate::batch::ListBatchesFilter {
                 created_after: Some(before_create),
                 created_before: Some(after_create + chrono::Duration::seconds(1)),
-                limit: 100,
+                limit: Some(100),
                 ..Default::default()
             })
             .await
@@ -9949,7 +9953,7 @@ mod tests {
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 search: Some(search_term.to_string()),
-                limit: 100,
+                limit: Some(100),
                 ..Default::default()
             })
             .await
@@ -9960,12 +9964,341 @@ mod tests {
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 search: Some("zzz_no_match_zzz".to_string()),
-                limit: 100,
+                limit: Some(100),
                 ..Default::default()
             })
             .await
             .unwrap();
         assert!(results.iter().all(|b| b.id != batch.id));
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_by_status_validating(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "validating-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Manually reset total_requests to 0 to simulate "validating" state
+        // (create_batch sets total_requests from template count)
+        sqlx::query!(
+            "UPDATE batches SET total_requests = 0 WHERE id = $1",
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // total_requests = 0, no terminal timestamps → "validating"
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("validating".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().any(|b| b.id == batch.id));
+
+        // Should NOT appear in "in_progress"
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("in_progress".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().all(|b| b.id != batch.id));
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_by_status_cancelled(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "cancelled-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Cancel the batch → sets both cancelling_at and cancelled_at
+        manager.cancel_batch(batch.id).await.unwrap();
+
+        // Should appear in "cancelled"
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("cancelled".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().any(|b| b.id == batch.id));
+
+        // Should NOT appear in "in_progress"
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("in_progress".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().all(|b| b.id != batch.id));
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_by_status_cancelling(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "cancelling-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Manually set only cancelling_at (without cancelled_at) to simulate "cancelling" state
+        sqlx::query!(
+            "UPDATE batches SET cancelling_at = NOW() WHERE id = $1",
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Should appear in "cancelling"
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("cancelling".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().any(|b| b.id == batch.id));
+
+        // Should NOT appear in "cancelled" (cancelled_at is still NULL)
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("cancelled".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().all(|b| b.id != batch.id));
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_by_status_failed(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "failed-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Manually set failed_at to simulate a failed batch
+        sqlx::query!(
+            "UPDATE batches SET failed_at = NOW() WHERE id = $1",
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Should appear in "failed"
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("failed".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().any(|b| b.id == batch.id));
+
+        // Should NOT appear in "in_progress"
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("in_progress".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().all(|b| b.id != batch.id));
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_by_status_expired(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "expired-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Set expires_at to the past to simulate an expired batch
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Should appear in "expired"
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("expired".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().any(|b| b.id == batch.id));
     }
 
     // =========================================================================

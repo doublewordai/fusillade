@@ -120,8 +120,9 @@ pub trait Storage: Send + Sync {
     ///
     /// See [`ListBatchesFilter`] for available filter options including:
     /// - `created_by` - Filter by batch creator user ID
-    /// - `search` - Case-insensitive substring match against endpoint, input filename, or batch ID
-    /// - `after` / `limit` - Cursor-based pagination
+    /// - `search` - Case-insensitive substring match against endpoint, input filename,
+    ///   batch ID, or metadata JSON text
+    /// - `after` / `limit` - Cursor-based pagination (limit defaults to 100 if not set)
     /// - `api_key_id` - Filter by the API key that created the batch (for per-member attribution)
     /// - `status` - Filter by derived batch status. Supported values:
     ///   `"validating"`, `"in_progress"`, `"finalizing"`, `"completed"`, `"failed"`,
