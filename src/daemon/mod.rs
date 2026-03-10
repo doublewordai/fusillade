@@ -124,7 +124,7 @@ pub struct DaemonConfig {
     /// Timeout for receiving response headers (connect + time-to-first-token) in milliseconds.
     /// This should be generous enough to cover slow model inference starts.
     /// Default: 86,400,000 (24 hours).
-    pub header_timeout_ms: u64,
+    pub first_chunk_timeout_ms: u64,
 
     /// Timeout for receiving the next chunk of response body in milliseconds.
     /// Once the server starts streaming, each inter-chunk gap must be shorter
@@ -228,7 +228,7 @@ impl Default for DaemonConfig {
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
-            header_timeout_ms: 86_400_000,      // 24 hours
+            first_chunk_timeout_ms: 86_400_000, // 24 hours
             chunk_timeout_ms: 86_400_000,       // 24 hours
             body_timeout_ms: 86_400_000,        // 24 hours
             status_log_interval_ms: Some(2000), // Log every 2 seconds by default
@@ -1010,7 +1010,7 @@ mod tests {
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
-            header_timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
             chunk_timeout_ms: 5000,
             body_timeout_ms: 86_400_000,
             status_log_interval_ms: None, // Disable status logging in tests
@@ -1185,7 +1185,7 @@ mod tests {
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
-            header_timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
             chunk_timeout_ms: 5000,
             body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
@@ -1418,7 +1418,7 @@ mod tests {
             backoff_ms: 10, // Very fast backoff for testing
             backoff_factor: 2,
             max_backoff_ms: 100,
-            header_timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
             chunk_timeout_ms: 5000,
             body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
@@ -1560,7 +1560,7 @@ mod tests {
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
-            header_timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
             chunk_timeout_ms: 5000,
             body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
@@ -1737,7 +1737,7 @@ mod tests {
             backoff_ms: 50,
             backoff_factor: 2,
             max_backoff_ms: 200,
-            header_timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
             chunk_timeout_ms: 5000,
             body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
@@ -1898,7 +1898,7 @@ mod tests {
             backoff_ms: 50,
             backoff_factor: 2,
             max_backoff_ms: 200,
-            header_timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
             chunk_timeout_ms: 5000,
             body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
@@ -2059,7 +2059,7 @@ mod tests {
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
-            header_timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
             chunk_timeout_ms: 5000,
             body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
@@ -2220,7 +2220,7 @@ mod tests {
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
-            header_timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
             chunk_timeout_ms: 5000,
             body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,

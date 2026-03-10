@@ -514,7 +514,7 @@ impl Request<Processing> {
                             error: reqwest_err.to_string(),
                         }
                     }
-                    FusilladeError::HeaderTimeout(msg) => {
+                    FusilladeError::FirstChunkTimeout(msg) => {
                         FailureReason::Timeout { error: msg.clone() }
                     }
                     FusilladeError::TokensTimeout(msg) => {

@@ -58,23 +58,27 @@ pub trait HttpClient: Send + Sync + Clone {
 ///
 /// This implementation makes real HTTP requests to external endpoints.
 /// Timeouts are configured at construction time:
-/// - `header_timeout`: max time to first token (connect + headers + first body chunk)
+/// - `first_chunk_timeout`: max time to first token (connect + headers + first body chunk)
 /// - `chunk_timeout`: max idle time between subsequent body chunks
 /// - `body_timeout`: max total time for the entire response body
 #[derive(Clone)]
 pub struct ReqwestHttpClient {
     client: reqwest::Client,
-    header_timeout: Duration,
+    first_chunk_timeout: Duration,
     chunk_timeout: Duration,
     body_timeout: Duration,
 }
 
 impl ReqwestHttpClient {
     /// Create a new reqwest-based HTTP client with the given timeouts.
-    pub fn new(header_timeout: Duration, chunk_timeout: Duration, body_timeout: Duration) -> Self {
+    pub fn new(
+        first_chunk_timeout: Duration,
+        chunk_timeout: Duration,
+        body_timeout: Duration,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
-            header_timeout,
+            first_chunk_timeout,
             chunk_timeout,
             body_timeout,
         }
@@ -105,7 +109,7 @@ impl HttpClient for ReqwestHttpClient {
 
         tracing::debug!(
             url.full = %url,
-            header_timeout_ms = self.header_timeout.as_millis() as u64,
+            first_chunk_timeout_ms = self.first_chunk_timeout.as_millis() as u64,
             chunk_timeout_ms = self.chunk_timeout.as_millis() as u64,
             body_timeout_ms = self.body_timeout.as_millis() as u64,
             "Executing HTTP request"
@@ -177,11 +181,11 @@ impl HttpClient for ReqwestHttpClient {
             );
         }
 
-        // header_timeout covers connect + send + response headers + first body chunk,
+        // first_chunk_timeout covers connect + send + response headers + first body chunk,
         // i.e. time-to-first-token. This handles servers (like vLLM) that return
         // headers immediately but queue the request before producing tokens.
         let (mut response, status, first_chunk) = tokio::time::timeout(
-            self.header_timeout,
+            self.first_chunk_timeout,
             async {
                 let mut resp = req
                     .send()
@@ -207,10 +211,10 @@ impl HttpClient for ReqwestHttpClient {
         )
         .await
         .map_err(|_| {
-            crate::error::FusilladeError::HeaderTimeout(format!(
+            crate::error::FusilladeError::FirstChunkTimeout(format!(
                 "No first token from {} within {}ms",
                 url,
-                self.header_timeout.as_millis()
+                self.first_chunk_timeout.as_millis()
             ))
         })??;
 
@@ -861,13 +865,13 @@ mod tests {
         let timeout = Duration::from_millis(200);
         let client = ReqwestHttpClient::new(timeout, timeout, NO_TIMEOUT);
         let result = client.execute(&request, "").await;
-        let err = result.expect_err("Expected HeaderTimeout for stalled headers");
+        let err = result.expect_err("Expected FirstChunkTimeout for stalled headers");
 
         match err {
-            crate::error::FusilladeError::HeaderTimeout(msg) => {
-                assert!(msg.contains("No response headers from"));
+            crate::error::FusilladeError::FirstChunkTimeout(msg) => {
+                assert!(msg.contains("No first token from"));
             }
-            other => panic!("Expected HeaderTimeout, got: {:?}", other),
+            other => panic!("Expected FirstChunkTimeout, got: {:?}", other),
         }
     }
 

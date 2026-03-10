@@ -157,7 +157,7 @@ impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> 
     /// ```
     pub fn new(pools: P, config: DaemonConfig) -> Self {
         let http_client = Arc::new(crate::http::ReqwestHttpClient::new(
-            std::time::Duration::from_millis(config.header_timeout_ms),
+            std::time::Duration::from_millis(config.first_chunk_timeout_ms),
             std::time::Duration::from_millis(config.chunk_timeout_ms),
             std::time::Duration::from_millis(config.body_timeout_ms),
         ));

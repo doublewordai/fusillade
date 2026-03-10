@@ -35,8 +35,8 @@ pub enum FusilladeError {
     HttpClient(#[from] reqwest::Error),
 
     /// Timed out waiting for response headers (connect + time-to-first-token)
-    #[error("Header timeout: {0}")]
-    HeaderTimeout(String),
+    #[error("First chunk timeout: {0}")]
+    FirstChunkTimeout(String),
 
     /// Timed out waiting for the next chunk of response body tokens
     #[error("Tokens timeout: {0}")]
