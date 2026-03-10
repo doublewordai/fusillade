@@ -87,12 +87,12 @@ impl ReqwestHttpClient {
 
 impl Default for ReqwestHttpClient {
     fn default() -> Self {
-        Self::new(NO_TIMEOUT, NO_TIMEOUT, NO_TIMEOUT)
+        Self::new(ONE_DAY_DURATION, ONE_DAY_DURATION, ONE_DAY_DURATION)
     }
 }
 
-/// Effectively infinite timeout used when no timeout is configured.
-const NO_TIMEOUT: Duration = Duration::from_secs(86_400);
+/// Very long timeout used when no timeout is configured.
+const ONE_DAY_DURATION: Duration = Duration::from_secs(86_400);
 
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
@@ -821,7 +821,7 @@ mod tests {
         };
 
         let timeout = Duration::from_millis(200);
-        let client = ReqwestHttpClient::new(timeout, timeout, NO_TIMEOUT);
+        let client = ReqwestHttpClient::new(timeout, timeout, ONE_DAY_DURATION);
         let result = client.execute(&request, "").await;
         let err = result.expect_err("Expected TokensTimeout for stalled body");
 
@@ -863,7 +863,7 @@ mod tests {
         };
 
         let timeout = Duration::from_millis(200);
-        let client = ReqwestHttpClient::new(timeout, timeout, NO_TIMEOUT);
+        let client = ReqwestHttpClient::new(timeout, timeout, ONE_DAY_DURATION);
         let result = client.execute(&request, "").await;
         let err = result.expect_err("Expected FirstChunkTimeout for stalled headers");
 
@@ -926,7 +926,7 @@ mod tests {
 
         // chunk_timeout=200ms (never trips), body_timeout=300ms (trips after ~6 chunks)
         let client = ReqwestHttpClient::new(
-            NO_TIMEOUT,
+            ONE_DAY_DURATION,
             Duration::from_millis(200),
             Duration::from_millis(300),
         );
