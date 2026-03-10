@@ -2357,10 +2357,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
-    async fn list_batches(
-        &self,
-        filter: ListBatchesFilter,
-    ) -> Result<Vec<Batch>> {
+    async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>> {
         let ListBatchesFilter {
             created_by,
             search,
@@ -9666,8 +9663,10 @@ mod tests {
         );
 
         let file_id = manager
-            .create_file("api-key-filter-test".to_string(), None, vec![
-                RequestTemplateInput {
+            .create_file(
+                "api-key-filter-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
                     custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
@@ -9675,8 +9674,8 @@ mod tests {
                     body: "{}".to_string(),
                     model: "test".to_string(),
                     api_key: "key".to_string(),
-                },
-            ])
+                }],
+            )
             .await
             .unwrap();
 
@@ -9684,47 +9683,62 @@ mod tests {
         let key_b = uuid::Uuid::new_v4();
 
         // Create batches with different api_key_ids
-        manager.create_batch(crate::batch::BatchInput {
-            file_id,
-            endpoint: "/v1/chat/completions".to_string(),
-            completion_window: "24h".to_string(),
-            metadata: None,
-            created_by: None,
-            api_key_id: Some(key_a),
-        }).await.unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: Some(key_a),
+            })
+            .await
+            .unwrap();
 
-        manager.create_batch(crate::batch::BatchInput {
-            file_id,
-            endpoint: "/v1/chat/completions".to_string(),
-            completion_window: "24h".to_string(),
-            metadata: None,
-            created_by: None,
-            api_key_id: Some(key_b),
-        }).await.unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: Some(key_b),
+            })
+            .await
+            .unwrap();
 
-        manager.create_batch(crate::batch::BatchInput {
-            file_id,
-            endpoint: "/v1/chat/completions".to_string(),
-            completion_window: "24h".to_string(),
-            metadata: None,
-            created_by: None,
-            api_key_id: None,
-        }).await.unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
 
         // Filter by key_a — should return only 1 batch
-        let results = manager.list_batches(crate::batch::ListBatchesFilter {
-            api_key_id: Some(key_a),
-            limit: 100,
-            ..Default::default()
-        }).await.unwrap();
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                api_key_id: Some(key_a),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].api_key_id, Some(key_a));
 
         // No filter — should return all 3
-        let results = manager.list_batches(crate::batch::ListBatchesFilter {
-            limit: 100,
-            ..Default::default()
-        }).await.unwrap();
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -9737,8 +9751,10 @@ mod tests {
         );
 
         let file_id = manager
-            .create_file("status-filter-test".to_string(), None, vec![
-                RequestTemplateInput {
+            .create_file(
+                "status-filter-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
                     custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
@@ -9746,36 +9762,45 @@ mod tests {
                     body: "{}".to_string(),
                     model: "test".to_string(),
                     api_key: "key".to_string(),
-                },
-            ])
+                }],
+            )
             .await
             .unwrap();
 
-        let batch = manager.create_batch(crate::batch::BatchInput {
-            file_id,
-            endpoint: "/v1/chat/completions".to_string(),
-            completion_window: "24h".to_string(),
-            metadata: None,
-            created_by: None,
-            api_key_id: None,
-        }).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
 
         // Batch has 1 template so total_requests > 0, and no terminal timestamps set
         // → status is "in_progress"
         // Filter for "completed" should not include it
-        let results = manager.list_batches(crate::batch::ListBatchesFilter {
-            status: Some("completed".to_string()),
-            limit: 100,
-            ..Default::default()
-        }).await.unwrap();
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("completed".to_string()),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert!(results.iter().all(|b| b.id != batch.id));
 
         // Filter for "in_progress" should include it
-        let results = manager.list_batches(crate::batch::ListBatchesFilter {
-            status: Some("in_progress".to_string()),
-            limit: 100,
-            ..Default::default()
-        }).await.unwrap();
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("in_progress".to_string()),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert!(results.iter().any(|b| b.id == batch.id));
     }
 
@@ -9787,15 +9812,21 @@ mod tests {
             http_client,
         );
 
-        let result = manager.list_batches(crate::batch::ListBatchesFilter {
-            status: Some("nonexistent_status".to_string()),
-            limit: 100,
-            ..Default::default()
-        }).await;
+        let result = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("nonexistent_status".to_string()),
+                limit: 100,
+                ..Default::default()
+            })
+            .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Unknown batch status filter"), "Expected error about unknown status, got: {}", err);
+        assert!(
+            err.contains("Unknown batch status filter"),
+            "Expected error about unknown status, got: {}",
+            err
+        );
     }
 
     #[sqlx::test]
@@ -9807,8 +9838,10 @@ mod tests {
         );
 
         let file_id = manager
-            .create_file("time-filter-test".to_string(), None, vec![
-                RequestTemplateInput {
+            .create_file(
+                "time-filter-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
                     custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
@@ -9816,47 +9849,59 @@ mod tests {
                     body: "{}".to_string(),
                     model: "test".to_string(),
                     api_key: "key".to_string(),
-                },
-            ])
+                }],
+            )
             .await
             .unwrap();
 
         let before_create = chrono::Utc::now();
 
-        manager.create_batch(crate::batch::BatchInput {
-            file_id,
-            endpoint: "/v1/chat/completions".to_string(),
-            completion_window: "24h".to_string(),
-            metadata: None,
-            created_by: None,
-            api_key_id: None,
-        }).await.unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
 
         let after_create = chrono::Utc::now();
 
         // created_after set to after batch creation — should exclude it
-        let results = manager.list_batches(crate::batch::ListBatchesFilter {
-            created_after: Some(after_create + chrono::Duration::seconds(1)),
-            limit: 100,
-            ..Default::default()
-        }).await.unwrap();
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                created_after: Some(after_create + chrono::Duration::seconds(1)),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert!(results.is_empty());
 
         // created_before set to before batch creation — should exclude it
-        let results = manager.list_batches(crate::batch::ListBatchesFilter {
-            created_before: Some(before_create - chrono::Duration::seconds(1)),
-            limit: 100,
-            ..Default::default()
-        }).await.unwrap();
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                created_before: Some(before_create - chrono::Duration::seconds(1)),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert!(results.is_empty());
 
         // Window that includes the batch
-        let results = manager.list_batches(crate::batch::ListBatchesFilter {
-            created_after: Some(before_create),
-            created_before: Some(after_create + chrono::Duration::seconds(1)),
-            limit: 100,
-            ..Default::default()
-        }).await.unwrap();
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                created_after: Some(before_create),
+                created_before: Some(after_create + chrono::Duration::seconds(1)),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert!(!results.is_empty());
     }
 
@@ -9869,8 +9914,10 @@ mod tests {
         );
 
         let file_id = manager
-            .create_file("id-search-test".to_string(), None, vec![
-                RequestTemplateInput {
+            .create_file(
+                "id-search-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
                     custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
@@ -9878,37 +9925,46 @@ mod tests {
                     body: "{}".to_string(),
                     model: "test".to_string(),
                     api_key: "key".to_string(),
-                },
-            ])
+                }],
+            )
             .await
             .unwrap();
 
-        let batch = manager.create_batch(crate::batch::BatchInput {
-            file_id,
-            endpoint: "/v1/chat/completions".to_string(),
-            completion_window: "24h".to_string(),
-            metadata: None,
-            created_by: None,
-            api_key_id: None,
-        }).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
 
         // Search by batch UUID substring
         let id_str = batch.id.0.to_string();
         let search_term = &id_str[..8]; // First 8 chars of UUID
 
-        let results = manager.list_batches(crate::batch::ListBatchesFilter {
-            search: Some(search_term.to_string()),
-            limit: 100,
-            ..Default::default()
-        }).await.unwrap();
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                search: Some(search_term.to_string()),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert!(results.iter().any(|b| b.id == batch.id));
 
         // Search with a nonsense string — should not find this batch
-        let results = manager.list_batches(crate::batch::ListBatchesFilter {
-            search: Some("zzz_no_match_zzz".to_string()),
-            limit: 100,
-            ..Default::default()
-        }).await.unwrap();
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                search: Some("zzz_no_match_zzz".to_string()),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert!(results.iter().all(|b| b.id != batch.id));
     }
 
@@ -9931,59 +9987,74 @@ mod tests {
         let key_b = uuid::Uuid::new_v4();
 
         // Create file with api_key_id = key_a
-        let file_a = manager.create_file_stream(stream::iter(vec![
-            FileStreamItem::Metadata(FileMetadata {
-                filename: Some("file-a.jsonl".to_string()),
-                api_key_id: Some(key_a),
-                ..Default::default()
-            }),
-            FileStreamItem::Template(RequestTemplateInput {
-                custom_id: None,
-                endpoint: "https://api.example.com".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/test".to_string(),
-                body: "{}".to_string(),
-                model: "test".to_string(),
-                api_key: "key".to_string(),
-            }),
-        ])).await.unwrap();
+        let file_a = manager
+            .create_file_stream(stream::iter(vec![
+                FileStreamItem::Metadata(FileMetadata {
+                    filename: Some("file-a.jsonl".to_string()),
+                    api_key_id: Some(key_a),
+                    ..Default::default()
+                }),
+                FileStreamItem::Template(RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }),
+            ]))
+            .await
+            .unwrap();
 
         // Create file with api_key_id = key_b
-        let file_b = manager.create_file_stream(stream::iter(vec![
-            FileStreamItem::Metadata(FileMetadata {
-                filename: Some("file-b.jsonl".to_string()),
-                api_key_id: Some(key_b),
-                ..Default::default()
-            }),
-            FileStreamItem::Template(RequestTemplateInput {
-                custom_id: None,
-                endpoint: "https://api.example.com".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/test".to_string(),
-                body: "{}".to_string(),
-                model: "test".to_string(),
-                api_key: "key".to_string(),
-            }),
-        ])).await.unwrap();
+        let file_b = manager
+            .create_file_stream(stream::iter(vec![
+                FileStreamItem::Metadata(FileMetadata {
+                    filename: Some("file-b.jsonl".to_string()),
+                    api_key_id: Some(key_b),
+                    ..Default::default()
+                }),
+                FileStreamItem::Template(RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }),
+            ]))
+            .await
+            .unwrap();
 
         // Filter by key_a — should return only file_a
-        let results = manager.list_files(crate::batch::FileFilter {
-            api_key_id: Some(key_a),
-            ..Default::default()
-        }).await.unwrap();
+        let results = manager
+            .list_files(crate::batch::FileFilter {
+                api_key_id: Some(key_a),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, file_a);
 
         // Filter by key_b — should return only file_b
-        let results = manager.list_files(crate::batch::FileFilter {
-            api_key_id: Some(key_b),
-            ..Default::default()
-        }).await.unwrap();
+        let results = manager
+            .list_files(crate::batch::FileFilter {
+                api_key_id: Some(key_b),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, file_b);
 
         // No filter — should return both
-        let results = manager.list_files(crate::batch::FileFilter::default()).await.unwrap();
+        let results = manager
+            .list_files(crate::batch::FileFilter::default())
+            .await
+            .unwrap();
         let ids: Vec<_> = results.iter().map(|f| f.id).collect();
         assert!(ids.contains(&file_a));
         assert!(ids.contains(&file_b));
