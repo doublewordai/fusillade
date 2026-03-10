@@ -34,6 +34,19 @@ pub enum FusilladeError {
     #[error("HTTP request failed: {0}")]
     HttpClient(#[from] reqwest::Error),
 
+    /// Timed out waiting for response headers (connect + time-to-first-token)
+    #[error("Header timeout: {0}")]
+    HeaderTimeout(String),
+
+    /// Timed out waiting for the next chunk of response body tokens
+    #[error("Tokens timeout: {0}")]
+    TokensTimeout(String),
+
+    /// Timed out waiting for the entire response body to complete
+    #[error("Body timeout: {0}")]
+    BodyTimeout(String),
+
+
     /// Serialization/deserialization error
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),

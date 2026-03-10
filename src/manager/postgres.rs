@@ -7554,7 +7554,6 @@ mod tests {
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
-            timeout_ms: 30000,
             status_log_interval_ms: None,
             heartbeat_interval_ms: 1000,
             should_retry: Arc::new(|_| false),

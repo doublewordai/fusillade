@@ -84,7 +84,7 @@
 //! let claimed = pending.claim(daemon_id, &storage).await?;
 //!
 //! // Start processing
-//! let processing = claimed.process(http_client, timeout_ms, &storage).await?;
+//! let processing = claimed.process(http_client, &storage).await?;
 //!
 //! // Wait for completion
 //! let result = processing.complete(&storage, |resp| resp.status >= 500).await?;
@@ -188,7 +188,6 @@ impl Request<Claimed> {
     pub async fn process<H: HttpClient + 'static, S: Storage>(
         self,
         http_client: H,
-        timeout_ms: u64,
         storage: &S,
     ) -> Result<Request<Processing>> {
         let request_data = self.data.clone();
@@ -202,7 +201,7 @@ impl Request<Claimed> {
         let task_handle = tokio::spawn(
             async move {
                 let result = http_client
-                    .execute(&request_data, &request_data.api_key, timeout_ms)
+                    .execute(&request_data, &request_data.api_key)
                     .await;
                 let _ = tx.send(result).await; // Ignore send errors (receiver dropped)
             }
@@ -505,11 +504,15 @@ impl Request<Processing> {
                             error: reqwest_err.to_string(),
                         }
                     }
-                    FusilladeError::HttpClient(reqwest_err) if reqwest_err.is_timeout() => {
-                        FailureReason::Timeout {
-                            error: reqwest_err.to_string(),
-                        }
-                    }
+                    FusilladeError::HeaderTimeout(msg) => FailureReason::Timeout {
+                        error: msg.clone(),
+                    },
+                    FusilladeError::TokensTimeout(msg) => FailureReason::Timeout {
+                        error: msg.clone(),
+                    },
+                    FusilladeError::BodyTimeout(msg) => FailureReason::Timeout {
+                        error: msg.clone(),
+                    },
                     _ => FailureReason::NetworkError {
                         error: crate::error::error_serialization::serialize_error(&e.into()),
                     },
