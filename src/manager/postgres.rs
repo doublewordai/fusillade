@@ -56,7 +56,7 @@ use super::utils::{
 /// use sqlx::PgPool;
 ///
 /// let pool = PgPool::connect("postgresql://localhost/fusillade").await?;
-/// let manager = Arc::new(PostgresRequestManager::new(TestDbPools::new(pool).await.unwrap()));
+/// let manager = Arc::new(PostgresRequestManager::new(TestDbPools::new(pool).await.unwrap(), Default::default()));
 ///
 /// // Start processing
 /// let handle = manager.clone().run()?;
@@ -144,24 +144,27 @@ macro_rules! batch_status_from_dynamic_row {
 }
 
 impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> {
-    /// Create a new PostgreSQL request manager with default settings.
+    /// Create a new PostgreSQL request manager with the default Reqwest HTTP client.
     ///
-    /// Uses the default Reqwest HTTP client and default daemon configuration.
-    /// Customize with `.with_config()` if needed.
+    /// The HTTP client is configured with the timeout values from the provided config.
     ///
     /// # Example
     /// ```ignore
     /// use fusillade::{PostgresRequestManager, SinglePool};
     ///
     /// let pools = TestDbPools::new(pool).await.unwrap();
-    /// let manager = PostgresRequestManager::new(pools)
-    ///     .with_config(my_config);
+    /// let manager = PostgresRequestManager::new(pools, my_config);
     /// ```
-    pub fn new(pools: P) -> Self {
+    pub fn new(pools: P, config: DaemonConfig) -> Self {
+        let http_client = Arc::new(crate::http::ReqwestHttpClient::new(
+            std::time::Duration::from_millis(config.header_timeout_ms),
+            std::time::Duration::from_millis(config.chunk_timeout_ms),
+            std::time::Duration::from_millis(config.body_timeout_ms),
+        ));
         Self {
             pools,
-            http_client: Arc::new(crate::http::ReqwestHttpClient::default()),
-            config: DaemonConfig::default(),
+            http_client,
+            config,
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
         }
@@ -215,7 +218,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// # Examples
     /// ```ignore
     /// // Use batched inserts with custom batch size
-    /// let manager = PostgresRequestManager::new(pool)
+    /// let manager = PostgresRequestManager::new(pool, Default::default())
     ///     .with_batch_insert_strategy(BatchInsertStrategy::Batched { batch_size: 10000 });
     /// ```
     ///
