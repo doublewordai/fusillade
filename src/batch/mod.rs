@@ -349,9 +349,9 @@ pub struct FileFilter {
     pub after: Option<FileId>,
     /// Maximum number of results to return
     pub limit: Option<usize>,
-    /// Sort order (true = ascending, false = descending)
     /// Filter by API key UUID (for per-member attribution within orgs)
     pub api_key_id: Option<Uuid>,
+    /// Sort order (true = ascending, false = descending)
     pub ascending: bool,
 }
 
