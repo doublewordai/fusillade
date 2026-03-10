@@ -228,9 +228,9 @@ impl Default for DaemonConfig {
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
-            first_chunk_timeout_ms: 86_400_000, // 24 hours
-            chunk_timeout_ms: 86_400_000,       // 24 hours
-            body_timeout_ms: 86_400_000,        // 24 hours
+            first_chunk_timeout_ms: 540_000,    // 9 minutes
+            chunk_timeout_ms: 540_000,          // 9 minutes
+            body_timeout_ms: 60_000,            // 1 minute
             status_log_interval_ms: Some(2000), // Log every 2 seconds by default
             heartbeat_interval_ms: 5000,        // Heartbeat every 5 seconds by default
             should_retry: Arc::new(default_should_retry),

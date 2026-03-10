@@ -57,7 +57,13 @@ pub trait HttpClient: Send + Sync + Clone {
 /// Production HTTP client using reqwest.
 ///
 /// This implementation makes real HTTP requests to external endpoints.
-/// Timeouts are configured at construction time:
+/// Timeouts are configured at construction time and applied differently
+/// depending on whether the request is streaming:
+///
+/// **Non-streaming** (`stream = false`): uses `first_chunk_timeout + body_timeout`
+/// as a single overall reqwest timeout covering the entire request.
+///
+/// **Streaming** (`stream = true`): split timeouts for fine-grained control:
 /// - `first_chunk_timeout`: max time to first token (connect + headers + first body chunk)
 /// - `chunk_timeout`: max idle time between subsequent body chunks
 /// - `body_timeout`: max total time for the entire response body
@@ -91,7 +97,7 @@ impl Default for ReqwestHttpClient {
     }
 }
 
-/// Very long timeout used when no timeout is configured.
+/// Long but finite fallback timeout (24 hours) used when no explicit timeout is configured.
 const ONE_DAY_DURATION: Duration = Duration::from_secs(86_400);
 
 #[async_trait]
@@ -884,7 +890,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "".to_string(),
-            stream: false,
+            stream: true,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -927,7 +933,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "".to_string(),
-            stream: false,
+            stream: true,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -990,7 +996,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "".to_string(),
-            stream: false,
+            stream: true,
             batch_metadata: std::collections::HashMap::new(),
         };
 
