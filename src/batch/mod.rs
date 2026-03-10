@@ -191,6 +191,8 @@ pub struct File {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub size_finalized: bool,
+    /// API key UUID that created this file, for per-member attribution within orgs
+    pub api_key_id: Option<Uuid>,
 }
 
 /// A request template defining how to make a request.
@@ -326,6 +328,8 @@ pub struct FileMetadata {
     pub expires_after_seconds: Option<i64>,
     pub size_bytes: Option<i64>,
     pub uploaded_by: Option<String>,
+    /// API key UUID that created this file, for per-member attribution within orgs
+    pub api_key_id: Option<Uuid>,
 }
 
 /// Filter parameters for listing files
@@ -346,6 +350,8 @@ pub struct FileFilter {
     /// Maximum number of results to return
     pub limit: Option<usize>,
     /// Sort order (true = ascending, false = descending)
+    /// Filter by API key UUID (for per-member attribution within orgs)
+    pub api_key_id: Option<Uuid>,
     pub ascending: bool,
 }
 
@@ -373,6 +379,8 @@ pub struct BatchInput {
     pub metadata: Option<serde_json::Value>,
     /// User who created this batch (for ownership tracking)
     pub created_by: Option<String>,
+    /// API key UUID that created this batch, for per-member attribution within orgs
+    pub api_key_id: Option<Uuid>,
 }
 
 /// A batch represents one execution of all of a file's templates.
@@ -421,6 +429,9 @@ pub struct Batch {
 
     /// When batch completion notification was sent. NULL means not yet notified.
     pub notification_sent_at: Option<DateTime<Utc>>,
+
+    /// API key UUID that created this batch, for per-member attribution within orgs
+    pub api_key_id: Option<Uuid>,
 }
 
 /// A batch with extra context for notification emails (file metadata, model names).

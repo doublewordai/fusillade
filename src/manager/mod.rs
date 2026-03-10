@@ -130,6 +130,10 @@ pub trait Storage: Send + Sync {
         search: Option<String>,
         after: Option<BatchId>,
         limit: i64,
+        api_key_id: Option<uuid::Uuid>,
+        status: Option<String>,
+        created_after: Option<chrono::DateTime<chrono::Utc>>,
+        created_before: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<Batch>>;
 
     /// Get a batch by its output or error file ID.

@@ -120,6 +120,7 @@ macro_rules! batch_from_dynamic_row {
             failed_requests: $row.get("failed_requests"),
             canceled_requests: $row.get("canceled_requests"),
             notification_sent_at: $row.get("notification_sent_at"),
+            api_key_id: $row.get::<Option<Uuid>, _>("api_key_id"),
         }
     };
 }
@@ -640,7 +641,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     async fn get_file_from_pool(&self, file_id: FileId, pool: &PgPool) -> Result<File> {
         let row = sqlx::query!(
             r#"
-            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
+            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at, api_key_id
             FROM files
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -678,6 +679,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             uploaded_by: row.uploaded_by,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            api_key_id: row.api_key_id,
         })
     }
 }
@@ -1497,6 +1499,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     if meta.uploaded_by.is_some() {
                         metadata.uploaded_by = meta.uploaded_by;
                     }
+                    if meta.api_key_id.is_some() {
+                        metadata.api_key_id = meta.api_key_id;
+                    }
                 }
                 FileStreamItem::Template(template) => {
                     // Ensure we have a file ID (create stub if needed)
@@ -1622,6 +1627,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 purpose = $6,
                 expires_at = $7,
                 uploaded_by = $8,
+                api_key_id = $9,
                 size_finalized = TRUE,
                 updated_at = NOW()
             WHERE id = $1
@@ -1634,6 +1640,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             purpose,
             expires_at,
             uploaded_by,
+            metadata.api_key_id,
         )
         .execute(&mut *tx)
         .await
@@ -1803,7 +1810,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             SELECT
                 f.id, f.name, f.description, f.size_bytes, f.size_finalized,
                 f.status, f.error_message, f.purpose, f.expires_at, f.deleted_at,
-                f.uploaded_by, f.created_at, f.updated_at,
+                f.uploaded_by, f.created_at, f.updated_at, f.api_key_id,
                 b.id as batch_id,
                 b.total_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -1857,6 +1864,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             let search_pattern = format!("%{}%", search.to_lowercase());
             query_builder.push(" AND LOWER(f.name) LIKE ");
             query_builder.push_bind(search_pattern);
+        }
+
+        if let Some(api_key_id) = &filter.api_key_id {
+            query_builder.push(" AND f.api_key_id = ");
+            query_builder.push_bind(*api_key_id);
         }
 
         // Add cursor-based pagination
@@ -1946,6 +1958,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             let updated_at: chrono::DateTime<Utc> = row
                 .try_get("updated_at")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read updated_at: {}", e)))?;
+            let api_key_id: Option<Uuid> = row
+                .try_get("api_key_id")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read api_key_id: {}", e)))?;
 
             // Calculate size for virtual files if not yet finalized
             if let Some(estimated_size) =
@@ -1972,6 +1987,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 uploaded_by,
                 created_at,
                 updated_at,
+                api_key_id,
             };
 
             // Check and mark as expired if needed (passive expiration)
@@ -2118,8 +2134,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // Create batch with new fields
         let row = sqlx::query!(
             r#"
-            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
             "#,
             *input.file_id as Uuid,
@@ -2128,6 +2144,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             input.metadata,
             input.created_by,
             expires_at,
+            input.api_key_id,
         )
         .fetch_one(&mut *tx)
         .await
@@ -2284,6 +2301,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.cancelled_at,
                 b.deleted_at,
                 b.notification_sent_at,
+                b.api_key_id,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -2344,6 +2362,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         search: Option<String>,
         after: Option<BatchId>,
         limit: i64,
+        api_key_id: Option<Uuid>,
+        status: Option<String>,
+        created_after: Option<chrono::DateTime<chrono::Utc>>,
+        created_before: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<Batch>> {
         // If after is provided, get the created_at timestamp of that batch for cursor-based pagination
         let (after_created_at, after_id) = if let Some(after_id) = after {
@@ -2382,6 +2404,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.cancelled_at,
                 b.deleted_at,
                 b.notification_sent_at,
+                b.api_key_id,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -2419,7 +2442,59 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         query_builder.push_bind(&search_pattern);
         query_builder.push(" OR LOWER(f.name) LIKE ");
         query_builder.push_bind(&search_pattern);
-        query_builder.push(") ORDER BY b.created_at DESC, b.id DESC LIMIT ");
+        query_builder.push(" OR b.id::text LIKE ");
+        query_builder.push_bind(&search_pattern);
+        query_builder.push(")");
+
+        if let Some(api_key_id) = &api_key_id {
+            query_builder.push(" AND b.api_key_id = ");
+            query_builder.push_bind(*api_key_id);
+        }
+
+        if let Some(created_after) = &created_after {
+            query_builder.push(" AND b.created_at >= ");
+            query_builder.push_bind(*created_after);
+        }
+
+        if let Some(created_before) = &created_before {
+            query_builder.push(" AND b.created_at <= ");
+            query_builder.push_bind(*created_before);
+        }
+
+        // Status filtering: map OpenAI-style status names to DB conditions.
+        // Status is derived from multiple columns, so we use SQL conditions.
+        if let Some(ref status) = status {
+            match status.as_str() {
+                "completed" => {
+                    query_builder.push(" AND b.completed_at IS NOT NULL");
+                }
+                "failed" => {
+                    query_builder.push(" AND b.failed_at IS NOT NULL AND b.completed_at IS NULL");
+                }
+                "cancelled" => {
+                    query_builder.push(" AND b.cancelled_at IS NOT NULL");
+                }
+                "cancelling" => {
+                    query_builder.push(" AND b.cancelling_at IS NOT NULL AND b.cancelled_at IS NULL AND b.completed_at IS NULL AND b.failed_at IS NULL");
+                }
+                "in_progress" => {
+                    query_builder.push(" AND b.total_requests > 0 AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL");
+                }
+                "validating" => {
+                    query_builder.push(" AND b.total_requests = 0 AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL");
+                }
+                "finalizing" => {
+                    // Finalizing: all requests done but output files not yet written
+                    query_builder.push(" AND b.finalizing_at IS NOT NULL AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL");
+                }
+                "expired" => {
+                    query_builder.push(" AND b.expires_at IS NOT NULL AND b.expires_at < NOW()");
+                }
+                _ => {} // Unknown status, ignore
+            }
+        }
+
+        query_builder.push(" ORDER BY b.created_at DESC, b.id DESC LIMIT ");
         query_builder.push_bind(limit);
 
         let rows = query_builder
@@ -2944,6 +3019,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 b.cancelled_at,
                 b.deleted_at,
                 b.notification_sent_at,
+                b.api_key_id,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -3056,6 +3132,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             cancelled_at,
             deleted_at: row.get("deleted_at"),
             notification_sent_at: row.get("notification_sent_at"),
+            api_key_id: row.get::<Option<Uuid>, _>("api_key_id"),
         })
     }
 
@@ -3127,7 +3204,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                           b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                           b.expires_at, b.cancelling_at, b.errors, b.total_requests,
                           b.requests_started_at, b.finalizing_at, b.completed_at,
-                          b.failed_at, b.cancelled_at, b.deleted_at, b.notification_sent_at,
+                          b.failed_at, b.cancelled_at, b.deleted_at, b.notification_sent_at, b.api_key_id,
                           c.completed_requests, c.failed_requests, c.canceled_requests,
                           c.pending_requests, c.in_progress_requests
             )
@@ -3169,6 +3246,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     cancelled_at: row.cancelled_at,
                     deleted_at: row.deleted_at,
                     notification_sent_at: row.notification_sent_at,
+                    api_key_id: row.api_key_id,
                     pending_requests: row.pending_requests.unwrap_or(0),
                     in_progress_requests: row.in_progress_requests.unwrap_or(0),
                     completed_requests: row.completed_requests.unwrap_or(0),
@@ -4466,6 +4544,7 @@ mod tests {
             expires_after_seconds: None,
             size_bytes: None,
             uploaded_by: Some("test-user".to_string()),
+            api_key_id: None,
         })];
 
         for i in 0..8000 {
@@ -4535,6 +4614,7 @@ mod tests {
             expires_after_seconds: None,
             size_bytes: None,
             uploaded_by: None,
+            api_key_id: None,
         })];
 
         let stream = stream::iter(items);
@@ -4576,6 +4656,7 @@ mod tests {
             expires_after_seconds: None,
             size_bytes: None,
             uploaded_by: None,
+            api_key_id: None,
         })];
 
         // Add 3000 templates
@@ -4894,6 +4975,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .expect("Failed to create batch");
@@ -4965,6 +5047,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5033,6 +5116,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5104,6 +5188,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5171,6 +5256,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5287,6 +5373,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5297,6 +5384,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5307,6 +5395,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5374,6 +5463,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5460,6 +5550,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5541,6 +5632,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5629,6 +5721,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5727,6 +5820,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5836,6 +5930,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5946,6 +6041,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -6024,6 +6120,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -6122,6 +6219,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: Some("test-user".to_string()),
+                api_key_id: None,
             })
             .await
             .expect("Failed to create batch");
@@ -6544,6 +6642,7 @@ mod tests {
                 expires_after_seconds: None,
                 size_bytes: None,
                 uploaded_by: Some("test-user".to_string()),
+                api_key_id: None,
             }),
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: Some("stream-1".to_string()),
@@ -6636,6 +6735,7 @@ mod tests {
                 expires_after_seconds: None,
                 size_bytes: None,
                 uploaded_by: Some("test-user".to_string()),
+                api_key_id: None,
             }),
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: None,
@@ -6752,6 +6852,7 @@ mod tests {
             completion_window: "24h".to_string(),
             metadata: Some(serde_json::json!({"project": "test"})),
             created_by: Some("test-user".to_string()),
+            api_key_id: None,
         };
 
         let created_batch = manager.create_batch(batch_input).await.unwrap();
@@ -6836,6 +6937,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -6908,6 +7010,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7007,6 +7110,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7127,6 +7231,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7186,6 +7291,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7266,6 +7372,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7547,6 +7654,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 endpoint: "/v1/chat/completions".to_string(),
                 metadata: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7721,6 +7829,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7851,6 +7960,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: Some("user1".to_string()),
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7937,6 +8047,7 @@ mod tests {
                     completion_window: "24h".to_string(),
                     metadata: None,
                     created_by: Some("user1".to_string()),
+                    api_key_id: None,
                 })
                 .await
                 .unwrap();
@@ -8067,6 +8178,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8177,6 +8289,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8351,6 +8464,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8385,6 +8499,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8426,6 +8541,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8525,6 +8641,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8621,6 +8738,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8880,6 +8998,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8946,6 +9065,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -9080,6 +9200,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -9185,6 +9306,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -9267,6 +9389,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -9307,6 +9430,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -9400,6 +9524,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
