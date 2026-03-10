@@ -58,8 +58,8 @@ pub trait HttpClient: Send + Sync + Clone {
 ///
 /// This implementation makes real HTTP requests to external endpoints.
 /// Timeouts are configured at construction time:
-/// - `header_timeout`: max time to wait for response headers (connect + time-to-first-token)
-/// - `chunk_timeout`: max idle time between body chunks
+/// - `header_timeout`: max time to first token (connect + headers + first body chunk)
+/// - `chunk_timeout`: max idle time between subsequent body chunks
 /// - `body_timeout`: max total time for the entire response body
 #[derive(Clone)]
 pub struct ReqwestHttpClient {
@@ -177,31 +177,45 @@ impl HttpClient for ReqwestHttpClient {
             );
         }
 
-        let mut response = tokio::time::timeout(self.header_timeout, req.send())
-            .await
-            .map_err(|_| {
-                crate::error::FusilladeError::HeaderTimeout(format!(
-                    "No response headers from {} within {}ms",
-                    url,
-                    self.header_timeout.as_millis()
-                ))
-            })?
-            .map_err(|e| -> crate::error::FusilladeError { e.into() })
-            .inspect_err(|e| {
-                tracing::error!(
-                    request_id = %request.id,
-                    url.full = %url,
-                    error = %e,
-                    custom_id = ?request.custom_id,
-                    batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
-                    "HTTP request failed"
-                );
-            })?;
-
-        let status = response.status().as_u16();
+        // header_timeout covers connect + send + response headers + first body chunk,
+        // i.e. time-to-first-token. This handles servers (like vLLM) that return
+        // headers immediately but queue the request before producing tokens.
+        let (mut response, status, first_chunk) = tokio::time::timeout(
+            self.header_timeout,
+            async {
+                let mut resp = req
+                    .send()
+                    .await
+                    .map_err(|e| -> crate::error::FusilladeError { e.into() })
+                    .inspect_err(|e| {
+                        tracing::error!(
+                            request_id = %request.id,
+                            url.full = %url,
+                            error = %e,
+                            custom_id = ?request.custom_id,
+                            batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
+                            "HTTP request failed"
+                        );
+                    })?;
+                let status = resp.status().as_u16();
+                let first_chunk = resp
+                    .chunk()
+                    .await
+                    .map_err(|e| -> crate::error::FusilladeError { e.into() })?;
+                Ok::<_, crate::error::FusilladeError>((resp, status, first_chunk))
+            },
+        )
+        .await
+        .map_err(|_| {
+            crate::error::FusilladeError::HeaderTimeout(format!(
+                "No first token from {} within {}ms",
+                url,
+                self.header_timeout.as_millis()
+            ))
+        })??;
 
         let body_bytes = tokio::time::timeout(self.body_timeout, async {
-            let mut buf: Vec<u8> = Vec::new();
+            let mut buf = Vec::from(first_chunk.unwrap_or_default());
             loop {
                 match tokio::time::timeout(self.chunk_timeout, response.chunk()).await {
                     Ok(Ok(Some(chunk))) => buf.extend_from_slice(&chunk),
