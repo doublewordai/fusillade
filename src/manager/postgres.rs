@@ -2452,7 +2452,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         .push(" AND (b.cancelled_at IS NOT NULL OR b.cancelling_at IS NOT NULL)");
                 }
                 "expired" => {
-                    query_builder.push(" AND b.expires_at IS NOT NULL AND b.expires_at < NOW()");
+                    // Matches batches with SLA issues: either still in-progress past deadline,
+                    // or terminal batches that finished after their deadline.
+                    query_builder.push(
+                        " AND b.expires_at IS NOT NULL AND (\
+                            (b.expires_at < NOW() AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL) \
+                            OR (b.completed_at IS NOT NULL AND b.completed_at > b.expires_at) \
+                            OR (b.failed_at IS NOT NULL AND b.failed_at > b.expires_at) \
+                            OR (b.cancelled_at IS NOT NULL AND b.cancelled_at > b.expires_at)\
+                        )",
+                    );
                 }
                 unknown => {
                     return Err(FusilladeError::Other(anyhow!(
@@ -2499,6 +2508,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
+            ORDER BY b.created_at DESC, b.id DESC
             "#,
         );
 
@@ -10223,7 +10233,8 @@ mod tests {
             .await
             .unwrap();
 
-        let batch = manager
+        // Batch A: in-progress and past deadline (overdue)
+        let batch_a = manager
             .create_batch(crate::batch::BatchInput {
                 file_id,
                 endpoint: "/v1/chat/completions".to_string(),
@@ -10234,17 +10245,54 @@ mod tests {
             })
             .await
             .unwrap();
-
-        // Set expires_at to the past to simulate an expired batch
         sqlx::query!(
             "UPDATE batches SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
-            *batch.id as Uuid,
+            *batch_a.id as Uuid,
         )
         .execute(&pool)
         .await
         .unwrap();
 
-        // Should appear in "expired"
+        // Batch B: completed AFTER its deadline (SLA miss)
+        let batch_b = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() - INTERVAL '2 hours', completed_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            *batch_b.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch C: completed BEFORE its deadline (on time — should NOT be expired)
+        let batch_c = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '1 hour', completed_at = NOW() WHERE id = $1",
+            *batch_c.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 status: Some("expired".to_string()),
@@ -10253,7 +10301,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(results.iter().any(|b| b.id == batch.id));
+
+        assert!(results.iter().any(|b| b.id == batch_a.id), "overdue in-progress batch should match");
+        assert!(results.iter().any(|b| b.id == batch_b.id), "completed-after-deadline batch should match");
+        assert!(results.iter().all(|b| b.id != batch_c.id), "on-time completed batch should not match");
     }
 
     // =========================================================================

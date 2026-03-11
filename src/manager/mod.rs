@@ -128,6 +128,8 @@ pub trait Storage: Send + Sync {
     ///   `"in_progress"`, `"completed"`, `"failed"`, `"cancelled"`, `"expired"`.
     ///   `"in_progress"` covers all non-terminal batches (including validating and finalizing
     ///   sub-states). `"cancelled"` includes batches that are still cancelling.
+    ///   `"expired"` matches batches with SLA issues: in-progress past their deadline,
+    ///   or terminal batches that finished after their deadline.
     ///   Unrecognized values return an error.
     /// - `created_after` / `created_before` - Time range filter on batch creation timestamp
     async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>>;
