@@ -1,4 +1,4 @@
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_batches_active
+CREATE INDEX IF NOT EXISTS idx_batches_active
 ON batches (id)
 WHERE cancelling_at IS NULL
   AND deleted_at IS NULL
