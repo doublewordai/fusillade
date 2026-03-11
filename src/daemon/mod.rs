@@ -775,8 +775,7 @@ where
                             "fusillade.state.processing",
                             otel.name = "fusillade.state.processing",
                             request_id = %request_id,
-                            retry_attempt = retry_attempt_at_completion,
-                            timeout_ms = timeout_ms,
+                            retry_attempt = retry_attempt_at_completion
                         )).await;
 
                         match completion_result {
