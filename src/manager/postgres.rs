@@ -784,41 +784,51 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let now = Utc::now();
 
-        // Iterate only models the daemon has capacity for (backed by held permits).
+        // Build model/capacity arrays for the single claim query.
         // Randomize order to prevent starvation when hitting the global limit.
-        let mut models: Vec<_> = available_capacity.keys().cloned().collect();
+        let mut model_capacity_pairs: Vec<(String, i64)> = available_capacity
+            .iter()
+            .filter(|(_, cap)| **cap > 0)
+            .map(|(model, cap)| (model.clone(), *cap as i64))
+            .collect();
         {
             use rand::seq::SliceRandom;
             let mut rng = rand::rng();
-            models.shuffle(&mut rng);
+            model_capacity_pairs.shuffle(&mut rng);
         }
 
+        let models_arr: Vec<String> = model_capacity_pairs
+            .iter()
+            .map(|(m, _)| m.clone())
+            .collect();
+        let capacities_arr: Vec<i64> = model_capacity_pairs.iter().map(|(_, c)| *c).collect();
+
         tracing::debug!(
-            model_count = models.len(),
-            "Claiming for models with available permits"
+            model_count = models_arr.len(),
+            "Claiming for models with available capacity"
         );
 
-        // Claim from models sequentially until we hit the global limit
-        let mut all_claimed = Vec::new();
-        let mut remaining_limit = limit;
+        if models_arr.is_empty() {
+            tracing::debug!("No models with available capacity, skipping claim");
+            return Ok(Vec::new());
+        }
 
-        for model in models {
-            if remaining_limit == 0 {
-                break;
-            }
-
-            let available = available_capacity.get(&model).copied().unwrap_or(0);
-
-            if available == 0 {
-                tracing::trace!(model = %model, "Skipping model with no available capacity");
-                continue;
-            }
-
-            // Claim pending requests for this model, capped by this daemon's
-            // available semaphore permits. No cross-daemon coordination.
-            let rows = sqlx::query!(
-                r#"
-                WITH to_claim AS (
+        // Single query claims across all models using LATERAL.
+        // The inner subquery forces Postgres to use the requests partial index
+        // (requests-first plan) rather than scanning all batches.
+        let rows = sqlx::query!(
+            r#"
+            WITH to_claim AS (
+                SELECT claimed.id, claimed.template_id, claimed.batch_id,
+                       claimed.batch_id_str, claimed.batch_file_id,
+                       claimed.batch_endpoint, claimed.batch_completion_window,
+                       claimed.batch_metadata, claimed.batch_output_file_id,
+                       claimed.batch_error_file_id, claimed.batch_created_by,
+                       claimed.batch_created_at, claimed.batch_expires_at,
+                       claimed.batch_cancelling_at, claimed.batch_errors,
+                       claimed.batch_total_requests
+                FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
+                CROSS JOIN LATERAL (
                     SELECT r.id, r.template_id, r.batch_id,
                            b.id::TEXT as batch_id_str,
                            b.file_id::TEXT as batch_file_id,
@@ -833,145 +843,145 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                            to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as batch_cancelling_at,
                            b.errors::TEXT as batch_errors,
                            b.total_requests::TEXT as batch_total_requests
-                    FROM requests r
+                    FROM (
+                        SELECT r2.id, r2.template_id, r2.batch_id
+                        FROM requests r2
+                        WHERE r2.state = 'pending'
+                            AND r2.model = m.model
+                            AND r2.template_id IS NOT NULL
+                            AND (r2.not_before IS NULL OR r2.not_before <= $3)
+                        LIMIT m.capacity
+                        FOR UPDATE OF r2 SKIP LOCKED
+                    ) r
                     JOIN batches b ON r.batch_id = b.id
-                    WHERE r.state = 'pending'
-                        AND r.model = $4
-                        AND r.template_id IS NOT NULL
-                        AND (r.not_before IS NULL OR r.not_before <= $3)
-                        AND b.cancelling_at IS NULL
+                    WHERE b.cancelling_at IS NULL
                         AND b.deleted_at IS NULL
                     ORDER BY b.expires_at ASC
-                    LIMIT LEAST($5::BIGINT, $2::BIGINT)
-                    FOR UPDATE OF r SKIP LOCKED
-                )
-                UPDATE requests r
-                SET
-                    state = 'claimed',
-                    daemon_id = $1,
-                    claimed_at = $3
-                FROM to_claim tc
-                JOIN active_request_templates t ON tc.template_id = t.id
-                JOIN batches b ON tc.batch_id = b.id
-                WHERE r.id = tc.id
-                RETURNING r.id, r.batch_id as "batch_id!", r.template_id as "template_id!", r.retry_attempt,
-                          t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
-                          t.body as "body!", t.model as "model!", t.api_key as "api_key!",
-                          b.expires_at as batch_expires_at,
-                          tc.batch_id_str as "batch_id_str!",
-                          tc.batch_file_id as "batch_file_id!",
-                          tc.batch_endpoint as "batch_endpoint!",
-                          tc.batch_completion_window as "batch_completion_window!",
-                          tc.batch_metadata as "batch_metadata",
-                          tc.batch_output_file_id as "batch_output_file_id",
-                          tc.batch_error_file_id as "batch_error_file_id",
-                          tc.batch_created_by as "batch_created_by!",
-                          tc.batch_created_at as "batch_created_at!",
-                          tc.batch_expires_at as "batch_expires_at_str",
-                          tc.batch_cancelling_at as "batch_cancelling_at",
-                          tc.batch_errors as "batch_errors",
-                          tc.batch_total_requests as "batch_total_requests!"
-                "#,
-                *daemon_id as Uuid,
-                available as i64,
-                now,
-                &model,
-                remaining_limit as i64,
+                    LIMIT m.capacity
+                ) claimed
+                LIMIT $2::BIGINT
             )
-            .fetch_all(self.pools.write())
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!(
-                    "Failed to claim requests for model {}: {}",
-                    model,
-                    e
-                ))
-            })?;
+            UPDATE requests r
+            SET
+                state = 'claimed',
+                daemon_id = $1,
+                claimed_at = $3
+            FROM to_claim tc
+            JOIN active_request_templates t ON tc.template_id = t.id
+            JOIN batches b ON tc.batch_id = b.id
+            WHERE r.id = tc.id
+            RETURNING r.id, r.batch_id as "batch_id!", r.template_id as "template_id!", r.retry_attempt,
+                      t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
+                      t.body as "body!", t.model as "model!", t.api_key as "api_key!",
+                      b.expires_at as batch_expires_at,
+                      tc.batch_id_str as "batch_id_str!",
+                      tc.batch_file_id as "batch_file_id!",
+                      tc.batch_endpoint as "batch_endpoint!",
+                      tc.batch_completion_window as "batch_completion_window!",
+                      tc.batch_metadata as "batch_metadata",
+                      tc.batch_output_file_id as "batch_output_file_id",
+                      tc.batch_error_file_id as "batch_error_file_id",
+                      tc.batch_created_by as "batch_created_by!",
+                      tc.batch_created_at as "batch_created_at!",
+                      tc.batch_expires_at as "batch_expires_at_str",
+                      tc.batch_cancelling_at as "batch_cancelling_at",
+                      tc.batch_errors as "batch_errors",
+                      tc.batch_total_requests as "batch_total_requests!"
+            "#,
+            *daemon_id as Uuid,
+            limit as i64,
+            now,
+            &models_arr,
+            &capacities_arr,
+        )
+        .fetch_all(self.pools.write())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to claim requests: {}",
+                e
+            ))
+        })?;
 
-            let claimed_count = rows.len();
-            if claimed_count > 0 {
-                tracing::debug!(
-                    model = %model,
-                    claimed = claimed_count,
-                    remaining_limit = remaining_limit - claimed_count,
-                    "Claimed requests for model"
-                );
+        let mut all_claimed = Vec::new();
+        let claimed_count = rows.len();
+        if claimed_count > 0 {
+            tracing::debug!(
+                claimed = claimed_count,
+                "Claimed requests across all models"
+            );
 
-                remaining_limit -= claimed_count;
+            // Cache parsed metadata JSON per batch to avoid re-parsing for each request
+            let mut parsed_metadata_cache: std::collections::HashMap<
+                Uuid,
+                Option<serde_json::Value>,
+            > = std::collections::HashMap::new();
 
-                // Cache parsed metadata JSON per batch to avoid re-parsing for each request
-                let mut parsed_metadata_cache: std::collections::HashMap<
-                    Uuid,
-                    Option<serde_json::Value>,
-                > = std::collections::HashMap::new();
+            all_claimed.extend(rows.into_iter().map(|row| {
+                // Build batch metadata HashMap from configured fields
+                let mut batch_metadata = std::collections::HashMap::new();
 
-                all_claimed.extend(rows.into_iter().map(|row| {
-                    // Build batch metadata HashMap from configured fields
-                    let mut batch_metadata = std::collections::HashMap::new();
+                // Get or parse the metadata JSON for this batch
+                let parsed_metadata =
+                    parsed_metadata_cache
+                        .entry(row.batch_id)
+                        .or_insert_with(|| {
+                            row.batch_metadata
+                                .as_deref()
+                                .and_then(|s| serde_json::from_str(s).ok())
+                        });
 
-                    // Get or parse the metadata JSON for this batch
-                    let parsed_metadata =
-                        parsed_metadata_cache
-                            .entry(row.batch_id)
-                            .or_insert_with(|| {
-                                row.batch_metadata
-                                    .as_deref()
-                                    .and_then(|s| serde_json::from_str(s).ok())
-                            });
+                for field_name in &self.config.batch_metadata_fields {
+                    // First check if it's a known column field
+                    let value: Option<&str> = match field_name.as_str() {
+                        "id" => Some(&row.batch_id_str),
+                        "file_id" => Some(&row.batch_file_id),
+                        "endpoint" => Some(&row.batch_endpoint),
+                        "completion_window" => Some(&row.batch_completion_window),
+                        "metadata" => row.batch_metadata.as_deref(),
+                        "output_file_id" => row.batch_output_file_id.as_deref(),
+                        "error_file_id" => row.batch_error_file_id.as_deref(),
+                        "created_by" => Some(&row.batch_created_by),
+                        "created_at" => Some(&row.batch_created_at),
+                        "expires_at" => row.batch_expires_at_str.as_deref(),
+                        "cancelling_at" => row.batch_cancelling_at.as_deref(),
+                        "errors" => row.batch_errors.as_deref(),
+                        "total_requests" => Some(&row.batch_total_requests),
+                        _ => None,
+                    };
 
-                    for field_name in &self.config.batch_metadata_fields {
-                        // First check if it's a known column field
-                        let value: Option<&str> = match field_name.as_str() {
-                            "id" => Some(&row.batch_id_str),
-                            "file_id" => Some(&row.batch_file_id),
-                            "endpoint" => Some(&row.batch_endpoint),
-                            "completion_window" => Some(&row.batch_completion_window),
-                            "metadata" => row.batch_metadata.as_deref(),
-                            "output_file_id" => row.batch_output_file_id.as_deref(),
-                            "error_file_id" => row.batch_error_file_id.as_deref(),
-                            "created_by" => Some(&row.batch_created_by),
-                            "created_at" => Some(&row.batch_created_at),
-                            "expires_at" => row.batch_expires_at_str.as_deref(),
-                            "cancelling_at" => row.batch_cancelling_at.as_deref(),
-                            "errors" => row.batch_errors.as_deref(),
-                            "total_requests" => Some(&row.batch_total_requests),
-                            _ => None,
-                        };
-
-                        if let Some(v) = value {
+                    if let Some(v) = value {
+                        batch_metadata.insert(field_name.clone(), v.to_string());
+                    } else if let Some(metadata_json) = parsed_metadata.as_ref() {
+                        // Fall back to extracting from metadata JSON for unknown field names
+                        if let Some(v) = metadata_json.get(field_name).and_then(|v| v.as_str()) {
                             batch_metadata.insert(field_name.clone(), v.to_string());
-                        } else if let Some(metadata_json) = parsed_metadata.as_ref() {
-                            // Fall back to extracting from metadata JSON for unknown field names
-                            if let Some(v) = metadata_json.get(field_name).and_then(|v| v.as_str())
-                            {
-                                batch_metadata.insert(field_name.clone(), v.to_string());
-                            }
                         }
                     }
+                }
 
-                    Request {
-                        state: Claimed {
-                            daemon_id,
-                            claimed_at: now,
-                            retry_attempt: row.retry_attempt as u32,
-                            batch_expires_at: row.batch_expires_at,
-                        },
-                        data: RequestData {
-                            id: RequestId(row.id),
-                            batch_id: BatchId(row.batch_id),
-                            template_id: TemplateId(row.template_id),
-                            custom_id: row.custom_id,
-                            endpoint: row.endpoint,
-                            method: row.method,
-                            path: row.path,
-                            body: row.body,
-                            model: row.model,
-                            api_key: row.api_key,
-                            batch_metadata,
-                        },
-                    }
-                }));
-            }
+                Request {
+                    state: Claimed {
+                        daemon_id,
+                        claimed_at: now,
+                        retry_attempt: row.retry_attempt as u32,
+                        batch_expires_at: row.batch_expires_at,
+                    },
+                    data: RequestData {
+                        id: RequestId(row.id),
+                        batch_id: BatchId(row.batch_id),
+                        template_id: TemplateId(row.template_id),
+                        custom_id: row.custom_id,
+                        endpoint: row.endpoint,
+                        method: row.method,
+                        path: row.path,
+                        body: row.body,
+                        model: row.model,
+                        api_key: row.api_key,
+                        batch_metadata,
+                    },
+                }
+            }));
         }
 
         tracing::debug!(
