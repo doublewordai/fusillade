@@ -1867,9 +1867,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             query_builder.push_bind(search_pattern);
         }
 
-        if let Some(api_key_id) = &filter.api_key_id {
-            query_builder.push(" AND f.api_key_id = ");
-            query_builder.push_bind(*api_key_id);
+        if let Some(api_key_ids) = &filter.api_key_ids {
+            query_builder.push(" AND f.api_key_id = ANY(");
+            query_builder.push_bind(api_key_ids.as_slice());
+            query_builder.push(")");
         }
 
         // Add cursor-based pagination
@@ -2363,7 +2364,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             search,
             after,
             limit,
-            api_key_id,
+            api_key_ids,
             status,
             created_after,
             created_before,
@@ -2423,9 +2424,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         query_builder.push_bind(&search_pattern);
         query_builder.push(")");
 
-        if let Some(api_key_id) = &api_key_id {
-            query_builder.push(" AND b.api_key_id = ");
-            query_builder.push_bind(*api_key_id);
+        if let Some(api_key_ids) = &api_key_ids {
+            query_builder.push(" AND b.api_key_id = ANY(");
+            query_builder.push_bind(api_key_ids.as_slice());
+            query_builder.push(")");
         }
 
         if let Some(created_after) = &created_after {
@@ -9750,7 +9752,7 @@ mod tests {
         // Filter by key_a — should return only 1 batch
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
-                api_key_id: Some(key_a),
+                api_key_ids: Some(vec![key_a]),
                 limit: Some(100),
                 ..Default::default()
             })
@@ -9758,6 +9760,32 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].api_key_id, Some(key_a));
+
+        // Filter by both key_a and key_b — should return 2 batches
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                api_key_ids: Some(vec![key_a, key_b]),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        let returned_keys: std::collections::HashSet<_> =
+            results.iter().filter_map(|b| b.api_key_id).collect();
+        assert!(returned_keys.contains(&key_a));
+        assert!(returned_keys.contains(&key_b));
+
+        // Empty vec — should return 0 (not all)
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                api_key_ids: Some(vec![]),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 0);
 
         // No filter — should return all 3
         let results = manager
@@ -9853,6 +9881,24 @@ mod tests {
         assert!(
             err.contains("Unknown batch status filter"),
             "Expected error about unknown status, got: {}",
+            err
+        );
+
+        // Empty api_key_ids with invalid status should still return the status error,
+        // not silently return empty results
+        let result = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                api_key_ids: Some(vec![]),
+                status: Some("not_a_status".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Unknown batch status filter"),
+            "Expected status error even with empty api_key_ids, got: {}",
             err
         );
     }
@@ -10387,7 +10433,7 @@ mod tests {
         // Filter by key_a — should return only file_a
         let results = manager
             .list_files(crate::batch::FileFilter {
-                api_key_id: Some(key_a),
+                api_key_ids: Some(vec![key_a]),
                 ..Default::default()
             })
             .await
@@ -10398,13 +10444,36 @@ mod tests {
         // Filter by key_b — should return only file_b
         let results = manager
             .list_files(crate::batch::FileFilter {
-                api_key_id: Some(key_b),
+                api_key_ids: Some(vec![key_b]),
                 ..Default::default()
             })
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, file_b);
+
+        // Filter by both key_a and key_b — should return both files
+        let results = manager
+            .list_files(crate::batch::FileFilter {
+                api_key_ids: Some(vec![key_a, key_b]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: std::collections::HashSet<_> = results.iter().map(|f| f.id).collect();
+        assert!(ids.contains(&file_a));
+        assert!(ids.contains(&file_b));
+
+        // Empty vec — should return 0 (not all)
+        let results = manager
+            .list_files(crate::batch::FileFilter {
+                api_key_ids: Some(vec![]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 0);
 
         // No filter — should return both
         let results = manager

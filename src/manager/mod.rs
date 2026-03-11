@@ -123,7 +123,7 @@ pub trait Storage: Send + Sync {
     /// - `search` - Case-insensitive substring match against metadata JSON text,
     ///   input filename, or batch ID
     /// - `after` / `limit` - Cursor-based pagination (limit defaults to 100 if not set)
-    /// - `api_key_id` - Filter by the API key that created the batch (for per-member attribution)
+    /// - `api_key_ids` - Filter by API key UUID(s) that created the batch (for per-member attribution)
     /// - `status` - Filter by batch status. Supported values:
     ///   `"in_progress"`, `"completed"`, `"failed"`, `"cancelled"`, `"expired"`.
     ///   `"in_progress"` covers all non-terminal batches (including validating and finalizing
