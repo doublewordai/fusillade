@@ -28,30 +28,26 @@ pub struct HttpResponse {
 ///
 /// # Example
 /// ```ignore
-/// let client = ReqwestHttpClient::new();
-/// let response = client.execute(&request_data, "api-key", 5000).await?;
+/// let client = ReqwestHttpClient::new(Duration::from_secs(300), Duration::from_secs(30), Duration::from_secs(600));
+/// let response = client.execute(&request_data, "api-key").await?;
 /// println!("Status: {}, Body: {}", response.status, response.body);
 /// ```
 #[async_trait]
 pub trait HttpClient: Send + Sync + Clone {
     /// Execute an HTTP request.
     ///
+    /// Timeout behavior is configured at client construction time, not per-request.
+    ///
     /// # Arguments
     /// * `request` - The request data containing endpoint, method, path, and body
     /// * `api_key` - API key to include in Authorization: Bearer header
-    /// * `timeout_ms` - Request timeout in milliseconds
     ///
     /// # Errors
     /// Returns an error if:
     /// - The request fails due to network issues
-    /// - The request times out
+    /// - The request times out (either waiting for headers or between body chunks)
     /// - The URL is invalid
-    async fn execute(
-        &self,
-        request: &RequestData,
-        api_key: &str,
-        timeout_ms: u64,
-    ) -> Result<HttpResponse>;
+    async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse>;
 }
 
 // ============================================================================
@@ -61,39 +57,55 @@ pub trait HttpClient: Send + Sync + Clone {
 /// Production HTTP client using reqwest.
 ///
 /// This implementation makes real HTTP requests to external endpoints.
+/// Timeouts are configured at construction time and applied differently
+/// depending on whether the request is streaming:
+///
+/// **Non-streaming** (`stream = false`): uses `first_chunk_timeout + body_timeout`
+/// as a single overall reqwest timeout covering the entire request.
+///
+/// **Streaming** (`stream = true`): split timeouts for fine-grained control:
+/// - `first_chunk_timeout`: max time to first token (connect + headers + first body chunk)
+/// - `chunk_timeout`: max idle time between subsequent body chunks
+/// - `body_timeout`: max total time for the entire response body
 #[derive(Clone)]
 pub struct ReqwestHttpClient {
     client: reqwest::Client,
+    first_chunk_timeout: Duration,
+    chunk_timeout: Duration,
+    body_timeout: Duration,
 }
 
 impl ReqwestHttpClient {
-    /// Create a new reqwest-based HTTP client.
-    /// TODO: Why have this and default
-    pub fn new() -> Self {
+    /// Create a new reqwest-based HTTP client with the given timeouts.
+    pub fn new(
+        first_chunk_timeout: Duration,
+        chunk_timeout: Duration,
+        body_timeout: Duration,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
+            first_chunk_timeout,
+            chunk_timeout,
+            body_timeout,
         }
     }
 }
 
 impl Default for ReqwestHttpClient {
     fn default() -> Self {
-        Self::new()
+        Self::new(ONE_DAY_DURATION, ONE_DAY_DURATION, ONE_DAY_DURATION)
     }
 }
 
+/// Long but finite fallback timeout (24 hours) used when no explicit timeout is configured.
+const ONE_DAY_DURATION: Duration = Duration::from_secs(86_400);
+
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
-    // TODO: document
-    #[tracing::instrument(name = "fusillade.execute", skip(self, request, api_key, timeout_ms), fields(
+    #[tracing::instrument(name = "fusillade.execute", skip(self, request, api_key), fields(
         otel.name = %format!("{} {}", request.method, request.path),
     ))]
-    async fn execute(
-        &self,
-        request: &RequestData,
-        api_key: &str,
-        timeout_ms: u64,
-    ) -> Result<HttpResponse> {
+    async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse> {
         let url = format!("{}{}", request.endpoint, request.path);
         let span = tracing::Span::current();
         span.set_attribute("otel.kind", "Client");
@@ -103,20 +115,19 @@ impl HttpClient for ReqwestHttpClient {
 
         tracing::debug!(
             url.full = %url,
-            timeout_ms = timeout_ms,
+            first_chunk_timeout_ms = self.first_chunk_timeout.as_millis() as u64,
+            chunk_timeout_ms = self.chunk_timeout.as_millis() as u64,
+            body_timeout_ms = self.body_timeout.as_millis() as u64,
             "Executing HTTP request"
         );
 
-        let mut req = self
-            .client
-            .request(
-                request.method.parse().map_err(|e| {
-                    tracing::error!(method = %request.method, error = %e, "Invalid HTTP method");
-                    anyhow::anyhow!("Invalid HTTP method '{}': {}", request.method, e)
-                })?,
-                &url,
-            )
-            .timeout(Duration::from_millis(timeout_ms));
+        let mut req = self.client.request(
+            request.method.parse().map_err(|e| {
+                tracing::error!(method = %request.method, error = %e, "Invalid HTTP method");
+                anyhow::anyhow!("Invalid HTTP method '{}': {}", request.method, e)
+            })?,
+            &url,
+        );
 
         // Only add Authorization header if api_key is not empty
         if !api_key.is_empty() {
@@ -176,12 +187,31 @@ impl HttpClient for ReqwestHttpClient {
             );
         }
 
-        let response = req.send().await.map_err(|e| {
+        if request.stream {
+            self.execute_streaming(request, req, &url).await
+        } else {
+            self.execute_non_streaming(request, req, &url).await
+        }
+    }
+}
+
+impl ReqwestHttpClient {
+    /// Execute a non-streaming request with a single overall timeout.
+    /// Uses first_chunk_timeout + body_timeout as the total allowed time,
+    /// since non-streaming responses return everything at once.
+    async fn execute_non_streaming(
+        &self,
+        request: &RequestData,
+        req: reqwest::RequestBuilder,
+        url: &str,
+    ) -> Result<HttpResponse> {
+        let total_timeout = self.first_chunk_timeout + self.body_timeout;
+        let response = req.timeout(total_timeout).send().await.map_err(|e| {
             if e.is_builder() {
                 tracing::error!(
                     request_id = %request.id,
                     url.full = %url,
-                    error = %e,
+                    error = %e.to_string(),
                     custom_id = ?request.custom_id,
                     batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
                     "Failed to build HTTP request (not retriable) - likely invalid header value"
@@ -199,6 +229,91 @@ impl HttpClient for ReqwestHttpClient {
 
         let status = response.status().as_u16();
         let body = response.text().await?;
+
+        tracing::debug!(
+            request_id = %request.id,
+            status = status,
+            response_len = body.len(),
+            "HTTP request completed"
+        );
+
+        Ok(HttpResponse { status, body })
+    }
+
+    /// Execute a streaming request with split timeouts:
+    /// - first_chunk_timeout: connect + headers + first body chunk (time-to-first-token).
+    ///   Handles servers (like vLLM) that return headers immediately but queue the request.
+    /// - chunk_timeout: max idle time between subsequent body chunks.
+    /// - body_timeout: max total time for the entire response body.
+    async fn execute_streaming(
+        &self,
+        request: &RequestData,
+        req: reqwest::RequestBuilder,
+        url: &str,
+    ) -> Result<HttpResponse> {
+        let (mut response, status, first_chunk) = tokio::time::timeout(
+            self.first_chunk_timeout,
+            async {
+                let mut resp = req
+                    .send()
+                    .await
+                    .map_err(|e| -> crate::error::FusilladeError { e.into() })
+                    .inspect_err(|e| {
+                        tracing::error!(
+                            request_id = %request.id,
+                            url.full = %url,
+                            error = %e,
+                            custom_id = ?request.custom_id,
+                            batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
+                            "HTTP request failed"
+                        );
+                    })?;
+                let status = resp.status().as_u16();
+                let first_chunk = resp
+                    .chunk()
+                    .await
+                    .map_err(|e| -> crate::error::FusilladeError { e.into() })?;
+                Ok::<_, crate::error::FusilladeError>((resp, status, first_chunk))
+            },
+        )
+        .await
+        .map_err(|_| {
+            crate::error::FusilladeError::FirstChunkTimeout(format!(
+                "No first token from {} within {}ms",
+                url,
+                self.first_chunk_timeout.as_millis()
+            ))
+        })??;
+
+        let body_bytes = tokio::time::timeout(self.body_timeout, async {
+            let mut buf = Vec::from(first_chunk.unwrap_or_default());
+            loop {
+                match tokio::time::timeout(self.chunk_timeout, response.chunk()).await {
+                    Ok(Ok(Some(chunk))) => buf.extend_from_slice(&chunk),
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => {
+                        return Err(crate::error::FusilladeError::TokensTimeout(format!(
+                            "Body read stalled from {} after {}ms ({} bytes received)",
+                            url,
+                            self.chunk_timeout.as_millis(),
+                            buf.len()
+                        )));
+                    }
+                }
+            }
+            Ok(buf)
+        })
+        .await
+        .map_err(|_| {
+            crate::error::FusilladeError::BodyTimeout(format!(
+                "Total body read from {} exceeded {}ms",
+                url,
+                self.body_timeout.as_millis()
+            ))
+        })??;
+        let body = String::from_utf8(body_bytes)
+            .map_err(|e| anyhow::anyhow!("Response body from {} is not valid UTF-8: {}", url, e))?;
 
         tracing::debug!(
             request_id = %request.id,
@@ -264,7 +379,6 @@ pub struct MockCall {
     pub path: String,
     pub body: String,
     pub api_key: String,
-    pub timeout_ms: u64,
     pub batch_metadata: std::collections::HashMap<String, String>,
 }
 
@@ -353,13 +467,7 @@ impl Default for MockHttpClient {
 
 #[async_trait]
 impl HttpClient for MockHttpClient {
-    // TODO: document
-    async fn execute(
-        &self,
-        request: &RequestData,
-        api_key: &str,
-        timeout_ms: u64,
-    ) -> Result<HttpResponse> {
+    async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse> {
         // Increment in-flight counter
         self.in_flight.fetch_add(1, Ordering::SeqCst);
 
@@ -374,7 +482,6 @@ impl HttpClient for MockHttpClient {
             path: request.path.clone(),
             body: request.body.clone(),
             api_key: api_key.to_string(),
-            timeout_ms,
             batch_metadata: request.batch_metadata.clone(),
         });
 
@@ -460,10 +567,11 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
-        let response = mock.execute(&request, "test-key", 5000).await.unwrap();
+        let response = mock.execute(&request, "test-key").await.unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, "success");
 
@@ -504,13 +612,14 @@ mod tests {
             body: "".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
-        let response1 = mock.execute(&request, "key", 5000).await.unwrap();
+        let response1 = mock.execute(&request, "key").await.unwrap();
         assert_eq!(response1.body, "first");
 
-        let response2 = mock.execute(&request, "key", 5000).await.unwrap();
+        let response2 = mock.execute(&request, "key").await.unwrap();
         assert_eq!(response2.body, "second");
 
         assert_eq!(mock.call_count(), 2);
@@ -531,10 +640,11 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
-        let result = mock.execute(&request, "key", 5000).await;
+        let result = mock.execute(&request, "key").await;
         assert!(result.is_err());
     }
 
@@ -561,12 +671,13 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
         // Spawn the request execution (it will block waiting for trigger)
         let mock_clone = mock.clone();
-        let handle = tokio::spawn(async move { mock_clone.execute(&request, "key", 5000).await });
+        let handle = tokio::spawn(async move { mock_clone.execute(&request, "key").await });
 
         // Give it a moment to start executing
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -614,10 +725,11 @@ mod tests {
             body: r#"{"key":"value"}"#.to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            stream: false,
             batch_metadata: batch_metadata.clone(),
         };
 
-        let response = mock.execute(&request, "test-key", 5000).await.unwrap();
+        let response = mock.execute(&request, "test-key").await.unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, "success");
 
@@ -726,18 +838,183 @@ mod tests {
             body: r#"{"prompt":"test"}"#.to_string(),
             model: "test-model".to_string(),
             api_key: "test-api-key".to_string(),
+            stream: false,
             batch_metadata,
         };
 
         // Use real HTTP client
-        let client = ReqwestHttpClient::new();
-        let response = client
-            .execute(&request, "test-api-key", 5000)
-            .await
-            .unwrap();
+        let client = ReqwestHttpClient::default();
+        let response = client.execute(&request, "test-api-key").await.unwrap();
 
         assert_eq!(response.status, 200);
         assert_eq!(response.body, r#"{"result":"ok"}"#);
+    }
+
+    #[tokio::test]
+    async fn test_read_timeout_on_stalled_body() {
+        use axum::{Router, http::StatusCode, routing::post};
+
+        // Server sends headers + partial body, then stalls forever
+        let app = Router::new().route(
+            "/test",
+            post(|| async {
+                use futures::StreamExt;
+                let stream = futures::stream::once(async {
+                    Ok::<_, std::convert::Infallible>("partial".to_string().into_bytes())
+                })
+                .chain(futures::stream::pending());
+
+                let body = axum::body::Body::from_stream(stream);
+                (StatusCode::OK, body)
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Give server time to start
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: format!("http://{}", addr),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            body: "{}".to_string(),
+            model: "test-model".to_string(),
+            api_key: "".to_string(),
+            stream: true,
+            batch_metadata: std::collections::HashMap::new(),
+        };
+
+        let timeout = Duration::from_millis(200);
+        let client = ReqwestHttpClient::new(timeout, timeout, ONE_DAY_DURATION);
+        let result = client.execute(&request, "").await;
+        let err = result.expect_err("Expected TokensTimeout for stalled body");
+
+        match err {
+            crate::error::FusilladeError::TokensTimeout(msg) => {
+                assert!(msg.contains("Body read stalled"));
+            }
+            other => panic!("Expected TokensTimeout, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_timeout_on_stalled_headers() {
+        // Server accepts connection but never sends headers
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                // Hold the connection open but never respond
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                drop(socket);
+            }
+        });
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: format!("http://{}", addr),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            body: "{}".to_string(),
+            model: "test-model".to_string(),
+            api_key: "".to_string(),
+            stream: true,
+            batch_metadata: std::collections::HashMap::new(),
+        };
+
+        let timeout = Duration::from_millis(200);
+        let client = ReqwestHttpClient::new(timeout, timeout, ONE_DAY_DURATION);
+        let result = client.execute(&request, "").await;
+        let err = result.expect_err("Expected FirstChunkTimeout for stalled headers");
+
+        match err {
+            crate::error::FusilladeError::FirstChunkTimeout(msg) => {
+                assert!(msg.contains("No first token from"));
+            }
+            other => panic!("Expected FirstChunkTimeout, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_body_timeout_on_slow_drip() {
+        use axum::{Router, http::StatusCode, routing::post};
+        use futures::StreamExt;
+
+        // Server sends one chunk every 50ms — never trips the 200ms chunk timeout,
+        // but exceeds the 300ms body timeout.
+        let app = Router::new().route(
+            "/test",
+            post(|| async {
+                let stream = futures::stream::unfold(0u32, |i| async move {
+                    if i >= 20 {
+                        return None;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Some((
+                        Ok::<_, std::convert::Infallible>(format!("chunk-{i}").into_bytes()),
+                        i + 1,
+                    ))
+                })
+                .boxed();
+                let body = axum::body::Body::from_stream(stream);
+                (StatusCode::OK, body)
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: format!("http://{}", addr),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            body: "{}".to_string(),
+            model: "test-model".to_string(),
+            api_key: "".to_string(),
+            stream: true,
+            batch_metadata: std::collections::HashMap::new(),
+        };
+
+        // chunk_timeout=200ms (never trips), body_timeout=300ms (trips after ~6 chunks)
+        let client = ReqwestHttpClient::new(
+            ONE_DAY_DURATION,
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+        );
+        let result = client.execute(&request, "").await;
+        let err = result.expect_err("Expected BodyTimeout for slow-drip response");
+
+        match err {
+            crate::error::FusilladeError::BodyTimeout(msg) => {
+                assert!(msg.contains("Total body read from"));
+            }
+            other => panic!("Expected BodyTimeout, got: {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -755,11 +1032,12 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
-        let client = ReqwestHttpClient::new();
-        let result = client.execute(&request, "test-key", 5000).await;
+        let client = ReqwestHttpClient::default();
+        let result = client.execute(&request, "test-key").await;
         let err = result.expect_err("Expected builder error for invalid header value");
 
         // Verify it's a builder error and map to FailureReason (same logic as transitions.rs)

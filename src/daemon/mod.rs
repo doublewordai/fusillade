@@ -119,8 +119,22 @@ pub struct DaemonConfig {
     /// Maximum backoff time in milliseconds
     pub max_backoff_ms: u64,
 
-    /// Timeout for each individual request attempt in milliseconds
-    pub timeout_ms: u64,
+    /// Timeout for receiving response headers (connect + time-to-first-token) in milliseconds.
+    /// This should be generous enough to cover slow model inference starts.
+    /// Default: 86,400,000 (24 hours).
+    pub first_chunk_timeout_ms: u64,
+
+    /// Timeout for receiving the next chunk of response body in milliseconds.
+    /// Once the server starts streaming, each inter-chunk gap must be shorter
+    /// than this value or the request is considered stalled.
+    /// Default: 86,400,000 (24 hours).
+    pub chunk_timeout_ms: u64,
+
+    /// Timeout for the entire response body in milliseconds.
+    /// Catches slow-drip responses that never trip the per-chunk timeout
+    /// but take an unreasonable total time.
+    /// Default: 86,400,000 (24 hours).
+    pub body_timeout_ms: u64,
 
     /// Interval for logging daemon status (requests in flight) in milliseconds
     /// Set to None to disable periodic status logging
@@ -211,7 +225,9 @@ impl Default for DaemonConfig {
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
-            timeout_ms: 600000,
+            first_chunk_timeout_ms: 540_000,    // 9 minutes
+            chunk_timeout_ms: 540_000,          // 9 minutes
+            body_timeout_ms: 60_000,            // 1 minute
             status_log_interval_ms: Some(2000), // Log every 2 seconds by default
             heartbeat_interval_ms: 5000,        // Heartbeat every 5 seconds by default
             should_retry: Arc::new(default_should_retry),
@@ -665,7 +681,6 @@ where
                     let model_clone = model.clone();
                     let storage = self.storage.clone();
                     let http_client = (*self.http_client).clone();
-                    let timeout_ms = self.config.timeout_ms;
                     let retry_config = (&self.config).into();
                     let requests_in_flight = self.requests_in_flight.clone();
                     let requests_processed = self.requests_processed.clone();
@@ -725,7 +740,6 @@ where
                             tracing::debug!("Sending batch request to inference endpoint");
                             request.process(
                                 http_client,
-                                timeout_ms,
                                 storage.as_ref()
                             ).await
                         }.instrument(tracing::info_span!(
@@ -761,8 +775,7 @@ where
                             "fusillade.state.processing",
                             otel.name = "fusillade.state.processing",
                             request_id = %request_id,
-                            retry_attempt = retry_attempt_at_completion,
-                            timeout_ms = timeout_ms,
+                            retry_attempt = retry_attempt_at_completion
                         )).await;
 
                         match completion_result {
@@ -946,7 +959,9 @@ mod tests {
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
-            timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
+            chunk_timeout_ms: 5000,
+            body_timeout_ms: 86_400_000,
             status_log_interval_ms: None, // Disable status logging in tests
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
@@ -1119,7 +1134,9 @@ mod tests {
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
-            timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
+            chunk_timeout_ms: 5000,
+            body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
@@ -1354,7 +1371,9 @@ mod tests {
             backoff_ms: 10, // Very fast backoff for testing
             backoff_factor: 2,
             max_backoff_ms: 100,
-            timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
+            chunk_timeout_ms: 5000,
+            body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
@@ -1494,7 +1513,9 @@ mod tests {
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
-            timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
+            chunk_timeout_ms: 5000,
+            body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
@@ -1673,7 +1694,9 @@ mod tests {
             backoff_ms: 50,
             backoff_factor: 2,
             max_backoff_ms: 200,
-            timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
+            chunk_timeout_ms: 5000,
+            body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
@@ -1836,7 +1859,9 @@ mod tests {
             backoff_ms: 50,
             backoff_factor: 2,
             max_backoff_ms: 200,
-            timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
+            chunk_timeout_ms: 5000,
+            body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
@@ -1999,7 +2024,9 @@ mod tests {
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
-            timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
+            chunk_timeout_ms: 5000,
+            body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
@@ -2162,7 +2189,9 @@ mod tests {
             backoff_ms: 100,
             backoff_factor: 2,
             max_backoff_ms: 1000,
-            timeout_ms: 5000,
+            first_chunk_timeout_ms: 5000,
+            chunk_timeout_ms: 5000,
+            body_timeout_ms: 86_400_000,
             status_log_interval_ms: None,
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
