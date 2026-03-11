@@ -1,5 +1,16 @@
 # Changelog
 
+## [11.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v10.0.0...fusillade-v11.0.0) (2026-03-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* allow filtering batches and files by multiple api key ids, so we can … ([#173](https://github.com/doublewordai/fusillade/issues/173))
+
+### Features
+
+* allow filtering batches and files by multiple api key ids, so we can … ([#173](https://github.com/doublewordai/fusillade/issues/173)) ([a8d2352](https://github.com/doublewordai/fusillade/commit/a8d2352f5e33af3e2974852e763b4cdc68655dea))
+
 ## [10.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v9.0.0...fusillade-v10.0.0) (2026-03-11)
 
 
