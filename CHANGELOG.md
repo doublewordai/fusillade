@@ -1,5 +1,16 @@
 # Changelog
 
+## [10.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v9.0.0...fusillade-v10.0.0) (2026-03-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* Split timeouts ([#163](https://github.com/doublewordai/fusillade/issues/163))
+
+### Features
+
+* Split timeouts ([#163](https://github.com/doublewordai/fusillade/issues/163)) ([6087e9f](https://github.com/doublewordai/fusillade/commit/6087e9fdc94f27e5bc470983bac11fda781bae72))
+
 ## [9.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v8.2.0...fusillade-v9.0.0) (2026-03-11)
 
 
