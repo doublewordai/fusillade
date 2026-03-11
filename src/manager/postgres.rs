@@ -1792,11 +1792,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     async fn list_files(&self, filter: crate::batch::FileFilter) -> Result<Vec<File>> {
         use sqlx::QueryBuilder;
 
-        // Empty api_key_ids means "match nothing" — short-circuit to avoid a pointless DB query
-        if matches!(&filter.api_key_ids, Some(ids) if ids.is_empty()) {
-            return Ok(vec![]);
-        }
-
         // Get cursor timestamp if needed
         let after_created_at = if let Some(after_id) = &filter.after {
             sqlx::query!(
@@ -2364,11 +2359,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
     #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
     async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>> {
-        // Empty api_key_ids means "match nothing" — short-circuit to avoid a pointless DB query
-        if matches!(&filter.api_key_ids, Some(ids) if ids.is_empty()) {
-            return Ok(vec![]);
-        }
-
         let ListBatchesFilter {
             created_by,
             search,
@@ -9891,6 +9881,24 @@ mod tests {
         assert!(
             err.contains("Unknown batch status filter"),
             "Expected error about unknown status, got: {}",
+            err
+        );
+
+        // Empty api_key_ids with invalid status should still return the status error,
+        // not silently return empty results
+        let result = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                api_key_ids: Some(vec![]),
+                status: Some("not_a_status".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Unknown batch status filter"),
+            "Expected status error even with empty api_key_ids, got: {}",
             err
         );
     }
