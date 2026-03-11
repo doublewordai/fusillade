@@ -10302,9 +10302,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(results.iter().any(|b| b.id == batch_a.id), "overdue in-progress batch should match");
-        assert!(results.iter().any(|b| b.id == batch_b.id), "completed-after-deadline batch should match");
-        assert!(results.iter().all(|b| b.id != batch_c.id), "on-time completed batch should not match");
+        assert!(
+            results.iter().any(|b| b.id == batch_a.id),
+            "overdue in-progress batch should match"
+        );
+        assert!(
+            results.iter().any(|b| b.id == batch_b.id),
+            "completed-after-deadline batch should match"
+        );
+        assert!(
+            results.iter().all(|b| b.id != batch_c.id),
+            "on-time completed batch should not match"
+        );
     }
 
     // =========================================================================
