@@ -213,8 +213,8 @@ impl Request<Claimed> {
             daemon_id: self.state.daemon_id,
             claimed_at: self.state.claimed_at,
             started_at: chrono::Utc::now(),
-            retry_attempt: self.state.retry_attempt, // Carry over retry attempt
-            batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
+            retry_attempt: self.state.retry_attempt,
+            batch_expires_at: self.state.batch_expires_at,
             result_rx: Arc::new(Mutex::new(rx)),
             abort_handle: task_handle.abort_handle(),
         };
@@ -294,12 +294,6 @@ impl Request<Failed> {
                 "reason" => "max_retries"
             )
             .increment(1);
-            tracing::debug!(
-                request_id = %self.data.id,
-                retry_attempt,
-                max_retries,
-                "No retries remaining (reached max_retries), request remains failed"
-            );
             return Err(Box::new(self));
         }
 
@@ -321,28 +315,10 @@ impl Request<Failed> {
                 "reason" => "deadline"
             )
             .increment(1);
-            let time_until_deadline = self.state.batch_expires_at - now;
-            tracing::warn!(
-                request_id = %self.data.id,
-                retry_attempt,
-                time_until_deadline_seconds = time_until_deadline.num_seconds(),
-                batch_expires_at = %self.state.batch_expires_at,
-                stop_before_deadline_ms = config.stop_before_deadline_ms,
-                "No retries remaining (would exceed batch deadline), request remains failed"
-            );
             return Err(Box::new(self));
         }
 
-        let time_until_deadline = effective_deadline - now;
-        tracing::debug!(
-            request_id = %self.data.id,
-            retry_attempt = retry_attempt + 1,
-            backoff_ms = backoff_duration,
-            not_before = %not_before,
-            time_until_deadline_seconds = time_until_deadline.num_seconds(),
-            batch_expires_at = %self.state.batch_expires_at,
-            "Retrying failed request with exponential backoff"
-        );
+        // state_transition span emitted by caller after persist
 
         let request = Request {
             data: self.data,

@@ -102,7 +102,7 @@ const ONE_DAY_DURATION: Duration = Duration::from_secs(86_400);
 
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
-    #[tracing::instrument(skip(self, request, api_key), fields(
+    #[tracing::instrument(name = "fusillade.execute", skip(self, request, api_key), fields(
         otel.name = %format!("{} {}", request.method, request.path),
     ))]
     async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse> {
