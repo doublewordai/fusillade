@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v8.1.0...fusillade-v8.1.1) (2026-03-11)
+
+
+### Bug Fixes
+
+* pre-filter active batches in claim query to avoid orphaned rows ([#168](https://github.com/doublewordai/fusillade/issues/168)) ([a66ab16](https://github.com/doublewordai/fusillade/commit/a66ab163bdc3149e8082c5e73c4138261e07796d))
+
 ## [8.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v8.0.0...fusillade-v8.1.0) (2026-03-11)
 
 
