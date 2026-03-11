@@ -9864,9 +9864,7 @@ mod tests {
             .await
             .unwrap();
 
-        let before_create = chrono::Utc::now();
-
-        manager
+        let batch = manager
             .create_batch(crate::batch::BatchInput {
                 file_id,
                 endpoint: "/v1/chat/completions".to_string(),
@@ -9878,12 +9876,13 @@ mod tests {
             .await
             .unwrap();
 
-        let after_create = chrono::Utc::now();
+        // Use the DB-generated timestamp to avoid client/server clock drift (flaky in CI)
+        let batch_created_at = batch.created_at;
 
         // created_after set to after batch creation — should exclude it
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
-                created_after: Some(after_create + chrono::Duration::seconds(1)),
+                created_after: Some(batch_created_at + chrono::Duration::seconds(1)),
                 limit: Some(100),
                 ..Default::default()
             })
@@ -9894,7 +9893,7 @@ mod tests {
         // created_before set to before batch creation — should exclude it
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
-                created_before: Some(before_create - chrono::Duration::seconds(1)),
+                created_before: Some(batch_created_at - chrono::Duration::seconds(1)),
                 limit: Some(100),
                 ..Default::default()
             })
@@ -9902,11 +9901,11 @@ mod tests {
             .unwrap();
         assert!(results.is_empty());
 
-        // Window that includes the batch
+        // Window that includes the batch (±1 second around DB timestamp)
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
-                created_after: Some(before_create),
-                created_before: Some(after_create + chrono::Duration::seconds(1)),
+                created_after: Some(batch_created_at - chrono::Duration::seconds(1)),
+                created_before: Some(batch_created_at + chrono::Duration::seconds(1)),
                 limit: Some(100),
                 ..Default::default()
             })
