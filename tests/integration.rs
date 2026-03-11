@@ -21,11 +21,13 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
     );
 
     // Setup: Create manager with fast claim interval (no sleeping)
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("test-model".to_string(), 10);
+
     let config = DaemonConfig {
         claim_batch_size: 10,
         claim_interval_ms: 10, // Very fast for testing
-        default_model_concurrency: 10,
-        model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+        model_concurrency_limits,
 
         max_retries: Some(3),
         stop_before_deadline_ms: None,
@@ -192,7 +194,6 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     let config = DaemonConfig {
         claim_batch_size: 10,
         claim_interval_ms: 10,
-        default_model_concurrency: 10,
         model_concurrency_limits,
 
         max_retries: Some(3),
@@ -425,11 +426,13 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
     );
 
     // Setup: Create manager with fast backoff for testing
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("test-model".to_string(), 10);
+
     let config = DaemonConfig {
         claim_batch_size: 10,
         claim_interval_ms: 10,
-        default_model_concurrency: 10,
-        model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+        model_concurrency_limits,
 
         max_retries: Some(5),
         stop_before_deadline_ms: None,
@@ -563,7 +566,6 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
     let config = DaemonConfig {
         claim_batch_size: 10,
         claim_interval_ms: 10,
-        default_model_concurrency: 10,
         model_concurrency_limits: model_concurrency_limits.clone(),
         max_retries: Some(3),
         stop_before_deadline_ms: None,
@@ -725,11 +727,13 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
     }
 
     // Use deadline-aware retry with a short completion window and short buffer
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("test-model".to_string(), 10);
+
     let config = DaemonConfig {
         claim_batch_size: 10,
         claim_interval_ms: 10,
-        default_model_concurrency: 10,
-        model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+        model_concurrency_limits,
 
         max_retries: Some(10_000),
         stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
@@ -892,11 +896,13 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
     }
 
     // No max_retries, no stop_before_deadline_ms
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("test-model".to_string(), 10);
+
     let config = DaemonConfig {
         claim_batch_size: 10,
         claim_interval_ms: 10,
-        default_model_concurrency: 10,
-        model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+        model_concurrency_limits,
 
         max_retries: None,             // No retry limit
         stop_before_deadline_ms: None, // No buffer - should retry until deadline
@@ -1073,11 +1079,14 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
         },
     );
 
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("gpt-4".to_string(), 10);
+    model_concurrency_limits.insert("gpt-4-turbo".to_string(), 10);
+
     let config = DaemonConfig {
         claim_batch_size: 10,
         claim_interval_ms: 10,
-        default_model_concurrency: 10,
-        model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+        model_concurrency_limits,
 
         model_escalations,
         max_retries: Some(3),
@@ -1222,11 +1231,14 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
         },
     );
 
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("gpt-4".to_string(), 10);
+    model_concurrency_limits.insert("gpt-4-turbo".to_string(), 10);
+
     let config = DaemonConfig {
         claim_batch_size: 10,
         claim_interval_ms: 10,
-        default_model_concurrency: 10,
-        model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+        model_concurrency_limits,
 
         model_escalations,
         max_retries: Some(3),
@@ -1367,10 +1379,13 @@ mod batch_results_stream {
             }),
         );
 
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+        model_concurrency_limits.insert("gpt-4".to_string(), 10);
+
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
+            model_concurrency_limits,
             ..Default::default()
         };
 
@@ -1549,10 +1564,13 @@ mod batch_results_stream {
             }),
         );
 
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+        model_concurrency_limits.insert("gpt-4".to_string(), 10);
+
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
+            model_concurrency_limits,
             ..Default::default()
         };
 
@@ -1667,10 +1685,13 @@ mod batch_results_stream {
             );
         }
 
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+        model_concurrency_limits.insert("gpt-4".to_string(), 10);
+
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
+            model_concurrency_limits,
             ..Default::default()
         };
 
@@ -1786,10 +1807,13 @@ mod batch_results_stream {
             }),
         );
 
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+        model_concurrency_limits.insert("gpt-4".to_string(), 10);
+
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
+            model_concurrency_limits,
             max_retries: Some(0), // No retries so it fails immediately
             ..Default::default()
         };
@@ -1893,10 +1917,13 @@ mod batch_results_stream {
             );
         }
 
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+        model_concurrency_limits.insert("gpt-4".to_string(), 10);
+
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
+            model_concurrency_limits,
             ..Default::default()
         };
 
@@ -2045,11 +2072,13 @@ mod batch_results_stream {
             );
         }
 
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+        model_concurrency_limits.insert("test-model".to_string(), 10);
+
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
-            default_model_concurrency: 10,
-            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            model_concurrency_limits,
 
             max_retries: Some(0), // No automatic retries
             stop_before_deadline_ms: None,

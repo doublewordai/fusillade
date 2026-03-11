@@ -1,5 +1,35 @@
 # Changelog
 
+## [8.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v8.1.0...fusillade-v8.1.1) (2026-03-11)
+
+
+### Bug Fixes
+
+* pre-filter active batches in claim query to avoid orphaned rows ([#168](https://github.com/doublewordai/fusillade/issues/168)) ([a66ab16](https://github.com/doublewordai/fusillade/commit/a66ab163bdc3149e8082c5e73c4138261e07796d))
+
+## [8.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v8.0.0...fusillade-v8.1.0) (2026-03-11)
+
+
+### Features
+
+* single LATERAL query for all-model claim ([#166](https://github.com/doublewordai/fusillade/issues/166)) ([5f4974a](https://github.com/doublewordai/fusillade/commit/5f4974a05405d06b283fcbfc32b4b818f109169b))
+
+## [8.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v7.2.0...fusillade-v8.0.0) (2026-03-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* acquire semaphore permits before claiming requests ([#157](https://github.com/doublewordai/fusillade/issues/157))
+
+### Features
+
+* acquire semaphore permits before claiming requests ([#157](https://github.com/doublewordai/fusillade/issues/157)) ([a0c8d94](https://github.com/doublewordai/fusillade/commit/a0c8d94bfdaad52546197c7b1a022d45e9dd91b7))
+
+
+### Bug Fixes
+
+* move test-log to dev-dependencies ([#162](https://github.com/doublewordai/fusillade/issues/162)) ([e7322ca](https://github.com/doublewordai/fusillade/commit/e7322ca9e0ad4c67d3fad76429a43fdbf6710950))
+
 ## [7.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v7.1.0...fusillade-v7.2.0) (2026-03-09)
 
 
