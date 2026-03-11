@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v8.0.0...fusillade-v8.1.0) (2026-03-11)
+
+
+### Features
+
+* single LATERAL query for all-model claim ([#166](https://github.com/doublewordai/fusillade/issues/166)) ([5f4974a](https://github.com/doublewordai/fusillade/commit/5f4974a05405d06b283fcbfc32b4b818f109169b))
+
 ## [8.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v7.2.0...fusillade-v8.0.0) (2026-03-11)
 
 
