@@ -994,6 +994,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1204,6 +1205,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1400,6 +1402,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1543,6 +1546,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1717,6 +1721,7 @@ mod tests {
                 completion_window: "2s".to_string(), // Very short window
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1879,6 +1884,7 @@ mod tests {
                 completion_window: "2s".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .expect("Failed to create batch");
@@ -2046,6 +2052,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: Some("test-user".to_string()),
+                api_key_id: None,
             })
             .await
             .expect("Failed to create batch");
@@ -2211,6 +2218,7 @@ mod tests {
                     "created_by": "user-123"
                 })),
                 created_by: Some("test-user".to_string()),
+                api_key_id: None,
             })
             .await
             .expect("Failed to create batch");

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at\n            FROM files\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
+  "query": "\n            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at, api_key_id\n            FROM files\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -67,6 +67,11 @@
         "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "api_key_id",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
@@ -87,8 +92,9 @@
       true,
       true,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "6cdeabe6b5b277c4b818a3f2d88e4182bc50677ceda617421af18b4f44a1d180"
+  "hash": "5264fb57b5bf373cf805802352c73c9bfee6d46ca03f0b305d0c2b9d87c4c48d"
 }

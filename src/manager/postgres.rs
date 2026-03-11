@@ -26,7 +26,8 @@ use super::{DaemonStorage, Storage};
 use crate::batch::{
     Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchNotification,
     BatchOutputItem, BatchResponseDetails, BatchStatus, File, FileContentItem, FileId,
-    FileMetadata, FileStreamItem, OutputFileType, RequestTemplateInput, TemplateId,
+    FileMetadata, FileStreamItem, ListBatchesFilter, OutputFileType, RequestTemplateInput,
+    TemplateId,
 };
 use crate::daemon::{
     AnyDaemonRecord, Daemon, DaemonConfig, DaemonData, DaemonRecord, DaemonState, DaemonStatus,
@@ -120,6 +121,7 @@ macro_rules! batch_from_dynamic_row {
             failed_requests: $row.get("failed_requests"),
             canceled_requests: $row.get("canceled_requests"),
             notification_sent_at: $row.get("notification_sent_at"),
+            api_key_id: $row.get::<Option<Uuid>, _>("api_key_id"),
         }
     };
 }
@@ -640,7 +642,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     async fn get_file_from_pool(&self, file_id: FileId, pool: &PgPool) -> Result<File> {
         let row = sqlx::query!(
             r#"
-            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
+            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at, api_key_id
             FROM files
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -678,6 +680,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             uploaded_by: row.uploaded_by,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            api_key_id: row.api_key_id,
         })
     }
 }
@@ -1489,6 +1492,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     if meta.uploaded_by.is_some() {
                         metadata.uploaded_by = meta.uploaded_by;
                     }
+                    if meta.api_key_id.is_some() {
+                        metadata.api_key_id = meta.api_key_id;
+                    }
                 }
                 FileStreamItem::Template(template) => {
                     // Ensure we have a file ID (create stub if needed)
@@ -1614,6 +1620,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 purpose = $6,
                 expires_at = $7,
                 uploaded_by = $8,
+                api_key_id = $9,
                 size_finalized = TRUE,
                 updated_at = NOW()
             WHERE id = $1
@@ -1626,6 +1633,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             purpose,
             expires_at,
             uploaded_by,
+            metadata.api_key_id,
         )
         .execute(&mut *tx)
         .await
@@ -1795,7 +1803,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             SELECT
                 f.id, f.name, f.description, f.size_bytes, f.size_finalized,
                 f.status, f.error_message, f.purpose, f.expires_at, f.deleted_at,
-                f.uploaded_by, f.created_at, f.updated_at,
+                f.uploaded_by, f.created_at, f.updated_at, f.api_key_id,
                 b.id as batch_id,
                 b.total_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -1849,6 +1857,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             let search_pattern = format!("%{}%", search.to_lowercase());
             query_builder.push(" AND LOWER(f.name) LIKE ");
             query_builder.push_bind(search_pattern);
+        }
+
+        if let Some(api_key_id) = &filter.api_key_id {
+            query_builder.push(" AND f.api_key_id = ");
+            query_builder.push_bind(*api_key_id);
         }
 
         // Add cursor-based pagination
@@ -1938,6 +1951,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             let updated_at: chrono::DateTime<Utc> = row
                 .try_get("updated_at")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read updated_at: {}", e)))?;
+            let api_key_id: Option<Uuid> = row
+                .try_get("api_key_id")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read api_key_id: {}", e)))?;
 
             // Calculate size for virtual files if not yet finalized
             if let Some(estimated_size) =
@@ -1964,6 +1980,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 uploaded_by,
                 created_at,
                 updated_at,
+                api_key_id,
             };
 
             // Check and mark as expired if needed (passive expiration)
@@ -2110,8 +2127,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // Create batch with new fields
         let row = sqlx::query!(
             r#"
-            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
             "#,
             *input.file_id as Uuid,
@@ -2120,6 +2137,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             input.metadata,
             input.created_by,
             expires_at,
+            input.api_key_id,
         )
         .fetch_one(&mut *tx)
         .await
@@ -2276,6 +2294,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.cancelled_at,
                 b.deleted_at,
                 b.notification_sent_at,
+                b.api_key_id,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -2329,14 +2348,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         }
     }
 
-    #[tracing::instrument(skip(self), fields(created_by = ?created_by, limit))]
-    async fn list_batches(
-        &self,
-        created_by: Option<String>,
-        search: Option<String>,
-        after: Option<BatchId>,
-        limit: i64,
-    ) -> Result<Vec<Batch>> {
+    #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
+    async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>> {
+        let ListBatchesFilter {
+            created_by,
+            search,
+            after,
+            limit,
+            api_key_id,
+            status,
+            created_after,
+            created_before,
+        } = filter;
+        let limit = limit.unwrap_or(100);
+
         // If after is provided, get the created_at timestamp of that batch for cursor-based pagination
         let (after_created_at, after_id) = if let Some(after_id) = after {
             let row = sqlx::query!(
@@ -2356,43 +2381,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             (None, None)
         };
 
-        // Use a single query with optional cursor filtering and on-demand counting
-        // Join with files table to enable searching by input filename
+        // Two-phase query: first filter and paginate batches (cheap), then attach
+        // request counts only to the result page (expensive LATERAL runs on ≤limit rows).
         let search_pattern = search.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
 
         let mut query_builder = QueryBuilder::new(
             r#"
-            SELECT
-                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
-                b.output_file_id, b.error_file_id, b.created_by, b.created_at,
-                b.expires_at, b.cancelling_at, b.errors,
-                b.total_requests,
-                b.requests_started_at,
-                b.finalizing_at,
-                b.completed_at,
-                b.failed_at,
-                b.cancelled_at,
-                b.deleted_at,
-                b.notification_sent_at,
-                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
-                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
-                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
-                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
-            FROM batches b
-            LEFT JOIN files f ON b.file_id = f.id
-            LEFT JOIN LATERAL (
-                SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
-                    COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
-                FROM requests
-                WHERE batch_id = b.id
-            ) counts ON TRUE
-            WHERE b.deleted_at IS NULL
-              AND ("#,
+            WITH filtered AS (
+                SELECT b.*
+                FROM batches b
+                LEFT JOIN files f ON b.file_id = f.id
+                WHERE b.deleted_at IS NULL
+                  AND ("#,
         );
         query_builder.push_bind(&created_by);
         query_builder.push("::TEXT IS NULL OR b.created_by = ");
@@ -2411,8 +2411,106 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         query_builder.push_bind(&search_pattern);
         query_builder.push(" OR LOWER(f.name) LIKE ");
         query_builder.push_bind(&search_pattern);
-        query_builder.push(") ORDER BY b.created_at DESC, b.id DESC LIMIT ");
+        query_builder.push(" OR b.id::text LIKE ");
+        query_builder.push_bind(&search_pattern);
+        query_builder.push(")");
+
+        if let Some(api_key_id) = &api_key_id {
+            query_builder.push(" AND b.api_key_id = ");
+            query_builder.push_bind(*api_key_id);
+        }
+
+        if let Some(created_after) = &created_after {
+            query_builder.push(" AND b.created_at >= ");
+            query_builder.push_bind(*created_after);
+        }
+
+        if let Some(created_before) = &created_before {
+            query_builder.push(" AND b.created_at <= ");
+            query_builder.push_bind(*created_before);
+        }
+
+        // Status filtering: map status names to DB column conditions.
+        // All filters use persisted batch columns only — no dependency on request counts.
+        // Derived sub-statuses (validating, finalizing) are resolved by the frontend
+        // from the count data attached in the second phase of this query.
+        if let Some(ref status) = status {
+            match status.as_str() {
+                "in_progress" => {
+                    // All non-terminal batches: covers validating, in_progress, and finalizing
+                    query_builder.push(" AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL");
+                }
+                "completed" => {
+                    query_builder.push(" AND b.completed_at IS NOT NULL");
+                }
+                "failed" => {
+                    query_builder.push(" AND b.failed_at IS NOT NULL AND b.completed_at IS NULL");
+                }
+                "cancelled" => {
+                    // Includes both cancelling and fully cancelled batches
+                    query_builder
+                        .push(" AND (b.cancelled_at IS NOT NULL OR b.cancelling_at IS NOT NULL)");
+                }
+                "expired" => {
+                    // Matches batches with SLA issues: either still in-progress past deadline,
+                    // or terminal batches that finished after their deadline.
+                    query_builder.push(
+                        " AND b.expires_at IS NOT NULL AND (\
+                            (b.expires_at < NOW() AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL) \
+                            OR (b.completed_at IS NOT NULL AND b.completed_at > b.expires_at) \
+                            OR (b.failed_at IS NOT NULL AND b.failed_at > b.expires_at) \
+                            OR (b.cancelled_at IS NOT NULL AND b.cancelled_at > b.expires_at)\
+                        )",
+                    );
+                }
+                unknown => {
+                    return Err(FusilladeError::Other(anyhow!(
+                        "Unknown batch status filter: '{}'. Valid values: in_progress, completed, failed, cancelled, expired",
+                        unknown
+                    )));
+                }
+            }
+        }
+
+        query_builder.push(" ORDER BY b.created_at DESC, b.id DESC LIMIT ");
         query_builder.push_bind(limit);
+
+        // Phase 2: attach request counts only to the filtered page of results
+        query_builder.push(
+            r#"
+            )
+            SELECT
+                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                b.output_file_id, b.error_file_id, b.created_by, b.created_at,
+                b.expires_at, b.cancelling_at, b.errors,
+                b.total_requests,
+                b.requests_started_at,
+                b.finalizing_at,
+                b.completed_at,
+                b.failed_at,
+                b.cancelled_at,
+                b.deleted_at,
+                b.notification_sent_at,
+                b.api_key_id,
+                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
+                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
+                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
+                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
+            FROM filtered b
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
+                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
+                    COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
+                FROM requests
+                WHERE batch_id = b.id
+            ) counts ON TRUE
+            ORDER BY b.created_at DESC, b.id DESC
+            "#,
+        );
 
         let rows = query_builder
             .build()
@@ -2936,6 +3034,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 b.cancelled_at,
                 b.deleted_at,
                 b.notification_sent_at,
+                b.api_key_id,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -3048,6 +3147,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             cancelled_at,
             deleted_at: row.get("deleted_at"),
             notification_sent_at: row.get("notification_sent_at"),
+            api_key_id: row.get::<Option<Uuid>, _>("api_key_id"),
         })
     }
 
@@ -3119,7 +3219,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                           b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                           b.expires_at, b.cancelling_at, b.errors, b.total_requests,
                           b.requests_started_at, b.finalizing_at, b.completed_at,
-                          b.failed_at, b.cancelled_at, b.deleted_at, b.notification_sent_at,
+                          b.failed_at, b.cancelled_at, b.deleted_at, b.notification_sent_at, b.api_key_id,
                           c.completed_requests, c.failed_requests, c.canceled_requests,
                           c.pending_requests, c.in_progress_requests
             )
@@ -3161,6 +3261,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     cancelled_at: row.cancelled_at,
                     deleted_at: row.deleted_at,
                     notification_sent_at: row.notification_sent_at,
+                    api_key_id: row.api_key_id,
                     pending_requests: row.pending_requests.unwrap_or(0),
                     in_progress_requests: row.in_progress_requests.unwrap_or(0),
                     completed_requests: row.completed_requests.unwrap_or(0),
@@ -4458,6 +4559,7 @@ mod tests {
             expires_after_seconds: None,
             size_bytes: None,
             uploaded_by: Some("test-user".to_string()),
+            api_key_id: None,
         })];
 
         for i in 0..8000 {
@@ -4527,6 +4629,7 @@ mod tests {
             expires_after_seconds: None,
             size_bytes: None,
             uploaded_by: None,
+            api_key_id: None,
         })];
 
         let stream = stream::iter(items);
@@ -4568,6 +4671,7 @@ mod tests {
             expires_after_seconds: None,
             size_bytes: None,
             uploaded_by: None,
+            api_key_id: None,
         })];
 
         // Add 3000 templates
@@ -4886,6 +4990,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .expect("Failed to create batch");
@@ -4957,6 +5062,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5026,6 +5132,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5097,6 +5204,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5164,6 +5272,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5280,6 +5389,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5290,6 +5400,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5300,6 +5411,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5367,6 +5479,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5453,6 +5566,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5535,6 +5649,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5624,6 +5739,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5723,6 +5839,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5833,6 +5950,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -5944,6 +6062,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -6023,6 +6142,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -6122,6 +6242,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: Some("test-user".to_string()),
+                api_key_id: None,
             })
             .await
             .expect("Failed to create batch");
@@ -6544,6 +6665,7 @@ mod tests {
                 expires_after_seconds: None,
                 size_bytes: None,
                 uploaded_by: Some("test-user".to_string()),
+                api_key_id: None,
             }),
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: Some("stream-1".to_string()),
@@ -6636,6 +6758,7 @@ mod tests {
                 expires_after_seconds: None,
                 size_bytes: None,
                 uploaded_by: Some("test-user".to_string()),
+                api_key_id: None,
             }),
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: None,
@@ -6752,6 +6875,7 @@ mod tests {
             completion_window: "24h".to_string(),
             metadata: Some(serde_json::json!({"project": "test"})),
             created_by: Some("test-user".to_string()),
+            api_key_id: None,
         };
 
         let created_batch = manager.create_batch(batch_input).await.unwrap();
@@ -6836,6 +6960,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -6909,6 +7034,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7008,6 +7134,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7129,6 +7256,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7188,6 +7316,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7268,6 +7397,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7549,6 +7679,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 endpoint: "/v1/chat/completions".to_string(),
                 metadata: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7724,6 +7855,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7854,6 +7986,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: Some("user1".to_string()),
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -7940,6 +8073,7 @@ mod tests {
                     completion_window: "24h".to_string(),
                     metadata: None,
                     created_by: Some("user1".to_string()),
+                    api_key_id: None,
                 })
                 .await
                 .unwrap();
@@ -8070,6 +8204,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8180,6 +8315,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8354,6 +8490,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8388,6 +8525,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8429,6 +8567,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8529,6 +8668,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8625,6 +8765,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8884,6 +9025,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -8950,6 +9092,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -9084,6 +9227,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -9189,6 +9333,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -9271,6 +9416,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -9311,6 +9457,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -9404,6 +9551,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -9520,5 +9668,743 @@ mod tests {
             .await
             .unwrap();
         assert!(counts.is_empty());
+    }
+
+    // =========================================================================
+    // LIST_BATCHES FILTER TESTS
+    // =========================================================================
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_by_api_key_id(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "api-key-filter-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let key_a = uuid::Uuid::new_v4();
+        let key_b = uuid::Uuid::new_v4();
+
+        // Create batches with different api_key_ids
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: Some(key_a),
+            })
+            .await
+            .unwrap();
+
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: Some(key_b),
+            })
+            .await
+            .unwrap();
+
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Filter by key_a — should return only 1 batch
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                api_key_id: Some(key_a),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].api_key_id, Some(key_a));
+
+        // No filter — should return all 3
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_by_status_completed(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "status-filter-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Batch has 1 template so total_requests > 0, and no terminal timestamps set
+        // → status is "in_progress"
+        // Filter for "completed" should not include it
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("completed".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().all(|b| b.id != batch.id));
+
+        // Filter for "in_progress" should include it
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("in_progress".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().any(|b| b.id == batch.id));
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_unknown_status_returns_error(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let result = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("nonexistent_status".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Unknown batch status filter"),
+            "Expected error about unknown status, got: {}",
+            err
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_by_time_range(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "time-filter-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Use the DB-generated timestamp to avoid client/server clock drift (flaky in CI)
+        let batch_created_at = batch.created_at;
+
+        // created_after set to after batch creation — should exclude it
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                created_after: Some(batch_created_at + chrono::Duration::seconds(1)),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+
+        // created_before set to before batch creation — should exclude it
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                created_before: Some(batch_created_at - chrono::Duration::seconds(1)),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+
+        // Window that includes the batch (±1 second around DB timestamp)
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                created_after: Some(batch_created_at - chrono::Duration::seconds(1)),
+                created_before: Some(batch_created_at + chrono::Duration::seconds(1)),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_search_by_batch_id(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "id-search-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Search by batch UUID substring
+        let id_str = batch.id.0.to_string();
+        let search_term = &id_str[..8]; // First 8 chars of UUID
+
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                search: Some(search_term.to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().any(|b| b.id == batch.id));
+
+        // Search with a nonsense string — should not find this batch
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                search: Some("zzz_no_match_zzz".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().all(|b| b.id != batch.id));
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_by_status_in_progress_includes_validating(
+        pool: sqlx::PgPool,
+    ) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "validating-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Manually reset total_requests to 0 to simulate "validating" sub-state
+        sqlx::query!(
+            "UPDATE batches SET total_requests = 0 WHERE id = $1",
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // "in_progress" filter covers all non-terminal batches including validating
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("in_progress".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().any(|b| b.id == batch.id));
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_by_status_cancelled(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "cancelled-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch_a = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        let batch_b = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Cancel batch_a fully (sets both cancelling_at and cancelled_at)
+        manager.cancel_batch(batch_a.id).await.unwrap();
+
+        // Set batch_b to cancelling-only (in-flight cancellation)
+        sqlx::query!(
+            "UPDATE batches SET cancelling_at = NOW() WHERE id = $1",
+            *batch_b.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // "cancelled" filter includes both fully cancelled and still-cancelling batches
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("cancelled".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            results.iter().any(|b| b.id == batch_a.id),
+            "fully cancelled batch should match"
+        );
+        assert!(
+            results.iter().any(|b| b.id == batch_b.id),
+            "cancelling batch should also match"
+        );
+
+        // Neither should appear in "in_progress"
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("in_progress".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().all(|b| b.id != batch_a.id));
+        assert!(results.iter().all(|b| b.id != batch_b.id));
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_by_status_failed(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "failed-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Manually set failed_at to simulate a failed batch
+        sqlx::query!(
+            "UPDATE batches SET failed_at = NOW() WHERE id = $1",
+            *batch.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Should appear in "failed"
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("failed".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().any(|b| b.id == batch.id));
+
+        // Should NOT appear in "in_progress"
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("in_progress".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.iter().all(|b| b.id != batch.id));
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_filter_by_status_expired(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "expired-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Batch A: in-progress and past deadline (overdue)
+        let batch_a = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            *batch_a.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch B: completed AFTER its deadline (SLA miss)
+        let batch_b = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() - INTERVAL '2 hours', completed_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            *batch_b.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Batch C: completed BEFORE its deadline (on time — should NOT be expired)
+        let batch_c = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '1 hour', completed_at = NOW() WHERE id = $1",
+            *batch_c.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                status: Some("expired".to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            results.iter().any(|b| b.id == batch_a.id),
+            "overdue in-progress batch should match"
+        );
+        assert!(
+            results.iter().any(|b| b.id == batch_b.id),
+            "completed-after-deadline batch should match"
+        );
+        assert!(
+            results.iter().all(|b| b.id != batch_c.id),
+            "on-time completed batch should not match"
+        );
+    }
+
+    // =========================================================================
+    // LIST_FILES FILTER TESTS
+    // =========================================================================
+
+    #[sqlx::test]
+    async fn test_list_files_filter_by_api_key_id(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let key_a = uuid::Uuid::new_v4();
+        let key_b = uuid::Uuid::new_v4();
+
+        // Create file with api_key_id = key_a
+        let file_a = manager
+            .create_file_stream(stream::iter(vec![
+                FileStreamItem::Metadata(FileMetadata {
+                    filename: Some("file-a.jsonl".to_string()),
+                    api_key_id: Some(key_a),
+                    ..Default::default()
+                }),
+                FileStreamItem::Template(RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }),
+            ]))
+            .await
+            .unwrap();
+
+        // Create file with api_key_id = key_b
+        let file_b = manager
+            .create_file_stream(stream::iter(vec![
+                FileStreamItem::Metadata(FileMetadata {
+                    filename: Some("file-b.jsonl".to_string()),
+                    api_key_id: Some(key_b),
+                    ..Default::default()
+                }),
+                FileStreamItem::Template(RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }),
+            ]))
+            .await
+            .unwrap();
+
+        // Filter by key_a — should return only file_a
+        let results = manager
+            .list_files(crate::batch::FileFilter {
+                api_key_id: Some(key_a),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, file_a);
+
+        // Filter by key_b — should return only file_b
+        let results = manager
+            .list_files(crate::batch::FileFilter {
+                api_key_id: Some(key_b),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, file_b);
+
+        // No filter — should return both
+        let results = manager
+            .list_files(crate::batch::FileFilter::default())
+            .await
+            .unwrap();
+        let ids: Vec<_> = results.iter().map(|f| f.id).collect();
+        assert!(ids.contains(&file_a));
+        assert!(ids.contains(&file_b));
     }
 }
