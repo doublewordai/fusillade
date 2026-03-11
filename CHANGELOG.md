@@ -1,5 +1,16 @@
 # Changelog
 
+## [9.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v8.2.0...fusillade-v9.0.0) (2026-03-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* add api_key_id attribution to batches and files for org-scoped … ([#165](https://github.com/doublewordai/fusillade/issues/165))
+
+### Features
+
+* add api_key_id attribution to batches and files for org-scoped … ([#165](https://github.com/doublewordai/fusillade/issues/165)) ([0de6400](https://github.com/doublewordai/fusillade/commit/0de6400d8347084692316b7a24d456a04a9264c4))
+
 ## [8.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v8.1.1...fusillade-v8.2.0) (2026-03-11)
 
 
