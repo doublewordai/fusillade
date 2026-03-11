@@ -814,11 +814,25 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         }
 
         // Single query claims across all models using LATERAL.
-        // The inner subquery forces Postgres to use the requests partial index
-        // (requests-first plan) rather than scanning all batches.
+        // The active_batch_ids CTE pre-filters batches to avoid orphaned pending
+        // requests from cancelled/deleted batches consuming the inner LIMIT.
         let rows = sqlx::query!(
             r#"
-            WITH to_claim AS (
+            WITH active_batch_ids AS MATERIALIZED (
+                SELECT b.id
+                FROM batches b
+                WHERE b.cancelling_at IS NULL
+                    AND b.deleted_at IS NULL
+                    AND b.completed_at IS NULL
+                    AND b.failed_at IS NULL
+                    AND b.cancelled_at IS NULL
+                    AND EXISTS (
+                        SELECT 1 FROM requests r
+                        WHERE r.batch_id = b.id
+                            AND r.state = 'pending'
+                    )
+            ),
+            to_claim AS (
                 SELECT claimed.id, claimed.template_id, claimed.batch_id,
                        claimed.batch_id_str, claimed.batch_file_id,
                        claimed.batch_endpoint, claimed.batch_completion_window,
@@ -850,12 +864,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             AND r2.model = m.model
                             AND r2.template_id IS NOT NULL
                             AND (r2.not_before IS NULL OR r2.not_before <= $3)
+                            AND r2.batch_id IN (SELECT id FROM active_batch_ids)
                         LIMIT m.capacity
                         FOR UPDATE OF r2 SKIP LOCKED
                     ) r
                     JOIN batches b ON r.batch_id = b.id
-                    WHERE b.cancelling_at IS NULL
-                        AND b.deleted_at IS NULL
                     ORDER BY b.expires_at ASC
                     LIMIT m.capacity
                 ) claimed
