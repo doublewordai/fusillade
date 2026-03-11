@@ -281,7 +281,7 @@ where
     /// or the task is cancelled.
     ///
     /// The daemon periodically polls for cancelled batches and aborts in-flight requests.
-    #[tracing::instrument(skip(self), fields(daemon_id = %self.daemon_id))]
+    #[tracing::instrument(name = "fusillade.daemon.run", skip(self), fields(daemon_id = %self.daemon_id))]
     pub async fn run(self: Arc<Self>) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
 
@@ -688,16 +688,15 @@ where
                         .increment(1.0);
 
                     let process_span = tracing::info_span!(
-                        "process_request",
+                        parent: tracing::Span::none(),
+                        "fusillade.process_request",
                         trace_id = tracing::field::Empty,
-                        otel.name = "process_request",
+                        otel.name = "fusillade.process_request",
                         request_id = %request_id,
                         batch_id = %batch_id,
                         model = %model,
+                        outcome = tracing::field::Empty,
                     );
-                    // Start a new trace root so process_request isn't
-                    // parented under the claim_requests span.
-                    let _ = process_span.set_parent(opentelemetry::Context::new());
 
                     join_set.spawn(async move {
                         // Record trace_id from OTel context
@@ -720,36 +719,55 @@ where
                             gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
                         });
 
-                        tracing::debug!("Sending batch request to inference endpoint");
-
-                        // Launch request processing (this goes on a background thread)
-                        let processing = request.process(
-                            http_client,
-                            timeout_ms,
-                            storage.as_ref()
-                        ).await?;
+                        // Duration span covering the claimed state (from claim to process start)
+                        let retry_attempt = request.state.retry_attempt;
+                        let processing = async {
+                            tracing::debug!("Sending batch request to inference endpoint");
+                            request.process(
+                                http_client,
+                                timeout_ms,
+                                storage.as_ref()
+                            ).await
+                        }.instrument(tracing::info_span!(
+                            "fusillade.state.claimed",
+                            otel.name = "fusillade.state.claimed",
+                            request_id = %request_id,
+                            daemon_id = %daemon_id,
+                            retry_attempt,
+                        )).await?;
 
                         // Capture retry attempt count before completion (not preserved in Completed state)
                         let retry_attempt_at_completion = processing.state.retry_attempt;
                         // Capture batch expiry time for SLA missed completion tracking
                         let batch_expires_at = processing.state.batch_expires_at;
 
-                        let cancellation = async {
-                            tokio::select! {
-                                _ = batch_cancellation_token.cancelled() => {
-                                    crate::request::transitions::CancellationReason::User
+                        // Duration span covering the processing state (HTTP in-flight)
+                        let completion_result = async {
+                            let cancellation = async {
+                                tokio::select! {
+                                    _ = batch_cancellation_token.cancelled() => {
+                                        crate::request::transitions::CancellationReason::User
+                                    }
+                                    _ = shutdown_token.cancelled() => {
+                                        crate::request::transitions::CancellationReason::Shutdown
+                                    }
                                 }
-                                _ = shutdown_token.cancelled() => {
-                                    crate::request::transitions::CancellationReason::Shutdown
-                                }
-                            }
-                        };
+                            };
 
-                        // Wait for completion
-                        match processing.complete(storage.as_ref(), |response| {
-                            (should_retry)(response)
-                        }, cancellation).await {
+                            processing.complete(storage.as_ref(), |response| {
+                                (should_retry)(response)
+                            }, cancellation).await
+                        }.instrument(tracing::info_span!(
+                            "fusillade.state.processing",
+                            otel.name = "fusillade.state.processing",
+                            request_id = %request_id,
+                            retry_attempt = retry_attempt_at_completion,
+                            timeout_ms = timeout_ms,
+                        )).await;
+
+                        match completion_result {
                             Ok(RequestCompletionResult::Completed(completed)) => {
+                                tracing::Span::current().record("outcome", "completed");
                                 requests_processed.fetch_add(1, Ordering::Relaxed);
                                 counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
                                 histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
@@ -771,6 +789,7 @@ where
                                 tracing::debug!(request_id = %request_id, retry_attempts = retry_attempt_at_completion, "Request completed successfully");
                             }
                             Ok(RequestCompletionResult::Failed(failed)) => {
+                                tracing::Span::current().record("outcome", "failed");
                                 let retry_attempt = failed.state.retry_attempt;
 
                                 // Check if this is a retriable error using the FailureReason
@@ -792,10 +811,11 @@ where
                                                 "model" => model_clone.clone(),
                                                 "attempt" => (retry_attempt + 1).to_string()
                                             ).increment(1);
-                                            tracing::debug!(
+                                            tracing::info!(
                                                 request_id = %request_id,
+                                                batch_id = %batch_id,
                                                 retry_attempt = retry_attempt + 1,
-                                                "Request queued for retry"
+                                                "request.retry_persisted"
                                             );
                                         }
                                         Err(failed) => {
@@ -818,8 +838,11 @@ where
 
                                             tracing::warn!(
                                                 request_id = %request_id,
+                                                batch_id = %batch_id,
                                                 retry_attempt,
-                                                "Request failed permanently (no retries remaining)"
+                                                failure_reason = %failed.state.reason.metric_label(),
+                                                error = %failed.state.reason.to_error_message(),
+                                                "request.terminal_failure"
                                             );
                                         }
                                     }
@@ -841,20 +864,25 @@ where
 
                                     tracing::warn!(
                                         request_id = %request_id,
+                                        batch_id = %batch_id,
+                                        failure_reason = %failed.state.reason.metric_label(),
                                         error = %failed.state.reason.to_error_message(),
-                                        "Request failed with non-retriable error, not retrying"
+                                        "request.terminal_failure"
                                     );
                                 }
                             }
                             Ok(RequestCompletionResult::Canceled(_canceled)) => {
+                                tracing::Span::current().record("outcome", "canceled");
                                 counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled").increment(1);
                                 tracing::debug!(request_id = %request_id, "Request canceled by user");
                             }
                             Err(FusilladeError::Shutdown) => {
+                                tracing::Span::current().record("outcome", "shutdown");
                                 tracing::info!(request_id = %request_id, "Request aborted due to shutdown");
                                 // Don't count as failed - request will be reclaimed
                             }
                             Err(e) => {
+                                tracing::Span::current().record("outcome", "error");
                                 // Unexpected error
                                 tracing::error!(request_id = %request_id, error = %e, "Unexpected error processing request");
                                 return Err(e);
