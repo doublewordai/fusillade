@@ -831,6 +831,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         WHERE r.batch_id = b.id
                             AND r.state = 'pending'
                     )
+                ORDER BY b.created_at ASC
+                LIMIT $6::BIGINT
             ),
             to_claim AS (
                 SELECT claimed.id, claimed.template_id, claimed.batch_id,
@@ -906,6 +908,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             now,
             &models_arr,
             &capacities_arr,
+            self.config.max_active_batches as i64,
         )
         .fetch_all(self.pools.write())
         .await

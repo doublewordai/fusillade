@@ -1,5 +1,5 @@
 CREATE INDEX IF NOT EXISTS idx_batches_active
-ON batches (id)
+ON batches (created_at, id)
 WHERE cancelling_at IS NULL
   AND deleted_at IS NULL
   AND completed_at IS NULL

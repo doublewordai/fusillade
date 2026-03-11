@@ -153,6 +153,12 @@ pub struct DaemonConfig {
     /// Limits database load when many requests become stale simultaneously (e.g., daemon crash).
     pub unclaim_batch_size: usize,
 
+    /// Maximum number of active batches to consider during claim.
+    /// Bounds the materialized CTE that pre-filters non-terminal batches with pending requests.
+    /// Batches are ordered by creation date (oldest first, FIFO).
+    /// Default: 1000.
+    pub max_active_batches: usize,
+
     /// Interval for polling batches to perform finalization and check for cancellations (milliseconds).
     ///
     /// This polling loop serves two purposes:
@@ -219,6 +225,7 @@ impl Default for DaemonConfig {
             processing_timeout_ms: 600000,       // 10 minutes
             stale_daemon_threshold_ms: 30_000,   // 30 seconds (6× heartbeat interval)
             unclaim_batch_size: 100,             // Unclaim up to 100 stale requests per poll
+            max_active_batches: 1000,            // Consider up to 1000 active batches per claim
             cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
             batch_metadata_fields: default_batch_metadata_fields(),
             purge_interval_ms: 600_000, // 10 minutes
@@ -926,6 +933,7 @@ mod tests {
             processing_timeout_ms: 600000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
+            max_active_batches: 1000,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
             purge_interval_ms: 0,               // Disabled in tests
@@ -1098,6 +1106,7 @@ mod tests {
             processing_timeout_ms: 600000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
+            max_active_batches: 1000,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100, // Fast polling for tests
             purge_interval_ms: 0,               // Disabled in tests
@@ -1332,6 +1341,7 @@ mod tests {
             processing_timeout_ms: 600000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
+            max_active_batches: 1000,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
             purge_interval_ms: 0, // Disabled in tests
@@ -1471,6 +1481,7 @@ mod tests {
             processing_timeout_ms: 600000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
+            max_active_batches: 1000,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
             purge_interval_ms: 0, // Disabled in tests
@@ -1649,6 +1660,7 @@ mod tests {
             processing_timeout_ms: 600000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
+            max_active_batches: 1000,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
             purge_interval_ms: 0, // Disabled in tests
@@ -1811,6 +1823,7 @@ mod tests {
             processing_timeout_ms: 600000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
+            max_active_batches: 1000,
             batch_metadata_fields: vec![],
             cancellation_poll_interval_ms: 100,
             purge_interval_ms: 0, // Disabled in tests
@@ -1973,6 +1986,7 @@ mod tests {
             processing_timeout_ms: 600000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
+            max_active_batches: 1000,
             batch_metadata_fields: vec![
                 "id".to_string(),
                 "endpoint".to_string(),
@@ -2135,6 +2149,7 @@ mod tests {
             processing_timeout_ms: 600000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
+            max_active_batches: 1000,
             batch_metadata_fields: vec![
                 "id".to_string(),
                 "endpoint".to_string(),
