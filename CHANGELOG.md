@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v8.1.1...fusillade-v8.2.0) (2026-03-11)
+
+
+### Features
+
+* state transition events ([#161](https://github.com/doublewordai/fusillade/issues/161)) ([165ea9f](https://github.com/doublewordai/fusillade/commit/165ea9f44e5c043c379f035e75bafcef381ac5fb))
+
 ## [8.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v8.1.0...fusillade-v8.1.1) (2026-03-11)
 
 
