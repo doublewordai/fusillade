@@ -1867,9 +1867,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             query_builder.push_bind(search_pattern);
         }
 
-        if let Some(api_key_id) = &filter.api_key_id {
-            query_builder.push(" AND f.api_key_id = ");
-            query_builder.push_bind(*api_key_id);
+        if let Some(api_key_ids) = &filter.api_key_ids {
+            query_builder.push(" AND f.api_key_id = ANY(");
+            query_builder.push_bind(api_key_ids.as_slice());
+            query_builder.push(")");
         }
 
         // Add cursor-based pagination
@@ -2363,7 +2364,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             search,
             after,
             limit,
-            api_key_id,
+            api_key_ids,
             status,
             created_after,
             created_before,
@@ -2423,9 +2424,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         query_builder.push_bind(&search_pattern);
         query_builder.push(")");
 
-        if let Some(api_key_id) = &api_key_id {
-            query_builder.push(" AND b.api_key_id = ");
-            query_builder.push_bind(*api_key_id);
+        if let Some(api_key_ids) = &api_key_ids {
+            query_builder.push(" AND b.api_key_id = ANY(");
+            query_builder.push_bind(api_key_ids.as_slice());
+            query_builder.push(")");
         }
 
         if let Some(created_after) = &created_after {
@@ -9750,7 +9752,7 @@ mod tests {
         // Filter by key_a — should return only 1 batch
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
-                api_key_id: Some(key_a),
+                api_key_ids: Some(vec![key_a]),
                 limit: Some(100),
                 ..Default::default()
             })
@@ -10387,7 +10389,7 @@ mod tests {
         // Filter by key_a — should return only file_a
         let results = manager
             .list_files(crate::batch::FileFilter {
-                api_key_id: Some(key_a),
+                api_key_ids: Some(vec![key_a]),
                 ..Default::default()
             })
             .await
@@ -10398,7 +10400,7 @@ mod tests {
         // Filter by key_b — should return only file_b
         let results = manager
             .list_files(crate::batch::FileFilter {
-                api_key_id: Some(key_b),
+                api_key_ids: Some(vec![key_b]),
                 ..Default::default()
             })
             .await
