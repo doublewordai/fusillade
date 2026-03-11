@@ -360,7 +360,7 @@ pub struct FileFilter {
 pub struct ListBatchesFilter {
     /// Filter by batch creator
     pub created_by: Option<String>,
-    /// Search query (matches endpoint, filename, or batch ID)
+    /// Search query (matches metadata JSON text, filename, or batch ID)
     pub search: Option<String>,
     /// Cursor for pagination (batch ID to start after)
     pub after: Option<BatchId>,

@@ -2381,44 +2381,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             (None, None)
         };
 
-        // Use a single query with optional cursor filtering and on-demand counting
-        // Join with files table to enable searching by input filename
+        // Two-phase query: first filter and paginate batches (cheap), then attach
+        // request counts only to the result page (expensive LATERAL runs on ≤limit rows).
         let search_pattern = search.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
 
         let mut query_builder = QueryBuilder::new(
             r#"
-            SELECT
-                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
-                b.output_file_id, b.error_file_id, b.created_by, b.created_at,
-                b.expires_at, b.cancelling_at, b.errors,
-                b.total_requests,
-                b.requests_started_at,
-                b.finalizing_at,
-                b.completed_at,
-                b.failed_at,
-                b.cancelled_at,
-                b.deleted_at,
-                b.notification_sent_at,
-                b.api_key_id,
-                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
-                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
-                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
-                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
-            FROM batches b
-            LEFT JOIN files f ON b.file_id = f.id
-            LEFT JOIN LATERAL (
-                SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
-                    COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
-                FROM requests
-                WHERE batch_id = b.id
-            ) counts ON TRUE
-            WHERE b.deleted_at IS NULL
-              AND ("#,
+            WITH filtered AS (
+                SELECT b.*
+                FROM batches b
+                LEFT JOIN files f ON b.file_id = f.id
+                WHERE b.deleted_at IS NULL
+                  AND ("#,
         );
         query_builder.push_bind(&created_by);
         query_builder.push("::TEXT IS NULL OR b.created_by = ");
@@ -2433,13 +2407,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         query_builder.push_bind(after_id);
         query_builder.push(")) AND (");
         query_builder.push_bind(&search_pattern);
-        query_builder.push("::TEXT IS NULL OR LOWER(b.endpoint) LIKE ");
+        query_builder.push("::TEXT IS NULL OR LOWER(b.metadata::text) LIKE ");
         query_builder.push_bind(&search_pattern);
         query_builder.push(" OR LOWER(f.name) LIKE ");
         query_builder.push_bind(&search_pattern);
         query_builder.push(" OR b.id::text LIKE ");
-        query_builder.push_bind(&search_pattern);
-        query_builder.push(" OR LOWER(b.metadata::text) LIKE ");
         query_builder.push_bind(&search_pattern);
         query_builder.push(")");
 
@@ -2458,10 +2430,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             query_builder.push_bind(*created_before);
         }
 
-        // Status filtering: map OpenAI-style status names to DB conditions.
-        // Status is derived from multiple columns, so we use SQL conditions.
+        // Status filtering: map status names to DB column conditions.
+        // All filters use persisted batch columns only — no dependency on request counts.
+        // Derived sub-statuses (validating, finalizing) are resolved by the frontend
+        // from the count data attached in the second phase of this query.
         if let Some(ref status) = status {
             match status.as_str() {
+                "in_progress" => {
+                    // All non-terminal batches: covers validating, in_progress, and finalizing
+                    query_builder.push(" AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL");
+                }
                 "completed" => {
                     query_builder.push(" AND b.completed_at IS NOT NULL");
                 }
@@ -2469,28 +2447,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     query_builder.push(" AND b.failed_at IS NOT NULL AND b.completed_at IS NULL");
                 }
                 "cancelled" => {
-                    query_builder.push(" AND b.cancelled_at IS NOT NULL");
-                }
-                "cancelling" => {
-                    query_builder.push(" AND b.cancelling_at IS NOT NULL AND b.cancelled_at IS NULL AND b.completed_at IS NULL AND b.failed_at IS NULL");
-                }
-                "in_progress" => {
-                    query_builder.push(" AND b.total_requests > 0 AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL");
-                }
-                "validating" => {
-                    query_builder.push(" AND b.total_requests = 0 AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL");
-                }
-                "finalizing" => {
-                    // Finalizing: 95%+ of requests in terminal state but not all done yet.
-                    // Mirrors the logic in BatchStatus::openai_status().
-                    query_builder.push(" AND b.total_requests > 0 AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL AND (COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0))::float / b.total_requests::float >= 0.95");
+                    // Includes both cancelling and fully cancelled batches
+                    query_builder
+                        .push(" AND (b.cancelled_at IS NOT NULL OR b.cancelling_at IS NOT NULL)");
                 }
                 "expired" => {
                     query_builder.push(" AND b.expires_at IS NOT NULL AND b.expires_at < NOW()");
                 }
                 unknown => {
                     return Err(FusilladeError::Other(anyhow!(
-                        "Unknown batch status filter: '{}'. Valid values: validating, in_progress, finalizing, completed, failed, cancelled, cancelling, expired",
+                        "Unknown batch status filter: '{}'. Valid values: in_progress, completed, failed, cancelled, expired",
                         unknown
                     )));
                 }
@@ -2499,6 +2465,42 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         query_builder.push(" ORDER BY b.created_at DESC, b.id DESC LIMIT ");
         query_builder.push_bind(limit);
+
+        // Phase 2: attach request counts only to the filtered page of results
+        query_builder.push(
+            r#"
+            )
+            SELECT
+                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                b.output_file_id, b.error_file_id, b.created_by, b.created_at,
+                b.expires_at, b.cancelling_at, b.errors,
+                b.total_requests,
+                b.requests_started_at,
+                b.finalizing_at,
+                b.completed_at,
+                b.failed_at,
+                b.cancelled_at,
+                b.deleted_at,
+                b.notification_sent_at,
+                b.api_key_id,
+                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
+                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
+                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
+                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
+                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
+            FROM filtered b
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
+                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
+                    COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
+                FROM requests
+                WHERE batch_id = b.id
+            ) counts ON TRUE
+            "#,
+        );
 
         let rows = query_builder
             .build()
@@ -9977,7 +9979,9 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_list_batches_filter_by_status_validating(pool: sqlx::PgPool) {
+    async fn test_list_batches_filter_by_status_in_progress_includes_validating(
+        pool: sqlx::PgPool,
+    ) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -10013,8 +10017,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Manually reset total_requests to 0 to simulate "validating" state
-        // (create_batch sets total_requests from template count)
+        // Manually reset total_requests to 0 to simulate "validating" sub-state
         sqlx::query!(
             "UPDATE batches SET total_requests = 0 WHERE id = $1",
             *batch.id as Uuid,
@@ -10023,18 +10026,7 @@ mod tests {
         .await
         .unwrap();
 
-        // total_requests = 0, no terminal timestamps → "validating"
-        let results = manager
-            .list_batches(crate::batch::ListBatchesFilter {
-                status: Some("validating".to_string()),
-                limit: Some(100),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(results.iter().any(|b| b.id == batch.id));
-
-        // Should NOT appear in "in_progress"
+        // "in_progress" filter covers all non-terminal batches including validating
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 status: Some("in_progress".to_string()),
@@ -10043,7 +10035,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(results.iter().all(|b| b.id != batch.id));
+        assert!(results.iter().any(|b| b.id == batch.id));
     }
 
     #[sqlx::test]
@@ -10071,7 +10063,7 @@ mod tests {
             .await
             .unwrap();
 
-        let batch = manager
+        let batch_a = manager
             .create_batch(crate::batch::BatchInput {
                 file_id,
                 endpoint: "/v1/chat/completions".to_string(),
@@ -10083,10 +10075,31 @@ mod tests {
             .await
             .unwrap();
 
-        // Cancel the batch → sets both cancelling_at and cancelled_at
-        manager.cancel_batch(batch.id).await.unwrap();
+        let batch_b = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
 
-        // Should appear in "cancelled"
+        // Cancel batch_a fully (sets both cancelling_at and cancelled_at)
+        manager.cancel_batch(batch_a.id).await.unwrap();
+
+        // Set batch_b to cancelling-only (in-flight cancellation)
+        sqlx::query!(
+            "UPDATE batches SET cancelling_at = NOW() WHERE id = $1",
+            *batch_b.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // "cancelled" filter includes both fully cancelled and still-cancelling batches
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 status: Some("cancelled".to_string()),
@@ -10095,9 +10108,16 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(results.iter().any(|b| b.id == batch.id));
+        assert!(
+            results.iter().any(|b| b.id == batch_a.id),
+            "fully cancelled batch should match"
+        );
+        assert!(
+            results.iter().any(|b| b.id == batch_b.id),
+            "cancelling batch should also match"
+        );
 
-        // Should NOT appear in "in_progress"
+        // Neither should appear in "in_progress"
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 status: Some("in_progress".to_string()),
@@ -10106,76 +10126,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(results.iter().all(|b| b.id != batch.id));
-    }
-
-    #[sqlx::test]
-    async fn test_list_batches_filter_by_status_cancelling(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client,
-        );
-
-        let file_id = manager
-            .create_file(
-                "cancelling-test".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: None,
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/test".to_string(),
-                    body: "{}".to_string(),
-                    model: "test".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-            })
-            .await
-            .unwrap();
-
-        // Manually set only cancelling_at (without cancelled_at) to simulate "cancelling" state
-        sqlx::query!(
-            "UPDATE batches SET cancelling_at = NOW() WHERE id = $1",
-            *batch.id as Uuid,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Should appear in "cancelling"
-        let results = manager
-            .list_batches(crate::batch::ListBatchesFilter {
-                status: Some("cancelling".to_string()),
-                limit: Some(100),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(results.iter().any(|b| b.id == batch.id));
-
-        // Should NOT appear in "cancelled" (cancelled_at is still NULL)
-        let results = manager
-            .list_batches(crate::batch::ListBatchesFilter {
-                status: Some("cancelled".to_string()),
-                limit: Some(100),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(results.iter().all(|b| b.id != batch.id));
+        assert!(results.iter().all(|b| b.id != batch_a.id));
+        assert!(results.iter().all(|b| b.id != batch_b.id));
     }
 
     #[sqlx::test]

@@ -120,13 +120,15 @@ pub trait Storage: Send + Sync {
     ///
     /// See [`ListBatchesFilter`] for available filter options including:
     /// - `created_by` - Filter by batch creator user ID
-    /// - `search` - Case-insensitive substring match against endpoint, input filename,
-    ///   batch ID, or metadata JSON text
+    /// - `search` - Case-insensitive substring match against metadata JSON text,
+    ///   input filename, or batch ID
     /// - `after` / `limit` - Cursor-based pagination (limit defaults to 100 if not set)
     /// - `api_key_id` - Filter by the API key that created the batch (for per-member attribution)
-    /// - `status` - Filter by derived batch status. Supported values:
-    ///   `"validating"`, `"in_progress"`, `"finalizing"`, `"completed"`, `"failed"`,
-    ///   `"cancelled"`, `"cancelling"`, `"expired"`. Unrecognized values return an error.
+    /// - `status` - Filter by batch status. Supported values:
+    ///   `"in_progress"`, `"completed"`, `"failed"`, `"cancelled"`, `"expired"`.
+    ///   `"in_progress"` covers all non-terminal batches (including validating and finalizing
+    ///   sub-states). `"cancelled"` includes batches that are still cancelling.
+    ///   Unrecognized values return an error.
     /// - `created_after` / `created_before` - Time range filter on batch creation timestamp
     async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>>;
 
