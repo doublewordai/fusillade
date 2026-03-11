@@ -1792,6 +1792,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     async fn list_files(&self, filter: crate::batch::FileFilter) -> Result<Vec<File>> {
         use sqlx::QueryBuilder;
 
+        // Empty api_key_ids means "match nothing" — short-circuit to avoid a pointless DB query
+        if matches!(&filter.api_key_ids, Some(ids) if ids.is_empty()) {
+            return Ok(vec![]);
+        }
+
         // Get cursor timestamp if needed
         let after_created_at = if let Some(after_id) = &filter.after {
             sqlx::query!(
@@ -2359,6 +2364,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
     #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
     async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>> {
+        // Empty api_key_ids means "match nothing" — short-circuit to avoid a pointless DB query
+        if matches!(&filter.api_key_ids, Some(ids) if ids.is_empty()) {
+            return Ok(vec![]);
+        }
+
         let ListBatchesFilter {
             created_by,
             search,
@@ -9761,6 +9771,32 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].api_key_id, Some(key_a));
 
+        // Filter by both key_a and key_b — should return 2 batches
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                api_key_ids: Some(vec![key_a, key_b]),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        let returned_keys: std::collections::HashSet<_> =
+            results.iter().filter_map(|b| b.api_key_id).collect();
+        assert!(returned_keys.contains(&key_a));
+        assert!(returned_keys.contains(&key_b));
+
+        // Empty vec — should return 0 (not all)
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                api_key_ids: Some(vec![]),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 0);
+
         // No filter — should return all 3
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
@@ -10407,6 +10443,29 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, file_b);
+
+        // Filter by both key_a and key_b — should return both files
+        let results = manager
+            .list_files(crate::batch::FileFilter {
+                api_key_ids: Some(vec![key_a, key_b]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: std::collections::HashSet<_> = results.iter().map(|f| f.id).collect();
+        assert!(ids.contains(&file_a));
+        assert!(ids.contains(&file_b));
+
+        // Empty vec — should return 0 (not all)
+        let results = manager
+            .list_files(crate::batch::FileFilter {
+                api_key_ids: Some(vec![]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 0);
 
         // No filter — should return both
         let results = manager

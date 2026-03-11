@@ -349,8 +349,9 @@ pub struct FileFilter {
     pub after: Option<FileId>,
     /// Maximum number of results to return
     pub limit: Option<usize>,
-    /// Filter by API key UUID(s) (for per-member attribution). Matches batches/files
+    /// Filter by API key UUID(s) (for per-member attribution). Matches files
     /// created with any of the given keys, supporting users with keys across multiple contexts.
+    /// An empty vec is treated as "no matches" (returns no results), not as "no filter".
     pub api_key_ids: Option<Vec<Uuid>>,
     /// Sort order (true = ascending, false = descending)
     pub ascending: bool,
@@ -369,6 +370,7 @@ pub struct ListBatchesFilter {
     pub limit: Option<i64>,
     /// Filter by API key UUID(s) (for per-member attribution). Matches batches
     /// created with any of the given keys, supporting users with keys across multiple contexts.
+    /// An empty vec is treated as "no matches" (returns no results), not as "no filter".
     pub api_key_ids: Option<Vec<Uuid>>,
     /// Filter by batch status (e.g. "completed", "in_progress", "failed")
     pub status: Option<String>,
