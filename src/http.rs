@@ -85,7 +85,7 @@ impl Default for ReqwestHttpClient {
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
     // TODO: document
-    #[tracing::instrument(skip(self, request, api_key, timeout_ms), fields(
+    #[tracing::instrument(name = "fusillade.execute", skip(self, request, api_key, timeout_ms), fields(
         otel.name = %format!("{} {}", request.method, request.path),
     ))]
     async fn execute(
