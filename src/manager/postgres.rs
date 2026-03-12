@@ -8464,6 +8464,131 @@ mod tests {
         assert_eq!(claimed3[0].data.custom_id, Some("no-sla-1".to_string()));
     }
 
+    /// Verifies that when claiming requests, they are drawn from the
+    /// earliest-expiring batch first (FIFO by expires_at) rather than
+    /// scattered across batches in arbitrary index order.
+    ///
+    /// Creates 10 batches each with 3 requests. The "urgent" batch
+    /// (expires soonest) is created last so its UUIDs are unlikely to
+    /// come first in the btree index. With per-model capacity set to 3,
+    /// the claim should return exactly the 3 requests from the urgent
+    /// batch. On the old query (which grabbed requests in UUID index
+    /// order before sorting), this fails with ~90% probability.
+    #[sqlx::test]
+    async fn test_claim_drains_earliest_batch_first(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create 9 "filler" batches, each expiring in 6 hours
+        let mut filler_ids = Vec::new();
+        for i in 0..9 {
+            let file = manager
+                .create_file(
+                    format!("filler-{i}"),
+                    None,
+                    (0..3)
+                        .map(|j| RequestTemplateInput {
+                            custom_id: Some(format!("filler-{i}-{j}")),
+                            endpoint: "https://api.example.com".to_string(),
+                            method: "POST".to_string(),
+                            path: "/test".to_string(),
+                            body: "{}".to_string(),
+                            model: "test-fifo".to_string(),
+                            api_key: "key".to_string(),
+                        })
+                        .collect(),
+                )
+                .await
+                .unwrap();
+
+            let batch = manager
+                .create_batch(crate::batch::BatchInput {
+                    file_id: file,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    created_by: None,
+                })
+                .await
+                .unwrap();
+
+            sqlx::query!(
+                "UPDATE batches SET expires_at = NOW() + INTERVAL '6 hours' WHERE id = $1",
+                *batch.id as Uuid
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            filler_ids.push(batch.id);
+        }
+
+        // Create the "urgent" batch LAST — expires in 30 minutes.
+        // Being created last means its UUIDs are unlikely to be first
+        // in the btree index, so the old code would miss it.
+        let urgent_file = manager
+            .create_file(
+                "urgent".to_string(),
+                None,
+                (0..3)
+                    .map(|j| RequestTemplateInput {
+                        custom_id: Some(format!("urgent-{j}")),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test-fifo".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let urgent_batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: urgent_file,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *urgent_batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        // Capacity of 3 per model — exactly one batch worth.
+        // The old code's inner LIMIT would grab 3 from whichever batch
+        // the index hits first (random UUID order); the new code
+        // iterates batches by expires_at so it always picks the urgent one.
+        let capacity = HashMap::from([("test-fifo".to_string(), 3)]);
+
+        let claimed = manager
+            .claim_requests(3, daemon_id, &capacity)
+            .await
+            .expect("Failed to claim requests");
+
+        assert_eq!(claimed.len(), 3);
+        for req in &claimed {
+            assert_eq!(
+                req.data.batch_id, urgent_batch.id,
+                "All claimed requests should come from the urgent batch (earliest expires_at), \
+                 but got one from a filler batch — indicates non-FIFO ordering"
+            );
+        }
+    }
+
     #[sqlx::test]
     async fn test_empty_virtual_files_finalized_at_zero(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
