@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    SELECT created_at,\n                           CASE WHEN completed_at IS NULL AND failed_at IS NULL\n                                     AND cancelled_at IS NULL\n                                THEN 0 ELSE 1 END as \"priority!: i32\"\n                    FROM batches\n                    WHERE id = $1\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 1,
+        "name": "priority!: i32",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "87695a7b8cb48facfe6cbee26f40e92b6b9120e50b1be02322168133a16f7b11"
+}
