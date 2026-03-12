@@ -2373,11 +2373,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let limit = limit.unwrap_or(100);
 
         // Helper expression: 0 for active batches, 1 for terminal.
-        // A batch is "active" until it reaches a terminal state (completed, failed, or cancelled).
-        // Batches with cancelling_at set are still active — they remain active until
-        // cancellation finishes and cancelled_at is set.
+        // A batch is "active" when it has no terminal or cancellation timestamp set.
+        // cancelling_at is included because cancel_batch sets both cancelling_at and
+        // cancelled_at atomically — a cancelling batch is effectively terminal.
+        // This matches the "in_progress" status filter which also excludes cancelling_at.
         let priority_expr = "CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL \
-            AND b.cancelled_at IS NULL THEN 0 ELSE 1 END";
+            AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL THEN 0 ELSE 1 END";
 
         // If after is provided, get the cursor batch's created_at (and priority when
         // active_first is enabled) for cursor-based pagination.
@@ -2389,7 +2390,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     r#"
                     SELECT created_at,
                            CASE WHEN completed_at IS NULL AND failed_at IS NULL
-                                     AND cancelled_at IS NULL
+                                     AND cancelled_at IS NULL AND cancelling_at IS NULL
                                 THEN 0 ELSE 1 END as "priority!: i32"
                     FROM batches
                     WHERE id = $1
@@ -10634,8 +10635,8 @@ mod tests {
         // Mark some as terminal:
         //   [0] → completed (terminal)
         //   [1] → failed (terminal)
-        //   [2] → cancelled (terminal)
-        //   [3] → cancelling (cancelling_at set, cancelled_at NULL → still active!)
+        //   [2] → cancelled via cancel_batch (both cancelling_at + cancelled_at set → terminal)
+        //   [3] → cancelling only (cancelling_at set → terminal, matches cancel_batch semantics)
         //   [4] → active (no terminal timestamps)
         sqlx::query("UPDATE batches SET completed_at = NOW() WHERE id = $1")
             .bind(*batch_ids[0] as Uuid)
@@ -10647,11 +10648,13 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE batches SET cancelled_at = NOW() WHERE id = $1")
+        // Mirrors cancel_batch: sets both atomically
+        sqlx::query("UPDATE batches SET cancelling_at = NOW(), cancelled_at = NOW() WHERE id = $1")
             .bind(*batch_ids[2] as Uuid)
             .execute(&pool)
             .await
             .unwrap();
+        // cancelling_at alone is also terminal (defensive — shouldn't happen in practice)
         sqlx::query("UPDATE batches SET cancelling_at = NOW() WHERE id = $1")
             .bind(*batch_ids[3] as Uuid)
             .execute(&pool)
@@ -10682,8 +10685,9 @@ mod tests {
         );
 
         // With active_first=true, active batches come first, then terminal.
-        // Active: [4] (fully active), [3] (cancelling — still active). Newest first within group.
-        // Terminal: [2] (cancelled), [1] (failed), [0] (completed). Newest first within group.
+        // Active: [4] only (no terminal or cancellation timestamps).
+        // Terminal: [3] (cancelling), [2] (cancelled), [1] (failed), [0] (completed).
+        // Each group sorted by created_at DESC (newest first).
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 active_first: true,
@@ -10702,7 +10706,7 @@ mod tests {
                 batch_ids[1],
                 batch_ids[0]
             ],
-            "Active batches (including cancelling) should sort before terminal ones"
+            "Active batch should sort before all terminal ones (including cancelling)"
         );
     }
 

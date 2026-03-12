@@ -133,9 +133,9 @@ pub trait Storage: Send + Sync {
     ///   Unrecognized values return an error.
     /// - `created_after` / `created_before` - Time range filter on batch creation timestamp
     /// - `active_first` - When true, sorts active batches before terminal ones
-    ///   (completed, failed, or cancelled), with each group sorted by created_at DESC.
-    ///   Batches still cancelling (cancelling_at set, cancelled_at not yet set) are
-    ///   considered active. Cursor pagination respects this ordering.
+    ///   (completed, failed, cancelled, or cancelling), with each group sorted by
+    ///   created_at DESC. Cancelling batches are terminal because cancel_batch sets
+    ///   both timestamps atomically. Cursor pagination respects this ordering.
     async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>>;
 
     /// Get a batch by its output or error file ID.
