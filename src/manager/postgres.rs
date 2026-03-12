@@ -2368,26 +2368,56 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             status,
             created_after,
             created_before,
+            active_first,
         } = filter;
         let limit = limit.unwrap_or(100);
 
-        // If after is provided, get the created_at timestamp of that batch for cursor-based pagination
-        let (after_created_at, after_id) = if let Some(after_id) = after {
-            let row = sqlx::query!(
-                r#"
-                SELECT created_at
-                FROM batches
-                WHERE id = $1
-                "#,
-                *after_id as Uuid,
-            )
-            .fetch_optional(self.pools.read())
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e)))?;
+        // Helper expression: 0 for active batches, 1 for terminal.
+        // "Active" means no terminal timestamp has been set.
+        let priority_expr = "CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL \
+            AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL THEN 0 ELSE 1 END";
 
-            (row.map(|r| r.created_at), Some(*after_id as Uuid))
+        // If after is provided, get the cursor batch's created_at (and priority when
+        // active_first is enabled) for cursor-based pagination.
+        let (after_created_at, after_id, after_priority) = if let Some(after_id) = after {
+            if active_first {
+                // Need priority for 3-tuple cursor comparison
+                let row = sqlx::query_as::<_, (chrono::DateTime<Utc>, i32)>(&format!(
+                    "SELECT created_at, ({}) as priority FROM batches WHERE id = $1",
+                    priority_expr.replace("b.", "")
+                ))
+                .bind(*after_id as Uuid)
+                .fetch_optional(self.pools.read())
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e))
+                })?;
+
+                match row {
+                    Some((created_at, priority)) => {
+                        (Some(created_at), Some(*after_id as Uuid), Some(priority))
+                    }
+                    None => (None, Some(*after_id as Uuid), None),
+                }
+            } else {
+                let row = sqlx::query!(
+                    r#"
+                    SELECT created_at
+                    FROM batches
+                    WHERE id = $1
+                    "#,
+                    *after_id as Uuid,
+                )
+                .fetch_optional(self.pools.read())
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e))
+                })?;
+
+                (row.map(|r| r.created_at), Some(*after_id as Uuid), None)
+            }
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         // Two-phase query: first filter and paginate batches (cheap), then attach
@@ -2406,15 +2436,53 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         query_builder.push_bind(&created_by);
         query_builder.push("::TEXT IS NULL OR b.created_by = ");
         query_builder.push_bind(&created_by);
-        query_builder.push(") AND (");
-        query_builder.push_bind(after_created_at);
-        query_builder.push("::TIMESTAMPTZ IS NULL OR b.created_at < ");
-        query_builder.push_bind(after_created_at);
-        query_builder.push(" OR (b.created_at = ");
-        query_builder.push_bind(after_created_at);
-        query_builder.push(" AND b.id < ");
-        query_builder.push_bind(after_id);
-        query_builder.push(")) AND (");
+        query_builder.push(")");
+
+        // Cursor pagination: when active_first is enabled, we use a 3-tuple
+        // (priority, created_at, id) comparison. Otherwise, the classic 2-tuple.
+        if active_first {
+            // 3-tuple cursor: (priority, created_at DESC, id DESC)
+            // We want rows where (priority, created_at DESC, id DESC) comes AFTER the cursor.
+            // Since priority ASC, created_at DESC, id DESC:
+            //   row is "after" cursor when:
+            //     priority > cursor_priority  (lower priority section)
+            //     OR (priority = cursor_priority AND created_at < cursor_created_at)
+            //     OR (priority = cursor_priority AND created_at = cursor_created_at AND id < cursor_id)
+            query_builder.push(" AND (");
+            query_builder.push_bind(after_priority);
+            query_builder.push("::INT IS NULL OR (");
+            query_builder.push(priority_expr);
+            query_builder.push(") > ");
+            query_builder.push_bind(after_priority);
+            query_builder.push(" OR ((");
+            query_builder.push(priority_expr);
+            query_builder.push(") = ");
+            query_builder.push_bind(after_priority);
+            query_builder.push(" AND b.created_at < ");
+            query_builder.push_bind(after_created_at);
+            query_builder.push(") OR ((");
+            query_builder.push(priority_expr);
+            query_builder.push(") = ");
+            query_builder.push_bind(after_priority);
+            query_builder.push(" AND b.created_at = ");
+            query_builder.push_bind(after_created_at);
+            query_builder.push(" AND b.id < ");
+            query_builder.push_bind(after_id);
+            query_builder.push("))");
+        } else {
+            // Classic 2-tuple cursor: (created_at DESC, id DESC)
+            query_builder.push(" AND (");
+            query_builder.push_bind(after_created_at);
+            query_builder.push("::TIMESTAMPTZ IS NULL OR b.created_at < ");
+            query_builder.push_bind(after_created_at);
+            query_builder.push(" OR (b.created_at = ");
+            query_builder.push_bind(after_created_at);
+            query_builder.push(" AND b.id < ");
+            query_builder.push_bind(after_id);
+            query_builder.push("))");
+        }
+
+        query_builder.push(" AND (");
         query_builder.push_bind(&search_pattern);
         query_builder.push("::TEXT IS NULL OR LOWER(b.metadata::text) LIKE ");
         query_builder.push_bind(&search_pattern);
@@ -2482,10 +2550,27 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             }
         }
 
-        query_builder.push(" ORDER BY b.created_at DESC, b.id DESC LIMIT ");
+        // ORDER BY: when active_first is enabled, sort by priority (active=0 first),
+        // then by created_at DESC within each group. Otherwise, pure chronological.
+        if active_first {
+            query_builder.push(" ORDER BY (");
+            query_builder.push(priority_expr);
+            query_builder.push(") ASC, b.created_at DESC, b.id DESC LIMIT ");
+        } else {
+            query_builder.push(" ORDER BY b.created_at DESC, b.id DESC LIMIT ");
+        }
         query_builder.push_bind(limit);
 
         // Phase 2: attach request counts only to the filtered page of results
+        let phase2_order = if active_first {
+            format!(
+                "ORDER BY ({}) ASC, b.created_at DESC, b.id DESC",
+                priority_expr
+            )
+        } else {
+            "ORDER BY b.created_at DESC, b.id DESC".to_string()
+        };
+
         query_builder.push(
             r#"
             )
@@ -2518,9 +2603,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
-            ORDER BY b.created_at DESC, b.id DESC
             "#,
         );
+        query_builder.push(&phase2_order);
 
         let rows = query_builder
             .build()

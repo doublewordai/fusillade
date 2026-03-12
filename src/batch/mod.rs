@@ -378,6 +378,9 @@ pub struct ListBatchesFilter {
     pub created_after: Option<DateTime<Utc>>,
     /// Only return batches created before this timestamp
     pub created_before: Option<DateTime<Utc>>,
+    /// When true, sort active (non-terminal) batches before terminal ones,
+    /// with each group sorted by created_at DESC. Default false (pure chronological).
+    pub active_first: bool,
 }
 
 /// Items that can be yielded from a file upload stream

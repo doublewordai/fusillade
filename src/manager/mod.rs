@@ -116,7 +116,7 @@ pub trait Storage: Send + Sync {
     async fn list_file_batches(&self, file_id: FileId) -> Result<Vec<BatchStatus>>;
 
     /// List batches with optional filtering and cursor-based pagination.
-    /// Returns batches sorted by created_at DESC.
+    /// Returns batches sorted by created_at DESC (or active-first when `active_first` is set).
     ///
     /// See [`ListBatchesFilter`] for available filter options including:
     /// - `created_by` - Filter by batch creator user ID
@@ -132,6 +132,8 @@ pub trait Storage: Send + Sync {
     ///   or terminal batches that finished after their deadline.
     ///   Unrecognized values return an error.
     /// - `created_after` / `created_before` - Time range filter on batch creation timestamp
+    /// - `active_first` - When true, sorts non-terminal batches before terminal ones,
+    ///   with each group sorted by created_at DESC. Cursor pagination respects this ordering.
     async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>>;
 
     /// Get a batch by its output or error file ID.
