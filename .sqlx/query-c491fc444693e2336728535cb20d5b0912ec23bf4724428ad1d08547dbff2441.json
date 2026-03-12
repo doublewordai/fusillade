@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                SELECT created_at\n                FROM batches\n                WHERE id = $1\n                ",
+  "query": "\n                    SELECT created_at\n                    FROM batches\n                    WHERE id = $1\n                    ",
   "describe": {
     "columns": [
       {
@@ -18,5 +18,5 @@
       false
     ]
   },
-  "hash": "e8bac693c693d27119b21bd4fc5b780a47b78e40d30522fe0a21fd448d2a4f0a"
+  "hash": "c491fc444693e2336728535cb20d5b0912ec23bf4724428ad1d08547dbff2441"
 }
