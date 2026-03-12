@@ -29,6 +29,8 @@ anyhow = "1"
 thiserror = "2"
 async-trait = "0.1"
 futures = "0.3"
+eventsource-stream = "0.2"
+openai-reassembler = "v0.1.0"
 parking_lot = "0.12"
 scopeguard = "1"
 humantime = "2"
@@ -41,10 +43,4 @@ sqlx-pool-router = "0.2.0"
 
 [dev-dependencies]
 test-log = "0.2.18"
-tokio-test = "0.4"
 axum = "0.8"
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
-tracing-subscriber = "0.3"
-rstest = "0.26"
-clap = { version = "4", features = ["derive"] }

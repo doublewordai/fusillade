@@ -4,9 +4,16 @@
 //! enabling testability with mock implementations.
 
 use crate::error::Result;
+/// Function signature for stream reassemblers.
+///
+/// A reassembler takes a slice of collected SSE events and produces a single
+/// response body string. Use [`openai_reassembler::reassemble`] for
+/// OpenAI-compatible endpoints.
+pub type StreamReassembler = fn(&[eventsource_stream::Event]) -> anyhow::Result<String>;
 use crate::types::RequestData;
 use async_trait::async_trait;
 use opentelemetry::trace::TraceContextExt;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -73,6 +80,7 @@ pub struct ReqwestHttpClient {
     first_chunk_timeout: Duration,
     chunk_timeout: Duration,
     body_timeout: Duration,
+    stream_reassembler: Option<StreamReassembler>,
 }
 
 impl ReqwestHttpClient {
@@ -87,7 +95,23 @@ impl ReqwestHttpClient {
             first_chunk_timeout,
             chunk_timeout,
             body_timeout,
+            stream_reassembler: Some(openai_reassembler::reassemble),
         }
+    }
+
+    /// Set a stream reassembler function that converts collected SSE events
+    /// into a single response body. Without this, streaming responses are stored as
+    /// newline-delimited event data payloads.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use openai_reassembler::reassemble;
+    /// let client = ReqwestHttpClient::new(...)
+    ///     .with_stream_reassembler(|events| reassemble(events).map_err(Into::into));
+    /// ```
+    pub fn with_stream_reassembler(mut self, reassembler: StreamReassembler) -> Self {
+        self.stream_reassembler = Some(reassembler);
+        self
     }
 }
 
@@ -243,18 +267,27 @@ impl ReqwestHttpClient {
     /// Execute a streaming request with split timeouts:
     /// - first_chunk_timeout: connect + headers + first body chunk (time-to-first-token).
     ///   Handles servers (like vLLM) that return headers immediately but queue the request.
-    /// - chunk_timeout: max idle time between subsequent body chunks.
+    /// - chunk_timeout: max idle time between subsequent SSE events.
     /// - body_timeout: max total time for the entire response body.
+    ///
+    /// The response is parsed as an SSE stream via `eventsource-stream`. Each event's
+    /// `data` field is collected (excluding `[DONE]`), and the final body is the
+    /// newline-joined data payloads.
     async fn execute_streaming(
         &self,
         request: &RequestData,
         req: reqwest::RequestBuilder,
         url: &str,
     ) -> Result<HttpResponse> {
-        let (mut response, status, first_chunk) = tokio::time::timeout(
+        use eventsource_stream::Eventsource;
+        use futures::StreamExt;
+
+        // Phase 1: connect, get headers, and wait for the first SSE event
+        // within first_chunk_timeout (time-to-first-token).
+        let (mut stream, status, first_event) = tokio::time::timeout(
             self.first_chunk_timeout,
             async {
-                let mut resp = req
+                let resp = req
                     .send()
                     .await
                     .map_err(|e| -> crate::error::FusilladeError { e.into() })
@@ -269,11 +302,15 @@ impl ReqwestHttpClient {
                         );
                     })?;
                 let status = resp.status().as_u16();
-                let first_chunk = resp
-                    .chunk()
-                    .await
-                    .map_err(|e| -> crate::error::FusilladeError { e.into() })?;
-                Ok::<_, crate::error::FusilladeError>((resp, status, first_chunk))
+                let mut stream = resp.bytes_stream().eventsource();
+                let first = match stream.next().await {
+                    Some(Ok(event)) => Some(event),
+                    Some(Err(e)) => {
+                        return Err(anyhow::anyhow!("SSE parse error from {}: {}", url, e).into());
+                    }
+                    None => None,
+                };
+                Ok::<_, crate::error::FusilladeError>((stream, status, first))
             },
         )
         .await
@@ -285,24 +322,30 @@ impl ReqwestHttpClient {
             ))
         })??;
 
-        let body_bytes = tokio::time::timeout(self.body_timeout, async {
-            let mut buf = Vec::from(first_chunk.unwrap_or_default());
+        // Phase 2: collect all SSE events with per-event and total body timeouts.
+        let collected = tokio::time::timeout(self.body_timeout, async {
+            let mut events: Vec<eventsource_stream::Event> = Vec::new();
+            if let Some(event) = first_event {
+                events.push(event);
+            }
             loop {
-                match tokio::time::timeout(self.chunk_timeout, response.chunk()).await {
-                    Ok(Ok(Some(chunk))) => buf.extend_from_slice(&chunk),
-                    Ok(Ok(None)) => break,
-                    Ok(Err(e)) => return Err(e.into()),
+                match tokio::time::timeout(self.chunk_timeout, stream.next()).await {
+                    Ok(Some(Ok(event))) => events.push(event),
+                    Ok(Some(Err(e))) => {
+                        return Err(anyhow::anyhow!("SSE parse error from {}: {}", url, e).into());
+                    }
+                    Ok(None) => break,
                     Err(_) => {
                         return Err(crate::error::FusilladeError::TokensTimeout(format!(
-                            "Body read stalled from {} after {}ms ({} bytes received)",
+                            "SSE stream stalled from {} after {}ms ({} events received)",
                             url,
                             self.chunk_timeout.as_millis(),
-                            buf.len()
+                            events.len()
                         )));
                     }
                 }
             }
-            Ok(buf)
+            Ok(events)
         })
         .await
         .map_err(|_| {
@@ -312,14 +355,17 @@ impl ReqwestHttpClient {
                 self.body_timeout.as_millis()
             ))
         })??;
-        let body = String::from_utf8(body_bytes)
-            .map_err(|e| anyhow::anyhow!("Response body from {} is not valid UTF-8: {}", url, e))?;
+
+        let body = match &self.stream_reassembler {
+            Some(reassemble) => reassemble(&collected)?,
+            None => collected.iter().map(|e| e.data.as_str()).collect::<Vec<_>>().join("\n"),
+        };
 
         tracing::debug!(
             request_id = %request.id,
             status = status,
             response_len = body.len(),
-            "HTTP request completed"
+            "Streaming HTTP request completed"
         );
 
         Ok(HttpResponse { status, body })
@@ -333,7 +379,6 @@ impl ReqwestHttpClient {
 // TODO: this should be a separate file within an http/ module.
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::oneshot;
 
@@ -854,13 +899,15 @@ mod tests {
     async fn test_read_timeout_on_stalled_body() {
         use axum::{Router, http::StatusCode, routing::post};
 
-        // Server sends headers + partial body, then stalls forever
+        // Server sends one SSE event, then stalls forever
         let app = Router::new().route(
             "/test",
             post(|| async {
                 use futures::StreamExt;
                 let stream = futures::stream::once(async {
-                    Ok::<_, std::convert::Infallible>("partial".to_string().into_bytes())
+                    Ok::<_, std::convert::Infallible>(
+                        "data: {\"chunk\":1}\n\n".to_string().into_bytes(),
+                    )
                 })
                 .chain(futures::stream::pending());
 
@@ -901,7 +948,7 @@ mod tests {
 
         match err {
             crate::error::FusilladeError::TokensTimeout(msg) => {
-                assert!(msg.contains("Body read stalled"));
+                assert!(msg.contains("SSE stream stalled"));
             }
             other => panic!("Expected TokensTimeout, got: {:?}", other),
         }
@@ -955,7 +1002,7 @@ mod tests {
         use axum::{Router, http::StatusCode, routing::post};
         use futures::StreamExt;
 
-        // Server sends one chunk every 50ms — never trips the 200ms chunk timeout,
+        // Server sends one SSE event every 50ms — never trips the 200ms chunk timeout,
         // but exceeds the 300ms body timeout.
         let app = Router::new().route(
             "/test",
@@ -966,7 +1013,9 @@ mod tests {
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     Some((
-                        Ok::<_, std::convert::Infallible>(format!("chunk-{i}").into_bytes()),
+                        Ok::<_, std::convert::Infallible>(
+                            format!("data: {{\"chunk\":{i}}}\n\n").into_bytes(),
+                        ),
                         i + 1,
                     ))
                 })
