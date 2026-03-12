@@ -849,6 +849,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         LIMIT m.capacity
                         FOR UPDATE OF r3 SKIP LOCKED
                     ) r2
+                    ORDER BY ab.expires_at ASC, ab.id ASC
                     LIMIT m.capacity
                 ) claimed
                 LIMIT $2::BIGINT
