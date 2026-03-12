@@ -2403,9 +2403,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 })?;
 
                 match row {
-                    Some(r) => {
-                        (Some(r.created_at), Some(*after_id as Uuid), Some(r.priority))
-                    }
+                    Some(r) => (
+                        Some(r.created_at),
+                        Some(*after_id as Uuid),
+                        Some(r.priority),
+                    ),
                     None => (None, Some(*after_id as Uuid), None),
                 }
             } else {
@@ -10668,7 +10670,16 @@ mod tests {
             .unwrap();
         let result_ids: Vec<_> = results.iter().map(|b| b.id).collect();
         // newest first: [4], [3], [2], [1], [0]
-        assert_eq!(result_ids, vec![batch_ids[4], batch_ids[3], batch_ids[2], batch_ids[1], batch_ids[0]]);
+        assert_eq!(
+            result_ids,
+            vec![
+                batch_ids[4],
+                batch_ids[3],
+                batch_ids[2],
+                batch_ids[1],
+                batch_ids[0]
+            ]
+        );
 
         // With active_first=true, active batches come first, then terminal.
         // Active: [4] (fully active), [3] (cancelling — still active). Newest first within group.
@@ -10684,7 +10695,13 @@ mod tests {
         let result_ids: Vec<_> = results.iter().map(|b| b.id).collect();
         assert_eq!(
             result_ids,
-            vec![batch_ids[4], batch_ids[3], batch_ids[2], batch_ids[1], batch_ids[0]],
+            vec![
+                batch_ids[4],
+                batch_ids[3],
+                batch_ids[2],
+                batch_ids[1],
+                batch_ids[0]
+            ],
             "Active batches (including cancelling) should sort before terminal ones"
         );
     }
@@ -10792,10 +10809,16 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(page3.is_empty(), "Should have no more results after last page");
+        assert!(
+            page3.is_empty(),
+            "Should have no more results after last page"
+        );
 
         // Full traversal should yield all batches in correct order with no duplicates.
         let all_ids: Vec<_> = page1.iter().chain(page2.iter()).map(|b| b.id).collect();
-        assert_eq!(all_ids, vec![batch_ids[3], batch_ids[2], batch_ids[1], batch_ids[0]]);
+        assert_eq!(
+            all_ids,
+            vec![batch_ids[3], batch_ids[2], batch_ids[1], batch_ids[0]]
+        );
     }
 }
