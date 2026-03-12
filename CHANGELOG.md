@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v11.0.0...fusillade-v11.0.1) (2026-03-12)
+
+
+### Bug Fixes
+
+* FIFO claim ordering via batch-first LATERAL join ([#176](https://github.com/doublewordai/fusillade/issues/176)) ([0226c14](https://github.com/doublewordai/fusillade/commit/0226c1400314c92ac7608e2af89c67e15a84036f))
+
 ## [11.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v10.0.0...fusillade-v11.0.0) (2026-03-11)
 
 
