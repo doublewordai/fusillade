@@ -2379,8 +2379,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // This matches the "in_progress" status filter which also excludes cancelling_at.
         //
         // This expression is used in the cursor lookup query and the CTE below.
-        // The CTE computes it as a column so ORDER BY and cursor WHERE can reference
-        // `priority` without repeating the CASE expression.
+        // The CTE computes it as a column so ORDER BY clauses can reference
+        // `priority` without repeating the CASE expression. The cursor WHERE
+        // still uses priority_expr directly (SQL doesn't allow aliases in WHERE).
         let priority_expr = "CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL \
             AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL THEN 0 ELSE 1 END";
 
@@ -2440,9 +2441,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // Two-phase query: first filter and paginate batches (cheap), then attach
         // request counts only to the result page (expensive LATERAL runs on ≤limit rows).
         //
-        // The CTE computes `priority` once via priority_expr so that ORDER BY and
-        // cursor WHERE clauses can reference the column name instead of repeating
-        // the CASE expression.
+        // The CTE computes `priority` once via priority_expr so that ORDER BY
+        // clauses can reference the column name instead of repeating the CASE
+        // expression. (The cursor WHERE still uses priority_expr directly since
+        // SQL doesn't allow aliases in WHERE.)
         let search_pattern = search.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
 
         let mut query_builder = QueryBuilder::new(
@@ -2492,7 +2494,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             query_builder.push_bind(after_created_at);
             query_builder.push(" AND b.id < ");
             query_builder.push_bind(after_id);
-            query_builder.push("))");
+            query_builder.push(")))");
         } else {
             // Classic 2-tuple cursor: (created_at DESC, id DESC)
             query_builder.push(" AND (");
