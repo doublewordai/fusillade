@@ -2372,11 +2372,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         } = filter;
         let limit = limit.unwrap_or(100);
 
-        // Helper expression: 0 for active batches, 1 for terminal.
-        // A batch is "active" when it has no terminal or cancellation timestamp set.
+        // Single source of truth for active/terminal classification.
+        // 0 = active (no terminal or cancellation timestamp set), 1 = terminal.
         // cancelling_at is included because cancel_batch sets both cancelling_at and
         // cancelled_at atomically — a cancelling batch is effectively terminal.
         // This matches the "in_progress" status filter which also excludes cancelling_at.
+        //
+        // This expression is used in the cursor lookup query and the CTE below.
+        // The CTE computes it as a column so ORDER BY and cursor WHERE can reference
+        // `priority` without repeating the CASE expression.
         let priority_expr = "CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL \
             AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL THEN 0 ELSE 1 END";
 
@@ -2385,7 +2389,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let (after_created_at, after_id, after_priority) = if let Some(after_id) = after {
             if active_first {
                 // Need priority for 3-tuple cursor comparison.
-                // Priority mirrors priority_expr: 0 = active, 1 = terminal.
+                // Uses the same CASE expression as priority_expr (without the `b.` alias
+                // since this queries `batches` directly).
                 let row = sqlx::query!(
                     r#"
                     SELECT created_at,
@@ -2434,12 +2439,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         // Two-phase query: first filter and paginate batches (cheap), then attach
         // request counts only to the result page (expensive LATERAL runs on ≤limit rows).
+        //
+        // The CTE computes `priority` once via priority_expr so that ORDER BY and
+        // cursor WHERE clauses can reference the column name instead of repeating
+        // the CASE expression.
         let search_pattern = search.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
 
         let mut query_builder = QueryBuilder::new(
             r#"
             WITH filtered AS (
-                SELECT b.*
+                SELECT b.*, ("#,
+        );
+        query_builder.push(priority_expr);
+        query_builder.push(
+            r#") AS priority
                 FROM batches b
                 LEFT JOIN files f ON b.file_id = f.id
                 WHERE b.deleted_at IS NULL
@@ -2452,14 +2465,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         // Cursor pagination: when active_first is enabled, we use a 3-tuple
         // (priority, created_at, id) comparison. Otherwise, the classic 2-tuple.
+        // The `priority` column is computed in the CTE SELECT above.
         if active_first {
-            // 3-tuple cursor: (priority, created_at DESC, id DESC)
-            // We want rows where (priority, created_at DESC, id DESC) comes AFTER the cursor.
-            // Since priority ASC, created_at DESC, id DESC:
-            //   row is "after" cursor when:
-            //     priority > cursor_priority  (lower priority section)
-            //     OR (priority = cursor_priority AND created_at < cursor_created_at)
-            //     OR (priority = cursor_priority AND created_at = cursor_created_at AND id < cursor_id)
+            // 3-tuple cursor: (priority ASC, created_at DESC, id DESC)
+            // Row comes after cursor when:
+            //   priority > cursor_priority  (lower priority group)
+            //   OR (priority = cursor_priority AND created_at < cursor_created_at)
+            //   OR (priority = cursor_priority AND created_at = cursor_created_at AND id < cursor_id)
             query_builder.push(" AND (");
             query_builder.push_bind(after_priority);
             query_builder.push("::INT IS NULL OR (");
@@ -2562,25 +2574,22 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             }
         }
 
-        // ORDER BY: when active_first is enabled, sort by priority (active=0 first),
-        // then by created_at DESC within each group. Otherwise, pure chronological.
+        // ORDER BY: when active_first is enabled, sort by the `priority` column
+        // computed in the CTE SELECT (0=active first, 1=terminal), then by
+        // created_at DESC within each group. Otherwise, pure chronological.
         if active_first {
-            query_builder.push(" ORDER BY (");
-            query_builder.push(priority_expr);
-            query_builder.push(") ASC, b.created_at DESC, b.id DESC LIMIT ");
+            query_builder.push(" ORDER BY priority ASC, b.created_at DESC, b.id DESC LIMIT ");
         } else {
             query_builder.push(" ORDER BY b.created_at DESC, b.id DESC LIMIT ");
         }
         query_builder.push_bind(limit);
 
-        // Phase 2: attach request counts only to the filtered page of results
+        // Phase 2: attach request counts only to the filtered page of results.
+        // References the `priority` column from the CTE output.
         let phase2_order = if active_first {
-            format!(
-                "ORDER BY ({}) ASC, b.created_at DESC, b.id DESC",
-                priority_expr
-            )
+            "ORDER BY b.priority ASC, b.created_at DESC, b.id DESC"
         } else {
-            "ORDER BY b.created_at DESC, b.id DESC".to_string()
+            "ORDER BY b.created_at DESC, b.id DESC"
         };
 
         query_builder.push(
@@ -2617,7 +2626,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ) counts ON TRUE
             "#,
         );
-        query_builder.push(&phase2_order);
+        query_builder.push(phase2_order);
 
         let rows = query_builder
             .build()
@@ -10608,6 +10617,7 @@ mod tests {
             .unwrap();
 
         // Create 5 batches with staggered created_at so ordering is deterministic.
+        // Timestamps: [0]=+0s, [1]=+1s, [2]=+2s, [3]=+3s, [4]=+4s (oldest→newest).
         let mut batch_ids = Vec::new();
         for i in 0..5 {
             let batch = manager
@@ -10621,7 +10631,6 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            // Space out created_at so newest-first ordering is deterministic.
             sqlx::query("UPDATE batches SET created_at = NOW() + ($1 || ' seconds')::INTERVAL WHERE id = $2")
                 .bind(i.to_string())
                 .bind(*batch.id as Uuid)
@@ -10631,36 +10640,30 @@ mod tests {
             batch_ids.push(batch.id);
         }
 
-        // batch_ids[0..4] ordered oldest→newest by created_at.
-        // Mark some as terminal:
-        //   [0] → completed (terminal)
-        //   [1] → failed (terminal)
-        //   [2] → cancelled via cancel_batch (both cancelling_at + cancelled_at set → terminal)
-        //   [3] → cancelling only (cancelling_at set → terminal, matches cancel_batch semantics)
-        //   [4] → active (no terminal timestamps)
+        // Key: some terminal batches are NEWER than active batches so that
+        // active_first=true produces a different order than pure chronological.
+        //   [0] → active  (oldest)
+        //   [1] → active
+        //   [2] → completed (terminal — newer than both active batches)
+        //   [3] → cancelled via cancel_batch (terminal — both cancelling_at + cancelled_at)
+        //   [4] → cancelling only (terminal — cancelling_at set, newest batch)
         sqlx::query("UPDATE batches SET completed_at = NOW() WHERE id = $1")
-            .bind(*batch_ids[0] as Uuid)
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE batches SET failed_at = NOW() WHERE id = $1")
-            .bind(*batch_ids[1] as Uuid)
+            .bind(*batch_ids[2] as Uuid)
             .execute(&pool)
             .await
             .unwrap();
         // Mirrors cancel_batch: sets both atomically
         sqlx::query("UPDATE batches SET cancelling_at = NOW(), cancelled_at = NOW() WHERE id = $1")
-            .bind(*batch_ids[2] as Uuid)
+            .bind(*batch_ids[3] as Uuid)
             .execute(&pool)
             .await
             .unwrap();
         // cancelling_at alone is also terminal (defensive — shouldn't happen in practice)
         sqlx::query("UPDATE batches SET cancelling_at = NOW() WHERE id = $1")
-            .bind(*batch_ids[3] as Uuid)
+            .bind(*batch_ids[4] as Uuid)
             .execute(&pool)
             .await
             .unwrap();
-        // batch_ids[4] stays fully active (no terminal timestamps).
 
         // With active_first=false, should be pure chronological (newest first).
         let results = manager
@@ -10685,9 +10688,9 @@ mod tests {
         );
 
         // With active_first=true, active batches come first, then terminal.
-        // Active: [4] only (no terminal or cancellation timestamps).
-        // Terminal: [3] (cancelling), [2] (cancelled), [1] (failed), [0] (completed).
-        // Each group sorted by created_at DESC (newest first).
+        // Active group (newest first): [1], [0]
+        // Terminal group (newest first): [4] (cancelling), [3] (cancelled), [2] (completed)
+        // This differs from chronological — [0] and [1] are promoted above newer terminal batches.
         let results = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 active_first: true,
@@ -10700,13 +10703,13 @@ mod tests {
         assert_eq!(
             result_ids,
             vec![
+                batch_ids[1],
+                batch_ids[0],
                 batch_ids[4],
                 batch_ids[3],
-                batch_ids[2],
-                batch_ids[1],
-                batch_ids[0]
+                batch_ids[2]
             ],
-            "Active batch should sort before all terminal ones (including cancelling)"
+            "Active batches should sort before newer terminal ones"
         );
     }
 
@@ -10736,6 +10739,7 @@ mod tests {
             .unwrap();
 
         // Create 4 batches with staggered timestamps.
+        // Timestamps: [0]=+0s, [1]=+1s, [2]=+2s, [3]=+3s (oldest→newest).
         let mut batch_ids = Vec::new();
         for i in 0..4 {
             let batch = manager
@@ -10758,22 +10762,24 @@ mod tests {
             batch_ids.push(batch.id);
         }
 
-        // [0] → completed (terminal)
-        // [1] → completed (terminal)
-        // [2] → active
-        // [3] → active
+        // Terminal batches are NEWER than active ones to exercise promotion.
+        // [0] → active  (oldest)
+        // [1] → active
+        // [2] → completed (terminal, newer than active batches)
+        // [3] → completed (terminal, newest)
         sqlx::query("UPDATE batches SET completed_at = NOW() WHERE id = $1")
-            .bind(*batch_ids[0] as Uuid)
+            .bind(*batch_ids[2] as Uuid)
             .execute(&pool)
             .await
             .unwrap();
         sqlx::query("UPDATE batches SET completed_at = NOW() WHERE id = $1")
-            .bind(*batch_ids[1] as Uuid)
+            .bind(*batch_ids[3] as Uuid)
             .execute(&pool)
             .await
             .unwrap();
 
-        // Expected active_first order: [3], [2] (active, newest first), [1], [0] (terminal, newest first).
+        // Expected active_first order: [1], [0] (active, newest first), [3], [2] (terminal, newest first).
+        // This differs from chronological ([3],[2],[1],[0]) — active batches are promoted.
 
         // Page 1: limit=2, should get the two active batches.
         let page1 = manager
@@ -10785,11 +10791,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page1.len(), 2);
-        assert_eq!(page1[0].id, batch_ids[3]);
-        assert_eq!(page1[1].id, batch_ids[2]);
+        assert_eq!(page1[0].id, batch_ids[1], "newest active batch first");
+        assert_eq!(page1[1].id, batch_ids[0], "oldest active batch second");
 
-        // Page 2: cursor = last item from page 1 (batch_ids[2], an active batch).
-        // Should cross the active/terminal boundary and return the two terminal batches.
+        // Page 2: cursor = last active batch. Should cross the active/terminal
+        // boundary and return the two terminal batches.
         let page2 = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 active_first: true,
@@ -10800,10 +10806,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page2.len(), 2);
-        assert_eq!(page2[0].id, batch_ids[1]);
-        assert_eq!(page2[1].id, batch_ids[0]);
+        assert_eq!(page2[0].id, batch_ids[3], "newest terminal batch first");
+        assert_eq!(page2[1].id, batch_ids[2], "oldest terminal batch second");
 
-        // Page 3: cursor = last terminal batch. Should return empty (no more results).
+        // Page 3: cursor = last terminal batch. Should return empty.
         let page3 = manager
             .list_batches(crate::batch::ListBatchesFilter {
                 active_first: true,
@@ -10818,11 +10824,12 @@ mod tests {
             "Should have no more results after last page"
         );
 
-        // Full traversal should yield all batches in correct order with no duplicates.
+        // Full traversal: all batches in correct order, no duplicates.
         let all_ids: Vec<_> = page1.iter().chain(page2.iter()).map(|b| b.id).collect();
         assert_eq!(
             all_ids,
-            vec![batch_ids[3], batch_ids[2], batch_ids[1], batch_ids[0]]
+            vec![batch_ids[1], batch_ids[0], batch_ids[3], batch_ids[2]],
+            "Full pagination should return all batches in active-first order"
         );
     }
 }
