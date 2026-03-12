@@ -8511,6 +8511,7 @@ mod tests {
                     completion_window: "24h".to_string(),
                     metadata: None,
                     created_by: None,
+                    api_key_id: None,
                 })
                 .await
                 .unwrap();
@@ -8555,6 +8556,7 @@ mod tests {
                 completion_window: "24h".to_string(),
                 metadata: None,
                 created_by: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
