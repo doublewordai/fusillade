@@ -2494,7 +2494,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             query_builder.push_bind(after_created_at);
             query_builder.push(" AND b.id < ");
             query_builder.push_bind(after_id);
-            query_builder.push(")))");
+            query_builder.push("))");
         } else {
             // Classic 2-tuple cursor: (created_at DESC, id DESC)
             query_builder.push(" AND (");
