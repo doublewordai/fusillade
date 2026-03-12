@@ -2373,20 +2373,29 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let limit = limit.unwrap_or(100);
 
         // Helper expression: 0 for active batches, 1 for terminal.
-        // "Active" means no terminal timestamp has been set.
+        // A batch is "active" until it reaches a terminal state (completed, failed, or cancelled).
+        // Batches with cancelling_at set are still active — they remain active until
+        // cancellation finishes and cancelled_at is set.
         let priority_expr = "CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL \
-            AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL THEN 0 ELSE 1 END";
+            AND b.cancelled_at IS NULL THEN 0 ELSE 1 END";
 
         // If after is provided, get the cursor batch's created_at (and priority when
         // active_first is enabled) for cursor-based pagination.
         let (after_created_at, after_id, after_priority) = if let Some(after_id) = after {
             if active_first {
-                // Need priority for 3-tuple cursor comparison
-                let row = sqlx::query_as::<_, (chrono::DateTime<Utc>, i32)>(&format!(
-                    "SELECT created_at, ({}) as priority FROM batches WHERE id = $1",
-                    priority_expr.replace("b.", "")
-                ))
-                .bind(*after_id as Uuid)
+                // Need priority for 3-tuple cursor comparison.
+                // Priority mirrors priority_expr: 0 = active, 1 = terminal.
+                let row = sqlx::query!(
+                    r#"
+                    SELECT created_at,
+                           CASE WHEN completed_at IS NULL AND failed_at IS NULL
+                                     AND cancelled_at IS NULL
+                                THEN 0 ELSE 1 END as "priority!: i32"
+                    FROM batches
+                    WHERE id = $1
+                    "#,
+                    *after_id as Uuid,
+                )
                 .fetch_optional(self.pools.read())
                 .await
                 .map_err(|e| {
@@ -2394,8 +2403,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 })?;
 
                 match row {
-                    Some((created_at, priority)) => {
-                        (Some(created_at), Some(*after_id as Uuid), Some(priority))
+                    Some(r) => {
+                        (Some(r.created_at), Some(*after_id as Uuid), Some(r.priority))
                     }
                     None => (None, Some(*after_id as Uuid), None),
                 }
@@ -10568,5 +10577,225 @@ mod tests {
         let ids: Vec<_> = results.iter().map(|f| f.id).collect();
         assert!(ids.contains(&file_a));
         assert!(ids.contains(&file_b));
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_active_first_sorting(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "active-first-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Create 5 batches with staggered created_at so ordering is deterministic.
+        let mut batch_ids = Vec::new();
+        for i in 0..5 {
+            let batch = manager
+                .create_batch(crate::batch::BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    created_by: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+            // Space out created_at so newest-first ordering is deterministic.
+            sqlx::query("UPDATE batches SET created_at = NOW() + ($1 || ' seconds')::INTERVAL WHERE id = $2")
+                .bind(i.to_string())
+                .bind(*batch.id as Uuid)
+                .execute(&pool)
+                .await
+                .unwrap();
+            batch_ids.push(batch.id);
+        }
+
+        // batch_ids[0..4] ordered oldest→newest by created_at.
+        // Mark some as terminal:
+        //   [0] → completed (terminal)
+        //   [1] → failed (terminal)
+        //   [2] → cancelled (terminal)
+        //   [3] → cancelling (cancelling_at set, cancelled_at NULL → still active!)
+        //   [4] → active (no terminal timestamps)
+        sqlx::query("UPDATE batches SET completed_at = NOW() WHERE id = $1")
+            .bind(*batch_ids[0] as Uuid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE batches SET failed_at = NOW() WHERE id = $1")
+            .bind(*batch_ids[1] as Uuid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE batches SET cancelled_at = NOW() WHERE id = $1")
+            .bind(*batch_ids[2] as Uuid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE batches SET cancelling_at = NOW() WHERE id = $1")
+            .bind(*batch_ids[3] as Uuid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // batch_ids[4] stays fully active (no terminal timestamps).
+
+        // With active_first=false, should be pure chronological (newest first).
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                active_first: false,
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let result_ids: Vec<_> = results.iter().map(|b| b.id).collect();
+        // newest first: [4], [3], [2], [1], [0]
+        assert_eq!(result_ids, vec![batch_ids[4], batch_ids[3], batch_ids[2], batch_ids[1], batch_ids[0]]);
+
+        // With active_first=true, active batches come first, then terminal.
+        // Active: [4] (fully active), [3] (cancelling — still active). Newest first within group.
+        // Terminal: [2] (cancelled), [1] (failed), [0] (completed). Newest first within group.
+        let results = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                active_first: true,
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let result_ids: Vec<_> = results.iter().map(|b| b.id).collect();
+        assert_eq!(
+            result_ids,
+            vec![batch_ids[4], batch_ids[3], batch_ids[2], batch_ids[1], batch_ids[0]],
+            "Active batches (including cancelling) should sort before terminal ones"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_active_first_cursor_pagination(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "cursor-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Create 4 batches with staggered timestamps.
+        let mut batch_ids = Vec::new();
+        for i in 0..4 {
+            let batch = manager
+                .create_batch(crate::batch::BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    created_by: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+            sqlx::query("UPDATE batches SET created_at = NOW() + ($1 || ' seconds')::INTERVAL WHERE id = $2")
+                .bind(i.to_string())
+                .bind(*batch.id as Uuid)
+                .execute(&pool)
+                .await
+                .unwrap();
+            batch_ids.push(batch.id);
+        }
+
+        // [0] → completed (terminal)
+        // [1] → completed (terminal)
+        // [2] → active
+        // [3] → active
+        sqlx::query("UPDATE batches SET completed_at = NOW() WHERE id = $1")
+            .bind(*batch_ids[0] as Uuid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE batches SET completed_at = NOW() WHERE id = $1")
+            .bind(*batch_ids[1] as Uuid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Expected active_first order: [3], [2] (active, newest first), [1], [0] (terminal, newest first).
+
+        // Page 1: limit=2, should get the two active batches.
+        let page1 = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                active_first: true,
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0].id, batch_ids[3]);
+        assert_eq!(page1[1].id, batch_ids[2]);
+
+        // Page 2: cursor = last item from page 1 (batch_ids[2], an active batch).
+        // Should cross the active/terminal boundary and return the two terminal batches.
+        let page2 = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                active_first: true,
+                limit: Some(2),
+                after: Some(page1.last().unwrap().id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2[0].id, batch_ids[1]);
+        assert_eq!(page2[1].id, batch_ids[0]);
+
+        // Page 3: cursor = last terminal batch. Should return empty (no more results).
+        let page3 = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                active_first: true,
+                limit: Some(2),
+                after: Some(page2.last().unwrap().id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(page3.is_empty(), "Should have no more results after last page");
+
+        // Full traversal should yield all batches in correct order with no duplicates.
+        let all_ids: Vec<_> = page1.iter().chain(page2.iter()).map(|b| b.id).collect();
+        assert_eq!(all_ids, vec![batch_ids[3], batch_ids[2], batch_ids[1], batch_ids[0]]);
     }
 }

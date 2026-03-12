@@ -378,8 +378,11 @@ pub struct ListBatchesFilter {
     pub created_after: Option<DateTime<Utc>>,
     /// Only return batches created before this timestamp
     pub created_before: Option<DateTime<Utc>>,
-    /// When true, sort active (non-terminal) batches before terminal ones,
-    /// with each group sorted by created_at DESC. Default false (pure chronological).
+    /// When true, sort active batches before terminal ones, with each group
+    /// sorted by created_at DESC. A batch is "active" until it reaches a terminal
+    /// state (completed_at, failed_at, or cancelled_at is set). Batches that are
+    /// still cancelling (cancelling_at set but cancelled_at not yet set) are
+    /// considered active. Default false (pure chronological).
     pub active_first: bool,
 }
 
