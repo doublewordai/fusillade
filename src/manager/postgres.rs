@@ -819,7 +819,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let rows = sqlx::query!(
             r#"
             WITH active_batch_ids AS MATERIALIZED (
-                SELECT b.id
+                SELECT b.id, b.expires_at
                 FROM batches b
                 WHERE b.cancelling_at IS NULL
                     AND b.deleted_at IS NULL
@@ -833,43 +833,22 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     )
             ),
             to_claim AS (
-                SELECT claimed.id, claimed.template_id, claimed.batch_id,
-                       claimed.batch_id_str, claimed.batch_file_id,
-                       claimed.batch_endpoint, claimed.batch_completion_window,
-                       claimed.batch_metadata, claimed.batch_output_file_id,
-                       claimed.batch_error_file_id, claimed.batch_created_by,
-                       claimed.batch_created_at, claimed.batch_expires_at,
-                       claimed.batch_cancelling_at, claimed.batch_errors,
-                       claimed.batch_total_requests
+                SELECT claimed.id, claimed.template_id, claimed.batch_id
                 FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
                 CROSS JOIN LATERAL (
-                    SELECT r.id, r.template_id, r.batch_id,
-                           b.id::TEXT as batch_id_str,
-                           b.file_id::TEXT as batch_file_id,
-                           b.endpoint as batch_endpoint,
-                           b.completion_window as batch_completion_window,
-                           b.metadata::TEXT as batch_metadata,
-                           b.output_file_id::TEXT as batch_output_file_id,
-                           b.error_file_id::TEXT as batch_error_file_id,
-                           COALESCE(b.created_by, '') as batch_created_by,
-                           to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as batch_created_at,
-                           to_char(b.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as batch_expires_at,
-                           to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as batch_cancelling_at,
-                           b.errors::TEXT as batch_errors,
-                           b.total_requests::TEXT as batch_total_requests
-                    FROM (
-                        SELECT r2.id, r2.template_id, r2.batch_id
-                        FROM requests r2
-                        WHERE r2.state = 'pending'
-                            AND r2.model = m.model
-                            AND r2.template_id IS NOT NULL
-                            AND (r2.not_before IS NULL OR r2.not_before <= $3)
-                            AND r2.batch_id IN (SELECT id FROM active_batch_ids)
+                    SELECT r2.id, r2.template_id, r2.batch_id
+                    FROM (SELECT id, expires_at FROM active_batch_ids ORDER BY expires_at ASC) ab
+                    CROSS JOIN LATERAL (
+                        SELECT r3.id, r3.template_id, r3.batch_id
+                        FROM requests r3
+                        WHERE r3.state = 'pending'
+                            AND r3.model = m.model
+                            AND r3.template_id IS NOT NULL
+                            AND r3.batch_id = ab.id
+                            AND (r3.not_before IS NULL OR r3.not_before <= $3)
                         LIMIT m.capacity
-                        FOR UPDATE OF r2 SKIP LOCKED
-                    ) r
-                    JOIN batches b ON r.batch_id = b.id
-                    ORDER BY b.expires_at ASC
+                        FOR UPDATE OF r3 SKIP LOCKED
+                    ) r2
                     LIMIT m.capacity
                 ) claimed
                 LIMIT $2::BIGINT
@@ -887,19 +866,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
                       t.body as "body!", t.model as "model!", t.api_key as "api_key!",
                       b.expires_at as batch_expires_at,
-                      tc.batch_id_str as "batch_id_str!",
-                      tc.batch_file_id as "batch_file_id!",
-                      tc.batch_endpoint as "batch_endpoint!",
-                      tc.batch_completion_window as "batch_completion_window!",
-                      tc.batch_metadata as "batch_metadata",
-                      tc.batch_output_file_id as "batch_output_file_id",
-                      tc.batch_error_file_id as "batch_error_file_id",
-                      tc.batch_created_by as "batch_created_by!",
-                      tc.batch_created_at as "batch_created_at!",
-                      tc.batch_expires_at as "batch_expires_at_str",
-                      tc.batch_cancelling_at as "batch_cancelling_at",
-                      tc.batch_errors as "batch_errors",
-                      tc.batch_total_requests as "batch_total_requests!"
+                      b.id::TEXT as "batch_id_str!",
+                      b.file_id::TEXT as "batch_file_id!",
+                      b.endpoint as "batch_endpoint!",
+                      b.completion_window as "batch_completion_window!",
+                      b.metadata::TEXT as "batch_metadata",
+                      b.output_file_id::TEXT as "batch_output_file_id",
+                      b.error_file_id::TEXT as "batch_error_file_id",
+                      COALESCE(b.created_by, '') as "batch_created_by!",
+                      to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_created_at!",
+                      to_char(b.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_expires_at_str",
+                      to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_cancelling_at",
+                      b.errors::TEXT as "batch_errors",
+                      b.total_requests::TEXT as "batch_total_requests!"
             "#,
             *daemon_id as Uuid,
             limit as i64,
