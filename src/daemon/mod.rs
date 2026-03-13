@@ -202,6 +202,20 @@ pub struct DaemonConfig {
     /// cycle (milliseconds). Prevents sustained high DB load when many orphans
     /// exist. Default: 100.
     pub purge_throttle_ms: u64,
+
+    /// Request paths that should use SSE streaming.
+    ///
+    /// When a request's path matches one of these entries, an `X-Fusillade-Stream`
+    /// header is sent with the request and the response is read as an SSE stream,
+    /// then reassembled into the equivalent non-streaming JSON format.
+    ///
+    /// The upstream proxy (onwards) is responsible for injecting `"stream": true`
+    /// and `"stream_options": {"include_usage": true}` into the request body
+    /// when it sees this header.
+    ///
+    /// Example: `vec!["/v1/chat/completions", "/v1/completions"]`
+    #[serde(default)]
+    pub streamable_endpoints: Vec<String>,
 }
 
 fn default_batch_metadata_fields() -> Vec<String> {
@@ -240,6 +254,7 @@ impl Default for DaemonConfig {
             purge_interval_ms: 600_000, // 10 minutes
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
         }
     }
 }
@@ -974,6 +989,7 @@ mod tests {
             purge_interval_ms: 0,               // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
         };
 
         let manager = Arc::new(
@@ -1149,6 +1165,7 @@ mod tests {
             purge_interval_ms: 0,               // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
         };
 
         let manager = Arc::new(
@@ -1386,6 +1403,7 @@ mod tests {
             purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
         };
 
         let manager = Arc::new(
@@ -1528,6 +1546,7 @@ mod tests {
             purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
         };
 
         let manager = Arc::new(
@@ -1709,6 +1728,7 @@ mod tests {
             purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
         };
 
         let manager = Arc::new(
@@ -1874,6 +1894,7 @@ mod tests {
             purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
         };
 
         let manager = Arc::new(
@@ -2044,6 +2065,7 @@ mod tests {
             purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
         };
 
         let manager = Arc::new(
@@ -2209,6 +2231,7 @@ mod tests {
             purge_interval_ms: 0, // Disabled in tests
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
         };
 
         let manager = Arc::new(
