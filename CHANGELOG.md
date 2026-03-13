@@ -1,5 +1,21 @@
 # Changelog
 
+## [12.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v11.0.1...fusillade-v12.0.0) (2026-03-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* mark streaming API as breaking. BREAKING CHANGE: removed stream field from RequestData, changed ReqwestHttpClient new signature
+
+### feat\
+
+* mark streaming API as breaking. BREAKING CHANGE: removed stream field from RequestData, changed ReqwestHttpClient new signature ([4220b4a](https://github.com/doublewordai/fusillade/commit/4220b4a892098564c734f23f245ac24007e7bb77))
+
+
+### Features
+
+* Stream requests for specified endpoints ([#178](https://github.com/doublewordai/fusillade/issues/178)) ([a25be4c](https://github.com/doublewordai/fusillade/commit/a25be4cc7fbfd753968237dc769d14d125ced8b4))
+
 ## [11.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v11.0.0...fusillade-v11.0.1) (2026-03-12)
 
 
