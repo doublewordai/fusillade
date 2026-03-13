@@ -65,12 +65,14 @@ pub trait HttpClient: Send + Sync + Clone {
 ///
 /// This implementation makes real HTTP requests to external endpoints.
 /// Timeouts are configured at construction time and applied differently
-/// depending on whether the request is streaming:
+/// depending on whether the request path matches a streamable endpoint:
 ///
-/// **Non-streaming** (`stream = false`): uses `first_chunk_timeout + body_timeout`
-/// as a single overall reqwest timeout covering the entire request.
+/// **Non-streaming** (path not in `streamable_endpoints`): uses
+/// `first_chunk_timeout + body_timeout` as a single overall reqwest timeout
+/// covering the entire request.
 ///
-/// **Streaming** (`stream = true`): split timeouts for fine-grained control:
+/// **Streaming** (path in `streamable_endpoints`): an `X-Fusillade-Stream`
+/// header is added and the response is read as SSE with split timeouts:
 /// - `first_chunk_timeout`: max time to first token (connect + headers + first body chunk)
 /// - `chunk_timeout`: max idle time between subsequent body chunks
 /// - `body_timeout`: max total time for the entire response body
@@ -280,9 +282,10 @@ impl ReqwestHttpClient {
     /// - chunk_timeout: max idle time between subsequent SSE events.
     /// - body_timeout: max total time for the entire response body.
     ///
-    /// The response is parsed as an SSE stream via `eventsource-stream`. Each event's
-    /// `data` field is collected (excluding `[DONE]`), and the final body is the
-    /// newline-joined data payloads.
+    /// The response is parsed as an SSE stream via `eventsource-stream`. All events
+    /// are collected, then passed to the stream reassembler (which skips `[DONE]`
+    /// and empty events internally). Without a reassembler, the fallback path
+    /// filters these events and newline-joins the remaining data payloads.
     async fn execute_streaming(
         &self,
         request: &RequestData,
@@ -370,6 +373,7 @@ impl ReqwestHttpClient {
             Some(reassemble) => reassemble(&collected)?,
             None => collected
                 .iter()
+                .filter(|e| !e.data.is_empty() && e.data != "[DONE]")
                 .map(|e| e.data.as_str())
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -1120,5 +1124,61 @@ mod tests {
             !reason.is_retriable(),
             "Builder errors should not be retriable"
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_reassembles_sse_into_json() {
+        use axum::{Router, http::StatusCode, routing::post};
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let sse = concat!(
+                    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n",
+                    "data: [DONE]\n\n",
+                );
+                (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    sse,
+                )
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: format!("http://{}", addr),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#.to_string(),
+            model: "gpt-4".to_string(),
+            api_key: "".to_string(),
+            batch_metadata: std::collections::HashMap::new(),
+        };
+
+        let client = ReqwestHttpClient::new(
+            ONE_DAY_DURATION,
+            ONE_DAY_DURATION,
+            ONE_DAY_DURATION,
+            vec!["/v1/chat/completions".to_string()],
+        );
+        let response = client.execute(&request, "").await.unwrap();
+        assert_eq!(response.status, 200);
+
+        let body: serde_json::Value =
+            serde_json::from_str(&response.body).expect("reassembled body should be valid JSON");
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["total_tokens"], 7);
     }
 }
