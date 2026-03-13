@@ -2370,16 +2370,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let (after_created_at, after_id, after_priority) = if let Some(after_id) = after {
             if active_first {
                 // Need priority for 3-tuple cursor comparison.
-                // Uses the same CASE expression as priority_expr (without the `b.` alias
-                // since this queries `batches` directly).
+                // Table aliased as `b` so the CASE expression matches priority_expr exactly.
                 let row = sqlx::query!(
                     r#"
-                    SELECT created_at,
-                           CASE WHEN completed_at IS NULL AND failed_at IS NULL
-                                     AND cancelled_at IS NULL AND cancelling_at IS NULL
+                    SELECT b.created_at,
+                           CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL
+                                     AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL
                                 THEN 0 ELSE 1 END as "priority!: i32"
-                    FROM batches
-                    WHERE id = $1
+                    FROM batches b
+                    WHERE b.id = $1
                     "#,
                     *after_id as Uuid,
                 )
