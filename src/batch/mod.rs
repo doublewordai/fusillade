@@ -378,6 +378,12 @@ pub struct ListBatchesFilter {
     pub created_after: Option<DateTime<Utc>>,
     /// Only return batches created before this timestamp
     pub created_before: Option<DateTime<Utc>>,
+    /// When true, sort active batches before terminal ones, with each group
+    /// sorted by created_at DESC. A batch is "active" when none of completed_at,
+    /// failed_at, cancelled_at, or cancelling_at are set. Cancelling batches are
+    /// treated as terminal because cancel_batch sets both cancelling_at and
+    /// cancelled_at atomically. Default false (pure chronological).
+    pub active_first: bool,
 }
 
 /// Items that can be yielded from a file upload stream
