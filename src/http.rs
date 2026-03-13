@@ -120,7 +120,12 @@ impl ReqwestHttpClient {
 
 impl Default for ReqwestHttpClient {
     fn default() -> Self {
-        Self::new(ONE_DAY_DURATION, ONE_DAY_DURATION, ONE_DAY_DURATION, Vec::new())
+        Self::new(
+            ONE_DAY_DURATION,
+            ONE_DAY_DURATION,
+            ONE_DAY_DURATION,
+            Vec::new(),
+        )
     }
 }
 
@@ -363,7 +368,11 @@ impl ReqwestHttpClient {
 
         let body = match &self.stream_reassembler {
             Some(reassemble) => reassemble(&collected)?,
-            None => collected.iter().map(|e| e.data.as_str()).collect::<Vec<_>>().join("\n"),
+            None => collected
+                .iter()
+                .map(|e| e.data.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
         };
 
         tracing::debug!(
@@ -940,7 +949,12 @@ mod tests {
         };
 
         let timeout = Duration::from_millis(200);
-        let client = ReqwestHttpClient::new(timeout, timeout, ONE_DAY_DURATION, vec!["/test".to_string()]);
+        let client = ReqwestHttpClient::new(
+            timeout,
+            timeout,
+            ONE_DAY_DURATION,
+            vec!["/test".to_string()],
+        );
         let result = client.execute(&request, "").await;
         let err = result.expect_err("Expected TokensTimeout for stalled body");
 
@@ -982,7 +996,12 @@ mod tests {
         };
 
         let timeout = Duration::from_millis(200);
-        let client = ReqwestHttpClient::new(timeout, timeout, ONE_DAY_DURATION, vec!["/test".to_string()]);
+        let client = ReqwestHttpClient::new(
+            timeout,
+            timeout,
+            ONE_DAY_DURATION,
+            vec!["/test".to_string()],
+        );
         let result = client.execute(&request, "").await;
         let err = result.expect_err("Expected FirstChunkTimeout for stalled headers");
 
