@@ -35,7 +35,7 @@ pub struct HttpResponse {
 ///
 /// # Example
 /// ```ignore
-/// let client = ReqwestHttpClient::new(Duration::from_secs(300), Duration::from_secs(30), Duration::from_secs(600));
+/// let client = ReqwestHttpClient::new(Duration::from_secs(300), Duration::from_secs(30), Duration::from_secs(600), vec![]);
 /// let response = client.execute(&request_data, "api-key").await?;
 /// println!("Status: {}, Body: {}", response.status, response.body);
 /// ```
@@ -81,6 +81,7 @@ pub struct ReqwestHttpClient {
     chunk_timeout: Duration,
     body_timeout: Duration,
     stream_reassembler: Option<StreamReassembler>,
+    streamable_endpoints: Vec<String>,
 }
 
 impl ReqwestHttpClient {
@@ -89,6 +90,7 @@ impl ReqwestHttpClient {
         first_chunk_timeout: Duration,
         chunk_timeout: Duration,
         body_timeout: Duration,
+        streamable_endpoints: Vec<String>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -96,6 +98,7 @@ impl ReqwestHttpClient {
             chunk_timeout,
             body_timeout,
             stream_reassembler: Some(openai_reassembler::reassemble),
+            streamable_endpoints,
         }
     }
 
@@ -117,7 +120,7 @@ impl ReqwestHttpClient {
 
 impl Default for ReqwestHttpClient {
     fn default() -> Self {
-        Self::new(ONE_DAY_DURATION, ONE_DAY_DURATION, ONE_DAY_DURATION)
+        Self::new(ONE_DAY_DURATION, ONE_DAY_DURATION, ONE_DAY_DURATION, Vec::new())
     }
 }
 
@@ -211,7 +214,9 @@ impl HttpClient for ReqwestHttpClient {
             );
         }
 
-        if request.stream {
+        let stream = self.streamable_endpoints.iter().any(|e| e == &request.path);
+        if stream {
+            req = req.header("X-Fusillade-Stream", "true");
             self.execute_streaming(request, req, &url).await
         } else {
             self.execute_non_streaming(request, req, &url).await
@@ -612,7 +617,6 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
-            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -657,7 +661,6 @@ mod tests {
             body: "".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
-            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -685,7 +688,6 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
-            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -716,7 +718,6 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
-            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -770,7 +771,6 @@ mod tests {
             body: r#"{"key":"value"}"#.to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
-            stream: false,
             batch_metadata: batch_metadata.clone(),
         };
 
@@ -883,7 +883,6 @@ mod tests {
             body: r#"{"prompt":"test"}"#.to_string(),
             model: "test-model".to_string(),
             api_key: "test-api-key".to_string(),
-            stream: false,
             batch_metadata,
         };
 
@@ -937,12 +936,11 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "".to_string(),
-            stream: true,
             batch_metadata: std::collections::HashMap::new(),
         };
 
         let timeout = Duration::from_millis(200);
-        let client = ReqwestHttpClient::new(timeout, timeout, ONE_DAY_DURATION);
+        let client = ReqwestHttpClient::new(timeout, timeout, ONE_DAY_DURATION, vec!["/test".to_string()]);
         let result = client.execute(&request, "").await;
         let err = result.expect_err("Expected TokensTimeout for stalled body");
 
@@ -980,12 +978,11 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "".to_string(),
-            stream: true,
             batch_metadata: std::collections::HashMap::new(),
         };
 
         let timeout = Duration::from_millis(200);
-        let client = ReqwestHttpClient::new(timeout, timeout, ONE_DAY_DURATION);
+        let client = ReqwestHttpClient::new(timeout, timeout, ONE_DAY_DURATION, vec!["/test".to_string()]);
         let result = client.execute(&request, "").await;
         let err = result.expect_err("Expected FirstChunkTimeout for stalled headers");
 
@@ -1045,7 +1042,6 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "".to_string(),
-            stream: true,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -1054,6 +1050,7 @@ mod tests {
             ONE_DAY_DURATION,
             Duration::from_millis(200),
             Duration::from_millis(300),
+            vec!["/test".to_string()],
         );
         let result = client.execute(&request, "").await;
         let err = result.expect_err("Expected BodyTimeout for slow-drip response");
@@ -1081,7 +1078,6 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
-            stream: false,
             batch_metadata: std::collections::HashMap::new(),
         };
 
