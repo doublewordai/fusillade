@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v12.0.0...fusillade-v12.1.0) (2026-03-16)
+
+
+### Features
+
+* server side, active batch first sorting on toggle ([#175](https://github.com/doublewordai/fusillade/issues/175)) ([d27db87](https://github.com/doublewordai/fusillade/commit/d27db873ff0c0ab41af35c8fc0d50a8b148d83af))
+
 ## [12.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v11.0.1...fusillade-v12.0.0) (2026-03-13)
 
 
