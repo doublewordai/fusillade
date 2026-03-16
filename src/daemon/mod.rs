@@ -1026,6 +1026,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1240,6 +1241,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1440,6 +1442,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1587,6 +1590,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1765,6 +1769,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1931,6 +1936,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -2102,6 +2108,7 @@ mod tests {
                 metadata: None,
                 created_by: Some("test-user".to_string()),
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -2271,6 +2278,7 @@ mod tests {
                 })),
                 created_by: Some("test-user".to_string()),
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
