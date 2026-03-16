@@ -17,7 +17,7 @@ pub mod request;
 pub use batch::*;
 pub use daemon::{Daemon, DaemonConfig, ModelEscalationConfig};
 pub use error::{FusilladeError, Result};
-pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient};
+pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient, StreamReassembler};
 pub use manager::postgres::{PoolProvider, PostgresRequestManager, TestDbPools};
 pub use manager::{DaemonExecutor, Storage};
 pub use request::*;

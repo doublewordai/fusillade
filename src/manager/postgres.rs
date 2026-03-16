@@ -162,6 +162,7 @@ impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> 
             std::time::Duration::from_millis(config.first_chunk_timeout_ms),
             std::time::Duration::from_millis(config.chunk_timeout_ms),
             std::time::Duration::from_millis(config.body_timeout_ms),
+            config.streamable_endpoints.clone(),
         ));
         Self {
             pools,
@@ -980,7 +981,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         body: row.body,
                         model: row.model,
                         api_key: row.api_key,
-                        stream: false,
                         batch_metadata,
                     },
                 }
@@ -1241,7 +1241,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     body,
                     model,
                     api_key,
-                    stream: false,
                     batch_metadata: std::collections::HashMap::new(),
                 },
                 _ => {
@@ -2935,7 +2934,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     body,
                     model,
                     api_key,
-                    stream: false,
                     batch_metadata: std::collections::HashMap::new(),
                 },
                 _ => {
