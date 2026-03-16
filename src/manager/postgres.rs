@@ -4657,7 +4657,6 @@ mod tests {
             size_bytes: None,
             uploaded_by: Some("test-user".to_string()),
             api_key_id: None,
-            api_key: None,
         })];
 
         for i in 0..8000 {
@@ -4728,7 +4727,6 @@ mod tests {
             size_bytes: None,
             uploaded_by: None,
             api_key_id: None,
-            api_key: None,
         })];
 
         let stream = stream::iter(items);
@@ -4771,7 +4769,6 @@ mod tests {
             size_bytes: None,
             uploaded_by: None,
             api_key_id: None,
-            api_key: None,
         })];
 
         // Add 3000 templates
@@ -6783,7 +6780,6 @@ mod tests {
                 size_bytes: None,
                 uploaded_by: Some("test-user".to_string()),
                 api_key_id: None,
-                api_key: None,
             }),
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: Some("stream-1".to_string()),
@@ -6877,7 +6873,6 @@ mod tests {
                 size_bytes: None,
                 uploaded_by: Some("test-user".to_string()),
                 api_key_id: None,
-                api_key: None,
             }),
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: None,
