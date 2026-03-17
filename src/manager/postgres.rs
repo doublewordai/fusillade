@@ -2116,7 +2116,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let row = sqlx::query!(
             r#"
             INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF(TRIM($8), ''))
             RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
             "#,
             *input.file_id as Uuid,

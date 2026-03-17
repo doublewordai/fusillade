@@ -2345,4 +2345,136 @@ mod tests {
             "request_source should be extracted from metadata JSON"
         );
     }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_api_key_overrides_template_api_key(pool: sqlx::PgPool) {
+        // Setup: Create HTTP client with mock response
+        let http_client = Arc::new(MockHttpClient::new());
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success"}"#.to_string(),
+            }),
+        );
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            model_concurrency_limits: {
+                let m = Arc::new(dashmap::DashMap::new());
+                m.insert("test-model".to_string(), 10);
+                m
+            },
+            model_escalations: Arc::new(dashmap::DashMap::new()),
+            max_retries: Some(3),
+            stop_before_deadline_ms: None,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            first_chunk_timeout_ms: 5000,
+            chunk_timeout_ms: 5000,
+            body_timeout_ms: 86_400_000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 5000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
+            unclaim_batch_size: 100,
+            batch_metadata_fields: vec![],
+            cancellation_poll_interval_ms: 100,
+            purge_interval_ms: 0,
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        // Create file with template using the file uploader's key
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test file".to_string()),
+                vec![crate::RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "template-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        // Create batch with a different key (the batch creator's key)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: Some("batch-creator-key".to_string()),
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let requests = manager
+            .get_batch_requests(batch.id)
+            .await
+            .expect("Failed to get batch requests");
+        assert_eq!(requests.len(), 1);
+        let request_id = requests[0].id();
+
+        // Start the daemon
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Poll for completion
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut completed = false;
+
+        while start.elapsed() < timeout {
+            let results = manager
+                .get_requests(vec![request_id])
+                .await
+                .expect("Failed to get request");
+
+            if let Some(Ok(any_request)) = results.first()
+                && any_request.is_terminal()
+            {
+                completed = true;
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown_token.cancel();
+        assert!(completed, "Request did not complete within timeout");
+
+        // Verify the daemon used the batch creator's key, not the template key
+        assert_eq!(http_client.call_count(), 1);
+        let calls = http_client.get_calls();
+        assert_eq!(
+            calls[0].api_key, "batch-creator-key",
+            "Daemon should use batch creator's API key, not the template's"
+        );
+    }
 }
