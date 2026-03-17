@@ -77,6 +77,7 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
             metadata: None,
             created_by: None,
             api_key_id: None,
+            api_key: None,
         })
         .await
         .expect("Failed to create batch");
@@ -281,6 +282,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
             metadata: None,
             created_by: None,
             api_key_id: None,
+            api_key: None,
         })
         .await
         .expect("Failed to create batch");
@@ -480,6 +482,7 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
             metadata: None,
             created_by: None,
             api_key_id: None,
+            api_key: None,
         })
         .await
         .expect("Failed to create batch");
@@ -616,6 +619,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
             metadata: None,
             created_by: None,
             api_key_id: None,
+            api_key: None,
         })
         .await
         .expect("Failed to create batch");
@@ -779,6 +783,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
             metadata: None,
             created_by: None,
             api_key_id: None,
+            api_key: None,
         })
         .await
         .expect("Failed to create batch");
@@ -947,6 +952,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
             metadata: None,
             created_by: None,
             api_key_id: None,
+            api_key: None,
         })
         .await
         .expect("Failed to create batch");
@@ -1132,6 +1138,7 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
             metadata: None,
             created_by: None,
             api_key_id: None,
+            api_key: None,
         })
         .await
         .expect("Failed to create batch");
@@ -1282,6 +1289,7 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
             metadata: None,
             created_by: None,
             api_key_id: None,
+            api_key: None,
         })
         .await
         .expect("Failed to create batch");
@@ -1426,6 +1434,7 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1511,6 +1520,7 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1599,6 +1609,7 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1721,6 +1732,7 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1843,6 +1855,7 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1972,6 +1985,7 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -2119,6 +2133,7 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -2243,6 +2258,7 @@ mod queue_counts {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -2293,6 +2309,7 @@ mod queue_counts {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();

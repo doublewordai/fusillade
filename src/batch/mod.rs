@@ -412,6 +412,10 @@ pub struct BatchInput {
     pub created_by: Option<String>,
     /// API key UUID that created this batch, for per-member attribution within orgs
     pub api_key_id: Option<Uuid>,
+    /// API key secret for batch request execution. Used instead of the key in
+    /// request_templates so that billing is attributed to the batch creator,
+    /// not the file uploader.
+    pub api_key: Option<String>,
 }
 
 /// A batch represents one execution of all of a file's templates.

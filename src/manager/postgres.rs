@@ -875,7 +875,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             WHERE r.id = tc.id
             RETURNING r.id, r.batch_id as "batch_id!", r.template_id as "template_id!", r.retry_attempt,
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
-                      t.body as "body!", t.model as "model!", t.api_key as "api_key!",
+                      t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
                       b.expires_at as batch_expires_at,
                       b.id::TEXT as "batch_id_str!",
                       b.file_id::TEXT as "batch_file_id!",
@@ -2115,8 +2115,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // Create batch with new fields
         let row = sqlx::query!(
             r#"
-            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF(TRIM($8), ''))
             RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
             "#,
             *input.file_id as Uuid,
@@ -2126,6 +2126,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             input.created_by,
             expires_at,
             input.api_key_id,
+            input.api_key,
         )
         .fetch_one(&mut *tx)
         .await
@@ -5087,6 +5088,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -5159,6 +5161,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -5229,6 +5232,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -5301,6 +5305,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -5369,6 +5374,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -5486,6 +5492,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -5497,6 +5504,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -5508,6 +5516,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -5576,6 +5585,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -5663,6 +5673,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -5746,6 +5757,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -5836,6 +5848,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -5936,6 +5949,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -6047,6 +6061,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -6159,6 +6174,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -6239,6 +6255,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -6339,6 +6356,7 @@ mod tests {
                 metadata: None,
                 created_by: Some("test-user".to_string()),
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .expect("Failed to create batch");
@@ -6972,6 +6990,7 @@ mod tests {
             metadata: Some(serde_json::json!({"project": "test"})),
             created_by: Some("test-user".to_string()),
             api_key_id: None,
+            api_key: None,
         };
 
         let created_batch = manager.create_batch(batch_input).await.unwrap();
@@ -7057,6 +7076,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -7131,6 +7151,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -7231,6 +7252,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -7353,6 +7375,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -7413,6 +7436,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -7494,6 +7518,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -7776,6 +7801,7 @@ mod tests {
                 endpoint: "/v1/chat/completions".to_string(),
                 metadata: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -7951,6 +7977,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -8082,6 +8109,7 @@ mod tests {
                 metadata: None,
                 created_by: Some("user1".to_string()),
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -8169,6 +8197,7 @@ mod tests {
                     metadata: None,
                     created_by: Some("user1".to_string()),
                     api_key_id: None,
+                    api_key: None,
                 })
                 .await
                 .unwrap();
@@ -8300,6 +8329,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -8411,6 +8441,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -8586,6 +8617,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -8621,6 +8653,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -8663,6 +8696,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -8767,6 +8801,7 @@ mod tests {
                     metadata: None,
                     created_by: None,
                     api_key_id: None,
+                    api_key: None,
                 })
                 .await
                 .unwrap();
@@ -8812,6 +8847,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -8891,6 +8927,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -8988,6 +9025,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -9248,6 +9286,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -9315,6 +9354,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -9450,6 +9490,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -9556,6 +9597,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -9639,6 +9681,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -9680,6 +9723,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -9774,6 +9818,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -9933,6 +9978,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: Some(key_a),
+                api_key: None,
             })
             .await
             .unwrap();
@@ -9945,6 +9991,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: Some(key_b),
+                api_key: None,
             })
             .await
             .unwrap();
@@ -9957,6 +10004,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -10043,6 +10091,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -10148,6 +10197,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -10223,6 +10273,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -10288,6 +10339,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -10346,6 +10398,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -10358,6 +10411,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -10438,6 +10492,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -10508,6 +10563,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -10528,6 +10584,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -10548,6 +10605,7 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
+                api_key: None,
             })
             .await
             .unwrap();
@@ -10734,6 +10792,7 @@ mod tests {
                     metadata: None,
                     created_by: None,
                     api_key_id: None,
+                    api_key: None,
                 })
                 .await
                 .unwrap();
@@ -10856,6 +10915,7 @@ mod tests {
                     metadata: None,
                     created_by: None,
                     api_key_id: None,
+                    api_key: None,
                 })
                 .await
                 .unwrap();
