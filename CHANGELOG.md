@@ -1,5 +1,16 @@
 # Changelog
 
+## [13.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v12.1.0...fusillade-v13.0.0) (2026-03-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* Batch execution now uses the batch creator's API key, not the file uploader's ([#181](https://github.com/doublewordai/fusillade/issues/181))
+
+### Features
+
+* Batch execution now uses the batch creator's API key, not the file uploader's ([#181](https://github.com/doublewordai/fusillade/issues/181)) ([1d7749a](https://github.com/doublewordai/fusillade/commit/1d7749a7cfae2b74ffb4ed45927abe75cee52277))
+
 ## [12.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v12.0.0...fusillade-v12.1.0) (2026-03-16)
 
 
