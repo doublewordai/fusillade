@@ -393,8 +393,20 @@ pub enum FileStreamItem {
     Metadata(FileMetadata),
     /// A request template parsed from JSONL
     Template(RequestTemplateInput),
+    /// Producer is aborting the stream. Fusillade should rollback and stop processing.
+    Abort,
     /// An error occurred during parsing
+    #[deprecated(note = "Use FileStreamItem::Abort and retain the producer error locally instead")]
     Error(String),
+}
+
+/// Result of creating a file from a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileStreamResult {
+    /// Successfully created a file
+    Success(FileId),
+    /// Stream was aborted by the producer and the transaction was rolled back
+    Aborted,
 }
 
 /// Input parameters for creating a new batch.

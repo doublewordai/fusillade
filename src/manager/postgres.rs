@@ -26,8 +26,8 @@ use super::{DaemonStorage, Storage};
 use crate::batch::{
     Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchNotification,
     BatchOutputItem, BatchResponseDetails, BatchStatus, File, FileContentItem, FileId,
-    FileMetadata, FileStreamItem, ListBatchesFilter, OutputFileType, RequestTemplateInput,
-    TemplateId,
+    FileMetadata, FileStreamItem, FileStreamResult, ListBatchesFilter, OutputFileType,
+    RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{
     AnyDaemonRecord, Daemon, DaemonConfig, DaemonData, DaemonRecord, DaemonState, DaemonStatus,
@@ -1426,14 +1426,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         }
 
         let stream = stream::iter(items);
-        self.create_file_stream(stream).await
+        match self.create_file_stream(stream).await? {
+            FileStreamResult::Success(file_id) => Ok(file_id),
+            FileStreamResult::Aborted => Err(FusilladeError::Other(anyhow!(
+                "create_file produced an aborted stream result for an internally constructed stream"
+            ))),
+        }
     }
 
     #[tracing::instrument(skip(self, stream))]
     async fn create_file_stream<S: Stream<Item = FileStreamItem> + Send + Unpin>(
         &self,
         mut stream: S,
-    ) -> Result<FileId> {
+    ) -> Result<FileStreamResult> {
         use futures::StreamExt;
 
         // Start a transaction for atomic file + templates creation
@@ -1522,7 +1527,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         template_buffer.clear();
                     }
                 }
+                FileStreamItem::Abort => {
+                    tx.rollback().await.map_err(|e| {
+                        FusilladeError::Other(anyhow!(
+                            "Failed to roll back aborted file stream transaction: {}",
+                            e
+                        ))
+                    })?;
+                    return Ok(FileStreamResult::Aborted);
+                }
+                #[allow(deprecated)]
                 FileStreamItem::Error(err) => {
+                    tracing::warn!("FileStreamItem::Error is deprecated; use Abort instead");
                     return Err(FusilladeError::ValidationError(err));
                 }
             }
@@ -1638,7 +1654,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "Successfully created file with templates"
         );
 
-        Ok(FileId(fid))
+        Ok(FileStreamResult::Success(FileId(fid)))
     }
 
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
@@ -4383,12 +4399,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> DaemonExecutor<H> for PostgresReq
 mod tests {
     use super::*;
     use crate::TestDbPools;
+    use crate::batch::FileStreamResult;
     use crate::daemon::{
         AnyDaemonRecord, DaemonData, DaemonRecord, DaemonStats, DaemonStatus, Dead, Initializing,
         Running,
     };
     use crate::http::MockHttpClient;
     use chrono::Timelike;
+
+    fn expect_stream_success(result: FileStreamResult) -> FileId {
+        match result {
+            FileStreamResult::Success(file_id) => file_id,
+            FileStreamResult::Aborted => panic!("Expected stream creation success, got abort"),
+        }
+    }
 
     // =========================================================================
     // FILE OPERATIONS
@@ -4672,10 +4696,12 @@ mod tests {
         }
 
         let stream = stream::iter(items);
-        let file_id = manager
-            .create_file_stream(stream)
-            .await
-            .expect("Failed to create file from stream");
+        let file_id = expect_stream_success(
+            manager
+                .create_file_stream(stream)
+                .await
+                .expect("Failed to create file from stream"),
+        );
 
         // Verify file metadata
         let file = manager.get_file(file_id).await.expect("Failed to get file");
@@ -4730,10 +4756,12 @@ mod tests {
         })];
 
         let stream = stream::iter(items);
-        let file_id = manager
-            .create_file_stream(stream)
-            .await
-            .expect("Failed to create empty file");
+        let file_id = expect_stream_success(
+            manager
+                .create_file_stream(stream)
+                .await
+                .expect("Failed to create empty file"),
+        );
 
         // Verify file was created
         let file = manager.get_file(file_id).await.expect("Failed to get file");
@@ -4749,6 +4777,7 @@ mod tests {
     }
 
     #[sqlx::test]
+    #[allow(deprecated)]
     async fn test_batched_insert_transactional_rollback(pool: sqlx::PgPool) {
         use crate::batch::{FileMetadata, FileStreamItem};
         use futures::stream;
@@ -6804,10 +6833,12 @@ mod tests {
         let stream = stream::iter(items);
 
         // Create file from stream
-        let file_id = manager
-            .create_file_stream(stream)
-            .await
-            .expect("Failed to create file from stream");
+        let file_id = expect_stream_success(
+            manager
+                .create_file_stream(stream)
+                .await
+                .expect("Failed to create file from stream"),
+        );
 
         // Verify the file was created with correct metadata
         let file = manager.get_file(file_id).await.expect("Failed to get file");
@@ -6886,10 +6917,12 @@ mod tests {
         ];
 
         let stream = stream::iter(items);
-        let file_id = manager
-            .create_file_stream(stream)
-            .await
-            .expect("Failed to create file from stream");
+        let file_id = expect_stream_success(
+            manager
+                .create_file_stream(stream)
+                .await
+                .expect("Failed to create file from stream"),
+        );
 
         // File should have the metadata even though it came after first template
         let file = manager.get_file(file_id).await.unwrap();
@@ -6902,7 +6935,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_create_file_stream_error_handling(pool: sqlx::PgPool) {
+    async fn test_create_file_stream_abort_handling(pool: sqlx::PgPool) {
         use crate::batch::FileStreamItem;
         use futures::stream;
 
@@ -6912,7 +6945,7 @@ mod tests {
             http_client,
         );
 
-        // Create a stream with an error in the middle
+        // Create a stream that aborts in the middle.
         let items = vec![
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: None,
@@ -6923,7 +6956,7 @@ mod tests {
                 model: "test".to_string(),
                 api_key: "key".to_string(),
             }),
-            FileStreamItem::Error("Invalid JSON on line 2".to_string()),
+            FileStreamItem::Abort,
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: None,
                 endpoint: "https://api.example.com".to_string(),
@@ -6938,8 +6971,46 @@ mod tests {
         let stream = stream::iter(items);
         let result = manager.create_file_stream(stream).await;
 
-        // Should fail with validation error
-        assert!(result.is_err());
+        match result {
+            Ok(FileStreamResult::Aborted) => {}
+            _ => panic!("Expected Aborted"),
+        }
+
+        let files = sqlx::query(r#"SELECT COUNT(*) as count FROM files"#)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let count: i64 = files.get("count");
+        assert_eq!(count, 0, "Aborted stream should roll back inserts");
+    }
+
+    #[sqlx::test]
+    #[allow(deprecated)]
+    async fn test_create_file_stream_deprecated_error_handling(pool: sqlx::PgPool) {
+        use crate::batch::FileStreamItem;
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let items = vec![
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: r#"{"n":1}"#.to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+            FileStreamItem::Error("Invalid JSON on line 2".to_string()),
+        ];
+
+        let result = manager.create_file_stream(stream::iter(items)).await;
+
         match result {
             Err(FusilladeError::ValidationError(msg)) => {
                 assert_eq!(msg, "Invalid JSON on line 2");
@@ -7633,10 +7704,12 @@ mod tests {
             }),
         ];
 
-        let file_id = manager
-            .create_file_stream(stream::iter(items))
-            .await
-            .expect("Should create file successfully");
+        let file_id = expect_stream_success(
+            manager
+                .create_file_stream(stream::iter(items))
+                .await
+                .expect("Should create file successfully"),
+        );
 
         // Verify the final filename is the one from metadata, not auto-generated
         let file = manager.get_file(file_id).await.unwrap();
@@ -7690,10 +7763,12 @@ mod tests {
             }),
         ];
 
-        let file_id = manager
-            .create_file_stream(stream::iter(items))
-            .await
-            .expect("Should create file");
+        let file_id = expect_stream_success(
+            manager
+                .create_file_stream(stream::iter(items))
+                .await
+                .expect("Should create file"),
+        );
 
         let file = manager.get_file(file_id).await.unwrap();
         assert_eq!(file.name, "final-name.jsonl");
@@ -7719,10 +7794,12 @@ mod tests {
             ..Default::default()
         })];
 
-        let file_id = manager
-            .create_file_stream(stream::iter(items))
-            .await
-            .expect("Should create empty file");
+        let file_id = expect_stream_success(
+            manager
+                .create_file_stream(stream::iter(items))
+                .await
+                .expect("Should create empty file"),
+        );
 
         let file = manager.get_file(file_id).await.unwrap();
         assert_eq!(file.name, "empty-file.jsonl");
@@ -10677,6 +10754,7 @@ mod tests {
                 }),
             ]))
             .await
+            .map(expect_stream_success)
             .unwrap();
 
         // Create file with api_key_id = key_b
@@ -10698,6 +10776,7 @@ mod tests {
                 }),
             ]))
             .await
+            .map(expect_stream_success)
             .unwrap();
 
         // Filter by key_a — should return only file_a
