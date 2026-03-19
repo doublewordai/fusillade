@@ -1428,9 +1428,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let stream = stream::iter(items);
         match self.create_file_stream(stream).await? {
             FileStreamResult::Success(file_id) => Ok(file_id),
-            FileStreamResult::Aborted => Err(FusilladeError::ValidationError(
-                "create_file aborted unexpectedly".to_string(),
-            )),
+            FileStreamResult::Aborted => Err(FusilladeError::Other(anyhow!(
+                "create_file produced an aborted stream result for an internally constructed stream"
+            ))),
         }
     }
 
@@ -1528,6 +1528,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     }
                 }
                 FileStreamItem::Abort => {
+                    tx.rollback().await.map_err(|e| {
+                        FusilladeError::Other(anyhow!(
+                            "Failed to roll back aborted file stream transaction: {}",
+                            e
+                        ))
+                    })?;
                     return Ok(FileStreamResult::Aborted);
                 }
                 #[allow(deprecated)]
