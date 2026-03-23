@@ -1,5 +1,12 @@
 # Changelog
 
+## [13.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v13.0.0...fusillade-v13.0.1) (2026-03-23)
+
+
+### Bug Fixes
+
+* adds support for streamed batch /v1/responses, bump reassembler ([#185](https://github.com/doublewordai/fusillade/issues/185)) ([9ab71a4](https://github.com/doublewordai/fusillade/commit/9ab71a4dec393d85bdcf8fab4a416cba312be918))
+
 ## [13.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v12.1.0...fusillade-v13.0.0) (2026-03-17)
 
 
