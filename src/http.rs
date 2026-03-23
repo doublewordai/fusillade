@@ -222,6 +222,7 @@ impl HttpClient for ReqwestHttpClient {
         }
 
         let stream = self.streamable_endpoints.iter().any(|e| e == &request.path);
+        span.set_attribute("fusillade.streaming", stream);
         if stream {
             req = req.header("X-Fusillade-Stream", "true");
             self.execute_streaming(request, req, &url).await
