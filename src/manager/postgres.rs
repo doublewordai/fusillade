@@ -15,7 +15,6 @@ use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use sqlx::QueryBuilder;
 use sqlx::Row;
-use sqlx::PgConnection;
 use sqlx::postgres::{PgListener, PgPool};
 use std::collections::HashMap;
 use tokio::sync::{Mutex, mpsc};
@@ -2087,16 +2086,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     async fn create_batch(&self, input: BatchInput) -> Result<Batch> {
         let file_id = input.file_id;
         let created_by = input.created_by.clone();
-        let mut conn = self.pools.write().acquire().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to acquire connection: {}", e))
-        })?;
-        let batch = self.create_batch_record(&mut conn, input).await?;
+        let batch = self.create_batch_record(input).await?;
         self.populate_batch(batch.id, file_id, created_by).await?;
         self.get_batch_from_pool(batch.id, self.pools.write()).await
     }
 
-    #[tracing::instrument(level = "debug", skip(self, conn))]
-    async fn create_batch_record(&self, conn: &mut PgConnection, input: BatchInput) -> Result<Batch> {
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn create_batch_record(&self, input: BatchInput) -> Result<Batch> {
         let now = Utc::now();
         let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -2133,7 +2129,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             input.api_key_id,
             input.api_key,
         )
-        .fetch_one(&mut *conn)
+        .fetch_one(self.pools.write())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch record: {}", e)))?;
 

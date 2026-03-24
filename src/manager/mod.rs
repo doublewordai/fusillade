@@ -13,7 +13,6 @@ use crate::http::HttpClient;
 use crate::request::{AnyRequest, Claimed, DaemonId, Request, RequestId, RequestState};
 use async_trait::async_trait;
 use futures::stream::Stream;
-use sqlx::PgConnection;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -108,11 +107,7 @@ pub trait Storage: Send + Sync {
     /// Inserts the batch row only (no virtual files, no template snapshot).
     /// Returns a batch with `total_requests: 0` and status `"validating"`.
     /// Use [`populate_batch`] to copy templates into requests afterward.
-    ///
-    /// Accepts a `&mut PgConnection` so callers can participate in an existing
-    /// transaction (e.g. to atomically enqueue a background job alongside the
-    /// batch insert).
-    async fn create_batch_record(&self, conn: &mut PgConnection, input: BatchInput) -> Result<Batch>;
+    async fn create_batch_record(&self, input: BatchInput) -> Result<Batch>;
 
     /// Populate an existing batch with requests from its file's templates.
     ///
