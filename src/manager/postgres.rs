@@ -2082,7 +2082,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(())
     }
 
-    #[allow(deprecated)]
     async fn create_batch(&self, input: BatchInput) -> Result<Batch> {
         let file_id = input.file_id;
         let created_by = input.created_by.clone();
@@ -2114,10 +2113,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ))
         })?;
 
+        let total_requests = input.total_requests.unwrap_or(0);
+
         let row = sqlx::query!(
             r#"
-            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF(TRIM($8), ''))
+            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key, total_requests)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF(TRIM($8), ''), $9)
             RETURNING id, created_at
             "#,
             *input.file_id as Uuid,
@@ -2128,6 +2129,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             expires_at,
             input.api_key_id,
             input.api_key,
+            total_requests,
         )
         .fetch_one(self.pools.write())
         .await
@@ -2146,7 +2148,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             expires_at,
             cancelling_at: None,
             errors: None,
-            total_requests: 0,
+            total_requests,
             pending_requests: 0,
             in_progress_requests: 0,
             completed_requests: 0,
@@ -5130,6 +5132,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -5203,6 +5206,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5274,6 +5278,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5347,6 +5352,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5416,6 +5422,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5534,6 +5541,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5546,6 +5554,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5558,6 +5567,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5627,6 +5637,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5715,6 +5726,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5799,6 +5811,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5890,6 +5903,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5991,6 +6005,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -6103,6 +6118,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -6216,6 +6232,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -6297,6 +6314,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -6398,6 +6416,7 @@ mod tests {
                 created_by: Some("test-user".to_string()),
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -7118,6 +7137,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7193,6 +7213,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7294,6 +7315,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7417,6 +7439,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7478,6 +7501,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7560,6 +7584,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7843,6 +7868,7 @@ mod tests {
                 metadata: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8019,6 +8045,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8151,6 +8178,7 @@ mod tests {
                 created_by: Some("user1".to_string()),
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8239,6 +8267,7 @@ mod tests {
                     created_by: Some("user1".to_string()),
                     api_key_id: None,
                     api_key: None,
+                total_requests: None,
                 })
                 .await
                 .unwrap();
@@ -8371,6 +8400,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8483,6 +8513,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8659,6 +8690,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8695,6 +8727,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8738,6 +8771,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8843,6 +8877,7 @@ mod tests {
                     created_by: None,
                     api_key_id: None,
                     api_key: None,
+                total_requests: None,
                 })
                 .await
                 .unwrap();
@@ -8889,6 +8924,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8969,6 +9005,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9067,6 +9104,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9328,6 +9366,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9396,6 +9435,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9532,6 +9572,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9639,6 +9680,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9723,6 +9765,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9765,6 +9808,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9860,6 +9904,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10020,6 +10065,7 @@ mod tests {
                 created_by: None,
                 api_key_id: Some(key_a),
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10033,6 +10079,7 @@ mod tests {
                 created_by: None,
                 api_key_id: Some(key_b),
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10046,6 +10093,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10133,6 +10181,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10239,6 +10288,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10315,6 +10365,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10381,6 +10432,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10440,6 +10492,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10453,6 +10506,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10534,6 +10588,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10605,6 +10660,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10626,6 +10682,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10647,6 +10704,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10834,6 +10892,7 @@ mod tests {
                     created_by: None,
                     api_key_id: None,
                     api_key: None,
+                total_requests: None,
                 })
                 .await
                 .unwrap();
@@ -10957,6 +11016,7 @@ mod tests {
                     created_by: None,
                     api_key_id: None,
                     api_key: None,
+                total_requests: None,
                 })
                 .await
                 .unwrap();

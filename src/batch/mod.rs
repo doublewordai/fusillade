@@ -416,6 +416,10 @@ pub struct BatchInput {
     /// request_templates so that billing is attributed to the batch creator,
     /// not the file uploader.
     pub api_key: Option<String>,
+    /// Total number of request templates in the file. Set at creation time so
+    /// the batch immediately reflects the expected request count before
+    /// population completes.
+    pub total_requests: Option<i64>,
 }
 
 /// A batch represents one execution of all of a file's templates.
