@@ -248,6 +248,29 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         self
     }
 
+    /// Mark a batch as permanently failed.
+    ///
+    /// Sets `failed_at` and `requests_started_at` (so status routes past
+    /// "validating" to "failed") and stores the error message. Idempotent —
+    /// skips batches that already have `failed_at` set.
+    pub async fn mark_batch_failed(&self, batch_id: BatchId, error_message: &str) -> Result<()> {
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET failed_at = NOW(),
+                errors = $2
+            WHERE id = $1 AND failed_at IS NULL
+            "#,
+            *batch_id as Uuid,
+            serde_json::json!({"message": error_message}),
+        )
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark batch as failed: {}", e)))?;
+
+        Ok(())
+    }
+
     /// Get the connection pool.
     /// Get the primary connection pool for write operations.
     ///
@@ -2081,12 +2104,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(())
     }
 
-    // Create_batch is the synchronous way to create a batch, without deferring populate_batch to a job queue.
+    #[tracing::instrument(level = "debug", skip(self, input), fields(file_id = %input.file_id))]
     async fn create_batch(&self, input: BatchInput) -> Result<Batch> {
         let file_id = input.file_id;
         let created_by = input.created_by.clone();
         let batch = self.create_batch_record(input).await?;
-        self.populate_batch(batch.id, file_id, created_by).await?;
+        if let Err(e) = self.populate_batch(batch.id, file_id, created_by).await {
+            let _ = self.mark_batch_failed(batch.id, &e.to_string()).await;
+            return Err(e);
+        }
         self.get_batch_from_pool(batch.id, self.pools.write()).await
     }
 
@@ -2219,28 +2245,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .rows_affected();
 
         if rows_affected == 0 {
-            // Mark batch as failed — this is a permanent error, no point retrying
-            sqlx::query!(
-                r#"
-                UPDATE batches
-                SET failed_at = NOW(),
-                    errors = $2
-                WHERE id = $1
-                "#,
-                *batch_id as Uuid,
-                serde_json::json!({"message": "File has no templates"}),
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark batch as failed: {}", e)))?;
-
-            tx.commit().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e))
-            })?;
-
-            return Err(FusilladeError::Other(anyhow!(
-                "Cannot populate batch from file with no templates"
-            )));
+            // Transaction drops → rollback (virtual files undone).
+            // Caller is responsible for marking the batch failed.
+            return Err(FusilladeError::ValidationError(
+                "Cannot populate batch from file with no templates".to_string(),
+            ));
         }
 
         // Update batch metadata

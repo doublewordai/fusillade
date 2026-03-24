@@ -103,7 +103,8 @@ pub trait Storage: Send + Sync {
     /// Create a batch record without populating requests.
     ///
     /// Inserts the batch row only (no virtual files, no template snapshot).
-    /// Returns a batch with `total_requests: 0` and status `"validating"`.
+    /// Returns a batch in `"validating"` status (`requests_started_at` is NULL).
+    /// `total_requests` will be set from `input.total_requests` if provided, or `0` otherwise.
     /// Use [`populate_batch`] to copy templates into requests afterward.
     async fn create_batch_record(&self, input: BatchInput) -> Result<Batch>;
 
