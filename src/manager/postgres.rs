@@ -690,7 +690,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             api_key_id: row.api_key_id,
         })
     }
-
 }
 
 // Implement Storage trait directly (no delegation)
@@ -2166,10 +2165,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
-    async fn populate_batch(&self, batch_id: BatchId, file_id: FileId, created_by: Option<String>) -> Result<()> {
-        let mut tx = self.pools.write().begin().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-        })?;
+    async fn populate_batch(
+        &self,
+        batch_id: BatchId,
+        file_id: FileId,
+        created_by: Option<String>,
+    ) -> Result<()> {
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
 
         // Create virtual output and error files
         let output_file_id = self
@@ -8267,7 +8272,7 @@ mod tests {
                     created_by: Some("user1".to_string()),
                     api_key_id: None,
                     api_key: None,
-                total_requests: None,
+                    total_requests: None,
                 })
                 .await
                 .unwrap();
@@ -8877,7 +8882,7 @@ mod tests {
                     created_by: None,
                     api_key_id: None,
                     api_key: None,
-                total_requests: None,
+                    total_requests: None,
                 })
                 .await
                 .unwrap();
@@ -10892,7 +10897,7 @@ mod tests {
                     created_by: None,
                     api_key_id: None,
                     api_key: None,
-                total_requests: None,
+                    total_requests: None,
                 })
                 .await
                 .unwrap();
@@ -11016,7 +11021,7 @@ mod tests {
                     created_by: None,
                     api_key_id: None,
                     api_key: None,
-                total_requests: None,
+                    total_requests: None,
                 })
                 .await
                 .unwrap();

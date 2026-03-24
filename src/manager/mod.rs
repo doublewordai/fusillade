@@ -114,7 +114,12 @@ pub trait Storage: Send + Sync {
     /// Creates virtual output/error files, copies templates into the requests
     /// table, and updates the batch with total_requests and requests_started_at.
     /// If the file has no templates, marks the batch as failed.
-    async fn populate_batch(&self, batch_id: BatchId, file_id: FileId, created_by: Option<String>) -> Result<()>;
+    async fn populate_batch(
+        &self,
+        batch_id: BatchId,
+        file_id: FileId,
+        created_by: Option<String>,
+    ) -> Result<()>;
 
     /// Get a batch by ID.
     ///
