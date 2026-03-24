@@ -2081,6 +2081,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(())
     }
 
+    // Create_batch is the synchronous way to create a batch, without deferring populate_batch to a job queue.
     async fn create_batch(&self, input: BatchInput) -> Result<Batch> {
         let file_id = input.file_id;
         let created_by = input.created_by.clone();
@@ -7056,6 +7057,7 @@ mod tests {
             created_by: Some("test-user".to_string()),
             api_key_id: None,
             api_key: None,
+            total_requests: None,
         };
 
         let created_batch = manager.create_batch(batch_input).await.unwrap();

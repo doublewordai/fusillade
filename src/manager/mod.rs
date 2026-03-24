@@ -94,12 +94,10 @@ pub trait Storage: Send + Sync {
     async fn delete_file(&self, file_id: FileId) -> Result<()>;
 
     /// Create a batch from a file's current templates.
-    /// This will spawn requests in the Pending state for all templates in the file.
     ///
-    /// Deprecated: use [`create_batch_record`] + [`populate_batch`] instead,
-    /// which allow the batch record to be returned immediately while template
-    /// population happens in the background.
-    #[deprecated(note = "use create_batch_record + populate_batch instead")]
+    /// Convenience method that calls [`create_batch_record`] to insert the batch
+    /// row, then [`populate_batch`] to copy templates into requests. Returns the
+    /// fully-populated batch.
     async fn create_batch(&self, input: BatchInput) -> Result<Batch>;
 
     /// Create a batch record without populating requests.

@@ -2286,6 +2286,7 @@ mod tests {
                 created_by: Some("test-user".to_string()),
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
