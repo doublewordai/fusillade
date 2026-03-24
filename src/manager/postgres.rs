@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use sqlx::QueryBuilder;
 use sqlx::Row;
+use sqlx::PgConnection;
 use sqlx::postgres::{PgListener, PgPool};
 use std::collections::HashMap;
 use tokio::sync::{Mutex, mpsc};
@@ -2086,13 +2087,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     async fn create_batch(&self, input: BatchInput) -> Result<Batch> {
         let file_id = input.file_id;
         let created_by = input.created_by.clone();
-        let batch = self.create_batch_record(input).await?;
+        let mut conn = self.pools.write().acquire().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to acquire connection: {}", e))
+        })?;
+        let batch = self.create_batch_record(&mut conn, input).await?;
         self.populate_batch(batch.id, file_id, created_by).await?;
         self.get_batch_from_pool(batch.id, self.pools.write()).await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn create_batch_record(&self, input: BatchInput) -> Result<Batch> {
+    #[tracing::instrument(level = "debug", skip(self, conn))]
+    async fn create_batch_record(&self, conn: &mut PgConnection, input: BatchInput) -> Result<Batch> {
         let now = Utc::now();
         let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -2114,11 +2118,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ))
         })?;
 
-        let batch_id: Uuid = sqlx::query_scalar!(
+        let row = sqlx::query!(
             r#"
             INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key)
             VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF(TRIM($8), ''))
-            RETURNING id
+            RETURNING id, created_at
             "#,
             *input.file_id as Uuid,
             input.endpoint,
@@ -2129,12 +2133,38 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             input.api_key_id,
             input.api_key,
         )
-        .fetch_one(self.pools.write())
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch record: {}", e)))?;
 
-        self.get_batch_from_pool(BatchId(batch_id), self.pools.write())
-            .await
+        Ok(Batch {
+            id: BatchId(row.id),
+            file_id: Some(input.file_id),
+            created_at: row.created_at,
+            metadata: input.metadata,
+            completion_window: input.completion_window,
+            endpoint: input.endpoint,
+            output_file_id: None,
+            error_file_id: None,
+            created_by: input.created_by,
+            expires_at,
+            cancelling_at: None,
+            errors: None,
+            total_requests: 0,
+            pending_requests: 0,
+            in_progress_requests: 0,
+            completed_requests: 0,
+            failed_requests: 0,
+            canceled_requests: 0,
+            requests_started_at: None,
+            finalizing_at: None,
+            completed_at: None,
+            failed_at: None,
+            cancelled_at: None,
+            deleted_at: None,
+            notification_sent_at: None,
+            api_key_id: input.api_key_id,
+        })
     }
 
     #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
