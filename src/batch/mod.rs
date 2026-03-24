@@ -520,7 +520,9 @@ impl BatchStatus {
     /// - "failed" - all requests in terminal state and all failed
     /// - "cancelled" - all requests cancelled
     pub fn openai_status(&self) -> &'static str {
-        if self.total_requests == 0 {
+        if self.started_at.is_none() {
+            // Batch hasn't been populated yet — total_requests may already be
+            // set from the template count, but no request rows exist.
             return "validating";
         }
 
@@ -528,8 +530,8 @@ impl BatchStatus {
             self.completed_requests + self.failed_requests + self.canceled_requests;
 
         if terminal_count == 0 {
-            // Nothing has started yet
-            "validating"
+            // Populated but nothing terminal yet
+            "in_progress"
         } else if terminal_count == self.total_requests {
             // All done - determine outcome
             if self.canceled_requests == self.total_requests {
