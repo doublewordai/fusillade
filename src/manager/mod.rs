@@ -95,7 +95,26 @@ pub trait Storage: Send + Sync {
 
     /// Create a batch from a file's current templates.
     /// This will spawn requests in the Pending state for all templates in the file.
+    ///
+    /// Deprecated: use [`create_batch_record`] + [`populate_batch`] instead,
+    /// which allow the batch record to be returned immediately while template
+    /// population happens in the background.
+    #[deprecated(note = "use create_batch_record + populate_batch instead")]
     async fn create_batch(&self, input: BatchInput) -> Result<Batch>;
+
+    /// Create a batch record without populating requests.
+    ///
+    /// Inserts the batch row only (no virtual files, no template snapshot).
+    /// Returns a batch with `total_requests: 0` and status `"validating"`.
+    /// Use [`populate_batch`] to copy templates into requests afterward.
+    async fn create_batch_record(&self, input: BatchInput) -> Result<Batch>;
+
+    /// Populate an existing batch with requests from its file's templates.
+    ///
+    /// Creates virtual output/error files, copies templates into the requests
+    /// table, and updates the batch with total_requests and requests_started_at.
+    /// If the file has no templates, marks the batch as failed.
+    async fn populate_batch(&self, batch_id: BatchId, file_id: FileId, created_by: Option<String>) -> Result<()>;
 
     /// Get a batch by ID.
     ///

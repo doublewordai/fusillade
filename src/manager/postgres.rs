@@ -690,6 +690,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             api_key_id: row.api_key_id,
         })
     }
+
 }
 
 // Implement Storage trait directly (no delegation)
@@ -2081,16 +2082,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(())
     }
 
-    #[tracing::instrument(skip(self, input), fields(file_id = ?input.file_id, endpoint = %input.endpoint))]
+    #[allow(deprecated)]
     async fn create_batch(&self, input: BatchInput) -> Result<Batch> {
-        let mut tx =
-            self.pools.write().begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        let file_id = input.file_id;
+        let created_by = input.created_by.clone();
+        let batch = self.create_batch_record(input).await?;
+        self.populate_batch(batch.id, file_id, created_by).await?;
+        self.get_batch_from_pool(batch.id, self.pools.write()).await
+    }
 
-        // Calculate expires_at from completion_window
-        // IMPORTANT: expires_at is required for queue prioritization and SLA monitoring
-        // Batches without it will never be processed, so we fail-fast on invalid completion_window
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn create_batch_record(&self, input: BatchInput) -> Result<Batch> {
         let now = Utc::now();
         let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -2112,12 +2114,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ))
         })?;
 
-        // Create batch with new fields
-        let row = sqlx::query!(
+        let batch_id: Uuid = sqlx::query_scalar!(
             r#"
             INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key)
             VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF(TRIM($8), ''))
-            RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+            RETURNING id
             "#,
             *input.file_id as Uuid,
             input.endpoint,
@@ -2128,18 +2129,26 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             input.api_key_id,
             input.api_key,
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(self.pools.write())
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch record: {}", e)))?;
 
-        let batch_id = row.id;
+        self.get_batch_from_pool(BatchId(batch_id), self.pools.write())
+            .await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
+    async fn populate_batch(&self, batch_id: BatchId, file_id: FileId, created_by: Option<String>) -> Result<()> {
+        let mut tx = self.pools.write().begin().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+        })?;
 
         // Create virtual output and error files
         let output_file_id = self
-            .create_virtual_output_file(&mut tx, batch_id, &input.created_by)
+            .create_virtual_output_file(&mut tx, *batch_id, &created_by)
             .await?;
         let error_file_id = self
-            .create_virtual_error_file(&mut tx, batch_id, &input.created_by)
+            .create_virtual_error_file(&mut tx, *batch_id, &created_by)
             .await?;
 
         // Update batch with file IDs
@@ -2149,7 +2158,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             SET output_file_id = $2, error_file_id = $3
             WHERE id = $1
             "#,
-            batch_id,
+            *batch_id as Uuid,
             output_file_id,
             error_file_id,
         )
@@ -2159,7 +2168,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FusilladeError::Other(anyhow!("Failed to update batch with file IDs: {}", e))
         })?;
 
-        // bulk insert requests from templates
+        // Bulk insert requests from templates
         let rows_affected = sqlx::query!(
             r#"
             INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt, model)
@@ -2167,8 +2176,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FROM request_templates
             WHERE file_id = $2
             "#,
-            batch_id,
-            *input.file_id as Uuid,
+            *batch_id as Uuid,
+            *file_id as Uuid,
         )
         .execute(&mut *tx)
         .await
@@ -2176,19 +2185,31 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .rows_affected();
 
         if rows_affected == 0 {
-            tx.rollback().await.map_err(|e| {
-                FusilladeError::Other(anyhow!(
-                    "Failed to rollback transaction after zero templates: {}",
-                    e
-                ))
+            // Mark batch as failed — this is a permanent error, no point retrying
+            sqlx::query!(
+                r#"
+                UPDATE batches
+                SET failed_at = NOW(),
+                    errors = $2
+                WHERE id = $1
+                "#,
+                *batch_id as Uuid,
+                serde_json::json!({"message": "File has no templates"}),
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark batch as failed: {}", e)))?;
+
+            tx.commit().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e))
             })?;
+
             return Err(FusilladeError::Other(anyhow!(
-                "Cannot create batch from file with no templates"
+                "Cannot populate batch from file with no templates"
             )));
         }
 
         // Update batch metadata
-        // Note: Request state counts are computed on-demand, not stored
         sqlx::query!(
             r#"
             UPDATE batches
@@ -2196,7 +2217,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 requests_started_at = NOW()
             WHERE id = $1
             "#,
-            batch_id,
+            *batch_id as Uuid,
             rows_affected as i64
         )
         .execute(&mut *tx)
@@ -2207,13 +2228,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
-        // IMPORTANT: Must query from write pool to guarantee read-after-write consistency.
-        // Different connections from the pool can have different transaction snapshots due to
-        // isolation levels (READ COMMITTED or REPEATABLE READ). Querying from the read pool
-        // immediately after committing on the write pool can result in "Batch not found" if
-        // the read connection's snapshot predates the write commit.
-        self.get_batch_from_pool(BatchId(batch_id), self.pools.write())
-            .await
+        Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
