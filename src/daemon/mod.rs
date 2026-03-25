@@ -273,6 +273,9 @@ where
     http_client: Arc<H>,
     config: DaemonConfig,
     requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
+    /// Per-user in-flight request counts across all models, used to prioritise
+    /// users with fewer active requests during claim (per-user fair scheduling).
+    user_requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
     requests_processed: Arc<AtomicU64>,
     requests_failed: Arc<AtomicU64>,
     shutdown_token: tokio_util::sync::CancellationToken,
@@ -299,6 +302,7 @@ where
             http_client,
             config,
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
+            user_requests_in_flight: Arc::new(dashmap::DashMap::new()),
             requests_processed: Arc::new(AtomicU64::new(0)),
             requests_failed: Arc::new(AtomicU64::new(0)),
             shutdown_token,
@@ -603,6 +607,14 @@ where
             let total_capacity: usize = available_capacity.values().sum();
             gauge!("fusillade_claim_capacity").set(total_capacity as f64);
 
+            // Snapshot per-user in-flight counts for fair scheduling.
+            // Users with fewer active requests get prioritised in the claim query.
+            let user_active_counts: HashMap<String, usize> = self
+                .user_requests_in_flight
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+                .collect();
+
             // Claim a batch of pending requests (guaranteed ≤ available capacity per model)
             let claim_start = std::time::Instant::now();
             let mut claimed = self
@@ -611,6 +623,7 @@ where
                     self.config.claim_batch_size,
                     self.daemon_id,
                     &available_capacity,
+                    &user_active_counts,
                 )
                 .await?;
             histogram!("fusillade_claim_duration_seconds")
@@ -694,10 +707,12 @@ where
 
                     // Spawn a processing task
                     let model_clone = model.clone();
+                    let user_id = request.data.created_by.clone();
                     let storage = self.storage.clone();
                     let http_client = (*self.http_client).clone();
                     let retry_config = (&self.config).into();
                     let requests_in_flight = self.requests_in_flight.clone();
+                    let user_requests_in_flight = self.user_requests_in_flight.clone();
                     let requests_processed = self.requests_processed.clone();
                     let requests_failed = self.requests_failed.clone();
                     let should_retry = self.config.should_retry.clone();
@@ -716,6 +731,12 @@ where
                         .fetch_add(1, Ordering::Relaxed);
                     gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
                         .increment(1.0);
+
+                    // Increment per-user in-flight counter for fair scheduling
+                    user_requests_in_flight
+                        .entry(user_id.clone())
+                        .or_default()
+                        .fetch_add(1, Ordering::Relaxed);
 
                     let process_span = tracing::info_span!(
                         parent: tracing::Span::none(),
@@ -739,14 +760,19 @@ where
                         // Track processing start time for duration metrics
                         let processing_start = std::time::Instant::now();
 
-                        // Ensure we decrement the per-model counter when this task completes
+                        // Ensure we decrement the per-model and per-user counters when this task completes
                         let model_for_guard = model_clone.clone();
+                        let user_for_guard = user_id;
                         let in_flight_for_guard = requests_in_flight.clone();
+                        let user_in_flight_for_guard = user_requests_in_flight.clone();
                         let _guard = scopeguard::guard((), move |_| {
                             if let Some(counter) = in_flight_for_guard.get(&model_for_guard) {
                                 counter.value().fetch_sub(1, Ordering::Relaxed);
                             }
                             gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
+                            if let Some(counter) = user_in_flight_for_guard.get(&user_for_guard) {
+                                counter.value().fetch_sub(1, Ordering::Relaxed);
+                            }
                         });
 
                         // Duration span covering the claimed state (from claim to process start)

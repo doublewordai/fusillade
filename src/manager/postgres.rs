@@ -776,12 +776,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(result)
     }
 
-    #[tracing::instrument(skip(self, available_capacity), fields(limit))]
+    #[tracing::instrument(skip(self, available_capacity, user_active_counts), fields(limit))]
     async fn claim_requests(
         &self,
         limit: usize,
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
     ) -> Result<Vec<Request<Claimed>>> {
         // First, unclaim any stale requests (self-healing for daemon crashes)
         let unclaimed_count = self.unclaim_stale_requests().await?;
@@ -823,13 +824,27 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             return Ok(Vec::new());
         }
 
+        // Build user priority arrays for per-user fair scheduling.
+        // Users with fewer in-flight requests get claimed first.
+        let user_ids_arr: Vec<String> = user_active_counts.keys().cloned().collect();
+        let user_counts_arr: Vec<i64> = user_ids_arr
+            .iter()
+            .map(|u| *user_active_counts.get(u).unwrap_or(&0) as i64)
+            .collect();
+
         // Single query claims across all models using LATERAL.
         // The active_batch_ids CTE pre-filters batches to avoid orphaned pending
         // requests from cancelled/deleted batches consuming the inner LIMIT.
+        //
+        // Per-user fair scheduling: user_priority (from $6/$7) provides each user's
+        // current in-flight count from the daemon's DashMap. Batches are ordered by
+        // (active_count ASC, expires_at ASC) so users with fewer in-flight requests
+        // are prioritised within each model's capacity. Cross-model fairness converges
+        // over claim cycles as the DashMap updates between cycles.
         let rows = sqlx::query!(
             r#"
             WITH active_batch_ids AS MATERIALIZED (
-                SELECT b.id, b.expires_at
+                SELECT b.id, b.expires_at, b.created_by
                 FROM batches b
                 WHERE b.cancelling_at IS NULL
                     AND b.deleted_at IS NULL
@@ -842,12 +857,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             AND r.state = 'pending'
                     )
             ),
+            user_priority AS (
+                SELECT * FROM unnest($6::TEXT[], $7::BIGINT[]) AS u(user_id, active_count)
+            ),
             to_claim AS (
                 SELECT claimed.id, claimed.template_id, claimed.batch_id
                 FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
                 CROSS JOIN LATERAL (
                     SELECT r2.id, r2.template_id, r2.batch_id
-                    FROM (SELECT id, expires_at FROM active_batch_ids ORDER BY expires_at ASC) ab
+                    FROM active_batch_ids ab
+                    LEFT JOIN user_priority up ON ab.created_by = up.user_id
                     CROSS JOIN LATERAL (
                         SELECT r3.id, r3.template_id, r3.batch_id
                         FROM requests r3
@@ -859,7 +878,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         LIMIT m.capacity
                         FOR UPDATE OF r3 SKIP LOCKED
                     ) r2
-                    ORDER BY ab.expires_at ASC, ab.id ASC
+                    ORDER BY COALESCE(up.active_count, 0) ASC, ab.expires_at ASC, ab.id ASC
                     LIMIT m.capacity
                 ) claimed
                 LIMIT $2::BIGINT
@@ -896,6 +915,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             now,
             &models_arr,
             &capacities_arr,
+            &user_ids_arr,
+            &user_counts_arr,
         )
         .fetch_all(self.pools.write())
         .await
@@ -981,6 +1002,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         body: row.body,
                         model: row.model,
                         api_key: row.api_key,
+                        created_by: row.batch_created_by.clone(),
                         batch_metadata,
                     },
                 }
@@ -1241,6 +1263,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     body,
                     model,
                     api_key,
+                    created_by: String::new(),
                     batch_metadata: std::collections::HashMap::new(),
                 },
                 _ => {
@@ -2939,6 +2962,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     body,
                     model,
                     api_key,
+                    created_by: String::new(),
                     batch_metadata: std::collections::HashMap::new(),
                 },
                 _ => {
@@ -5175,7 +5199,7 @@ mod tests {
         // Claim 3 requests
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(3, daemon_id, &capacity)
+            .claim_requests(3, daemon_id, &capacity, &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -5187,7 +5211,7 @@ mod tests {
 
         // Try to claim again - should get the remaining 2
         let claimed2 = manager
-            .claim_requests(10, daemon_id, &capacity)
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -5686,7 +5710,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity)
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -5704,7 +5728,7 @@ mod tests {
         // Now daemon2 tries to claim - should unclaim the stale request and re-claim it
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &capacity)
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
             .await
             .unwrap();
 
@@ -5770,7 +5794,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity)
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -5798,7 +5822,7 @@ mod tests {
         // Now daemon2 tries to claim - should unclaim the stale processing request
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &capacity)
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
             .await
             .unwrap();
 
@@ -5878,7 +5902,7 @@ mod tests {
         // Claim request as daemon1, then set to processing
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity)
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -5899,7 +5923,7 @@ mod tests {
         // Daemon2 claims — should reclaim daemon1's request because daemon1 is dead
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &capacity)
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
             .await
             .unwrap();
 
@@ -5979,7 +6003,7 @@ mod tests {
         // Claim request as daemon1, then set to processing
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity)
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -6000,7 +6024,7 @@ mod tests {
         // Daemon2 claims — should reclaim because daemon1's heartbeat is stale
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &capacity)
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
             .await
             .unwrap();
 
@@ -6091,7 +6115,7 @@ mod tests {
         // Daemon1 claims first request and sets to processing
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity)
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -6108,7 +6132,7 @@ mod tests {
         // Daemon2 claims — should get the second request, NOT steal from healthy daemon1
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let claimed2 = manager
-            .claim_requests(1, daemon2_id, &capacity)
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
             .await
             .unwrap();
 
@@ -6187,7 +6211,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let claimed1 = manager
-            .claim_requests(1, daemon1_id, &capacity)
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed1.len(), 1);
@@ -6195,7 +6219,7 @@ mod tests {
         // Daemon2 immediately tries to claim - should get the second request, not steal the first
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let claimed2 = manager
-            .claim_requests(1, daemon2_id, &capacity)
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed2.len(), 1);
@@ -6286,7 +6310,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(1, daemon_id, &capacity)
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
             .await
             .unwrap();
 
@@ -7089,7 +7113,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(2, daemon_id, &capacity)
+            .claim_requests(2, daemon_id, &capacity, &HashMap::new())
             .await
             .unwrap();
 
@@ -7268,7 +7292,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(2, daemon_id, &capacity)
+            .claim_requests(2, daemon_id, &capacity, &HashMap::new())
             .await
             .unwrap();
         let claimed_ids: Vec<_> = claimed.iter().map(|r| r.data.id).collect();
@@ -7536,15 +7560,15 @@ mod tests {
             [("model-a".to_string(), 3), ("model-b".to_string(), 3)].into();
 
         let claimed1 = manager
-            .claim_requests(10, daemon1_id, &full_capacity)
+            .claim_requests(10, daemon1_id, &full_capacity, &HashMap::new())
             .await
             .unwrap();
         let claimed2 = manager
-            .claim_requests(10, daemon2_id, &full_capacity)
+            .claim_requests(10, daemon2_id, &full_capacity, &HashMap::new())
             .await
             .unwrap();
         let claimed3 = manager
-            .claim_requests(10, daemon3_id, &full_capacity)
+            .claim_requests(10, daemon3_id, &full_capacity, &HashMap::new())
             .await
             .unwrap();
 
@@ -8719,7 +8743,7 @@ mod tests {
 
         // Claim 1 request - should get the most urgent one (batch1, 30 min)
         let claimed = manager
-            .claim_requests(1, daemon_id, &capacity)
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -8732,7 +8756,7 @@ mod tests {
 
         // Claim another - should get medium priority (batch2, 2 hours)
         let claimed2 = manager
-            .claim_requests(1, daemon_id, &capacity)
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -8745,7 +8769,7 @@ mod tests {
 
         // Claim last one - should get no-SLA batch (batch3)
         let claimed3 = manager
-            .claim_requests(1, daemon_id, &capacity)
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -8872,7 +8896,7 @@ mod tests {
         let capacity = HashMap::from([("test-fifo".to_string(), 3)]);
 
         let claimed = manager
-            .claim_requests(3, daemon_id, &capacity)
+            .claim_requests(3, daemon_id, &capacity, &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -8884,6 +8908,330 @@ mod tests {
                  but got one from a filler batch — indicates non-FIFO ordering"
             );
         }
+    }
+
+    /// Verifies that claim_requests interleaves users fairly rather than
+    /// draining one user's queue before moving to the next.
+    ///
+    /// Creates 3 users with different request counts (10, 3, 1). With capacity
+    /// of 6, expects requests distributed across all users rather than all 6
+    /// coming from the high-volume user.
+    #[sqlx::test]
+    async fn test_per_user_fair_scheduling(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // User A: high-volume, 10 requests across 2 batches
+        let file_a1 = manager
+            .create_file(
+                "user-a-batch-1".to_string(),
+                None,
+                (0..5)
+                    .map(|j| RequestTemplateInput {
+                        custom_id: Some(format!("a1-{j}")),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "fair-test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let _batch_a1 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_a1,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("user-a".to_string()),
+                api_key_id: None,
+                api_key: None,
+            })
+            .await
+            .unwrap();
+
+        let file_a2 = manager
+            .create_file(
+                "user-a-batch-2".to_string(),
+                None,
+                (0..5)
+                    .map(|j| RequestTemplateInput {
+                        custom_id: Some(format!("a2-{j}")),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "fair-test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let _batch_a2 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_a2,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("user-a".to_string()),
+                api_key_id: None,
+                api_key: None,
+            })
+            .await
+            .unwrap();
+
+        // User B: medium-volume, 3 requests
+        let file_b = manager
+            .create_file(
+                "user-b-batch".to_string(),
+                None,
+                (0..3)
+                    .map(|j| RequestTemplateInput {
+                        custom_id: Some(format!("b-{j}")),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "fair-test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let _batch_b = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_b,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("user-b".to_string()),
+                api_key_id: None,
+                api_key: None,
+            })
+            .await
+            .unwrap();
+
+        // User C: low-volume, 1 request
+        let file_c = manager
+            .create_file(
+                "user-c-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("c-0".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "fair-test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let _batch_c = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_c,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("user-c".to_string()),
+                api_key_id: None,
+                api_key: None,
+            })
+            .await
+            .unwrap();
+
+        // Make all batches expire at the same time so deadline doesn't dominate
+        sqlx::query!("UPDATE batches SET expires_at = NOW() + INTERVAL '1 hour'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("fair-test".to_string(), 6)]);
+
+        // === Cold start: empty DashMap (no prior usage data) ===
+        // With no user counts, all users have COALESCE'd count 0 so ordering
+        // falls back to deadline. All batches share the same expires_at, so
+        // order is deterministic by batch id. The key invariant: all 6 slots
+        // are filled and the system doesn't break.
+        let claimed_cold = manager
+            .claim_requests(6, daemon_id, &capacity, &HashMap::new())
+            .await
+            .expect("Failed to claim requests (cold start)");
+
+        assert_eq!(
+            claimed_cold.len(),
+            6,
+            "Cold start should still claim 6 requests"
+        );
+
+        // Unclaim everything so we can test the populated case
+        sqlx::query!("UPDATE requests SET state = 'pending', daemon_id = NULL, claimed_at = NULL WHERE state = 'claimed'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // === Populated DashMap: user-a has 5 in-flight ===
+        // Simulate user-a already having 5 in-flight requests (from prior cycles).
+        // Users B and C have 0. The claim should prioritise B and C.
+        let user_active_counts = HashMap::from([
+            ("user-a".to_string(), 5),
+            ("user-b".to_string(), 0),
+            ("user-c".to_string(), 0),
+        ]);
+
+        let claimed = manager
+            .claim_requests(6, daemon_id, &capacity, &user_active_counts)
+            .await
+            .expect("Failed to claim requests (populated)");
+
+        assert_eq!(claimed.len(), 6, "Should claim exactly 6 requests");
+
+        // Count per-user claims
+        let mut user_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for req in &claimed {
+            *user_counts.entry(req.data.created_by.as_str()).or_default() += 1;
+        }
+
+        // User B and C should be prioritised over user A (who has 5 in-flight)
+        assert!(
+            user_counts.contains_key("user-b"),
+            "User B (0 in-flight) should have claimed requests"
+        );
+        assert!(
+            user_counts.contains_key("user-c"),
+            "User C (0 in-flight) should have claimed requests"
+        );
+
+        // User A has 10 pending but 5 already in-flight — should get fewer
+        // than B+C combined in this cycle.
+        let user_a_count = user_counts.get("user-a").copied().unwrap_or(0);
+        let user_b_count = user_counts.get("user-b").copied().unwrap_or(0);
+        let user_c_count = user_counts.get("user-c").copied().unwrap_or(0);
+        assert!(
+            user_b_count + user_c_count >= user_a_count,
+            "Users with fewer in-flight should get at least as many claims as user-a: \
+             A={user_a_count}, B={user_b_count}, C={user_c_count}"
+        );
+    }
+
+    /// Verifies that within a single user's requests, deadline ordering is
+    /// preserved — the most urgent batch is processed first.
+    #[sqlx::test]
+    async fn test_per_user_deadline_ordering_preserved(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Same user, two batches with different deadlines
+        let file_urgent = manager
+            .create_file(
+                "urgent".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("urgent-0".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "deadline-test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch_urgent = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_urgent,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("same-user".to_string()),
+                api_key_id: None,
+                api_key: None,
+            })
+            .await
+            .unwrap();
+
+        let file_relaxed = manager
+            .create_file(
+                "relaxed".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("relaxed-0".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "deadline-test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch_relaxed = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_relaxed,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("same-user".to_string()),
+                api_key_id: None,
+                api_key: None,
+            })
+            .await
+            .unwrap();
+
+        // Set deadlines: urgent = 30min, relaxed = 6h
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+            *batch_urgent.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '6 hours' WHERE id = $1",
+            *batch_relaxed.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("deadline-test".to_string(), 1)]);
+
+        // Claim 1 — should be the urgent batch
+        let claimed = manager
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
+            .await
+            .expect("Failed to claim requests");
+
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].data.batch_id, batch_urgent.id,
+            "Within a single user, the most urgent batch should be claimed first"
+        );
+        assert_eq!(claimed[0].data.custom_id, Some("urgent-0".to_string()));
     }
 
     #[sqlx::test]
