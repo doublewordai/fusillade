@@ -1,5 +1,17 @@
 # Changelog
 
+## [13.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v13.0.1...fusillade-v13.1.0) (2026-03-25)
+
+
+### Features
+
+* split create_batch in two to allow job dispatch ([#188](https://github.com/doublewordai/fusillade/issues/188)) ([3f1ca8b](https://github.com/doublewordai/fusillade/commit/3f1ca8b5cc32a7705f49b7b0a113006648a9760d))
+
+
+### Bug Fixes
+
+* add migration for pending, claimed and processing index ([#184](https://github.com/doublewordai/fusillade/issues/184)) ([fa9c9a1](https://github.com/doublewordai/fusillade/commit/fa9c9a1bbbdd984f5158cce63cf1aff924b2c0e5))
+
 ## [13.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v13.0.0...fusillade-v13.0.1) (2026-03-23)
 
 
