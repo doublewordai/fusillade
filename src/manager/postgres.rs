@@ -251,8 +251,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
     /// Mark a batch as permanently failed.
     ///
-    /// Sets `failed_at` and `requests_started_at` (so status routes past
-    /// "validating" to "failed") and stores the error message. Idempotent —
+    /// Sets `failed_at` and stores the error message. Idempotent —
     /// skips batches that already have `failed_at` set.
     pub async fn mark_batch_failed(&self, batch_id: BatchId, error_message: &str) -> Result<()> {
         sqlx::query!(
