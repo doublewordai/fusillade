@@ -140,6 +140,7 @@ macro_rules! batch_status_from_dynamic_row {
             failed_requests: $row.get("failed_requests"),
             canceled_requests: $row.get("canceled_requests"),
             started_at: $row.get("started_at"),
+            failed_at: $row.get("failed_at"),
             created_at: $row.get("created_at"),
         }
     };
@@ -246,6 +247,28 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         }
         self.batch_insert_strategy = strategy;
         self
+    }
+
+    /// Mark a batch as permanently failed.
+    ///
+    /// Sets `failed_at` and stores the error message. Idempotent —
+    /// skips batches that already have `failed_at` set.
+    pub async fn mark_batch_failed(&self, batch_id: BatchId, error_message: &str) -> Result<()> {
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET failed_at = NOW(),
+                errors = $2
+            WHERE id = $1 AND failed_at IS NULL
+            "#,
+            *batch_id as Uuid,
+            serde_json::json!({"message": error_message}),
+        )
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark batch as failed: {}", e)))?;
+
+        Ok(())
     }
 
     /// Get the connection pool.
@@ -2081,16 +2104,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(())
     }
 
-    #[tracing::instrument(skip(self, input), fields(file_id = ?input.file_id, endpoint = %input.endpoint))]
+    #[tracing::instrument(level = "debug", skip(self, input), fields(file_id = %input.file_id))]
     async fn create_batch(&self, input: BatchInput) -> Result<Batch> {
-        let mut tx =
-            self.pools.write().begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        let file_id = input.file_id;
+        let created_by = input.created_by.clone();
+        let batch = self.create_batch_record(input).await?;
+        if let Err(e) = self.populate_batch(batch.id, file_id, created_by).await {
+            let _ = self.mark_batch_failed(batch.id, &e.to_string()).await;
+            return Err(e);
+        }
+        self.get_batch_from_pool(batch.id, self.pools.write()).await
+    }
 
-        // Calculate expires_at from completion_window
-        // IMPORTANT: expires_at is required for queue prioritization and SLA monitoring
-        // Batches without it will never be processed, so we fail-fast on invalid completion_window
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn create_batch_record(&self, input: BatchInput) -> Result<Batch> {
         let now = Utc::now();
         let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -2112,12 +2139,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ))
         })?;
 
-        // Create batch with new fields
+        let total_requests = input.total_requests.unwrap_or(0);
+
         let row = sqlx::query!(
             r#"
-            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF(TRIM($8), ''))
-            RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key, total_requests)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF(TRIM($8), ''), $9)
+            RETURNING id, created_at
             "#,
             *input.file_id as Uuid,
             input.endpoint,
@@ -2127,19 +2155,60 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             expires_at,
             input.api_key_id,
             input.api_key,
+            total_requests,
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(self.pools.write())
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch record: {}", e)))?;
 
-        let batch_id = row.id;
+        Ok(Batch {
+            id: BatchId(row.id),
+            file_id: Some(input.file_id),
+            created_at: row.created_at,
+            metadata: input.metadata,
+            completion_window: input.completion_window,
+            endpoint: input.endpoint,
+            output_file_id: None,
+            error_file_id: None,
+            created_by: input.created_by,
+            expires_at,
+            cancelling_at: None,
+            errors: None,
+            total_requests,
+            pending_requests: 0,
+            in_progress_requests: 0,
+            completed_requests: 0,
+            failed_requests: 0,
+            canceled_requests: 0,
+            requests_started_at: None,
+            finalizing_at: None,
+            completed_at: None,
+            failed_at: None,
+            cancelled_at: None,
+            deleted_at: None,
+            notification_sent_at: None,
+            api_key_id: input.api_key_id,
+        })
+    }
+
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
+    async fn populate_batch(
+        &self,
+        batch_id: BatchId,
+        file_id: FileId,
+        created_by: Option<String>,
+    ) -> Result<()> {
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
 
         // Create virtual output and error files
         let output_file_id = self
-            .create_virtual_output_file(&mut tx, batch_id, &input.created_by)
+            .create_virtual_output_file(&mut tx, *batch_id, &created_by)
             .await?;
         let error_file_id = self
-            .create_virtual_error_file(&mut tx, batch_id, &input.created_by)
+            .create_virtual_error_file(&mut tx, *batch_id, &created_by)
             .await?;
 
         // Update batch with file IDs
@@ -2149,7 +2218,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             SET output_file_id = $2, error_file_id = $3
             WHERE id = $1
             "#,
-            batch_id,
+            *batch_id as Uuid,
             output_file_id,
             error_file_id,
         )
@@ -2159,7 +2228,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FusilladeError::Other(anyhow!("Failed to update batch with file IDs: {}", e))
         })?;
 
-        // bulk insert requests from templates
+        // Bulk insert requests from templates
         let rows_affected = sqlx::query!(
             r#"
             INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt, model)
@@ -2167,8 +2236,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FROM request_templates
             WHERE file_id = $2
             "#,
-            batch_id,
-            *input.file_id as Uuid,
+            *batch_id as Uuid,
+            *file_id as Uuid,
         )
         .execute(&mut *tx)
         .await
@@ -2176,19 +2245,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .rows_affected();
 
         if rows_affected == 0 {
-            tx.rollback().await.map_err(|e| {
-                FusilladeError::Other(anyhow!(
-                    "Failed to rollback transaction after zero templates: {}",
-                    e
-                ))
-            })?;
-            return Err(FusilladeError::Other(anyhow!(
-                "Cannot create batch from file with no templates"
-            )));
+            // Transaction drops → rollback (virtual files undone).
+            // Caller is responsible for marking the batch failed.
+            return Err(FusilladeError::ValidationError(
+                "Cannot populate batch from file with no templates".to_string(),
+            ));
         }
 
         // Update batch metadata
-        // Note: Request state counts are computed on-demand, not stored
         sqlx::query!(
             r#"
             UPDATE batches
@@ -2196,7 +2260,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 requests_started_at = NOW()
             WHERE id = $1
             "#,
-            batch_id,
+            *batch_id as Uuid,
             rows_affected as i64
         )
         .execute(&mut *tx)
@@ -2207,13 +2271,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
-        // IMPORTANT: Must query from write pool to guarantee read-after-write consistency.
-        // Different connections from the pool can have different transaction snapshots due to
-        // isolation levels (READ COMMITTED or REPEATABLE READ). Querying from the read pool
-        // immediately after committing on the write pool can result in "Batch not found" if
-        // the read connection's snapshot predates the write commit.
-        self.get_batch_from_pool(BatchId(batch_id), self.pools.write())
-            .await
+        Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
@@ -2231,6 +2289,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 f.name as file_name,
                 b.total_requests,
                 b.requests_started_at as started_at,
+                b.failed_at,
                 b.created_at,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
@@ -2630,6 +2689,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 f.name as file_name,
                 b.total_requests,
                 b.requests_started_at as started_at,
+                b.failed_at,
                 b.created_at,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
@@ -5089,6 +5149,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -5162,6 +5223,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5233,6 +5295,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5306,6 +5369,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5375,6 +5439,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5493,6 +5558,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5505,6 +5571,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5517,6 +5584,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5586,6 +5654,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5674,6 +5743,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5758,6 +5828,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5849,6 +5920,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5950,6 +6022,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -6062,6 +6135,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -6175,6 +6249,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -6256,6 +6331,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -6357,6 +6433,7 @@ mod tests {
                 created_by: Some("test-user".to_string()),
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -6991,6 +7068,7 @@ mod tests {
             created_by: Some("test-user".to_string()),
             api_key_id: None,
             api_key: None,
+            total_requests: None,
         };
 
         let created_batch = manager.create_batch(batch_input).await.unwrap();
@@ -7077,6 +7155,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7152,6 +7231,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7253,6 +7333,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7376,6 +7457,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7437,6 +7519,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7519,6 +7602,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7802,6 +7886,7 @@ mod tests {
                 metadata: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7978,6 +8063,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8110,6 +8196,7 @@ mod tests {
                 created_by: Some("user1".to_string()),
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8198,6 +8285,7 @@ mod tests {
                     created_by: Some("user1".to_string()),
                     api_key_id: None,
                     api_key: None,
+                    total_requests: None,
                 })
                 .await
                 .unwrap();
@@ -8330,6 +8418,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8442,6 +8531,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8618,6 +8708,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8654,6 +8745,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8697,6 +8789,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8802,6 +8895,7 @@ mod tests {
                     created_by: None,
                     api_key_id: None,
                     api_key: None,
+                    total_requests: None,
                 })
                 .await
                 .unwrap();
@@ -8848,6 +8942,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8928,6 +9023,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9026,6 +9122,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9287,6 +9384,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9355,6 +9453,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9491,6 +9590,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9598,6 +9698,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9682,6 +9783,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9724,6 +9826,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9819,6 +9922,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9979,6 +10083,7 @@ mod tests {
                 created_by: None,
                 api_key_id: Some(key_a),
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9992,6 +10097,7 @@ mod tests {
                 created_by: None,
                 api_key_id: Some(key_b),
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10005,6 +10111,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10092,6 +10199,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10198,6 +10306,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10274,6 +10383,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10340,6 +10450,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10399,6 +10510,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10412,6 +10524,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10493,6 +10606,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10564,6 +10678,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10585,6 +10700,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10606,6 +10722,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10793,6 +10910,7 @@ mod tests {
                     created_by: None,
                     api_key_id: None,
                     api_key: None,
+                    total_requests: None,
                 })
                 .await
                 .unwrap();
@@ -10916,6 +11034,7 @@ mod tests {
                     created_by: None,
                     api_key_id: None,
                     api_key: None,
+                    total_requests: None,
                 })
                 .await
                 .unwrap();
