@@ -884,7 +884,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                       b.metadata::TEXT as "batch_metadata",
                       b.output_file_id::TEXT as "batch_output_file_id",
                       b.error_file_id::TEXT as "batch_error_file_id",
-                      COALESCE(b.created_by, '') as "batch_created_by!",
+                      b.created_by as "batch_created_by!",
                       to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_created_at!",
                       to_char(b.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_expires_at_str",
                       to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_cancelling_at",
@@ -2116,7 +2116,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let row = sqlx::query!(
             r#"
             INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF(TRIM($8), ''))
+            VALUES ($1, $2, $3, $4, COALESCE($5, ''), $6, $7, NULLIF(TRIM($8), ''))
             RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
             "#,
             *input.file_id as Uuid,
@@ -2136,10 +2136,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         // Create virtual output and error files
         let output_file_id = self
-            .create_virtual_output_file(&mut tx, batch_id, &input.created_by)
+            .create_virtual_output_file(
+                &mut tx,
+                batch_id,
+                input.created_by.as_deref().unwrap_or(""),
+            )
             .await?;
         let error_file_id = self
-            .create_virtual_error_file(&mut tx, batch_id, &input.created_by)
+            .create_virtual_error_file(&mut tx, batch_id, input.created_by.as_deref().unwrap_or(""))
             .await?;
 
         // Update batch with file IDs
@@ -3958,7 +3962,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         batch_id: Uuid,
-        created_by: &Option<String>,
+        created_by: &str,
     ) -> Result<Uuid> {
         let name = format!("batch-{}-output.jsonl", batch_id);
         let description = format!("Output file for batch {}", batch_id);
@@ -3966,12 +3970,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         let file_id = sqlx::query_scalar!(
             r#"
             INSERT INTO files (name, description, size_bytes, size_finalized, status, purpose, uploaded_by)
-            VALUES ($1, $2, 0, FALSE, 'processed', 'batch_output', $3)
+            VALUES ($1, $2, 0, FALSE, 'processed', 'batch_output', NULLIF($3, ''))
             RETURNING id
             "#,
             name,
             description,
-            created_by.as_deref(),
+            created_by,
         )
         .fetch_one(&mut **tx)
         .await
@@ -3985,7 +3989,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         batch_id: Uuid,
-        created_by: &Option<String>,
+        created_by: &str,
     ) -> Result<Uuid> {
         let name = format!("batch-{}-error.jsonl", batch_id);
         let description = format!("Error file for batch {}", batch_id);
@@ -3993,12 +3997,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         let file_id = sqlx::query_scalar!(
             r#"
             INSERT INTO files (name, description, size_bytes, size_finalized, status, purpose, uploaded_by)
-            VALUES ($1, $2, 0, FALSE, 'processed', 'batch_error', $3)
+            VALUES ($1, $2, 0, FALSE, 'processed', 'batch_error', NULLIF($3, ''))
             RETURNING id
             "#,
             name,
             description,
-            created_by.as_deref(),
+            created_by,
         )
         .fetch_one(&mut **tx)
         .await
@@ -7010,7 +7014,7 @@ mod tests {
             retrieved_batch.metadata,
             Some(serde_json::json!({"project": "test"}))
         );
-        assert_eq!(retrieved_batch.created_by, Some("test-user".to_string()));
+        assert_eq!(retrieved_batch.created_by, "test-user");
         assert!(retrieved_batch.output_file_id.is_some());
         assert!(retrieved_batch.error_file_id.is_some());
         assert_eq!(retrieved_batch.total_requests, 1);

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF(TRIM($8), ''))\n            RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors\n            ",
+  "query": "\n            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key)\n            VALUES ($1, $2, $3, $4, COALESCE($5, ''), $6, $7, NULLIF(TRIM($8), ''))\n            RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors\n            ",
   "describe": {
     "columns": [
       {
@@ -84,12 +84,12 @@
       true,
       true,
       true,
-      true,
+      false,
       false,
       false,
       true,
       true
     ]
   },
-  "hash": "28f96e34c44adc8a50bde64e46783dbd3981fa8e7ac36d2b12817b220f4cf6c6"
+  "hash": "6f6fb6ccf8fa54b06e389c9695f73904b06dbe00cb472d38eb7c3d1886a6b91a"
 }

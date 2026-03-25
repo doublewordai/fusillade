@@ -435,7 +435,7 @@ pub struct Batch {
     /// File ID containing the error results
     pub error_file_id: Option<FileId>,
     /// User who created this batch
-    pub created_by: Option<String>,
+    pub created_by: String,
     /// When the batch will expire (created_at + completion_window)
     /// This is required for queue prioritization and SLA monitoring
     pub expires_at: DateTime<Utc>,
