@@ -496,6 +496,7 @@ pub struct BatchStatus {
     pub failed_requests: i64,
     pub canceled_requests: i64,
     pub started_at: Option<DateTime<Utc>>,
+    pub failed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -520,6 +521,10 @@ impl BatchStatus {
     /// - "failed" - all requests in terminal state and all failed
     /// - "cancelled" - all requests cancelled
     pub fn openai_status(&self) -> &'static str {
+        if self.failed_at.is_some() {
+            return "failed";
+        }
+
         if self.started_at.is_none() {
             // Batch hasn't been populated yet — total_requests may already be
             // set from the template count, but no request rows exist.

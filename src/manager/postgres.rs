@@ -140,6 +140,7 @@ macro_rules! batch_status_from_dynamic_row {
             failed_requests: $row.get("failed_requests"),
             canceled_requests: $row.get("canceled_requests"),
             started_at: $row.get("started_at"),
+            failed_at: $row.get("failed_at"),
             created_at: $row.get("created_at"),
         }
     };
@@ -2289,6 +2290,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 f.name as file_name,
                 b.total_requests,
                 b.requests_started_at as started_at,
+                b.failed_at,
                 b.created_at,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
@@ -2688,6 +2690,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 f.name as file_name,
                 b.total_requests,
                 b.requests_started_at as started_at,
+                b.failed_at,
                 b.created_at,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,

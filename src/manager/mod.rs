@@ -112,7 +112,8 @@ pub trait Storage: Send + Sync {
     ///
     /// Creates virtual output/error files, copies templates into the requests
     /// table, and updates the batch with total_requests and requests_started_at.
-    /// If the file has no templates, marks the batch as failed.
+    /// If the file has no templates, returns a [`ValidationError`](crate::FusilladeError::ValidationError)
+    /// and the caller is responsible for marking the batch as failed.
     async fn populate_batch(
         &self,
         batch_id: BatchId,
