@@ -118,7 +118,6 @@ pub trait Storage: Send + Sync {
         &self,
         batch_id: BatchId,
         file_id: FileId,
-        created_by: Option<String>,
     ) -> Result<()>;
 
     /// Get a batch by ID.
