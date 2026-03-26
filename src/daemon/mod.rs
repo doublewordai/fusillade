@@ -1140,6 +1140,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1356,6 +1357,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1558,6 +1560,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1707,6 +1710,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -1887,6 +1891,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -2055,6 +2060,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -2228,6 +2234,7 @@ mod tests {
                 created_by: Some("test-user".to_string()),
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -2399,6 +2406,7 @@ mod tests {
                 created_by: Some("test-user".to_string()),
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -2548,6 +2556,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: Some("batch-creator-key".to_string()),
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");

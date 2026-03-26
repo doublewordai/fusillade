@@ -140,6 +140,7 @@ macro_rules! batch_status_from_dynamic_row {
             failed_requests: $row.get("failed_requests"),
             canceled_requests: $row.get("canceled_requests"),
             started_at: $row.get("started_at"),
+            failed_at: $row.get("failed_at"),
             created_at: $row.get("created_at"),
         }
     };
@@ -246,6 +247,28 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         }
         self.batch_insert_strategy = strategy;
         self
+    }
+
+    /// Mark a batch as permanently failed.
+    ///
+    /// Sets `failed_at` and stores the error message. Idempotent —
+    /// skips batches that already have `failed_at` set.
+    pub async fn mark_batch_failed(&self, batch_id: BatchId, error_message: &str) -> Result<()> {
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET failed_at = NOW(),
+                errors = $2
+            WHERE id = $1 AND failed_at IS NULL
+            "#,
+            *batch_id as Uuid,
+            serde_json::json!({"message": error_message}),
+        )
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark batch as failed: {}", e)))?;
+
+        Ok(())
     }
 
     /// Get the connection pool.
@@ -824,8 +847,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             return Ok(Vec::new());
         }
 
-        // Build user priority arrays for per-user fair scheduling.
-        // Users with fewer in-flight requests get claimed first.
         let user_ids_arr: Vec<String> = user_active_counts.keys().cloned().collect();
         let user_counts_arr: Vec<i64> = user_ids_arr
             .iter()
@@ -835,12 +856,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // Single query claims across all models using LATERAL.
         // The active_batch_ids CTE pre-filters batches to avoid orphaned pending
         // requests from cancelled/deleted batches consuming the inner LIMIT.
-        //
-        // Per-user fair scheduling: user_priority (from $6/$7) provides each user's
-        // current in-flight count from the daemon's DashMap. Batches are ordered by
-        // (active_count ASC, expires_at ASC) so users with fewer in-flight requests
-        // are prioritised within each model's capacity. Cross-model fairness converges
-        // over claim cycles as the DashMap updates between cycles.
         let rows = sqlx::query!(
             r#"
             WITH active_batch_ids AS MATERIALIZED (
@@ -2104,16 +2119,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(())
     }
 
-    #[tracing::instrument(skip(self, input), fields(file_id = ?input.file_id, endpoint = %input.endpoint))]
+    #[tracing::instrument(level = "debug", skip(self, input), fields(file_id = %input.file_id))]
     async fn create_batch(&self, input: BatchInput) -> Result<Batch> {
-        let mut tx =
-            self.pools.write().begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        let file_id = input.file_id;
+        let created_by = input.created_by.clone();
+        let batch = self.create_batch_record(input).await?;
+        if let Err(e) = self.populate_batch(batch.id, file_id, created_by).await {
+            let _ = self.mark_batch_failed(batch.id, &e.to_string()).await;
+            return Err(e);
+        }
+        self.get_batch_from_pool(batch.id, self.pools.write()).await
+    }
 
-        // Calculate expires_at from completion_window
-        // IMPORTANT: expires_at is required for queue prioritization and SLA monitoring
-        // Batches without it will never be processed, so we fail-fast on invalid completion_window
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn create_batch_record(&self, input: BatchInput) -> Result<Batch> {
         let now = Utc::now();
         let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -2135,12 +2154,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ))
         })?;
 
-        // Create batch with new fields
+        let total_requests = input.total_requests.unwrap_or(0);
+
         let row = sqlx::query!(
             r#"
-            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key)
-            VALUES ($1, $2, $3, $4, COALESCE($5, ''), $6, $7, NULLIF(TRIM($8), ''))
-            RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key, total_requests)
+            VALUES ($1, $2, $3, $4, COALESCE($5, ''), $6, $7, NULLIF(TRIM($8), ''), $9)
+            RETURNING id, created_at
             "#,
             *input.file_id as Uuid,
             input.endpoint,
@@ -2150,23 +2170,60 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             expires_at,
             input.api_key_id,
             input.api_key,
+            total_requests,
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(self.pools.write())
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch record: {}", e)))?;
 
-        let batch_id = row.id;
+        Ok(Batch {
+            id: BatchId(row.id),
+            file_id: Some(input.file_id),
+            created_at: row.created_at,
+            metadata: input.metadata,
+            completion_window: input.completion_window,
+            endpoint: input.endpoint,
+            output_file_id: None,
+            error_file_id: None,
+            created_by: input.created_by.unwrap_or_default(),
+            expires_at,
+            cancelling_at: None,
+            errors: None,
+            total_requests,
+            pending_requests: 0,
+            in_progress_requests: 0,
+            completed_requests: 0,
+            failed_requests: 0,
+            canceled_requests: 0,
+            requests_started_at: None,
+            finalizing_at: None,
+            completed_at: None,
+            failed_at: None,
+            cancelled_at: None,
+            deleted_at: None,
+            notification_sent_at: None,
+            api_key_id: input.api_key_id,
+        })
+    }
+
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
+    async fn populate_batch(
+        &self,
+        batch_id: BatchId,
+        file_id: FileId,
+        created_by: Option<String>,
+    ) -> Result<()> {
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
 
         // Create virtual output and error files
         let output_file_id = self
-            .create_virtual_output_file(
-                &mut tx,
-                batch_id,
-                input.created_by.as_deref().unwrap_or(""),
-            )
+            .create_virtual_output_file(&mut tx, *batch_id, created_by.as_deref().unwrap_or(""))
             .await?;
         let error_file_id = self
-            .create_virtual_error_file(&mut tx, batch_id, input.created_by.as_deref().unwrap_or(""))
+            .create_virtual_error_file(&mut tx, *batch_id, created_by.as_deref().unwrap_or(""))
             .await?;
 
         // Update batch with file IDs
@@ -2176,7 +2233,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             SET output_file_id = $2, error_file_id = $3
             WHERE id = $1
             "#,
-            batch_id,
+            *batch_id as Uuid,
             output_file_id,
             error_file_id,
         )
@@ -2186,7 +2243,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FusilladeError::Other(anyhow!("Failed to update batch with file IDs: {}", e))
         })?;
 
-        // bulk insert requests from templates
+        // Bulk insert requests from templates
         let rows_affected = sqlx::query!(
             r#"
             INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt, model)
@@ -2194,8 +2251,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FROM request_templates
             WHERE file_id = $2
             "#,
-            batch_id,
-            *input.file_id as Uuid,
+            *batch_id as Uuid,
+            *file_id as Uuid,
         )
         .execute(&mut *tx)
         .await
@@ -2203,19 +2260,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .rows_affected();
 
         if rows_affected == 0 {
-            tx.rollback().await.map_err(|e| {
-                FusilladeError::Other(anyhow!(
-                    "Failed to rollback transaction after zero templates: {}",
-                    e
-                ))
-            })?;
-            return Err(FusilladeError::Other(anyhow!(
-                "Cannot create batch from file with no templates"
-            )));
+            // Transaction drops → rollback (virtual files undone).
+            // Caller is responsible for marking the batch failed.
+            return Err(FusilladeError::ValidationError(
+                "Cannot populate batch from file with no templates".to_string(),
+            ));
         }
 
         // Update batch metadata
-        // Note: Request state counts are computed on-demand, not stored
         sqlx::query!(
             r#"
             UPDATE batches
@@ -2223,7 +2275,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 requests_started_at = NOW()
             WHERE id = $1
             "#,
-            batch_id,
+            *batch_id as Uuid,
             rows_affected as i64
         )
         .execute(&mut *tx)
@@ -2234,13 +2286,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
-        // IMPORTANT: Must query from write pool to guarantee read-after-write consistency.
-        // Different connections from the pool can have different transaction snapshots due to
-        // isolation levels (READ COMMITTED or REPEATABLE READ). Querying from the read pool
-        // immediately after committing on the write pool can result in "Batch not found" if
-        // the read connection's snapshot predates the write commit.
-        self.get_batch_from_pool(BatchId(batch_id), self.pools.write())
-            .await
+        Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
@@ -2258,6 +2304,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 f.name as file_name,
                 b.total_requests,
                 b.requests_started_at as started_at,
+                b.failed_at,
                 b.created_at,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
@@ -2657,6 +2704,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 f.name as file_name,
                 b.total_requests,
                 b.requests_started_at as started_at,
+                b.failed_at,
                 b.created_at,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
@@ -5117,6 +5165,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -5190,6 +5239,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5261,6 +5311,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5334,6 +5385,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5403,6 +5455,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5521,6 +5574,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5533,6 +5587,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5545,6 +5600,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5614,6 +5670,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5702,6 +5759,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5786,6 +5844,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5877,6 +5936,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -5978,6 +6038,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -6090,6 +6151,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -6203,6 +6265,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -6284,6 +6347,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -6385,6 +6449,7 @@ mod tests {
                 created_by: Some("test-user".to_string()),
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .expect("Failed to create batch");
@@ -7019,6 +7084,7 @@ mod tests {
             created_by: Some("test-user".to_string()),
             api_key_id: None,
             api_key: None,
+            total_requests: None,
         };
 
         let created_batch = manager.create_batch(batch_input).await.unwrap();
@@ -7105,6 +7171,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7180,6 +7247,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7281,6 +7349,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7404,6 +7473,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7465,6 +7535,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7547,6 +7618,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -7830,6 +7902,7 @@ mod tests {
                 metadata: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8006,6 +8079,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8138,6 +8212,7 @@ mod tests {
                 created_by: Some("user1".to_string()),
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8226,6 +8301,7 @@ mod tests {
                     created_by: Some("user1".to_string()),
                     api_key_id: None,
                     api_key: None,
+                    total_requests: None,
                 })
                 .await
                 .unwrap();
@@ -8358,6 +8434,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8470,6 +8547,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8646,6 +8724,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8682,6 +8761,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8725,6 +8805,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8830,6 +8911,7 @@ mod tests {
                     created_by: None,
                     api_key_id: None,
                     api_key: None,
+                    total_requests: None,
                 })
                 .await
                 .unwrap();
@@ -8876,6 +8958,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -8910,12 +8993,6 @@ mod tests {
         }
     }
 
-    /// Verifies that claim_requests interleaves users fairly rather than
-    /// draining one user's queue before moving to the next.
-    ///
-    /// Creates 3 users with different request counts (10, 3, 1). With capacity
-    /// of 6, expects requests distributed across all users rather than all 6
-    /// coming from the high-volume user.
     #[sqlx::test]
     async fn test_per_user_fair_scheduling(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
@@ -8924,213 +9001,113 @@ mod tests {
             http_client,
         );
 
-        // User A: high-volume, 10 requests across 2 batches
-        let file_a1 = manager
-            .create_file(
-                "user-a-batch-1".to_string(),
-                None,
-                (0..5)
-                    .map(|j| RequestTemplateInput {
-                        custom_id: Some(format!("a1-{j}")),
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: "{}".to_string(),
-                        model: "fair-test".to_string(),
-                        api_key: "key".to_string(),
-                    })
-                    .collect(),
-            )
-            .await
-            .unwrap();
+        // Create files and batches for 3 users, each with 2 requests, same model and deadline
+        let mut batch_ids = Vec::new();
+        for user in &["user-a", "user-b", "user-c"] {
+            let file_id = manager
+                .create_file(
+                    format!("{}-file", user),
+                    None,
+                    vec![
+                        RequestTemplateInput {
+                            custom_id: Some(format!("{}-req-1", user)),
+                            endpoint: "https://api.example.com".to_string(),
+                            method: "POST".to_string(),
+                            path: "/test".to_string(),
+                            body: "{}".to_string(),
+                            model: "fair-test".to_string(),
+                            api_key: "key".to_string(),
+                        },
+                        RequestTemplateInput {
+                            custom_id: Some(format!("{}-req-2", user)),
+                            endpoint: "https://api.example.com".to_string(),
+                            method: "POST".to_string(),
+                            path: "/test".to_string(),
+                            body: "{}".to_string(),
+                            model: "fair-test".to_string(),
+                            api_key: "key".to_string(),
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
 
-        let _batch_a1 = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_a1,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: Some("user-a".to_string()),
-                api_key_id: None,
-                api_key: None,
-            })
-            .await
-            .unwrap();
-
-        let file_a2 = manager
-            .create_file(
-                "user-a-batch-2".to_string(),
-                None,
-                (0..5)
-                    .map(|j| RequestTemplateInput {
-                        custom_id: Some(format!("a2-{j}")),
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: "{}".to_string(),
-                        model: "fair-test".to_string(),
-                        api_key: "key".to_string(),
-                    })
-                    .collect(),
-            )
-            .await
-            .unwrap();
-
-        let _batch_a2 = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_a2,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: Some("user-a".to_string()),
-                api_key_id: None,
-                api_key: None,
-            })
-            .await
-            .unwrap();
-
-        // User B: medium-volume, 3 requests
-        let file_b = manager
-            .create_file(
-                "user-b-batch".to_string(),
-                None,
-                (0..3)
-                    .map(|j| RequestTemplateInput {
-                        custom_id: Some(format!("b-{j}")),
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/test".to_string(),
-                        body: "{}".to_string(),
-                        model: "fair-test".to_string(),
-                        api_key: "key".to_string(),
-                    })
-                    .collect(),
-            )
-            .await
-            .unwrap();
-
-        let _batch_b = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_b,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: Some("user-b".to_string()),
-                api_key_id: None,
-                api_key: None,
-            })
-            .await
-            .unwrap();
-
-        // User C: low-volume, 1 request
-        let file_c = manager
-            .create_file(
-                "user-c-batch".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("c-0".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    body: "{}".to_string(),
-                    model: "fair-test".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let _batch_c = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_c,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: Some("user-c".to_string()),
-                api_key_id: None,
-                api_key: None,
-            })
-            .await
-            .unwrap();
-
-        // Make all batches expire at the same time so deadline doesn't dominate
-        sqlx::query!("UPDATE batches SET expires_at = NOW() + INTERVAL '1 hour'")
-            .execute(&pool)
-            .await
-            .unwrap();
+            let batch = manager
+                .create_batch(BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    created_by: Some(user.to_string()),
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+            batch_ids.push(batch.id);
+        }
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("fair-test".to_string(), 6)]);
 
-        // === Cold start: empty DashMap (no prior usage data) ===
-        // With no user counts, all users have COALESCE'd count 0 so ordering
-        // falls back to deadline. All batches share the same expires_at, so
-        // order is deterministic by batch id. The key invariant: all 6 slots
-        // are filled and the system doesn't break.
-        let claimed_cold = manager
+        // Cold start: empty HashMap means no user priority info — all users equal
+        let claimed = manager
             .claim_requests(6, daemon_id, &capacity, &HashMap::new())
             .await
             .expect("Failed to claim requests (cold start)");
 
         assert_eq!(
-            claimed_cold.len(),
+            claimed.len(),
             6,
-            "Cold start should still claim 6 requests"
+            "Should claim all 6 requests on cold start"
         );
 
-        // Unclaim everything so we can test the populated case
+        // Unclaim all requests so we can re-claim with user priorities
         sqlx::query!("UPDATE requests SET state = 'pending', daemon_id = NULL, claimed_at = NULL WHERE state = 'claimed'")
             .execute(&pool)
             .await
             .unwrap();
 
-        // === Populated DashMap: user-a has 5 in-flight ===
-        // Simulate user-a already having 5 in-flight requests (from prior cycles).
-        // Users B and C have 0. The claim should prioritise B and C.
-        let user_active_counts = HashMap::from([
-            ("user-a".to_string(), 5),
-            ("user-b".to_string(), 0),
-            ("user-c".to_string(), 0),
-        ]);
-
+        // Re-claim with user-a having 5 in-flight requests; user-b and user-c have 0
+        let user_counts = HashMap::from([("user-a".to_string(), 5usize)]);
         let claimed = manager
-            .claim_requests(6, daemon_id, &capacity, &user_active_counts)
+            .claim_requests(6, daemon_id, &capacity, &user_counts)
             .await
-            .expect("Failed to claim requests (populated)");
+            .expect("Failed to claim requests (with user counts)");
 
-        assert_eq!(claimed.len(), 6, "Should claim exactly 6 requests");
+        assert_eq!(claimed.len(), 6, "Should still claim all 6 requests");
 
-        // Count per-user claims
-        let mut user_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for req in &claimed {
-            *user_counts.entry(req.data.created_by.as_str()).or_default() += 1;
+        // Count how many requests were claimed per user
+        let mut per_user: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, req) in claimed.iter().enumerate() {
+            per_user
+                .entry(req.data.created_by.clone())
+                .or_default()
+                .push(i);
         }
 
-        // User B and C should be prioritised over user A (who has 5 in-flight)
-        assert!(
-            user_counts.contains_key("user-b"),
-            "User B (0 in-flight) should have claimed requests"
-        );
-        assert!(
-            user_counts.contains_key("user-c"),
-            "User C (0 in-flight) should have claimed requests"
-        );
+        // user-b and user-c should appear before user-a in the claim order
+        let user_a_first = per_user.get("user-a").map(|v| v[0]).unwrap_or(0);
+        let user_b_first = per_user.get("user-b").map(|v| v[0]).unwrap_or(usize::MAX);
+        let user_c_first = per_user.get("user-c").map(|v| v[0]).unwrap_or(usize::MAX);
 
-        // User A has 10 pending but 5 already in-flight — should get fewer
-        // than B+C combined in this cycle.
-        let user_a_count = user_counts.get("user-a").copied().unwrap_or(0);
-        let user_b_count = user_counts.get("user-b").copied().unwrap_or(0);
-        let user_c_count = user_counts.get("user-c").copied().unwrap_or(0);
         assert!(
-            user_b_count + user_c_count >= user_a_count,
-            "Users with fewer in-flight should get at least as many claims as user-a: \
-             A={user_a_count}, B={user_b_count}, C={user_c_count}"
+            user_b_first < user_a_first,
+            "user-b (0 active) should be prioritised over user-a (5 active), \
+             but user-b first index={} vs user-a first index={}",
+            user_b_first,
+            user_a_first
+        );
+        assert!(
+            user_c_first < user_a_first,
+            "user-c (0 active) should be prioritised over user-a (5 active), \
+             but user-c first index={} vs user-a first index={}",
+            user_c_first,
+            user_a_first
         );
     }
 
-    /// Verifies that within a single user's requests, deadline ordering is
-    /// preserved — the most urgent batch is processed first.
     #[sqlx::test]
     async fn test_per_user_deadline_ordering_preserved(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
@@ -9139,13 +9116,13 @@ mod tests {
             http_client,
         );
 
-        // Same user, two batches with different deadlines
-        let file_urgent = manager
+        // Same user with two batches at different deadlines
+        let file_id_urgent = manager
             .create_file(
-                "urgent".to_string(),
+                "urgent-file".to_string(),
                 None,
                 vec![RequestTemplateInput {
-                    custom_id: Some("urgent-0".to_string()),
+                    custom_id: Some("urgent-req".to_string()),
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -9157,25 +9134,12 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_urgent = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_urgent,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: Some("same-user".to_string()),
-                api_key_id: None,
-                api_key: None,
-            })
-            .await
-            .unwrap();
-
-        let file_relaxed = manager
+        let file_id_relaxed = manager
             .create_file(
-                "relaxed".to_string(),
+                "relaxed-file".to_string(),
                 None,
                 vec![RequestTemplateInput {
-                    custom_id: Some("relaxed-0".to_string()),
+                    custom_id: Some("relaxed-req".to_string()),
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -9187,51 +9151,51 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_relaxed = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_relaxed,
+        // Create urgent batch first (short completion window)
+        let urgent_batch = manager
+            .create_batch(BatchInput {
+                file_id: file_id_urgent,
                 endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
+                completion_window: "1h".to_string(),
                 metadata: None,
                 created_by: Some("same-user".to_string()),
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
 
-        // Set deadlines: urgent = 30min, relaxed = 6h
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
-            *batch_urgent.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query!(
-            "UPDATE batches SET expires_at = NOW() + INTERVAL '6 hours' WHERE id = $1",
-            *batch_relaxed.id as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        // Create relaxed batch (long completion window)
+        let _relaxed_batch = manager
+            .create_batch(BatchInput {
+                file_id: file_id_relaxed,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "7d".to_string(),
+                metadata: None,
+                created_by: Some("same-user".to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let capacity = HashMap::from([("deadline-test".to_string(), 1)]);
+        let capacity = HashMap::from([("deadline-test".to_string(), 2)]);
 
-        // Claim 1 — should be the urgent batch
+        // Both batches belong to same user with same active count — deadline should break tie
+        let user_counts = HashMap::from([("same-user".to_string(), 0usize)]);
         let claimed = manager
-            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon_id, &capacity, &user_counts)
             .await
             .expect("Failed to claim requests");
 
         assert_eq!(claimed.len(), 1);
         assert_eq!(
-            claimed[0].data.batch_id, batch_urgent.id,
-            "Within a single user, the most urgent batch should be claimed first"
+            claimed[0].data.batch_id, urgent_batch.id,
+            "Urgent batch (earlier deadline) should be claimed first when user priority is equal"
         );
-        assert_eq!(claimed[0].data.custom_id, Some("urgent-0".to_string()));
     }
 
     #[sqlx::test]
@@ -9280,6 +9244,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9378,6 +9343,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9639,6 +9605,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9707,6 +9674,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9843,6 +9811,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -9950,6 +9919,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10034,6 +10004,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10076,6 +10047,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10171,6 +10143,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10331,6 +10304,7 @@ mod tests {
                 created_by: None,
                 api_key_id: Some(key_a),
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10344,6 +10318,7 @@ mod tests {
                 created_by: None,
                 api_key_id: Some(key_b),
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10357,6 +10332,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10444,6 +10420,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10550,6 +10527,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10626,6 +10604,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10692,6 +10671,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10751,6 +10731,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10764,6 +10745,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10845,6 +10827,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10916,6 +10899,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10937,6 +10921,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -10958,6 +10943,7 @@ mod tests {
                 created_by: None,
                 api_key_id: None,
                 api_key: None,
+                total_requests: None,
             })
             .await
             .unwrap();
@@ -11145,6 +11131,7 @@ mod tests {
                     created_by: None,
                     api_key_id: None,
                     api_key: None,
+                    total_requests: None,
                 })
                 .await
                 .unwrap();
@@ -11268,6 +11255,7 @@ mod tests {
                     created_by: None,
                     api_key_id: None,
                     api_key: None,
+                    total_requests: None,
                 })
                 .await
                 .unwrap();

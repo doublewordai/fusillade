@@ -416,6 +416,10 @@ pub struct BatchInput {
     /// request_templates so that billing is attributed to the batch creator,
     /// not the file uploader.
     pub api_key: Option<String>,
+    /// Total number of request templates in the file. Set at creation time so
+    /// the batch immediately reflects the expected request count before
+    /// population completes.
+    pub total_requests: Option<i64>,
 }
 
 /// A batch represents one execution of all of a file's templates.
@@ -492,6 +496,7 @@ pub struct BatchStatus {
     pub failed_requests: i64,
     pub canceled_requests: i64,
     pub started_at: Option<DateTime<Utc>>,
+    pub failed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -516,7 +521,13 @@ impl BatchStatus {
     /// - "failed" - all requests in terminal state and all failed
     /// - "cancelled" - all requests cancelled
     pub fn openai_status(&self) -> &'static str {
-        if self.total_requests == 0 {
+        if self.failed_at.is_some() {
+            return "failed";
+        }
+
+        if self.started_at.is_none() {
+            // Batch hasn't been populated yet — total_requests may already be
+            // set from the template count, but no request rows exist.
             return "validating";
         }
 
@@ -524,8 +535,8 @@ impl BatchStatus {
             self.completed_requests + self.failed_requests + self.canceled_requests;
 
         if terminal_count == 0 {
-            // Nothing has started yet
-            "validating"
+            // Populated but nothing terminal yet
+            "in_progress"
         } else if terminal_count == self.total_requests {
             // All done - determine outcome
             if self.canceled_requests == self.total_requests {
