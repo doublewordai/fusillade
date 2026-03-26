@@ -100,9 +100,10 @@ pub trait Storage: Send + Sync {
     /// fully-populated batch.
     async fn create_batch(&self, input: BatchInput) -> Result<Batch>;
 
-    /// Create a batch record without populating requests.
+    /// Create a batch record with virtual output/error files, without populating requests.
     ///
-    /// Inserts the batch row only (no virtual files, no template snapshot).
+    /// Inserts the batch row and creates virtual output/error files so their IDs
+    /// are available in the API response immediately.
     /// Returns a batch in `"validating"` status (`requests_started_at` is NULL).
     /// `total_requests` will be set from `input.total_requests` if provided, or `0` otherwise.
     /// Use [`populate_batch`] to copy templates into requests afterward.
@@ -110,8 +111,8 @@ pub trait Storage: Send + Sync {
 
     /// Populate an existing batch with requests from its file's templates.
     ///
-    /// Creates virtual output/error files, copies templates into the requests
-    /// table, and updates the batch with total_requests and requests_started_at.
+    /// Copies templates into the requests table and updates the batch with
+    /// total_requests and requests_started_at.
     /// If the file has no templates, returns a [`ValidationError`](crate::FusilladeError::ValidationError)
     /// and the caller is responsible for marking the batch as failed.
     async fn populate_batch(&self, batch_id: BatchId, file_id: FileId) -> Result<()>;

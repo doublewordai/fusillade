@@ -2244,7 +2244,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .rows_affected();
 
         if rows_affected == 0 {
-            // Transaction drops → rollback (virtual files undone).
             // Caller is responsible for marking the batch failed.
             return Err(FusilladeError::ValidationError(
                 "Cannot populate batch from file with no templates".to_string(),
