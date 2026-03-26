@@ -2140,9 +2140,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let total_requests = input.total_requests.unwrap_or(0);
 
-        let mut tx = self.pools.write().begin().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-        })?;
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
 
         let row = sqlx::query!(
             r#"
@@ -2185,9 +2186,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FusilladeError::Other(anyhow!("Failed to update batch with file IDs: {}", e))
         })?;
 
-        tx.commit().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e))
-        })?;
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
         Ok(Batch {
             id: BatchId(row.id),
@@ -2220,11 +2221,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
-    async fn populate_batch(
-        &self,
-        batch_id: BatchId,
-        file_id: FileId,
-    ) -> Result<()> {
+    async fn populate_batch(&self, batch_id: BatchId, file_id: FileId) -> Result<()> {
         let mut tx =
             self.pools.write().begin().await.map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))

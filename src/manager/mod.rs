@@ -114,11 +114,7 @@ pub trait Storage: Send + Sync {
     /// table, and updates the batch with total_requests and requests_started_at.
     /// If the file has no templates, returns a [`ValidationError`](crate::FusilladeError::ValidationError)
     /// and the caller is responsible for marking the batch as failed.
-    async fn populate_batch(
-        &self,
-        batch_id: BatchId,
-        file_id: FileId,
-    ) -> Result<()>;
+    async fn populate_batch(&self, batch_id: BatchId, file_id: FileId) -> Result<()>;
 
     /// Get a batch by ID.
     ///
