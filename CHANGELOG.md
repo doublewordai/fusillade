@@ -1,5 +1,12 @@
 # Changelog
 
+## [13.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v13.1.0...fusillade-v13.1.1) (2026-03-26)
+
+
+### Bug Fixes
+
+* create output file on synchronous part of batch creation ([#190](https://github.com/doublewordai/fusillade/issues/190)) ([5ac0b8d](https://github.com/doublewordai/fusillade/commit/5ac0b8d5d30c63c1231be4483e672c06d0723cbe))
+
 ## [13.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v13.0.1...fusillade-v13.1.0) (2026-03-25)
 
 
