@@ -9009,7 +9009,6 @@ mod tests {
         );
 
         // Create files and batches for 3 users, each with 2 requests, same model and deadline
-        let mut batch_ids = Vec::new();
         for user in &["user-a", "user-b", "user-c"] {
             let file_id = manager
                 .create_file(
@@ -9052,7 +9051,6 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            batch_ids.push(batch.id);
         }
 
         let daemon_id = DaemonId::from(Uuid::new_v4());

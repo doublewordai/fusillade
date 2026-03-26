@@ -455,55 +455,68 @@ where
             let user_throughput = self.user_throughput.clone();
             let user_requests_in_flight = self.user_requests_in_flight.clone();
             let daemon_id = self.daemon_id;
+            let shutdown_token = self.shutdown_token.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+                // Skip the immediate first tick to avoid a near-zero window on the first emission
+                interval.tick().await;
                 let mut last_emission = std::time::Instant::now();
 
                 loop {
-                    interval.tick().await;
-                    let elapsed = last_emission.elapsed();
-                    let window_secs = elapsed.as_secs_f64();
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let elapsed = last_emission.elapsed();
+                            let window_secs = elapsed.as_secs_f64();
 
-                    // Atomically read-and-reset each user's counters
-                    let mut users_to_remove = Vec::new();
-                    for entry in user_throughput.iter() {
-                        let user_id = entry.key();
-                        let completed = entry.value().completed.swap(0, Ordering::Relaxed);
-                        let failed = entry.value().failed.swap(0, Ordering::Relaxed);
+                            // Atomically read-and-reset each user's counters
+                            let mut users_to_remove = Vec::new();
+                            for entry in user_throughput.iter() {
+                                let user_id = entry.key();
+                                let completed = entry.value().completed.swap(0, Ordering::Relaxed);
+                                let failed = entry.value().failed.swap(0, Ordering::Relaxed);
 
-                        if completed > 0 || failed > 0 {
-                            let in_flight = user_requests_in_flight
-                                .get(user_id)
-                                .map(|e| e.value().load(Ordering::Relaxed))
-                                .unwrap_or(0);
-                            let throughput_rpm = if window_secs > 0.0 {
-                                (completed + failed) as f64 / window_secs * 60.0
-                            } else {
-                                0.0
-                            };
+                                if completed > 0 || failed > 0 {
+                                    let in_flight = user_requests_in_flight
+                                        .get(user_id)
+                                        .map(|e| e.value().load(Ordering::Relaxed))
+                                        .unwrap_or(0);
+                                    let throughput_rpm = if window_secs > 0.0 {
+                                        (completed + failed) as f64 / window_secs * 60.0
+                                    } else {
+                                        0.0
+                                    };
 
-                            tracing::info!(
+                                    tracing::info!(
+                                        daemon_id = %daemon_id,
+                                        user = %user_id,
+                                        completed = completed,
+                                        failed = failed,
+                                        in_flight = in_flight,
+                                        throughput_rpm = format!("{throughput_rpm:.1}"),
+                                        window_seconds = format!("{window_secs:.1}"),
+                                        "fusillade.user_throughput"
+                                    );
+                                } else {
+                                    // No activity — mark for eviction
+                                    users_to_remove.push(user_id.clone());
+                                }
+                            }
+
+                            // Evict inactive users to prevent unbounded map growth
+                            for user_id in users_to_remove {
+                                user_throughput.remove(&user_id);
+                            }
+
+                            last_emission = std::time::Instant::now();
+                        }
+                        _ = shutdown_token.cancelled() => {
+                            tracing::debug!(
                                 daemon_id = %daemon_id,
-                                user = %user_id,
-                                completed = completed,
-                                failed = failed,
-                                in_flight = in_flight,
-                                throughput_rpm = format!("{throughput_rpm:.1}"),
-                                window_seconds = format!("{window_secs:.1}"),
-                                "fusillade.user_throughput"
+                                "Shutting down per-user throughput emission task"
                             );
-                        } else {
-                            // No activity — mark for eviction
-                            users_to_remove.push(user_id.clone());
+                            break;
                         }
                     }
-
-                    // Evict inactive users to prevent unbounded map growth
-                    for user_id in users_to_remove {
-                        user_throughput.remove(&user_id);
-                    }
-
-                    last_emission = std::time::Instant::now();
                 }
             });
         }
@@ -694,10 +707,19 @@ where
 
             // Snapshot per-user in-flight counts for fair scheduling.
             // Users with fewer active requests get prioritised in the claim query.
+            // Only include users with count > 0 to avoid unbounded array growth
+            // (missing users COALESCE to 0 in the SQL query).
             let user_active_counts: HashMap<String, usize> = self
                 .user_requests_in_flight
                 .iter()
-                .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+                .filter_map(|entry| {
+                    let count = entry.value().load(Ordering::Relaxed);
+                    if count > 0 {
+                        Some((entry.key().clone(), count))
+                    } else {
+                        None
+                    }
+                })
                 .collect();
 
             // Claim a batch of pending requests (guaranteed ≤ available capacity per model)
@@ -857,7 +879,12 @@ where
                             }
                             gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
                             if let Some(counter) = user_in_flight_for_guard.get(&user_for_guard) {
-                                counter.value().fetch_sub(1, Ordering::Relaxed);
+                                let prev = counter.value().fetch_sub(1, Ordering::Relaxed);
+                                drop(counter);
+                                if prev == 1 {
+                                    // Counter reached zero — remove to prevent unbounded map growth
+                                    user_in_flight_for_guard.remove(&user_for_guard);
+                                }
                             }
                         });
 

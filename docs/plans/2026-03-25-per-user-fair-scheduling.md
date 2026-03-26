@@ -46,7 +46,7 @@ user_requests_in_flight: DashMap
 - **DB-computed user counts (COUNT in-flight per user):** Full scan of in-flight requests on every claim cycle. DashMap is O(1) with eventual cross-daemon convergence.
 
 **Tradeoffs:**
-- Fairness is per-daemon, not global across the cluster (each daemon has its own DashMap).
+- Fairness is per-daemon, not global across the cluster (each daemon has its own DashMap). See **Scaling Considerations** below.
 - Cold start: first few cycles have no fairness signal (empty DashMap). Converges quickly.
 - Users whose models appear earlier in the randomised model loop get a slight head start per cycle, but this balances across cycles.
 
@@ -138,8 +138,53 @@ Bundle COR-227 + COR-228/229 into a single PR with `feat!:` (major version bump,
 3. `just lint` — no warnings
 4. `cargo sqlx prepare` — offline query cache up to date
 
-## Open Questions
+## Scaling Considerations
 
-1. **DashMap eviction cadence:** How often should the zero-count sweep run? Alongside heartbeat polling (~30s) seems reasonable.
-2. **Weighted fairness:** Current design is equal-share. Should users with higher-priority SLAs get proportionally more capacity? Not in scope for this iteration.
-3. **Cross-daemon fairness:** Each daemon's DashMap is independent. For stronger global guarantees, consider periodic DB queries for cluster-wide per-user counts, sampled infrequently to avoid hot-path overhead.
+Each daemon replica maintains its own `user_requests_in_flight` DashMap — there is no
+cross-daemon synchronisation. This has different implications depending on the scaling
+strategy:
+
+### Vertical scaling (single daemon, large instance)
+
+One daemon sees all in-flight requests, so the DashMap is a complete picture of the
+system. Fairness is globally accurate. This is the simplest deployment and the DashMap
+approach works optimally here.
+
+### Horizontal scaling (multiple daemon replicas, all models)
+
+Each replica only sees the requests it claimed. With N replicas, each has roughly 1/N
+of the in-flight state. Consequences:
+
+- **Under-counting:** A user with 100 in-flight requests across 4 replicas appears as
+  ~25 in-flight on each. Each replica grants them more capacity than it should globally.
+- **Emergent fairness:** Despite per-replica inaccuracy, the system still converges
+  toward fair distribution. High-volume users are deprioritised on every replica they
+  touch. Over multiple claim cycles, the aggregate effect approximates global fairness.
+- **Acceptable for most workloads:** The scheduling signal doesn't need to be exact —
+  it only needs to prevent starvation. Even an approximate view of per-user load
+  achieves this.
+
+### Horizontal scaling (per-model daemon replicas)
+
+If fusillade is scaled so that each replica handles a subset of models, the DashMap
+becomes per-user-per-model fairness rather than per-user-global fairness. This is
+arguably a desirable property — a user who is heavy on model A doesn't get deprioritised
+on model B.
+
+### Future: cross-daemon coordination
+
+For stronger global guarantees, the daemon could periodically query the database for
+cluster-wide per-user in-flight counts (e.g. `COUNT(*) WHERE state = 'processing'
+GROUP BY created_by`). This would be sampled infrequently (every 10-30 seconds) to
+avoid hot-path overhead, with the DashMap providing cycle-to-cycle precision between
+samples. Not in scope for this iteration.
+
+## Resolved Questions
+
+1. **DashMap eviction:** Zero-count entries are now removed when the counter transitions
+   to zero (in the scopeguard). The snapshot also filters out zero-count users to avoid
+   inflating SQL parameter arrays.
+2. **Weighted fairness:** Implemented via `DaemonConfig::urgency_weight` — a configurable
+   blend of user-fairness and SLA deadline urgency (see `2026-03-26-sla-weighted-fair-scheduling.md`).
+3. **Cross-daemon fairness:** Per-daemon DashMap is accepted as sufficient for now.
+   See scaling considerations above.
