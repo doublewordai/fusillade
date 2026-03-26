@@ -1,5 +1,132 @@
 # Changelog
 
+## [14.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v13.1.1...fusillade-v14.0.0) (2026-03-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* Batch execution now uses the batch creator's API key, not the file uploader's ([#181](https://github.com/doublewordai/fusillade/issues/181))
+* mark streaming API as breaking. BREAKING CHANGE: removed stream field from RequestData, changed ReqwestHttpClient new signature
+* allow filtering batches and files by multiple api key ids, so we can … ([#173](https://github.com/doublewordai/fusillade/issues/173))
+* Split timeouts ([#163](https://github.com/doublewordai/fusillade/issues/163))
+* add api_key_id attribution to batches and files for org-scoped … ([#165](https://github.com/doublewordai/fusillade/issues/165))
+* acquire semaphore permits before claiming requests ([#157](https://github.com/doublewordai/fusillade/issues/157))
+* parameterise get pending counts  ([#150](https://github.com/doublewordai/fusillade/issues/150))
+* remove hiding of retriable errors ([#130](https://github.com/doublewordai/fusillade/issues/130))
+* add method to get pending request counts by model and completion window ([#111](https://github.com/doublewordai/fusillade/issues/111))
+* The ErrorFilter enum has been removed and replaced with a boolean parameter across all Storage trait methods.
+* Removes the following from the public API:
+    - SlaThreshold struct and related types
+    - Superseded request state
+    - Escalation-related fields on RequestData (is_escalated,
+      escalated_from_request_id, superseded_at, superseded_by_request_id)
+    - Manager trait methods: find_pending_escalation, get_at_risk_batches,
+      get_missed_sla_batches, create_escalated_requests
+    - DaemonConfig fields: sla_check_interval_seconds, sla_thresholds
+* separate out db connections into read and write ([#76](https://github.com/doublewordai/fusillade/issues/76))
+* sla escalation through control layer ([#67](https://github.com/doublewordai/fusillade/issues/67))
+
+### feat\
+
+* mark streaming API as breaking. BREAKING CHANGE: removed stream field from RequestData, changed ReqwestHttpClient new signature ([4220b4a](https://github.com/doublewordai/fusillade/commit/4220b4a892098564c734f23f245ac24007e7bb77))
+
+
+### Features
+
+* acquire semaphore permits before claiming requests ([#157](https://github.com/doublewordai/fusillade/issues/157)) ([a0c8d94](https://github.com/doublewordai/fusillade/commit/a0c8d94bfdaad52546197c7b1a022d45e9dd91b7))
+* add api_key_id attribution to batches and files for org-scoped … ([#165](https://github.com/doublewordai/fusillade/issues/165)) ([0de6400](https://github.com/doublewordai/fusillade/commit/0de6400d8347084692316b7a24d456a04a9264c4))
+* add comprehensive daemon loop metrics ([#144](https://github.com/doublewordai/fusillade/issues/144)) ([efd0e65](https://github.com/doublewordai/fusillade/commit/efd0e65ba4470f6db1d322b0062f09d023111d37))
+* add enhanced retry and escalation observability metrics ([#64](https://github.com/doublewordai/fusillade/issues/64)) ([7786e97](https://github.com/doublewordai/fusillade/commit/7786e9712c251fe3d7739f69f3003da9499f9721))
+* add error code label to retriable HTTP status metric ([#159](https://github.com/doublewordai/fusillade/issues/159)) ([1efbd3a](https://github.com/doublewordai/fusillade/commit/1efbd3a7893d1000230b786003455395a1f58fcc))
+* add error filtering into fusillade batch methods ([#102](https://github.com/doublewordai/fusillade/issues/102)) ([ec454ba](https://github.com/doublewordai/fusillade/commit/ec454baaf41433e08689d125dc60dbee4b10b2c0))
+* add index for schedulable pending requests query ([#97](https://github.com/doublewordai/fusillade/issues/97)) ([48eb459](https://github.com/doublewordai/fusillade/commit/48eb4593bd766673dfa80920c7ee8299abb4216b))
+* add method to get pending request counts by model and completion window ([#111](https://github.com/doublewordai/fusillade/issues/111)) ([a05018c](https://github.com/doublewordai/fusillade/commit/a05018c8441249bbe3321171563bea11d2ca5ab9))
+* add metric to track requests completing after SLA expiry ([#122](https://github.com/doublewordai/fusillade/issues/122)) ([b634064](https://github.com/doublewordai/fusillade/commit/b6340645925106feaac7f8c78d39d5c3e0782e8b))
+* Add metrics for (nearly) missed SLAs ([#61](https://github.com/doublewordai/fusillade/issues/61)) ([b1ab86e](https://github.com/doublewordai/fusillade/commit/b1ab86e725075670a1753c6dea93cc8b12e32db4))
+* add prometheus metrics for daemon operations ([#58](https://github.com/doublewordai/fusillade/issues/58)) ([b86d526](https://github.com/doublewordai/fusillade/commit/b86d526c2c7f765b800d977d3bee018c4a252666))
+* add Timeout variant to FailureReason ([#146](https://github.com/doublewordai/fusillade/issues/146)) ([03e3f9c](https://github.com/doublewordai/fusillade/commit/03e3f9cb3e3d82a3bed72800b7890709c396983f))
+* allow filtering batches and files by multiple api key ids, so we can … ([#173](https://github.com/doublewordai/fusillade/issues/173)) ([a8d2352](https://github.com/doublewordai/fusillade/commit/a8d2352f5e33af3e2974852e763b4cdc68655dea))
+* Batch execution now uses the batch creator's API key, not the file uploader's ([#181](https://github.com/doublewordai/fusillade/issues/181)) ([1d7749a](https://github.com/doublewordai/fusillade/commit/1d7749a7cfae2b74ffb4ed45927abe75cee52277))
+* bulk cancellation check query for daemon polling loop ([#149](https://github.com/doublewordai/fusillade/issues/149)) ([39da1fb](https://github.com/doublewordai/fusillade/commit/39da1fb104ea025b66ba209663a88827070425f6))
+* custom ID header ([#46](https://github.com/doublewordai/fusillade/issues/46)) ([1a6a5d2](https://github.com/doublewordai/fusillade/commit/1a6a5d25d048e5ffbfa68b641e6abb3166837640))
+* delete files batches requests ([#36](https://github.com/doublewordai/fusillade/issues/36)) ([764ce6e](https://github.com/doublewordai/fusillade/commit/764ce6e6da45d3a8f928967d5b303f3303b66778))
+* file and batch search ([#39](https://github.com/doublewordai/fusillade/issues/39)) ([8564fac](https://github.com/doublewordai/fusillade/commit/8564facaa483a64dfeac88f3d91c630fa970ca9f))
+* get_file_template_stats ([#26](https://github.com/doublewordai/fusillade/issues/26)) ([cdd2487](https://github.com/doublewordai/fusillade/commit/cdd248727601b6ea3bcbf01e0cc432b31f214b44))
+* implement soft deletes for files and batches ([#101](https://github.com/doublewordai/fusillade/issues/101)) ([37f4726](https://github.com/doublewordai/fusillade/commit/37f47265cc7a17aac8d092c913217d64a6044f2b))
+* initial fusillade release ([4102ab7](https://github.com/doublewordai/fusillade/commit/4102ab771d991e43101e59adbd4525801924ca2b))
+* make concurrency limit per-daemon instead of global ([#134](https://github.com/doublewordai/fusillade/issues/134)) ([2f4f66d](https://github.com/doublewordai/fusillade/commit/2f4f66dfd62e1eed1576002623d3233996ae9dbc))
+* Output & Error File sizes ([#14](https://github.com/doublewordai/fusillade/issues/14))  ([a19b0ff](https://github.com/doublewordai/fusillade/commit/a19b0ff292ee60be0714ef83fbd659c13ac8709c))
+* parameterise get pending counts  ([#150](https://github.com/doublewordai/fusillade/issues/150)) ([a2c6f28](https://github.com/doublewordai/fusillade/commit/a2c6f28610310084b6ac4ccbe7350b9dff44e7f5))
+* pass in fields to forward as headers ([#38](https://github.com/doublewordai/fusillade/issues/38)) ([3d1e309](https://github.com/doublewordai/fusillade/commit/3d1e309a986b4c32245bb92f1fcaeefc3fa9311c))
+* periodic purge of orphaned request_templates and requests ([#127](https://github.com/doublewordai/fusillade/issues/127)) ([4ecda5f](https://github.com/doublewordai/fusillade/commit/4ecda5f6b8bddd05a613d2b0d92898ffcfd37a0e))
+* race condition fix when creating file and fetching directly after in diff… ([#87](https://github.com/doublewordai/fusillade/issues/87)) ([1f3f690](https://github.com/doublewordai/fusillade/commit/1f3f690497da5883efd3bb4006b7c7eba8c88bc2))
+* remove filename unique constraint ([#70](https://github.com/doublewordai/fusillade/issues/70)) ([3e68874](https://github.com/doublewordai/fusillade/commit/3e68874e34738d7d7f85b364cfa7f8183e5695c3))
+* remove hiding of retriable errors ([#130](https://github.com/doublewordai/fusillade/issues/130)) ([1717596](https://github.com/doublewordai/fusillade/commit/17175964f98d5e2dd24bb7cfe912b3246c74fc27))
+* replace cascade deletes with SET NULL for performance ([#89](https://github.com/doublewordai/fusillade/issues/89)) ([aa47c5c](https://github.com/doublewordai/fusillade/commit/aa47c5caaaf4cff11b009a1116e4327353bf2f88))
+* replace escalation racing with route-at-claim-time ([#98](https://github.com/doublewordai/fusillade/issues/98)) ([8fa21ea](https://github.com/doublewordai/fusillade/commit/8fa21ea313ccfd50a43b592678265966b06279bf))
+* Retry failed batch requests up to SLA and provide manual retry afterwards ([#28](https://github.com/doublewordai/fusillade/issues/28)) ([df7a2b4](https://github.com/doublewordai/fusillade/commit/df7a2b421c7db5cc9818b05b8020651b6b3ee48c))
+* separate out db connections into read and write ([#76](https://github.com/doublewordai/fusillade/issues/76)) ([ce80c3f](https://github.com/doublewordai/fusillade/commit/ce80c3f1d0c63732b07df443e4098898fa899ad2))
+* server side, active batch first sorting on toggle ([#175](https://github.com/doublewordai/fusillade/issues/175)) ([d27db87](https://github.com/doublewordai/fusillade/commit/d27db873ff0c0ab41af35c8fc0d50a8b148d83af))
+* single LATERAL query for all-model claim ([#166](https://github.com/doublewordai/fusillade/issues/166)) ([5f4974a](https://github.com/doublewordai/fusillade/commit/5f4974a05405d06b283fcbfc32b4b818f109169b))
+* Sla escalation ([#34](https://github.com/doublewordai/fusillade/issues/34)) ([6c6b802](https://github.com/doublewordai/fusillade/commit/6c6b802285caa417cc2f169be3e464610be6fa77))
+* split create_batch in two to allow job dispatch ([#188](https://github.com/doublewordai/fusillade/issues/188)) ([3f1ca8b](https://github.com/doublewordai/fusillade/commit/3f1ca8b5cc32a7705f49b7b0a113006648a9760d))
+* Split timeouts ([#163](https://github.com/doublewordai/fusillade/issues/163)) ([6087e9f](https://github.com/doublewordai/fusillade/commit/6087e9fdc94f27e5bc470983bac11fda781bae72))
+* standardised tracing names ([a5334d0](https://github.com/doublewordai/fusillade/commit/a5334d0e97776897e48c0e7fff65c9be2700ec45))
+* state transition events ([#161](https://github.com/doublewordai/fusillade/issues/161)) ([165ea9f](https://github.com/doublewordai/fusillade/commit/165ea9f44e5c043c379f035e75bafcef381ac5fb))
+* Stream requests for specified endpoints ([#178](https://github.com/doublewordai/fusillade/issues/178)) ([a25be4c](https://github.com/doublewordai/fusillade/commit/a25be4cc7fbfd753968237dc769d14d125ced8b4))
+* stream_batch_results in postgres manager ([#66](https://github.com/doublewordai/fusillade/issues/66)) ([05a96d5](https://github.com/doublewordai/fusillade/commit/05a96d59463dac3c12d7463e584d60b0f7088f14))
+* templates batched writes ([#80](https://github.com/doublewordai/fusillade/issues/80)) ([94c82c8](https://github.com/doublewordai/fusillade/commit/94c82c8c710b524d70ce3661742cdd3537c149cc))
+* test release-please with manifest config ([081662d](https://github.com/doublewordai/fusillade/commit/081662d622397369f49f176a6a1f3c9d604d606d))
+* Track when batches have been actioned/accepted as completed by the upstream. ([#120](https://github.com/doublewordai/fusillade/issues/120)) ([1cc6a14](https://github.com/doublewordai/fusillade/commit/1cc6a146ac9d9c6575530903acddac2f0d225973))
+* X-Fusillade-Request-Id ([#20](https://github.com/doublewordai/fusillade/issues/20)) ([3af81a1](https://github.com/doublewordai/fusillade/commit/3af81a1362c02b336775cbda5368d3034da8b23e))
+
+
+### Bug Fixes
+
+* add limit to stale request unclaim query ([#105](https://github.com/doublewordai/fusillade/issues/105)) ([b03c0f4](https://github.com/doublewordai/fusillade/commit/b03c0f4bed5169ed79110c5d523f6a282cbfb43a))
+* add migration for pending, claimed and processing index ([#184](https://github.com/doublewordai/fusillade/issues/184)) ([fa9c9a1](https://github.com/doublewordai/fusillade/commit/fa9c9a1bbbdd984f5158cce63cf1aff924b2c0e5))
+* add sqlx pool provider ([#81](https://github.com/doublewordai/fusillade/issues/81)) ([dce6566](https://github.com/doublewordai/fusillade/commit/dce6566052a382ba5bafa3c39764f1e0618064f1))
+* add test coverage for get batch lazy finalization path ([b1b4fa1](https://github.com/doublewordai/fusillade/commit/b1b4fa1782579daacd207e2ef2dffedca0d60db8))
+* adds support for streamed batch /v1/responses, bump reassembler ([#185](https://github.com/doublewordai/fusillade/issues/185)) ([9ab71a4](https://github.com/doublewordai/fusillade/commit/9ab71a4dec393d85bdcf8fab4a416cba312be918))
+* avoid full scans and ensure safe concurrency in purge queries ([#138](https://github.com/doublewordai/fusillade/issues/138)) ([3c41a15](https://github.com/doublewordai/fusillade/commit/3c41a15bb7aa7d452e59b41eccc5a4439719bacd))
+* batch id header ([#22](https://github.com/doublewordai/fusillade/issues/22)) ([9fd20f3](https://github.com/doublewordai/fusillade/commit/9fd20f394490e5cab2c3aa30f918ab598f918f9e))
+* batch metadata parsing ([6fcca42](https://github.com/doublewordai/fusillade/commit/6fcca420cba3c2b9d84a696a7e9ad4b9deb92e56))
+* builder errors should be unretriable, they're a new class of error ([#72](https://github.com/doublewordai/fusillade/issues/72)) ([77995cc](https://github.com/doublewordai/fusillade/commit/77995cc6f65b02642a2d1756fde4e4a228c82179))
+* cancellations ([#17](https://github.com/doublewordai/fusillade/issues/17)) ([c9b9f25](https://github.com/doublewordai/fusillade/commit/c9b9f258a19dedb65e67842789e65ce52ef5bbea))
+* consolidate batch request traces into single trace trees ([#140](https://github.com/doublewordai/fusillade/issues/140)) ([6d5a197](https://github.com/doublewordai/fusillade/commit/6d5a197a759d1cd5a326bbf15bdf8db485dca87c))
+* coordinate multiple replicas ([#13](https://github.com/doublewordai/fusillade/issues/13)) ([9838f21](https://github.com/doublewordai/fusillade/commit/9838f2148da42e7b7eabd8e8233be5787c7ba27a))
+* create output file on synchronous part of batch creation ([#190](https://github.com/doublewordai/fusillade/issues/190)) ([5ac0b8d](https://github.com/doublewordai/fusillade/commit/5ac0b8d5d30c63c1231be4483e672c06d0723cbe))
+* **deps:** update rust crate rand to 0.10 ([#124](https://github.com/doublewordai/fusillade/issues/124)) ([4e877c0](https://github.com/doublewordai/fusillade/commit/4e877c024cad71035504ab5dcefb1423d826f4c6))
+* dummy migration on requests table ([#31](https://github.com/doublewordai/fusillade/issues/31)) ([34d9dff](https://github.com/doublewordai/fusillade/commit/34d9dff140e87183c2b73075c6fcc2546e4c3990))
+* eliminate CPU spikes on batch cancellation ([#95](https://github.com/doublewordai/fusillade/issues/95)) ([6f50e91](https://github.com/doublewordai/fusillade/commit/6f50e916a2933e4d5d6fced3cb68e3953b2a4d74))
+* ensure we don't notify on existing batches ([#128](https://github.com/doublewordai/fusillade/issues/128)) ([33419a5](https://github.com/doublewordai/fusillade/commit/33419a558f0bef81bd269f7ebb562ff7fd93df10))
+* FIFO claim ordering via batch-first LATERAL join ([#176](https://github.com/doublewordai/fusillade/issues/176)) ([0226c14](https://github.com/doublewordai/fusillade/commit/0226c1400314c92ac7608e2af89c67e15a84036f))
+* handle multiple escalated requests in supersede_racing_pair query ([#54](https://github.com/doublewordai/fusillade/issues/54)) ([0ac1068](https://github.com/doublewordai/fusillade/commit/0ac1068808b9eba52d90008a0bc80cec76b16b79))
+* inserts config validation ([#84](https://github.com/doublewordai/fusillade/issues/84)) ([c5ad534](https://github.com/doublewordai/fusillade/commit/c5ad534913ad61a43d0a65574ab551761ccf3018))
+* move test-log to dev-dependencies ([#162](https://github.com/doublewordai/fusillade/issues/162)) ([e7322ca](https://github.com/doublewordai/fusillade/commit/e7322ca9e0ad4c67d3fad76429a43fdbf6710950))
+* optimise deletion (again) ([#142](https://github.com/doublewordai/fusillade/issues/142)) ([35089c7](https://github.com/doublewordai/fusillade/commit/35089c7efed12d67ebac43c746e64342661712ed))
+* pre-filter active batches in claim query to avoid orphaned rows ([#168](https://github.com/doublewordai/fusillade/issues/168)) ([a66ab16](https://github.com/doublewordai/fusillade/commit/a66ab163bdc3149e8082c5e73c4138261e07796d))
+* Purge query optimisation ([#132](https://github.com/doublewordai/fusillade/issues/132)) ([76f256b](https://github.com/doublewordai/fusillade/commit/76f256b275bf5a3b142b752db2a2e2bce8450c07))
+* reclaim requests from dead or stale-heartbeat daemons ([#136](https://github.com/doublewordai/fusillade/issues/136)) ([53c0391](https://github.com/doublewordai/fusillade/commit/53c0391591d74909f550b620003477e597c3099f))
+* remove queries joining request templates without need ([#74](https://github.com/doublewordai/fusillade/issues/74)) ([ca21c95](https://github.com/doublewordai/fusillade/commit/ca21c9564cccab48105ab76fec74e25e0efbcb79))
+* remove test column from requests ([#33](https://github.com/doublewordai/fusillade/issues/33)) ([508e2a7](https://github.com/doublewordai/fusillade/commit/508e2a786b81a4fab9525d6f222030405261f4bf))
+* remove test files ([d4234c5](https://github.com/doublewordai/fusillade/commit/d4234c540d2ba01768b350a6b1ba0f46a108d84b))
+* remove useless trigger ([#15](https://github.com/doublewordai/fusillade/issues/15)) ([828f30e](https://github.com/doublewordai/fusillade/commit/828f30edc039f35740ad7e8c78e2f84c9480110a))
+* retry tests ([#30](https://github.com/doublewordai/fusillade/issues/30)) ([9fdb5de](https://github.com/doublewordai/fusillade/commit/9fdb5de171b6813d5dfbe162c5723b56ae3d8379))
+* simplify batch insert strategy - only batched ([#83](https://github.com/doublewordai/fusillade/issues/83)) ([ed77652](https://github.com/doublewordai/fusillade/commit/ed776528a992739f1e7a6d74033662e44018e53a))
+* single persistence to failed for retryable errrors ([#44](https://github.com/doublewordai/fusillade/issues/44)) ([cd1005a](https://github.com/doublewordai/fusillade/commit/cd1005a5ba705a5c161a8438c775ed062f422e52))
+* sla escalation through control layer ([#67](https://github.com/doublewordai/fusillade/issues/67)) ([b0ada75](https://github.com/doublewordai/fusillade/commit/b0ada75f6ed51337ff121007fa9150f50d5c8210))
+* sla query to only focus on expiry time in order to pick all at risk requests ([#48](https://github.com/doublewordai/fusillade/issues/48)) ([e691424](https://github.com/doublewordai/fusillade/commit/e6914246aaeb8fe58084fba38ac805b28fa49986))
+* supersede failed requests and do not create more than one escalated request ([#63](https://github.com/doublewordai/fusillade/issues/63)) ([f9be9e9](https://github.com/doublewordai/fusillade/commit/f9be9e9e189c22a98e79aedb00bac7148d63fe7c))
+* Tracing clean-up ([#152](https://github.com/doublewordai/fusillade/issues/152)) ([2d5855d](https://github.com/doublewordai/fusillade/commit/2d5855dbcb31765798d0b02198a14f7eb452f9df))
+* update model field in request body when escalating ([#108](https://github.com/doublewordai/fusillade/issues/108)) ([7527537](https://github.com/doublewordai/fusillade/commit/75275373815892177ec615d1a4838a69cc91fd9a))
+* use dashes not underscores for headers ([#42](https://github.com/doublewordai/fusillade/issues/42)) ([d941f22](https://github.com/doublewordai/fusillade/commit/d941f226e6479a29607dc07a5cbdc18bef04cb54))
+* use ISO 8601 format for batch timestamp headers ([#56](https://github.com/doublewordai/fusillade/issues/56)) ([61306b8](https://github.com/doublewordai/fusillade/commit/61306b8eee506cd01ccb1da285d1e0b920787b4d))
+* use primary pool to fetch batch after creation to avoid race conditions ([#86](https://github.com/doublewordai/fusillade/issues/86)) ([f53d197](https://github.com/doublewordai/fusillade/commit/f53d1974d42265b1174fe17829ad943bd7d62570))
+* use targeted query for escalation lookup ([#52](https://github.com/doublewordai/fusillade/issues/52)) ([6e84c39](https://github.com/doublewordai/fusillade/commit/6e84c39e72d46f94e544674578bce6fac3564bfd))
+* use write pool for UPDATE in get_batch() ([012796c](https://github.com/doublewordai/fusillade/commit/012796c8bf33561b33b7f2b6867581acf3c10279))
+* when a batch is retried, clear the status from the batch as well ([#154](https://github.com/doublewordai/fusillade/issues/154)) ([647cd04](https://github.com/doublewordai/fusillade/commit/647cd04c56e17ce9b88d4d904b0a685be9d97d79))
+
 ## [13.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v13.1.0...fusillade-v13.1.1) (2026-03-26)
 
 
