@@ -314,6 +314,10 @@ pub trait Storage: Send + Sync {
     /// in-flight requests across all models. Used to prioritise users with fewer
     /// active requests for per-user fair scheduling. Pass an empty map to disable
     /// user-level prioritisation (falls back to deadline-only ordering).
+    ///
+    /// Implementations may blend user-fairness with SLA urgency (batch deadline
+    /// proximity) via `DaemonConfig::urgency_weight`. See the PostgreSQL
+    /// implementation for the composite scoring formula.
     async fn claim_requests(
         &self,
         limit: usize,

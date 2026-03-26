@@ -221,6 +221,17 @@ pub struct DaemonConfig {
     /// Example: `vec!["/v1/chat/completions", "/v1/completions"]`
     #[serde(default)]
     pub streamable_endpoints: Vec<String>,
+
+    /// Weight controlling how much SLA urgency influences claim scheduling (0.0–1.0).
+    ///
+    /// Blends per-user fairness with batch deadline urgency when ordering claims:
+    /// - `0.0`: Pure user-fairness (users with fewer in-flight requests go first)
+    /// - `1.0`: Pure deadline urgency (batches closest to expiry go first)
+    /// - `0.3`: Recommended starting point
+    ///
+    /// Default: `0.0` (backward-compatible, pure user-fairness).
+    #[serde(default)]
+    pub urgency_weight: f64,
 }
 
 fn default_batch_metadata_fields() -> Vec<String> {
@@ -261,6 +272,7 @@ impl Default for DaemonConfig {
             purge_throttle_ms: 100,
             throughput_log_interval_ms: Some(60_000), // Log per-user throughput every minute
             streamable_endpoints: Vec::new(),
+            urgency_weight: 0.0,
         }
     }
 }
@@ -1103,6 +1115,7 @@ mod tests {
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -1282,6 +1295,7 @@ mod tests {
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -1523,6 +1537,7 @@ mod tests {
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -1669,6 +1684,7 @@ mod tests {
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -1854,6 +1870,7 @@ mod tests {
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -2023,6 +2040,7 @@ mod tests {
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -2197,6 +2215,7 @@ mod tests {
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -2366,6 +2385,7 @@ mod tests {
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -2518,6 +2538,7 @@ mod tests {
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(

@@ -893,7 +893,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         LIMIT m.capacity
                         FOR UPDATE OF r3 SKIP LOCKED
                     ) r2
-                    ORDER BY COALESCE(up.active_count, 0) ASC, ab.expires_at ASC, ab.id ASC
+                    ORDER BY
+                        (1.0 - $8::DOUBLE PRECISION)
+                            * COALESCE(up.active_count, 0)::DOUBLE PRECISION
+                            / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
+                        + $8::DOUBLE PRECISION
+                            * LEAST(GREATEST(EXTRACT(EPOCH FROM ab.expires_at - $3), 0.0) / 86400.0, 1.0)
+                        ASC,
+                        ab.expires_at ASC,
+                        ab.id ASC
                     LIMIT m.capacity
                 ) claimed
                 LIMIT $2::BIGINT
@@ -932,6 +940,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             &capacities_arr,
             &user_ids_arr,
             &user_counts_arr,
+            self.config.urgency_weight,
         )
         .fetch_all(self.pools.write())
         .await
@@ -9193,6 +9202,126 @@ mod tests {
         assert_eq!(
             claimed[0].data.batch_id, urgent_batch.id,
             "Urgent batch (earlier deadline) should be claimed first when user priority is equal"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_urgency_weighted_scheduling(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Two users: user-a has a 1hr SLA batch, user-b has a 24hr SLA batch.
+        // Both have equal in-flight counts (1 each).
+
+        // -- Helper: create file + batch for a user with a given completion window --
+        async fn setup_user_batch(
+            manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+            user: &str,
+            completion_window: &str,
+        ) -> BatchId {
+            let file_id = manager
+                .create_file(
+                    format!("{}-file", user),
+                    None,
+                    vec![RequestTemplateInput {
+                        custom_id: Some(format!("{}-req", user)),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "urgency-test".to_string(),
+                        api_key: "key".to_string(),
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let batch = manager
+                .create_batch(BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: completion_window.to_string(),
+                    metadata: None,
+                    created_by: Some(user.to_string()),
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+            batch.id
+        }
+
+        // Test 1: With urgency_weight = 0.5, the 1hr SLA batch should win
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(DaemonConfig {
+            urgency_weight: 0.5,
+            ..DaemonConfig::default()
+        });
+
+        let batch_a = setup_user_batch(&manager, "user-a", "1h").await;
+        let _batch_b = setup_user_batch(&manager, "user-b", "24h").await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("urgency-test".to_string(), 2)]);
+
+        // Both users have equal in-flight counts
+        let user_counts = HashMap::from([
+            ("user-a".to_string(), 1usize),
+            ("user-b".to_string(), 1usize),
+        ]);
+
+        let claimed = manager
+            .claim_requests(1, daemon_id, &capacity, &user_counts)
+            .await
+            .expect("Failed to claim with urgency weight");
+
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].data.batch_id, batch_a,
+            "With urgency_weight=0.5 and equal user activity, \
+             the 1hr SLA batch should be claimed before the 24hr batch"
+        );
+
+        // Reset all requests to pending for the next test
+        sqlx::query!(
+            "UPDATE requests SET state = 'pending', daemon_id = NULL, claimed_at = NULL WHERE state = 'claimed'"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Test 2: With urgency_weight = 0.0, both users are equal priority.
+        // Deadline is only a tiebreaker, so 1hr batch still wins (earlier expires_at).
+        // But if user-b has fewer in-flight, user-b should win instead.
+        let manager_no_urgency = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(DaemonConfig {
+            urgency_weight: 0.0,
+            ..DaemonConfig::default()
+        });
+
+        // Give user-a MORE in-flight than user-b — without urgency weight,
+        // user-b (less busy) should be prioritised despite having a longer SLA.
+        let user_counts_skewed = HashMap::from([
+            ("user-a".to_string(), 5usize),
+            ("user-b".to_string(), 0usize),
+        ]);
+
+        let claimed = manager_no_urgency
+            .claim_requests(1, daemon_id, &capacity, &user_counts_skewed)
+            .await
+            .expect("Failed to claim without urgency weight");
+
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].data.created_by, "user-b",
+            "With urgency_weight=0.0, user-b (0 active) should beat user-a (5 active) \
+             despite user-a having a more urgent 1hr SLA"
         );
     }
 
