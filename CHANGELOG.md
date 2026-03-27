@@ -1,5 +1,12 @@
 # Changelog
 
+## [14.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v14.0.0...fusillade-v14.0.1) (2026-03-27)
+
+
+### Bug Fixes
+
+* separate file stream aborts from fusillade errors ([b1cfb1e](https://github.com/doublewordai/fusillade/commit/b1cfb1e810bd0e8e85a5a537f59ae08db8f5e8ed))
+
 ## [14.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v13.1.1...fusillade-v14.0.0) (2026-03-27)
 
 
