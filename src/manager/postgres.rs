@@ -1528,6 +1528,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     }
                 }
                 FileStreamItem::Abort => {
+                    // Roll back explicitly so the DB work is finished before we return and the
+                    // connection is released promptly instead of relying on async drop cleanup.
                     tx.rollback().await.map_err(|e| {
                         FusilladeError::Other(anyhow!(
                             "Failed to roll back aborted file stream transaction: {}",

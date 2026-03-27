@@ -395,7 +395,7 @@ pub enum FileStreamItem {
     Template(RequestTemplateInput),
     /// Producer is aborting the stream. Fusillade should rollback and stop processing.
     Abort,
-    /// An error occurred during parsing
+    /// Deprecated compatibility path for callers that still surface producer parse errors here.
     #[deprecated(note = "Use FileStreamItem::Abort and retain the producer error locally instead")]
     Error(String),
 }
