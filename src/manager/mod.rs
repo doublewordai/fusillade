@@ -309,11 +309,21 @@ pub trait Storage: Send + Sync {
     /// `available_capacity` maps model names to the number of permits the daemon
     /// is currently holding for that model. Only models present in this map will
     /// be claimed — this is the authoritative set of models to process.
+    ///
+    /// `user_active_counts` maps user identifiers to their current number of
+    /// in-flight requests across all models. Used to prioritise users with fewer
+    /// active requests for per-user fair scheduling. Pass an empty map to disable
+    /// user-level prioritisation (falls back to deadline-only ordering).
+    ///
+    /// Implementations may blend user-fairness with SLA urgency (batch deadline
+    /// proximity) via `DaemonConfig::urgency_weight`. See the PostgreSQL
+    /// implementation for the composite scoring formula.
     async fn claim_requests(
         &self,
         limit: usize,
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
     ) -> Result<Vec<Request<Claimed>>>;
 
     /// Update an existing request's state in storage.

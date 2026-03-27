@@ -203,6 +203,11 @@ pub struct DaemonConfig {
     /// exist. Default: 100.
     pub purge_throttle_ms: u64,
 
+    /// Interval for emitting per-user throughput metrics via structured logs (milliseconds).
+    /// Set to None to disable per-user throughput logging.
+    /// Default: 60_000 (1 minute).
+    pub throughput_log_interval_ms: Option<u64>,
+
     /// Request paths that should use SSE streaming.
     ///
     /// When a request's path matches one of these entries, an `X-Fusillade-Stream`
@@ -216,6 +221,17 @@ pub struct DaemonConfig {
     /// Example: `vec!["/v1/chat/completions", "/v1/completions"]`
     #[serde(default)]
     pub streamable_endpoints: Vec<String>,
+
+    /// Weight controlling how much SLA urgency influences claim scheduling (0.0–1.0).
+    ///
+    /// Blends per-user fairness with batch deadline urgency when ordering claims:
+    /// - `0.0`: Pure user-fairness (users with fewer in-flight requests go first)
+    /// - `1.0`: Pure deadline urgency (batches closest to expiry go first)
+    /// - `0.3`: Recommended starting point
+    ///
+    /// Default: `0.0` (backward-compatible, pure user-fairness).
+    #[serde(default)]
+    pub urgency_weight: f64,
 }
 
 fn default_batch_metadata_fields() -> Vec<String> {
@@ -254,9 +270,17 @@ impl Default for DaemonConfig {
             purge_interval_ms: 600_000, // 10 minutes
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            throughput_log_interval_ms: Some(60_000), // Log per-user throughput every minute
             streamable_endpoints: Vec::new(),
+            urgency_weight: 0.0,
         }
     }
+}
+
+/// Per-user throughput counters, reset after each emission cycle.
+struct UserThroughputStats {
+    completed: AtomicU64,
+    failed: AtomicU64,
 }
 
 /// Daemon that processes batched requests.
@@ -273,6 +297,11 @@ where
     http_client: Arc<H>,
     config: DaemonConfig,
     requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
+    /// Per-user in-flight request counts across all models, used to prioritise
+    /// users with fewer active requests during claim (per-user fair scheduling).
+    user_requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
+    /// Per-user throughput counters for periodic OTel emission.
+    user_throughput: Arc<dashmap::DashMap<String, UserThroughputStats>>,
     requests_processed: Arc<AtomicU64>,
     requests_failed: Arc<AtomicU64>,
     shutdown_token: tokio_util::sync::CancellationToken,
@@ -299,6 +328,8 @@ where
             http_client,
             config,
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
+            user_requests_in_flight: Arc::new(dashmap::DashMap::new()),
+            user_throughput: Arc::new(dashmap::DashMap::new()),
             requests_processed: Arc::new(AtomicU64::new(0)),
             requests_failed: Arc::new(AtomicU64::new(0)),
             shutdown_token,
@@ -415,6 +446,77 @@ where
                         requests_in_flight = count,
                         "Daemon status"
                     );
+                }
+            });
+        }
+
+        // Spawn periodic per-user throughput emission task if configured
+        if let Some(interval_ms) = self.config.throughput_log_interval_ms {
+            let user_throughput = self.user_throughput.clone();
+            let user_requests_in_flight = self.user_requests_in_flight.clone();
+            let daemon_id = self.daemon_id;
+            let shutdown_token = self.shutdown_token.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+                // Skip the immediate first tick to avoid a near-zero window on the first emission
+                interval.tick().await;
+                let mut last_emission = std::time::Instant::now();
+
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let elapsed = last_emission.elapsed();
+                            let window_secs = elapsed.as_secs_f64();
+
+                            // Atomically read-and-reset each user's counters
+                            let mut users_to_remove = Vec::new();
+                            for entry in user_throughput.iter() {
+                                let user_id = entry.key();
+                                let completed = entry.value().completed.swap(0, Ordering::Relaxed);
+                                let failed = entry.value().failed.swap(0, Ordering::Relaxed);
+
+                                if completed > 0 || failed > 0 {
+                                    let in_flight = user_requests_in_flight
+                                        .get(user_id)
+                                        .map(|e| e.value().load(Ordering::Relaxed))
+                                        .unwrap_or(0);
+                                    let throughput_rpm = if window_secs > 0.0 {
+                                        (completed + failed) as f64 / window_secs * 60.0
+                                    } else {
+                                        0.0
+                                    };
+
+                                    tracing::info!(
+                                        daemon_id = %daemon_id,
+                                        user = %user_id,
+                                        completed = completed,
+                                        failed = failed,
+                                        in_flight = in_flight,
+                                        throughput_rpm = format!("{throughput_rpm:.1}"),
+                                        window_seconds = format!("{window_secs:.1}"),
+                                        "fusillade.user_throughput"
+                                    );
+                                } else {
+                                    // No activity — mark for eviction
+                                    users_to_remove.push(user_id.clone());
+                                }
+                            }
+
+                            // Evict inactive users to prevent unbounded map growth
+                            for user_id in users_to_remove {
+                                user_throughput.remove(&user_id);
+                            }
+
+                            last_emission = std::time::Instant::now();
+                        }
+                        _ = shutdown_token.cancelled() => {
+                            tracing::debug!(
+                                daemon_id = %daemon_id,
+                                "Shutting down per-user throughput emission task"
+                            );
+                            break;
+                        }
+                    }
                 }
             });
         }
@@ -603,6 +705,23 @@ where
             let total_capacity: usize = available_capacity.values().sum();
             gauge!("fusillade_claim_capacity").set(total_capacity as f64);
 
+            // Snapshot per-user in-flight counts for fair scheduling.
+            // Users with fewer active requests get prioritised in the claim query.
+            // Only include users with count > 0 to avoid unbounded array growth
+            // (missing users COALESCE to 0 in the SQL query).
+            let user_active_counts: HashMap<String, usize> = self
+                .user_requests_in_flight
+                .iter()
+                .filter_map(|entry| {
+                    let count = entry.value().load(Ordering::Relaxed);
+                    if count > 0 {
+                        Some((entry.key().clone(), count))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
             // Claim a batch of pending requests (guaranteed ≤ available capacity per model)
             let claim_start = std::time::Instant::now();
             let mut claimed = self
@@ -611,6 +730,7 @@ where
                     self.config.claim_batch_size,
                     self.daemon_id,
                     &available_capacity,
+                    &user_active_counts,
                 )
                 .await?;
             histogram!("fusillade_claim_duration_seconds")
@@ -694,10 +814,13 @@ where
 
                     // Spawn a processing task
                     let model_clone = model.clone();
+                    let user_id = request.data.created_by.clone();
                     let storage = self.storage.clone();
                     let http_client = (*self.http_client).clone();
                     let retry_config = (&self.config).into();
                     let requests_in_flight = self.requests_in_flight.clone();
+                    let user_throughput = self.user_throughput.clone();
+                    let user_requests_in_flight = self.user_requests_in_flight.clone();
                     let requests_processed = self.requests_processed.clone();
                     let requests_failed = self.requests_failed.clone();
                     let should_retry = self.config.should_retry.clone();
@@ -716,6 +839,12 @@ where
                         .fetch_add(1, Ordering::Relaxed);
                     gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
                         .increment(1.0);
+
+                    // Increment per-user in-flight counter for fair scheduling
+                    user_requests_in_flight
+                        .entry(user_id.clone())
+                        .or_default()
+                        .fetch_add(1, Ordering::Relaxed);
 
                     let process_span = tracing::info_span!(
                         parent: tracing::Span::none(),
@@ -739,14 +868,24 @@ where
                         // Track processing start time for duration metrics
                         let processing_start = std::time::Instant::now();
 
-                        // Ensure we decrement the per-model counter when this task completes
+                        // Ensure we decrement the per-model and per-user counters when this task completes
                         let model_for_guard = model_clone.clone();
+                        let user_for_guard = user_id.clone();
                         let in_flight_for_guard = requests_in_flight.clone();
+                        let user_in_flight_for_guard = user_requests_in_flight.clone();
                         let _guard = scopeguard::guard((), move |_| {
                             if let Some(counter) = in_flight_for_guard.get(&model_for_guard) {
                                 counter.value().fetch_sub(1, Ordering::Relaxed);
                             }
                             gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
+                            if let Some(counter) = user_in_flight_for_guard.get(&user_for_guard) {
+                                let prev = counter.value().fetch_sub(1, Ordering::Relaxed);
+                                drop(counter);
+                                if prev == 1 {
+                                    // Counter reached zero — remove to prevent unbounded map growth
+                                    user_in_flight_for_guard.remove(&user_for_guard);
+                                }
+                            }
                         });
 
                         // Duration span covering the claimed state (from claim to process start)
@@ -797,6 +936,10 @@ where
                             Ok(RequestCompletionResult::Completed(completed)) => {
                                 tracing::Span::current().record("outcome", "completed");
                                 requests_processed.fetch_add(1, Ordering::Relaxed);
+                                user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
+                                    completed: AtomicU64::new(0),
+                                    failed: AtomicU64::new(0),
+                                }).completed.fetch_add(1, Ordering::Relaxed);
                                 counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
                                 histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
                                     .record(processing_start.elapsed().as_secs_f64());
@@ -849,6 +992,10 @@ where
                                         Err(failed) => {
                                             // No retries left - persist as Failed (terminal)
                                             storage.persist(&*failed).await?;
+                                            user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
+                                                completed: AtomicU64::new(0),
+                                                failed: AtomicU64::new(0),
+                                            }).failed.fetch_add(1, Ordering::Relaxed);
                                             requests_failed.fetch_add(1, Ordering::Relaxed);
                                             counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
                                             histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
@@ -876,6 +1023,10 @@ where
                                     }
                                 } else {
                                     requests_failed.fetch_add(1, Ordering::Relaxed);
+                                    user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
+                                        completed: AtomicU64::new(0),
+                                        failed: AtomicU64::new(0),
+                                    }).failed.fetch_add(1, Ordering::Relaxed);
                                     counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
                                     histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                         .record(processing_start.elapsed().as_secs_f64());
@@ -990,6 +1141,8 @@ mod tests {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
+            throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -1168,6 +1321,8 @@ mod tests {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
+            throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -1408,6 +1563,8 @@ mod tests {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
+            throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -1553,6 +1710,8 @@ mod tests {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
+            throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -1737,6 +1896,8 @@ mod tests {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
+            throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -1905,6 +2066,8 @@ mod tests {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
+            throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -2078,6 +2241,8 @@ mod tests {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
+            throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -2246,6 +2411,8 @@ mod tests {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
+            throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(
@@ -2397,6 +2564,8 @@ mod tests {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
+            throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
         };
 
         let manager = Arc::new(

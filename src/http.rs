@@ -631,6 +631,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            created_by: String::new(),
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -675,6 +676,7 @@ mod tests {
             body: "".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            created_by: String::new(),
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -702,6 +704,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            created_by: String::new(),
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -732,6 +735,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            created_by: String::new(),
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -785,6 +789,7 @@ mod tests {
             body: r#"{"key":"value"}"#.to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            created_by: String::new(),
             batch_metadata: batch_metadata.clone(),
         };
 
@@ -897,6 +902,7 @@ mod tests {
             body: r#"{"prompt":"test"}"#.to_string(),
             model: "test-model".to_string(),
             api_key: "test-api-key".to_string(),
+            created_by: String::new(),
             batch_metadata,
         };
 
@@ -950,6 +956,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "".to_string(),
+            created_by: String::new(),
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -997,6 +1004,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "".to_string(),
+            created_by: String::new(),
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -1066,6 +1074,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "".to_string(),
+            created_by: String::new(),
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -1102,6 +1111,7 @@ mod tests {
             body: "{}".to_string(),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
+            created_by: String::new(),
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -1163,6 +1173,7 @@ mod tests {
             body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#.to_string(),
             model: "gpt-4".to_string(),
             api_key: "".to_string(),
+            created_by: String::new(),
             batch_metadata: std::collections::HashMap::new(),
         };
 
