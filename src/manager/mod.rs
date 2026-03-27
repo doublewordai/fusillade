@@ -5,7 +5,7 @@
 
 use crate::batch::{
     Batch, BatchId, BatchInput, BatchStatus, File, FileContentItem, FileFilter, FileId,
-    FileStreamItem, ListBatchesFilter, OutputFileType, RequestTemplateInput,
+    FileStreamItem, FileStreamResult, ListBatchesFilter, OutputFileType, RequestTemplateInput,
 };
 use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
@@ -42,10 +42,11 @@ pub trait Storage: Send + Sync {
     /// The stream yields FileStreamItem which can be either:
     /// - Metadata: File metadata (can appear anywhere, will be accumulated)
     /// - Template: Request templates (processed as they arrive)
+    /// - Abort: Producer initiated rollback without treating it as a fusillade error
     async fn create_file_stream<S: Stream<Item = FileStreamItem> + Send + Unpin>(
         &self,
         stream: S,
-    ) -> Result<FileId>;
+    ) -> Result<FileStreamResult>;
 
     /// Get a file by ID.
     async fn get_file(&self, file_id: FileId) -> Result<File>;
