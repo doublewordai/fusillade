@@ -1,5 +1,16 @@
 # Changelog
 
+## [14.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v13.1.1...fusillade-v14.0.0) (2026-03-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* per-user fair usage scheduling ([#189](https://github.com/doublewordai/fusillade/issues/189))
+
+### Features
+
+* per-user fair usage scheduling ([#189](https://github.com/doublewordai/fusillade/issues/189)) ([440604f](https://github.com/doublewordai/fusillade/commit/440604f6bed08e71137d361a752f9a1c7dfaac9a))
+
 ## [13.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v13.1.0...fusillade-v13.1.1) (2026-03-26)
 
 
