@@ -333,6 +333,29 @@ impl Request<Failed> {
     }
 }
 
+/// Check if a successful HTTP response body contains an embedded error object.
+///
+/// Some providers return HTTP 200 but embed an error in the response body
+/// (e.g. an error object inside a reassembled SSE stream). When detected,
+/// returns the status code from the error's `code` field so the caller can
+/// reclassify the response as a failure with the correct retriability.
+fn extract_embedded_error_status(body: &str) -> Option<u16> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error_obj = value.get("error")?;
+    // Only trigger if there's no other top-level data — a response with both
+    // "error" and other fields (e.g. "choices") is ambiguous and should not
+    // be reclassified.
+    if value.as_object().map_or(false, |m| m.len() > 1) {
+        return None;
+    }
+    let code = error_obj.get("code")?.as_u64()?;
+    if code >= 400 && code < 600 {
+        Some(code as u16)
+    } else {
+        None
+    }
+}
+
 impl Request<Processing> {
     /// Wait for the HTTP request to complete.
     ///
@@ -465,6 +488,49 @@ impl Request<Processing> {
                     };
                     storage.persist(&request).await?;
                     Ok(RequestCompletionResult::Failed(request))
+                } else if let Some(embedded_status) = extract_embedded_error_status(&http_response.body) {
+                    // HTTP 200 but body contains an error object (e.g. provider
+                    // returned an error inside an SSE stream that was reassembled).
+                    // Reclassify using the embedded status code so retry logic
+                    // treats it the same as a direct HTTP error response.
+                    let synthetic = HttpResponse {
+                        status: embedded_status,
+                        body: http_response.body.clone(),
+                    };
+                    if should_retry(&synthetic) {
+                        let failed_state = Failed {
+                            reason: FailureReason::RetriableHttpStatus {
+                                status: embedded_status,
+                                body: http_response.body,
+                            },
+                            failed_at: chrono::Utc::now(),
+                            retry_attempt: self.state.retry_attempt,
+                            batch_expires_at: self.state.batch_expires_at,
+                            routed_model: self.data.model.clone(),
+                        };
+                        let request = Request {
+                            data: self.data,
+                            state: failed_state,
+                        };
+                        Ok(RequestCompletionResult::Failed(request))
+                    } else {
+                        let failed_state = Failed {
+                            reason: FailureReason::NonRetriableHttpStatus {
+                                status: embedded_status,
+                                body: http_response.body,
+                            },
+                            failed_at: chrono::Utc::now(),
+                            retry_attempt: self.state.retry_attempt,
+                            batch_expires_at: self.state.batch_expires_at,
+                            routed_model: self.data.model.clone(),
+                        };
+                        let request = Request {
+                            data: self.data,
+                            state: failed_state,
+                        };
+                        storage.persist(&request).await?;
+                        Ok(RequestCompletionResult::Failed(request))
+                    }
                 } else {
                     // HTTP request completed successfully
                     let completed_state = Completed {
