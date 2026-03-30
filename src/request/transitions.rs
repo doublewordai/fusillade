@@ -339,26 +339,32 @@ impl Request<Failed> {
 /// (e.g. an error object inside a reassembled SSE stream). When detected,
 /// returns the HTTP status code from the error's numeric `code` field
 /// (only 4xx/5xx values) so the caller can reclassify the response as a
-/// failure with the correct retriability. String-style codes such as
-/// `"service_unavailable"` are ignored.
+/// failure with the correct retriability. If `code` is missing or
+/// non-numeric (e.g. `"context_length_exceeded"`), defaults to 500.
+#[derive(serde::Deserialize)]
+struct EmbeddedErrorEnvelope {
+    error: EmbeddedErrorBody,
+}
+
+#[derive(serde::Deserialize)]
+struct EmbeddedErrorBody {
+    code: Option<serde_json::Value>,
+}
+
 fn extract_embedded_error_status(body: &str) -> Option<u16> {
     if !body.starts_with("{\"error\"") {
         return None;
     }
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let error_obj = value.get("error")?;
-    // Only trigger if there's no other top-level data — a response with both
-    // "error" and other fields (e.g. "choices") is ambiguous and should not
-    // be reclassified.
-    if value.as_object().is_some_and(|m| m.len() > 1) {
-        return None;
-    }
-    let code = error_obj.get("code")?.as_u64()?;
-    if (400..600).contains(&code) {
-        Some(code as u16)
-    } else {
-        None
-    }
+    let envelope: EmbeddedErrorEnvelope = serde_json::from_str(body).ok()?;
+    let code = envelope
+        .error
+        .code
+        .as_ref()
+        .and_then(|c| c.as_u64())
+        .map(|c| c as u16)
+        .filter(|c| (400..600).contains(c))
+        .unwrap_or(500);
+    Some(code)
 }
 
 impl Request<Processing> {
