@@ -845,6 +845,8 @@ where
                         .entry(user_id.clone())
                         .or_default()
                         .fetch_add(1, Ordering::Relaxed);
+                    gauge!("fusillade_user_requests_in_flight", "user" => user_id.clone())
+                        .increment(1.0);
 
                     let process_span = tracing::info_span!(
                         parent: tracing::Span::none(),
@@ -878,6 +880,7 @@ where
                                 counter.value().fetch_sub(1, Ordering::Relaxed);
                             }
                             gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
+                            gauge!("fusillade_user_requests_in_flight", "user" => user_for_guard.clone()).decrement(1.0);
                             if let Some(counter) = user_in_flight_for_guard.get(&user_for_guard) {
                                 let prev = counter.value().fetch_sub(1, Ordering::Relaxed);
                                 drop(counter);
@@ -941,6 +944,7 @@ where
                                     failed: AtomicU64::new(0),
                                 }).completed.fetch_add(1, Ordering::Relaxed);
                                 counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
+                                counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "success").increment(1);
                                 histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
                                     .record(processing_start.elapsed().as_secs_f64());
                                 // Record how many retries it took to succeed (0 = first attempt succeeded)
@@ -998,6 +1002,7 @@ where
                                             }).failed.fetch_add(1, Ordering::Relaxed);
                                             requests_failed.fetch_add(1, Ordering::Relaxed);
                                             counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
+                                            counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed").increment(1);
                                             histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                                 .record(processing_start.elapsed().as_secs_f64());
 
@@ -1028,6 +1033,7 @@ where
                                         failed: AtomicU64::new(0),
                                     }).failed.fetch_add(1, Ordering::Relaxed);
                                     counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
+                                    counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed").increment(1);
                                     histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                         .record(processing_start.elapsed().as_secs_f64());
 
@@ -1053,6 +1059,7 @@ where
                             Ok(RequestCompletionResult::Canceled(_canceled)) => {
                                 tracing::Span::current().record("outcome", "canceled");
                                 counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled").increment(1);
+                                counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "cancelled").increment(1);
                                 tracing::debug!(request_id = %request_id, "Request canceled by user");
                             }
                             Err(FusilladeError::Shutdown) => {
