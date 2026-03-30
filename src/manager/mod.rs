@@ -200,6 +200,13 @@ pub trait Storage: Send + Sync {
     /// This is a destructive operation that removes the batch and all request data.
     async fn delete_batch(&self, batch_id: BatchId) -> Result<()>;
 
+    /// Soft-delete batches and files belonging to a creator, nullifying metadata.
+    ///
+    /// Processes up to `batch_size` batches and `batch_size` files per call.
+    /// Returns the total number of rows updated. Callers should loop until
+    /// the return value is 0 to ensure all records are processed.
+    async fn bulk_delete_data(&self, creator_id: &str, batch_size: i64) -> Result<u64>;
+
     /// Retry failed requests by resetting them to pending state.
     ///
     /// This resets the specified failed requests to pending state with retry_attempt = 0,
