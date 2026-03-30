@@ -1,5 +1,12 @@
 # Changelog
 
+## [14.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v14.0.1...fusillade-v14.1.0) (2026-03-30)
+
+
+### Features
+
+* prometheus metric user completed_requests ([#197](https://github.com/doublewordai/fusillade/issues/197)) ([9f0b5b0](https://github.com/doublewordai/fusillade/commit/9f0b5b02bfc4531d047000fa7745e2daa7fb4cf6))
+
 ## [14.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v14.0.0...fusillade-v14.0.1) (2026-03-27)
 
 
