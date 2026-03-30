@@ -350,11 +350,11 @@ fn extract_embedded_error_status(body: &str) -> Option<u16> {
     // Only trigger if there's no other top-level data — a response with both
     // "error" and other fields (e.g. "choices") is ambiguous and should not
     // be reclassified.
-    if value.as_object().map_or(false, |m| m.len() > 1) {
+    if value.as_object().is_some_and(|m| m.len() > 1) {
         return None;
     }
     let code = error_obj.get("code")?.as_u64()?;
-    if code >= 400 && code < 600 {
+    if (400..600).contains(&code) {
         Some(code as u16)
     } else {
         None
