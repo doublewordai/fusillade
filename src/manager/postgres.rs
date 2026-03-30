@@ -1059,15 +1059,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     AnyRequest::Pending(req) => {
                         let rows_affected = sqlx::query!(
                             r#"
-                    UPDATE requests SET
-                        state = 'pending',
-                        retry_attempt = $2,
-                        not_before = $3,
-                        daemon_id = NULL,
-                        claimed_at = NULL,
-                        started_at = NULL
-                    WHERE id = $1
-                    "#,
+                            UPDATE requests SET
+                                state = 'pending',
+                                retry_attempt = $2,
+                                not_before = $3,
+                                daemon_id = NULL,
+                                claimed_at = NULL,
+                                started_at = NULL
+                            WHERE id = $1
+                            "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
                             req.state.not_before,
@@ -1086,15 +1086,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     AnyRequest::Claimed(req) => {
                         let rows_affected = sqlx::query!(
                             r#"
-                    UPDATE requests SET
-                        state = 'claimed',
-                        retry_attempt = $2,
-                        daemon_id = $3,
-                        claimed_at = $4,
-                        started_at = NULL,
-                        not_before = NULL
-                    WHERE id = $1
-                    "#,
+                            UPDATE requests SET
+                                state = 'claimed',
+                                retry_attempt = $2,
+                                daemon_id = $3,
+                                claimed_at = $4,
+                                started_at = NULL,
+                                not_before = NULL
+                            WHERE id = $1
+                            "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
                             *req.state.daemon_id as Uuid,
@@ -1114,14 +1114,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     AnyRequest::Processing(req) => {
                         let rows_affected = sqlx::query!(
                             r#"
-                    UPDATE requests SET
-                        state = 'processing',
-                        retry_attempt = $2,
-                        daemon_id = $3,
-                        claimed_at = $4,
-                        started_at = $5
-                    WHERE id = $1
-                    "#,
+                            UPDATE requests SET
+                                state = 'processing',
+                                retry_attempt = $2,
+                                daemon_id = $3,
+                                claimed_at = $4,
+                                started_at = $5
+                            WHERE id = $1
+                            "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
                             *req.state.daemon_id as Uuid,
@@ -1148,17 +1148,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
                         let rows_affected = sqlx::query!(
                             r#"
-                    UPDATE requests SET
-                        state = 'completed',
-                        response_status = $2,
-                        response_body = $3,
-                        claimed_at = $4,
-                        started_at = $5,
-                        completed_at = $6,
-                        response_size = $7,
-                        routed_model = $8
-                    WHERE id = $1
-                    "#,
+                            UPDATE requests SET
+                                state = 'completed',
+                                response_status = $2,
+                                response_body = $3,
+                                claimed_at = $4,
+                                started_at = $5,
+                                completed_at = $6,
+                                response_size = $7,
+                                routed_model = $8
+                            WHERE id = $1
+                            "#,
                             *req.data.id as Uuid,
                             req.state.response_status as i16,
                             req.state.response_body,
@@ -1196,15 +1196,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
                         let rows_affected = sqlx::query!(
                             r#"
-                    UPDATE requests SET
-                        state = 'failed',
-                        retry_attempt = $2,
-                        error = $3,
-                        failed_at = $4,
-                        response_size = $5,
-                        routed_model = $6
-                    WHERE id = $1
-                    "#,
+                            UPDATE requests SET
+                                state = 'failed',
+                                retry_attempt = $2,
+                                error = $3,
+                                failed_at = $4,
+                                response_size = $5,
+                                routed_model = $6
+                            WHERE id = $1
+                            "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
                             error_json,
@@ -1226,11 +1226,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     AnyRequest::Canceled(req) => {
                         let rows_affected = sqlx::query!(
                             r#"
-                    UPDATE requests SET
-                        state = 'canceled',
-                        canceled_at = $2
-                    WHERE id = $1
-                    "#,
+                            UPDATE requests SET
+                                state = 'canceled',
+                                canceled_at = $2
+                            WHERE id = $1
+                            "#,
                             *req.data.id as Uuid,
                             req.state.canceled_at,
                         )
