@@ -1059,6 +1059,7 @@ where
                             Ok(RequestCompletionResult::Canceled(_canceled)) => {
                                 tracing::Span::current().record("outcome", "canceled");
                                 counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled").increment(1);
+                                counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "cancelled").increment(1);
                                 tracing::debug!(request_id = %request_id, "Request canceled by user");
                             }
                             Err(FusilladeError::Shutdown) => {
