@@ -1270,7 +1270,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             }
         }
 
-        unreachable!()
+        Err(FusilladeError::Other(anyhow!(
+            "Failed to persist request state after {} attempts",
+            MAX_ATTEMPTS
+        )))
     }
 
     #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]

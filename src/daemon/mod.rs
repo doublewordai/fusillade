@@ -984,7 +984,7 @@ where
                                                 tracing::error!(
                                                     request_id = %request_id,
                                                     batch_id = %batch_id,
-                                                    retry_attempt,
+                                                    retry_attempt = pending.state.retry_attempt,
                                                     error = %e,
                                                     "Failed to persist retry — request orphaned in processing state"
                                                 );
