@@ -337,9 +337,14 @@ impl Request<Failed> {
 ///
 /// Some providers return HTTP 200 but embed an error in the response body
 /// (e.g. an error object inside a reassembled SSE stream). When detected,
-/// returns the status code from the error's `code` field so the caller can
-/// reclassify the response as a failure with the correct retriability.
+/// returns the HTTP status code from the error's numeric `code` field
+/// (only 4xx/5xx values) so the caller can reclassify the response as a
+/// failure with the correct retriability. String-style codes such as
+/// `"service_unavailable"` are ignored.
 fn extract_embedded_error_status(body: &str) -> Option<u16> {
+    if !body.starts_with("{\"error\"") {
+        return None;
+    }
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let error_obj = value.get("error")?;
     // Only trigger if there's no other top-level data — a response with both
@@ -488,7 +493,9 @@ impl Request<Processing> {
                     };
                     storage.persist(&request).await?;
                     Ok(RequestCompletionResult::Failed(request))
-                } else if let Some(embedded_status) = extract_embedded_error_status(&http_response.body) {
+                } else if let Some(embedded_status) =
+                    extract_embedded_error_status(&http_response.body)
+                {
                     // HTTP 200 but body contains an error object (e.g. provider
                     // returned an error inside an SSE stream that was reassembled).
                     // Reclassify using the embedded status code so retry logic
@@ -498,6 +505,22 @@ impl Request<Processing> {
                         body: http_response.body.clone(),
                     };
                     if should_retry(&synthetic) {
+                        let error_code =
+                            serde_json::from_str::<serde_json::Value>(&http_response.body)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("error")?.get("code")?.as_str().map(String::from)
+                                })
+                                .unwrap_or_default();
+
+                        counter!(
+                            "fusillade_http_status_retriable_total",
+                            "model" => self.data.model.clone(),
+                            "status" => embedded_status.to_string(),
+                            "code" => error_code,
+                        )
+                        .increment(1);
+
                         let failed_state = Failed {
                             reason: FailureReason::RetriableHttpStatus {
                                 status: embedded_status,
