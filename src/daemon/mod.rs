@@ -980,7 +980,16 @@ where
                                     match failed.can_retry(retry_attempt, retry_config) {
                                         Ok(pending) => {
                                             // Can retry - persist as Pending
-                                            storage.persist(&pending).await?;
+                                            if let Err(e) = storage.persist(&pending).await {
+                                                tracing::error!(
+                                                    request_id = %request_id,
+                                                    batch_id = %batch_id,
+                                                    retry_attempt,
+                                                    error = %e,
+                                                    "Failed to persist retry — request orphaned in processing state"
+                                                );
+                                                return Err(e);
+                                            }
                                             counter!(
                                                 "fusillade_requests_retried_total",
                                                 "model" => model_clone.clone(),
@@ -995,7 +1004,16 @@ where
                                         }
                                         Err(failed) => {
                                             // No retries left - persist as Failed (terminal)
-                                            storage.persist(&*failed).await?;
+                                            if let Err(e) = storage.persist(&*failed).await {
+                                                tracing::error!(
+                                                    request_id = %request_id,
+                                                    batch_id = %batch_id,
+                                                    retry_attempt,
+                                                    error = %e,
+                                                    "Failed to persist terminal failure — request orphaned in processing state"
+                                                );
+                                                return Err(e);
+                                            }
                                             user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
                                                 completed: AtomicU64::new(0),
                                                 failed: AtomicU64::new(0),
