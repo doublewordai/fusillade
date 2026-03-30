@@ -815,8 +815,18 @@ where
                     // Spawn a processing task
                     let model_clone = model.clone();
                     let user_id = request.data.created_by.clone();
-                    let completion_window = request.data.batch_metadata.get("completion_window").cloned().unwrap_or_default();
-                    let user_email = request.data.batch_metadata.get("created_by_email").cloned().unwrap_or_else(|| user_id.clone());
+                    let completion_window = request
+                        .data
+                        .batch_metadata
+                        .get("completion_window")
+                        .cloned()
+                        .unwrap_or_default();
+                    let user_email = request
+                        .data
+                        .batch_metadata
+                        .get("created_by_email")
+                        .cloned()
+                        .unwrap_or_else(|| user_id.clone());
                     let storage = self.storage.clone();
                     let http_client = (*self.http_client).clone();
                     let retry_config = (&self.config).into();
