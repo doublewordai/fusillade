@@ -9197,7 +9197,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let batch = manager
+            let _batch = manager
                 .create_batch(BatchInput {
                     file_id,
                     endpoint: "/v1/chat/completions".to_string(),
@@ -10476,7 +10476,7 @@ mod tests {
 
         // Only model-a pending should be counted
         assert_eq!(*counts.get("model-a").unwrap().get("15m").unwrap(), 1);
-        assert!(counts.get("model-b").is_none());
+        assert!(!counts.contains_key("model-b"));
 
         // Now include claimed state and remove model filter
         let states = vec!["pending".to_string(), "claimed".to_string()];
