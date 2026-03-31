@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                            UPDATE requests SET\n                                state = 'completed',\n                                response_status = $2,\n                                response_body = $3,\n                                reasoning_artifact = $4,\n                                reasoning_tokens = $5,\n                                claimed_at = $6,\n                                started_at = $7,\n                                completed_at = $8,\n                                response_size = $9,\n                                routed_model = $10\n                            WHERE id = $1\n                            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int2",
+        "Text",
+        "Jsonb",
+        "Int8",
+        "Timestamptz",
+        "Timestamptz",
+        "Timestamptz",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6efe7916b539f7bc43c74533f57c45b71a4b0496588ce1eaf29e7fcc956033fb"
+}

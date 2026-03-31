@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.batch_id as \"batch_id!\", r.template_id as \"template_id?\", r.state,\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", t.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at, r.routed_model\n            FROM requests r\n            LEFT JOIN active_request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.id = ANY($1)\n            ",
+  "query": "\n            SELECT\n                r.id, r.batch_id as \"batch_id!\", r.template_id as \"template_id?\", r.state,\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", t.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.reasoning_artifact, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at, r.routed_model\n            FROM requests r\n            LEFT JOIN active_request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.batch_id = $1 AND b.deleted_at IS NULL\n            ORDER BY r.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -95,38 +95,43 @@
       },
       {
         "ordinal": 18,
+        "name": "reasoning_artifact",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 19,
         "name": "completed_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 19,
+        "ordinal": 20,
         "name": "error",
         "type_info": "Text"
       },
       {
-        "ordinal": 20,
+        "ordinal": 21,
         "name": "failed_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 21,
+        "ordinal": 22,
         "name": "canceled_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 22,
+        "ordinal": 23,
         "name": "batch_expires_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 23,
+        "ordinal": 24,
         "name": "routed_model",
         "type_info": "Text"
       }
     ],
     "parameters": {
       "Left": [
-        "UuidArray"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -152,9 +157,10 @@
       true,
       true,
       true,
+      true,
       false,
       true
     ]
   },
-  "hash": "3e82696580034b94b75874a60dbdb12064ef5866f44fc050680b685eedbb34e8"
+  "hash": "9551dbb0c4c0d3fa3c9b758c1f4728d5ce26d24817e87e604403bd3bd42b1a07"
 }
