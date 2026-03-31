@@ -1,5 +1,17 @@
 # Changelog
 
+## [14.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v14.1.0...fusillade-v14.2.0) (2026-03-31)
+
+
+### Features
+
+* split user throughput metrics sla ([#202](https://github.com/doublewordai/fusillade/issues/202)) ([3472748](https://github.com/doublewordai/fusillade/commit/3472748c8039969dfcececc9123d6a55427f09f6))
+
+
+### Bug Fixes
+
+* add retries and error logging to critical state persisting ([#200](https://github.com/doublewordai/fusillade/issues/200)) ([953b2f3](https://github.com/doublewordai/fusillade/commit/953b2f3c290be36dfc50a25661d699203b796652))
+
 ## [14.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v14.0.1...fusillade-v14.1.0) (2026-03-30)
 
 
