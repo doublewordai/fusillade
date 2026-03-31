@@ -387,28 +387,28 @@ impl ReqwestHttpClient {
         // the error JSON directly as the body and override the status with the
         // embedded code so downstream retry logic classifies it correctly.
         // The reassembler doesn't handle error objects and would mangle them.
-        if let Some(event) = collected.iter().find(|e| e.data.starts_with("{\"error\"")) {
-            if let Ok(envelope) = serde_json::from_str::<EmbeddedErrorEnvelope>(&event.data) {
-                let code = envelope
-                    .error
-                    .code
-                    .as_ref()
-                    .and_then(|c| c.as_u64())
-                    .map(|c| c as u16)
-                    .filter(|c| (400..600).contains(c))
-                    .unwrap_or(500);
+        if let Some(event) = collected.iter().find(|e| e.data.starts_with("{\"error\""))
+            && let Ok(envelope) = serde_json::from_str::<EmbeddedErrorEnvelope>(&event.data)
+        {
+            let code = envelope
+                .error
+                .code
+                .as_ref()
+                .and_then(|c| c.as_u64())
+                .map(|c| c as u16)
+                .filter(|c| (400..600).contains(c))
+                .unwrap_or(500);
 
-                tracing::warn!(
-                    request_id = %request.id,
-                    embedded_status = code,
-                    "Provider returned error inside SSE stream, reclassifying as HTTP error"
-                );
+            tracing::warn!(
+                request_id = %request.id,
+                embedded_status = code,
+                "Provider returned error inside SSE stream, reclassifying as HTTP error"
+            );
 
-                return Ok(HttpResponse {
-                    status: code,
-                    body: event.data.clone(),
-                });
-            }
+            return Ok(HttpResponse {
+                status: code,
+                body: event.data.clone(),
+            });
         }
 
         let body = match &self.stream_reassembler {
