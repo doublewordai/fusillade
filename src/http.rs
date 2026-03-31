@@ -28,6 +28,18 @@ pub struct HttpResponse {
     pub body: String,
 }
 
+/// Minimal representation of a provider error embedded in an SSE stream.
+/// Used to detect and extract error status codes from events before reassembly.
+#[derive(serde::Deserialize)]
+struct EmbeddedErrorEnvelope {
+    error: EmbeddedErrorBody,
+}
+
+#[derive(serde::Deserialize)]
+struct EmbeddedErrorBody {
+    code: Option<serde_json::Value>,
+}
+
 /// Trait for executing HTTP requests.
 ///
 /// This abstraction allows for different implementations (production vs. testing)
@@ -369,6 +381,35 @@ impl ReqwestHttpClient {
                 self.body_timeout.as_millis()
             ))
         })??;
+
+        // Check for provider error objects before reassembly. Some providers
+        // return HTTP 200 but embed an error in the SSE stream. If found, use
+        // the error JSON directly as the body and override the status with the
+        // embedded code so downstream retry logic classifies it correctly.
+        // The reassembler doesn't handle error objects and would mangle them.
+        if let Some(event) = collected.iter().find(|e| e.data.starts_with("{\"error\"")) {
+            if let Ok(envelope) = serde_json::from_str::<EmbeddedErrorEnvelope>(&event.data) {
+                let code = envelope
+                    .error
+                    .code
+                    .as_ref()
+                    .and_then(|c| c.as_u64())
+                    .map(|c| c as u16)
+                    .filter(|c| (400..600).contains(c))
+                    .unwrap_or(500);
+
+                tracing::warn!(
+                    request_id = %request.id,
+                    embedded_status = code,
+                    "Provider returned error inside SSE stream, reclassifying as HTTP error"
+                );
+
+                return Ok(HttpResponse {
+                    status: code,
+                    body: event.data.clone(),
+                });
+            }
+        }
 
         let body = match &self.stream_reassembler {
             Some(reassemble) => reassemble(&collected)?,
