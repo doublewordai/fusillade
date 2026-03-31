@@ -15,6 +15,23 @@ use crate::batch::{BatchId, TemplateId};
 use crate::error::Result;
 use crate::http::HttpResponse;
 
+/// Reasoning artifact captured separately from the final response body.
+///
+/// This preserves reasoning-related content and token accounting without
+/// mutating the OpenAI-compatible response body stored for the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningArtifact {
+    /// Number of reasoning tokens reported by the provider, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<i64>,
+    /// Raw streamed reasoning text captured from delta events, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_text: Option<String>,
+    /// Response API reasoning items or other structured provider payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured: Option<serde_json::Value>,
+}
+
 /// Database state for filtering and querying requests.
 ///
 /// This enum represents the string values stored in the database's `state` column.
@@ -174,6 +191,8 @@ impl RequestState for Processing {}
 pub struct Completed {
     pub response_status: u16,
     pub response_body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_artifact: Option<ReasoningArtifact>,
     pub claimed_at: DateTime<Utc>,
     pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,

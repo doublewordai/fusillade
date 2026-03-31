@@ -470,6 +470,7 @@ impl Request<Processing> {
                     let completed_state = Completed {
                         response_status: http_response.status,
                         response_body: http_response.body,
+                        reasoning_artifact: http_response.reasoning_artifact,
                         claimed_at: self.state.claimed_at,
                         started_at: self.state.started_at,
                         completed_at: chrono::Utc::now(),

@@ -14,6 +14,8 @@ use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
+use crate::request::ReasoningArtifact;
+
 /// Unique identifier for a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -312,6 +314,8 @@ pub struct BatchResultItem {
     pub input_body: serde_json::Value,
     /// Full response object (choices, usage, etc.) for completed requests
     pub response_body: Option<serde_json::Value>,
+    /// Separately captured reasoning artifact for completed requests
+    pub reasoning_artifact: Option<ReasoningArtifact>,
     /// Error message for failed requests
     pub error: Option<String>,
     /// Current status of the request

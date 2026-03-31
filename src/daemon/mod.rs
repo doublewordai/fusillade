@@ -1138,6 +1138,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -1291,6 +1292,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"1"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
         let trigger2 = http_client.add_response_with_trigger(
@@ -1298,6 +1300,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"2"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
         let trigger3 = http_client.add_response_with_trigger(
@@ -1305,6 +1308,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"3"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
         let trigger4 = http_client.add_response_with_trigger(
@@ -1312,6 +1316,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"4"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
         let trigger5 = http_client.add_response_with_trigger(
@@ -1319,6 +1324,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"5"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -1542,6 +1548,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 500,
                 body: r#"{"error":"internal error"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -1551,6 +1558,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 503,
                 body: r#"{"error":"service unavailable"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -1560,6 +1568,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"success after retries"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -1706,6 +1715,7 @@ mod tests {
                 Ok(HttpResponse {
                     status: 200,
                     body: format!(r#"{{"result":"{}"}}"#, i),
+                    reasoning_artifact: None,
                 }),
             );
             triggers.push(trigger);
@@ -1892,6 +1902,7 @@ mod tests {
                 Ok(HttpResponse {
                     status: 500,
                     body: r#"{"error":"server error"}"#.to_string(),
+                    reasoning_artifact: None,
                 }),
             );
         }
@@ -2062,6 +2073,7 @@ mod tests {
                 Ok(HttpResponse {
                     status: 500,
                     body: r#"{"error":"server error"}"#.to_string(),
+                    reasoning_artifact: None,
                 }),
             );
         }
@@ -2234,6 +2246,7 @@ mod tests {
                 status: 200,
                 body: r#"{"id":"chatcmpl-123","choices":[{"message":{"content":"test"}}]}"#
                     .to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -2402,6 +2415,7 @@ mod tests {
                 status: 200,
                 body: r#"{"id":"chatcmpl-123","choices":[{"message":{"content":"test"}}]}"#
                     .to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -2563,6 +2577,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
 

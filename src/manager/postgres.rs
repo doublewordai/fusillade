@@ -1145,6 +1145,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             .ok_or_else(|| {
                                 FusilladeError::Other(anyhow!("Response body too large"))
                             })?;
+                        let reasoning_artifact = req
+                            .state
+                            .reasoning_artifact
+                            .as_ref()
+                            .map(serde_json::to_value)
+                            .transpose()
+                            .map_err(|e| {
+                                FusilladeError::Other(anyhow!(
+                                    "Failed to serialize reasoning artifact: {}",
+                                    e
+                                ))
+                            })?;
+                        let reasoning_tokens =
+                            req.state.reasoning_artifact.as_ref().and_then(|artifact| artifact.reasoning_tokens);
 
                         let rows_affected = sqlx::query!(
                             r#"
@@ -1152,16 +1166,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 state = 'completed',
                                 response_status = $2,
                                 response_body = $3,
-                                claimed_at = $4,
-                                started_at = $5,
-                                completed_at = $6,
-                                response_size = $7,
-                                routed_model = $8
+                                reasoning_artifact = $4,
+                                reasoning_tokens = $5,
+                                claimed_at = $6,
+                                started_at = $7,
+                                completed_at = $8,
+                                response_size = $9,
+                                routed_model = $10
                             WHERE id = $1
                             "#,
                             *req.data.id as Uuid,
                             req.state.response_status as i16,
                             req.state.response_body,
+                            reasoning_artifact,
+                            reasoning_tokens,
                             req.state.claimed_at,
                             req.state.started_at,
                             req.state.completed_at,
@@ -1287,7 +1305,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
                 t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
-                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
+                r.response_status, r.response_body, r.reasoning_artifact, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at, r.routed_model
             FROM requests r
             LEFT JOIN active_request_templates t ON r.template_id = t.id
@@ -1419,6 +1437,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 "Missing response_body for completed request"
                             ))
                         })?,
+                        reasoning_artifact: row
+                            .reasoning_artifact
+                            .and_then(|value| serde_json::from_value(value).ok()),
                         claimed_at: row.claimed_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!(
                                 "Missing claimed_at for completed request"
@@ -3036,7 +3057,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
                 t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
                 r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
-                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
+                r.response_status, r.response_body, r.reasoning_artifact, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at, r.routed_model
             FROM requests r
             LEFT JOIN active_request_templates t ON r.template_id = t.id
@@ -3162,6 +3183,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 "Missing response_body for completed execution"
                             ))
                         })?,
+                        reasoning_artifact: row
+                            .reasoning_artifact
+                            .and_then(|value| serde_json::from_value(value).ok()),
                         claimed_at: row.claimed_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!(
                                 "Missing claimed_at for completed execution"
@@ -4005,6 +4029,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     r.state,
                     t.body as input_body,
                     r.response_body,
+                    r.reasoning_artifact,
                     r.error,
                     t.line_number
                 FROM request_templates t
@@ -4049,6 +4074,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
                         let input_body_str: String = row.get("input_body");
                         let response_body_opt: Option<String> = row.get("response_body");
+                        let reasoning_artifact_opt: Option<serde_json::Value> = row.get("reasoning_artifact");
                         let state: String = row.get("state");
                         let id: Uuid = row.get("id");
                         let custom_id: Option<String> = row.get("custom_id");
@@ -4065,6 +4091,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                                 serde_json::from_str(body)
                                     .unwrap_or_else(|_| serde_json::Value::String(body.to_string()))
                             });
+                        let reasoning_artifact =
+                            reasoning_artifact_opt.and_then(|value| serde_json::from_value(value).ok());
 
                         // Map state to BatchResultStatus
                         let status = match state.as_str() {
@@ -4081,6 +4109,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                             model,
                             input_body,
                             response_body,
+                            reasoning_artifact,
                             error,
                             status,
                         };
@@ -8049,6 +8078,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: "ok".to_string(),
+                reasoning_artifact: None,
             }),
         );
         let _trigger2 = http_client.add_response_with_trigger(
@@ -8056,6 +8086,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: "ok".to_string(),
+                reasoning_artifact: None,
             }),
         );
 

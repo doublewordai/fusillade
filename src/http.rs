@@ -4,6 +4,7 @@
 //! enabling testability with mock implementations.
 
 use crate::error::Result;
+use crate::request::ReasoningArtifact;
 /// Function signature for stream reassemblers.
 ///
 /// A reassembler takes a slice of collected SSE events and produces a single
@@ -26,6 +27,8 @@ pub struct HttpResponse {
     pub status: u16,
     /// Response body as a string
     pub body: String,
+    /// Separately captured reasoning artifact, if one was present.
+    pub reasoning_artifact: Option<ReasoningArtifact>,
 }
 
 /// Minimal representation of a provider error embedded in an SSE stream.
@@ -286,7 +289,12 @@ impl ReqwestHttpClient {
             "HTTP request completed"
         );
 
-        Ok(HttpResponse { status, body })
+        let reasoning_artifact = extract_reasoning_artifact_from_body(&body);
+        Ok(HttpResponse {
+            status,
+            body,
+            reasoning_artifact,
+        })
     }
 
     /// Execute a streaming request with split timeouts:
@@ -382,6 +390,8 @@ impl ReqwestHttpClient {
             ))
         })??;
 
+        let reasoning_artifact = extract_reasoning_artifact_from_events(&collected);
+
         // Check for provider error objects before reassembly. Some providers
         // return HTTP 200 but embed an error in the SSE stream. If found, use
         // the error JSON directly as the body and override the status with the
@@ -408,6 +418,7 @@ impl ReqwestHttpClient {
             return Ok(HttpResponse {
                 status: code,
                 body: event.data.clone(),
+                reasoning_artifact,
             });
         }
 
@@ -428,7 +439,107 @@ impl ReqwestHttpClient {
             "Streaming HTTP request completed"
         );
 
-        Ok(HttpResponse { status, body })
+        let reasoning_artifact = reasoning_artifact.or_else(|| extract_reasoning_artifact_from_body(&body));
+
+        Ok(HttpResponse {
+            status,
+            body,
+            reasoning_artifact,
+        })
+    }
+}
+
+fn extract_reasoning_artifact_from_body(body: &str) -> Option<ReasoningArtifact> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    extract_reasoning_artifact_from_value(&value)
+}
+
+fn extract_reasoning_artifact_from_events(events: &[eventsource_stream::Event]) -> Option<ReasoningArtifact> {
+    let mut reasoning_text = String::new();
+    let mut reasoning_tokens: Option<i64> = None;
+    let mut structured_items: Vec<serde_json::Value> = Vec::new();
+
+    for event in events {
+        if event.data.is_empty() || event.data == "[DONE]" {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(&event.data) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        if let Some(extracted) = extract_reasoning_artifact_from_value(&value) {
+            if reasoning_tokens.is_none() {
+                reasoning_tokens = extracted.reasoning_tokens;
+            }
+            if let Some(text) = extracted.reasoning_text {
+                reasoning_text.push_str(&text);
+            }
+            if let Some(structured) = extracted.structured {
+                match structured {
+                    serde_json::Value::Array(items) => structured_items.extend(items),
+                    item => structured_items.push(item),
+                }
+            }
+        }
+
+        if let Some(delta) = value
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.as_object())
+            && let Some(text) = delta.get("reasoning_content").and_then(|v| v.as_str())
+        {
+            reasoning_text.push_str(text);
+        }
+    }
+
+    if reasoning_tokens.is_none() && reasoning_text.is_empty() && structured_items.is_empty() {
+        None
+    } else {
+        Some(ReasoningArtifact {
+            reasoning_tokens,
+            reasoning_text: (!reasoning_text.is_empty()).then_some(reasoning_text),
+            structured: (!structured_items.is_empty()).then_some(serde_json::Value::Array(structured_items)),
+        })
+    }
+}
+
+fn extract_reasoning_artifact_from_value(value: &serde_json::Value) -> Option<ReasoningArtifact> {
+    let reasoning_tokens = value
+        .get("usage")
+        .and_then(|usage| usage.get("completion_tokens_details").or_else(|| usage.get("output_tokens_details")))
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(|tokens| tokens.as_i64());
+
+    let reasoning_text = value
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("reasoning_content"))
+        .and_then(|content| content.as_str())
+        .map(ToOwned::to_owned);
+
+    let structured = value.get("output").and_then(|output| {
+        let reasoning_items: Vec<_> = output
+            .as_array()?
+            .iter()
+            .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("reasoning"))
+            .cloned()
+            .collect();
+        Some(serde_json::Value::Array(reasoning_items)).filter(|items| items.as_array().is_some_and(|items| !items.is_empty()))
+    });
+
+    if reasoning_tokens.is_none() && reasoning_text.is_none() && structured.is_none() {
+        None
+    } else {
+        Some(ReasoningArtifact {
+            reasoning_tokens,
+            reasoning_text,
+            structured,
+        })
     }
 }
 
@@ -455,6 +566,7 @@ use tokio::sync::oneshot;
 ///     HttpResponse {
 ///         status: 200,
 ///         body: r#"{"result": "success"}"#.to_string(),
+///         reasoning_artifact: None,
 ///     },
 /// );
 /// ```
@@ -518,7 +630,7 @@ impl MockHttpClient {
     /// ```ignore
     /// let trigger = mock.add_response_with_trigger(
     ///     "POST /test",
-    ///     Ok(HttpResponse { status: 200, body: "ok".to_string() })
+    ///     Ok(HttpResponse { status: 200, body: "ok".to_string(), reasoning_artifact: None })
     /// );
     /// // ... request is now blocked waiting ...
     /// trigger.send(()).unwrap(); // Now it completes
@@ -658,6 +770,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: "success".to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -696,6 +809,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: "first".to_string(),
+                reasoning_artifact: None,
             }),
         );
         mock.add_response(
@@ -703,6 +817,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: "second".to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -762,6 +877,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: "triggered".to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -807,6 +923,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 body: "success".to_string(),
+                reasoning_artifact: None,
             }),
         );
 

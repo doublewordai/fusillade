@@ -17,6 +17,7 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
         Ok(HttpResponse {
             status: 200,
             body: r#"{"result":"success"}"#.to_string(),
+            reasoning_artifact: None,
         }),
     );
 
@@ -157,6 +158,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
         Ok(HttpResponse {
             status: 200,
             body: r#"{"result":"1"}"#.to_string(),
+            reasoning_artifact: None,
         }),
     );
     let trigger2 = http_client.add_response_with_trigger(
@@ -164,6 +166,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
         Ok(HttpResponse {
             status: 200,
             body: r#"{"result":"2"}"#.to_string(),
+            reasoning_artifact: None,
         }),
     );
     let trigger3 = http_client.add_response_with_trigger(
@@ -171,6 +174,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
         Ok(HttpResponse {
             status: 200,
             body: r#"{"result":"3"}"#.to_string(),
+            reasoning_artifact: None,
         }),
     );
     let trigger4 = http_client.add_response_with_trigger(
@@ -178,6 +182,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
         Ok(HttpResponse {
             status: 200,
             body: r#"{"result":"4"}"#.to_string(),
+            reasoning_artifact: None,
         }),
     );
     let trigger5 = http_client.add_response_with_trigger(
@@ -185,6 +190,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
         Ok(HttpResponse {
             status: 200,
             body: r#"{"result":"5"}"#.to_string(),
+            reasoning_artifact: None,
         }),
     );
 
@@ -406,6 +412,7 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
         Ok(HttpResponse {
             status: 500,
             body: r#"{"error":"internal error"}"#.to_string(),
+            reasoning_artifact: None,
         }),
     );
 
@@ -415,6 +422,7 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
         Ok(HttpResponse {
             status: 503,
             body: r#"{"error":"service unavailable"}"#.to_string(),
+            reasoning_artifact: None,
         }),
     );
 
@@ -424,6 +432,7 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
         Ok(HttpResponse {
             status: 200,
             body: r#"{"result":"success after retries"}"#.to_string(),
+            reasoning_artifact: None,
         }),
     );
 
@@ -557,6 +566,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
             Ok(HttpResponse {
                 status: 200,
                 body: format!(r#"{{"result":"{}"}}"#, i),
+                reasoning_artifact: None,
             }),
         );
         triggers.push(trigger);
@@ -726,6 +736,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
             Ok(HttpResponse {
                 status: 500,
                 body: r#"{"error":"server error"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
     }
@@ -896,6 +907,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
             Ok(HttpResponse {
                 status: 500,
                 body: r#"{"error":"server error"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
     }
@@ -1071,6 +1083,7 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
         Ok(HttpResponse {
             status: 200,
             body: r#"{"result":"escalated response"}"#.to_string(),
+            reasoning_artifact: None,
         }),
     );
 
@@ -1225,6 +1238,7 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
         Ok(HttpResponse {
             status: 200,
             body: r#"{"result":"normal response"}"#.to_string(),
+            reasoning_artifact: None,
         }),
     );
 
@@ -1377,6 +1391,7 @@ mod batch_results_stream {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"success1"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
         http_client.add_response(
@@ -1384,6 +1399,7 @@ mod batch_results_stream {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"success2"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -1573,6 +1589,7 @@ mod batch_results_stream {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -1695,6 +1712,7 @@ mod batch_results_stream {
                 Ok(HttpResponse {
                     status: 200,
                     body: format!(r#"{{"result":"success{}"}}"#, i),
+                    reasoning_artifact: None,
                 }),
             );
         }
@@ -1806,6 +1824,7 @@ mod batch_results_stream {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"success1"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
         http_client.add_response(
@@ -1813,6 +1832,7 @@ mod batch_results_stream {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"success2"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
         http_client.add_response(
@@ -1820,6 +1840,7 @@ mod batch_results_stream {
             Ok(HttpResponse {
                 status: 500,
                 body: r#"{"error":"server error"}"#.to_string(),
+                reasoning_artifact: None,
             }),
         );
 
@@ -1931,6 +1952,7 @@ mod batch_results_stream {
                 Ok(HttpResponse {
                     status: 200,
                     body: r#"{"result":"success"}"#.to_string(),
+                    reasoning_artifact: None,
                 }),
             );
         }
@@ -2068,6 +2090,7 @@ mod batch_results_stream {
                 Ok(HttpResponse {
                     status: 429,
                     body: "rate limited".to_string(),
+                    reasoning_artifact: None,
                 }),
             );
         }
@@ -2077,6 +2100,7 @@ mod batch_results_stream {
                 Ok(HttpResponse {
                     status: 400,
                     body: "bad request".to_string(),
+                    reasoning_artifact: None,
                 }),
             );
         }
@@ -2088,6 +2112,7 @@ mod batch_results_stream {
                 Ok(HttpResponse {
                     status: 200,
                     body: r#"{"result":"success"}"#.to_string(),
+                    reasoning_artifact: None,
                 }),
             );
         }
