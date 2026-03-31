@@ -815,6 +815,12 @@ where
                     // Spawn a processing task
                     let model_clone = model.clone();
                     let user_id = request.data.created_by.clone();
+                    let completion_window = request
+                        .data
+                        .batch_metadata
+                        .get("completion_window")
+                        .cloned()
+                        .unwrap_or_default();
                     let storage = self.storage.clone();
                     let http_client = (*self.http_client).clone();
                     let retry_config = (&self.config).into();
@@ -845,7 +851,7 @@ where
                         .entry(user_id.clone())
                         .or_default()
                         .fetch_add(1, Ordering::Relaxed);
-                    gauge!("fusillade_user_requests_in_flight", "user" => user_id.clone())
+                    gauge!("fusillade_user_requests_in_flight", "user" => user_id.clone(), "completion_window" => completion_window.clone())
                         .increment(1.0);
 
                     let process_span = tracing::info_span!(
@@ -873,6 +879,7 @@ where
                         // Ensure we decrement the per-model and per-user counters when this task completes
                         let model_for_guard = model_clone.clone();
                         let user_for_guard = user_id.clone();
+                        let cw_for_guard = completion_window.clone();
                         let in_flight_for_guard = requests_in_flight.clone();
                         let user_in_flight_for_guard = user_requests_in_flight.clone();
                         let _guard = scopeguard::guard((), move |_| {
@@ -880,7 +887,7 @@ where
                                 counter.value().fetch_sub(1, Ordering::Relaxed);
                             }
                             gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
-                            gauge!("fusillade_user_requests_in_flight", "user" => user_for_guard.clone()).decrement(1.0);
+                            gauge!("fusillade_user_requests_in_flight", "user" => user_for_guard.clone(), "completion_window" => cw_for_guard).decrement(1.0);
                             if let Some(counter) = user_in_flight_for_guard.get(&user_for_guard) {
                                 let prev = counter.value().fetch_sub(1, Ordering::Relaxed);
                                 drop(counter);
@@ -944,7 +951,7 @@ where
                                     failed: AtomicU64::new(0),
                                 }).completed.fetch_add(1, Ordering::Relaxed);
                                 counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
-                                counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "success").increment(1);
+                                counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "success", "completion_window" => completion_window.clone()).increment(1);
                                 histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
                                     .record(processing_start.elapsed().as_secs_f64());
                                 // Record how many retries it took to succeed (0 = first attempt succeeded)
@@ -1020,7 +1027,7 @@ where
                                             }).failed.fetch_add(1, Ordering::Relaxed);
                                             requests_failed.fetch_add(1, Ordering::Relaxed);
                                             counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
-                                            counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed").increment(1);
+                                            counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
                                             histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                                 .record(processing_start.elapsed().as_secs_f64());
 
@@ -1051,7 +1058,7 @@ where
                                         failed: AtomicU64::new(0),
                                     }).failed.fetch_add(1, Ordering::Relaxed);
                                     counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
-                                    counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed").increment(1);
+                                    counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
                                     histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                         .record(processing_start.elapsed().as_secs_f64());
 
@@ -1077,7 +1084,7 @@ where
                             Ok(RequestCompletionResult::Canceled(_canceled)) => {
                                 tracing::Span::current().record("outcome", "canceled");
                                 counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled").increment(1);
-                                counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "cancelled").increment(1);
+                                counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "cancelled", "completion_window" => completion_window.clone()).increment(1);
                                 tracing::debug!(request_id = %request_id, "Request canceled by user");
                             }
                             Err(FusilladeError::Shutdown) => {
