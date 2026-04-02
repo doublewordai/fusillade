@@ -1157,8 +1157,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                     e
                                 ))
                             })?;
-                        let reasoning_tokens =
-                            req.state.reasoning_artifact.as_ref().and_then(|artifact| artifact.reasoning_tokens);
+                        let reasoning_tokens = req
+                            .state
+                            .reasoning_artifact
+                            .as_ref()
+                            .and_then(|artifact| artifact.reasoning_tokens);
 
                         let rows_affected = sqlx::query!(
                             r#"
@@ -4074,7 +4077,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
                         let input_body_str: String = row.get("input_body");
                         let response_body_opt: Option<String> = row.get("response_body");
-                        let reasoning_artifact_opt: Option<serde_json::Value> = row.get("reasoning_artifact");
+                        let reasoning_artifact_opt: Option<serde_json::Value> =
+                            row.get("reasoning_artifact");
                         let state: String = row.get("state");
                         let id: Uuid = row.get("id");
                         let custom_id: Option<String> = row.get("custom_id");
@@ -4091,8 +4095,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                                 serde_json::from_str(body)
                                     .unwrap_or_else(|_| serde_json::Value::String(body.to_string()))
                             });
-                        let reasoning_artifact =
-                            reasoning_artifact_opt.and_then(|value| serde_json::from_value(value).ok());
+                        let reasoning_artifact = reasoning_artifact_opt
+                            .and_then(|value| serde_json::from_value(value).ok());
 
                         // Map state to BatchResultStatus
                         let status = match state.as_str() {

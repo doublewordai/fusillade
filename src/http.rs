@@ -390,7 +390,7 @@ impl ReqwestHttpClient {
             ))
         })??;
 
-        let reasoning_artifact = extract_reasoning_artifact_from_events(&collected);
+        let reasoning_artifact_from_events = extract_reasoning_artifact_from_events(&collected);
 
         // Check for provider error objects before reassembly. Some providers
         // return HTTP 200 but embed an error in the SSE stream. If found, use
@@ -418,7 +418,10 @@ impl ReqwestHttpClient {
             return Ok(HttpResponse {
                 status: code,
                 body: event.data.clone(),
-                reasoning_artifact,
+                reasoning_artifact: merge_reasoning_artifacts(
+                    extract_reasoning_artifact_from_body(&event.data),
+                    reasoning_artifact_from_events,
+                ),
             });
         }
 
@@ -439,7 +442,10 @@ impl ReqwestHttpClient {
             "Streaming HTTP request completed"
         );
 
-        let reasoning_artifact = reasoning_artifact.or_else(|| extract_reasoning_artifact_from_body(&body));
+        let reasoning_artifact = merge_reasoning_artifacts(
+            extract_reasoning_artifact_from_body(&body),
+            reasoning_artifact_from_events,
+        );
 
         Ok(HttpResponse {
             status,
@@ -454,7 +460,24 @@ fn extract_reasoning_artifact_from_body(body: &str) -> Option<ReasoningArtifact>
     extract_reasoning_artifact_from_value(&value)
 }
 
-fn extract_reasoning_artifact_from_events(events: &[eventsource_stream::Event]) -> Option<ReasoningArtifact> {
+fn merge_reasoning_artifacts(
+    body_artifact: Option<ReasoningArtifact>,
+    event_artifact: Option<ReasoningArtifact>,
+) -> Option<ReasoningArtifact> {
+    match (body_artifact, event_artifact) {
+        (None, None) => None,
+        (Some(artifact), None) | (None, Some(artifact)) => Some(artifact),
+        (Some(body), Some(events)) => Some(ReasoningArtifact {
+            reasoning_tokens: body.reasoning_tokens.or(events.reasoning_tokens),
+            reasoning_text: body.reasoning_text.or(events.reasoning_text),
+            structured: body.structured.or(events.structured),
+        }),
+    }
+}
+
+fn extract_reasoning_artifact_from_events(
+    events: &[eventsource_stream::Event],
+) -> Option<ReasoningArtifact> {
     let mut reasoning_text = String::new();
     let mut reasoning_tokens: Option<i64> = None;
     let mut structured_items: Vec<serde_json::Value> = Vec::new();
@@ -501,7 +524,8 @@ fn extract_reasoning_artifact_from_events(events: &[eventsource_stream::Event]) 
         Some(ReasoningArtifact {
             reasoning_tokens,
             reasoning_text: (!reasoning_text.is_empty()).then_some(reasoning_text),
-            structured: (!structured_items.is_empty()).then_some(serde_json::Value::Array(structured_items)),
+            structured: (!structured_items.is_empty())
+                .then_some(serde_json::Value::Array(structured_items)),
         })
     }
 }
@@ -509,7 +533,11 @@ fn extract_reasoning_artifact_from_events(events: &[eventsource_stream::Event]) 
 fn extract_reasoning_artifact_from_value(value: &serde_json::Value) -> Option<ReasoningArtifact> {
     let reasoning_tokens = value
         .get("usage")
-        .and_then(|usage| usage.get("completion_tokens_details").or_else(|| usage.get("output_tokens_details")))
+        .and_then(|usage| {
+            usage
+                .get("completion_tokens_details")
+                .or_else(|| usage.get("output_tokens_details"))
+        })
         .and_then(|details| details.get("reasoning_tokens"))
         .and_then(|tokens| tokens.as_i64());
 
@@ -529,7 +557,8 @@ fn extract_reasoning_artifact_from_value(value: &serde_json::Value) -> Option<Re
             .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("reasoning"))
             .cloned()
             .collect();
-        Some(serde_json::Value::Array(reasoning_items)).filter(|items| items.as_array().is_some_and(|items| !items.is_empty()))
+        Some(serde_json::Value::Array(reasoning_items))
+            .filter(|items| items.as_array().is_some_and(|items| !items.is_empty()))
     });
 
     if reasoning_tokens.is_none() && reasoning_text.is_none() && structured.is_none() {
@@ -1350,5 +1379,57 @@ mod tests {
         assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
         assert_eq!(body["usage"]["total_tokens"], 7);
+    }
+
+    #[test]
+    fn test_merge_reasoning_artifacts_prefers_body_structure_and_event_text() {
+        let body = ReasoningArtifact {
+            reasoning_tokens: Some(42),
+            reasoning_text: None,
+            structured: Some(serde_json::json!([
+                { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "summarized" }] }
+            ])),
+        };
+        let events = ReasoningArtifact {
+            reasoning_tokens: Some(40),
+            reasoning_text: Some("streamed reasoning".to_string()),
+            structured: Some(serde_json::json!([
+                { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "partial" }] }
+            ])),
+        };
+
+        let merged = merge_reasoning_artifacts(Some(body), Some(events)).unwrap();
+        assert_eq!(merged.reasoning_tokens, Some(42));
+        assert_eq!(merged.reasoning_text.as_deref(), Some("streamed reasoning"));
+        assert_eq!(
+            merged.structured,
+            Some(serde_json::json!([
+                { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "summarized" }] }
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_extract_reasoning_artifact_from_events_captures_streamed_reasoning_text_and_tokens() {
+        let events = vec![
+            eventsource_stream::Event {
+                event: "message".to_string(),
+                data: r#"{"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#.to_string(),
+                id: String::new(),
+                retry: None,
+            },
+            eventsource_stream::Event {
+                event: "message".to_string(),
+                data: r#"{"usage":{"completion_tokens_details":{"reasoning_tokens":17}}}"#
+                    .to_string(),
+                id: String::new(),
+                retry: None,
+            },
+        ];
+
+        let artifact = extract_reasoning_artifact_from_events(&events).unwrap();
+        assert_eq!(artifact.reasoning_tokens, Some(17));
+        assert_eq!(artifact.reasoning_text.as_deref(), Some("thinking..."));
+        assert_eq!(artifact.structured, None);
     }
 }
