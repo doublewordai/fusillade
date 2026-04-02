@@ -1583,6 +1583,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     if meta.api_key_id.is_some() {
                         metadata.api_key_id = meta.api_key_id;
                     }
+                    if meta.source_connection_id.is_some() {
+                        metadata.source_connection_id = meta.source_connection_id;
+                    }
+                    if meta.source_external_key.is_some() {
+                        metadata.source_external_key = meta.source_external_key;
+                    }
                 }
                 FileStreamItem::Template(template) => {
                     // Ensure we have a file ID (create stub if needed)
@@ -1722,6 +1728,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 expires_at = $7,
                 uploaded_by = $8,
                 api_key_id = $9,
+                source_connection_id = COALESCE($10, source_connection_id),
+                source_external_key = COALESCE($11, source_external_key),
                 size_finalized = TRUE,
                 updated_at = NOW()
             WHERE id = $1
@@ -1735,6 +1743,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             expires_at,
             uploaded_by,
             metadata.api_key_id,
+            metadata.source_connection_id,
+            metadata.source_external_key,
         )
         .execute(&mut *tx)
         .await
