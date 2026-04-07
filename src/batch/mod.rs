@@ -193,6 +193,10 @@ pub struct File {
     pub size_finalized: bool,
     /// API key UUID that created this file, for per-member attribution within orgs
     pub api_key_id: Option<Uuid>,
+    /// Connection UUID when file was ingested from an external source.
+    pub source_connection_id: Option<Uuid>,
+    /// Original external file key/path within the source connection scope.
+    pub source_external_key: Option<String>,
 }
 
 /// A request template defining how to make a request.
