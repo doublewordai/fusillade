@@ -2069,12 +2069,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             let api_key_id: Option<Uuid> = row
                 .try_get("api_key_id")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read api_key_id: {}", e)))?;
-            let source_connection_id: Option<Uuid> = row
-                .try_get("source_connection_id")
-                .unwrap_or(None);
-            let source_external_key: Option<String> = row
-                .try_get("source_external_key")
-                .unwrap_or(None);
+            let source_connection_id: Option<Uuid> =
+                row.try_get("source_connection_id").unwrap_or(None);
+            let source_external_key: Option<String> =
+                row.try_get("source_external_key").unwrap_or(None);
 
             // Calculate size for virtual files if not yet finalized
             if let Some(estimated_size) =
