@@ -1,5 +1,12 @@
 # Changelog
 
+## [14.2.2](https://github.com/doublewordai/fusillade/compare/fusillade-v14.2.1...fusillade-v14.2.2) (2026-04-07)
+
+
+### Bug Fixes
+
+* bump reassembler version to 0.3.0 ([#210](https://github.com/doublewordai/fusillade/issues/210)) ([6b59947](https://github.com/doublewordai/fusillade/commit/6b59947de6e7c7ce535676631d8b9d96fe347a34))
+
 ## [14.2.1](https://github.com/doublewordai/fusillade/compare/fusillade-v14.2.0...fusillade-v14.2.1) (2026-03-31)
 
 
