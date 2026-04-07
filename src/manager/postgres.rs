@@ -26,8 +26,8 @@ use super::{DaemonStorage, Storage};
 use crate::batch::{
     Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchNotification,
     BatchOutputItem, BatchResponseDetails, BatchStatus, File, FileContentItem, FileId,
-    FileMetadata, FileStreamItem, FileStreamResult, ListBatchesFilter, OutputFileType,
-    RequestTemplateInput, TemplateId,
+    FileMetadata, FilePlaceholderInput, FileStreamItem, FileStreamResult, ListBatchesFilter,
+    OutputFileType, RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{
     AnyDaemonRecord, Daemon, DaemonConfig, DaemonData, DaemonRecord, DaemonState, DaemonStatus,
@@ -1530,6 +1530,71 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         }
     }
 
+    #[tracing::instrument(skip(self), fields(file_id = %input.file_id))]
+    async fn create_file_placeholder(&self, input: FilePlaceholderInput) -> Result<()> {
+        let mut tx = self.pools.write().begin().await.map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to begin placeholder file transaction: {}",
+                e
+            ))
+        })?;
+
+        Self::insert_file_stub(&mut tx, *input.file_id as Uuid, &input.metadata).await?;
+        Self::finalize_file_metadata(&mut tx, *input.file_id as Uuid, &input.metadata).await?;
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to commit placeholder file transaction: {}",
+                e
+            ))
+        })?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self, templates), fields(file_id = %file_id, template_count = templates.len()))]
+    async fn populate_file_templates(
+        &self,
+        file_id: FileId,
+        templates: Vec<RequestTemplateInput>,
+    ) -> Result<()> {
+        let mut tx = self.pools.write().begin().await.map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to begin file template population transaction: {}",
+                e
+            ))
+        })?;
+
+        let exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS(SELECT 1 FROM files WHERE id = $1)
+            "#,
+        )
+        .bind(*file_id as Uuid)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to verify file exists: {}", e)))?;
+
+        if !exists {
+            return Err(FusilladeError::Other(anyhow!(
+                "Cannot populate templates for missing file {}",
+                file_id
+            )));
+        }
+
+        self.insert_templates_for_existing_file(&mut tx, *file_id as Uuid, templates)
+            .await?;
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to commit file template population transaction: {}",
+                e
+            ))
+        })?;
+
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self, stream))]
     async fn create_file_stream<S: Stream<Item = FileStreamItem> + Send + Unpin>(
         &self,
@@ -1588,27 +1653,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     // Ensure we have a file ID (create stub if needed)
                     if file_id.is_none() {
                         let new_id = Uuid::new_v4();
-                        let stub_name = metadata
-                            .filename
-                            .clone()
-                            .unwrap_or_else(|| format!("upload-{}", new_id));
-                        let status = crate::batch::FileStatus::Processed.to_string();
-
-                        sqlx::query!(
-                            r#"
-                            INSERT INTO files (id, name, status, created_at, updated_at)
-                            VALUES ($1, $2, $3, NOW(), NOW())
-                            "#,
-                            new_id,
-                            stub_name,
-                            status,
-                        )
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| {
-                            FusilladeError::Other(anyhow!("Failed to create file stub: {}", e))
-                        })?;
-
+                        Self::insert_file_stub(&mut tx, new_id, &metadata).await?;
                         file_id = Some(new_id);
                     }
 
@@ -1653,92 +1698,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             id
         } else {
             let new_id = Uuid::new_v4();
-            let stub_name = metadata
-                .filename
-                .clone()
-                .unwrap_or_else(|| format!("upload-{}", new_id));
-            let status = crate::batch::FileStatus::Processed.to_string();
-
-            sqlx::query!(
-                r#"
-                INSERT INTO files (id, name, status, created_at, updated_at)
-                VALUES ($1, $2, $3, NOW(), NOW())
-                "#,
-                new_id,
-                stub_name,
-                status,
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create file: {}", e)))?;
-
+            Self::insert_file_stub(&mut tx, new_id, &metadata).await?;
             new_id
         };
 
-        // Now update the file with all the final metadata
-        let size_bytes = metadata.size_bytes.unwrap_or(0);
-        let status = crate::batch::FileStatus::Processed.to_string();
-        let purpose = metadata.purpose.clone();
-
-        // Use provided anchor time if available, otherwise use now
-        let expires_at = if let Some(seconds) = metadata.expires_after_seconds {
-            // Calculate expires_at from expires_after if provided
-            let anchor = if let Some(anchor_str) = metadata.expires_after_anchor.as_ref() {
-                match anchor_str.as_str() {
-                    "created_at" => Utc::now(), // Use file creation time
-                    _ => {
-                        tracing::warn!(
-                            anchor = anchor_str,
-                            "Unknown expires_after_anchor value, defaulting to 'created_at'"
-                        );
-                        Utc::now()
-                    }
-                }
-            } else {
-                Utc::now()
-            };
-
-            anchor.checked_add_signed(chrono::Duration::seconds(seconds))
-        } else {
-            // Default expiration: 30 days from now when no explicit expires_after_seconds is provided
-            Utc::now().checked_add_signed(chrono::Duration::days(30))
-        };
-
-        let description = metadata.description.clone();
-        let uploaded_by = metadata.uploaded_by.clone();
-        let name = metadata.filename.clone();
-
-        // Final update with file metadata
-        // Updates the file stub with complete metadata from the stream
-        // Input files always have finalized sizes (calculated at upload time)
-        sqlx::query!(
-            r#"
-            UPDATE files
-            SET name = COALESCE($2, name),
-                description = $3,
-                size_bytes = $4,
-                status = $5,
-                purpose = $6,
-                expires_at = $7,
-                uploaded_by = $8,
-                api_key_id = $9,
-                size_finalized = TRUE,
-                updated_at = NOW()
-            WHERE id = $1
-            "#,
-            fid,
-            name,
-            description,
-            size_bytes,
-            status,
-            purpose,
-            expires_at,
-            uploaded_by,
-            metadata.api_key_id,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file metadata: {}", e)))?;
+        Self::finalize_file_metadata(&mut tx, fid, &metadata).await?;
 
         // Commit the transaction
         tx.commit()
@@ -3256,6 +3220,139 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
 // Helper methods for file streaming and virtual file creation
 impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
+    fn default_file_name(file_id: Uuid, metadata: &FileMetadata) -> String {
+        metadata
+            .filename
+            .clone()
+            .unwrap_or_else(|| format!("upload-{}", file_id))
+    }
+
+    fn compute_file_expires_at(metadata: &FileMetadata) -> Option<DateTime<Utc>> {
+        if let Some(seconds) = metadata.expires_after_seconds {
+            let anchor = if let Some(anchor_str) = metadata.expires_after_anchor.as_ref() {
+                match anchor_str.as_str() {
+                    "created_at" => Utc::now(),
+                    _ => {
+                        tracing::warn!(
+                            anchor = anchor_str,
+                            "Unknown expires_after_anchor value, defaulting to 'created_at'"
+                        );
+                        Utc::now()
+                    }
+                }
+            } else {
+                Utc::now()
+            };
+
+            anchor.checked_add_signed(chrono::Duration::seconds(seconds))
+        } else {
+            Utc::now().checked_add_signed(chrono::Duration::days(30))
+        }
+    }
+
+    async fn insert_file_stub(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        file_id: Uuid,
+        metadata: &FileMetadata,
+    ) -> Result<()> {
+        let stub_name = Self::default_file_name(file_id, metadata);
+        let status = crate::batch::FileStatus::Processed.to_string();
+
+        sqlx::query(
+            r#"
+            INSERT INTO files (id, name, status, created_at, updated_at)
+            VALUES ($1, $2, $3, NOW(), NOW())
+            "#,
+        )
+        .bind(file_id)
+        .bind(stub_name)
+        .bind(status)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create file stub: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn finalize_file_metadata(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        file_id: Uuid,
+        metadata: &FileMetadata,
+    ) -> Result<()> {
+        let size_bytes = metadata.size_bytes.unwrap_or(0);
+        let status = crate::batch::FileStatus::Processed.to_string();
+        let purpose = metadata.purpose.clone();
+        let expires_at = Self::compute_file_expires_at(metadata);
+        let description = metadata.description.clone();
+        let uploaded_by = metadata.uploaded_by.clone();
+        let name = metadata.filename.clone();
+
+        sqlx::query!(
+            r#"
+            UPDATE files
+            SET name = COALESCE($2, name),
+                description = $3,
+                size_bytes = $4,
+                status = $5,
+                purpose = $6,
+                expires_at = $7,
+                uploaded_by = $8,
+                api_key_id = $9,
+                size_finalized = TRUE,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+            file_id,
+            name,
+            description,
+            size_bytes,
+            status,
+            purpose,
+            expires_at,
+            uploaded_by,
+            metadata.api_key_id,
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file metadata: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn insert_templates_for_existing_file(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        file_id: Uuid,
+        templates: Vec<RequestTemplateInput>,
+    ) -> Result<()> {
+        if templates.is_empty() {
+            return Ok(());
+        }
+
+        let batch_size = match self.batch_insert_strategy {
+            BatchInsertStrategy::Batched { batch_size } => batch_size.max(1),
+        };
+
+        let mut template_count: i32 = 0;
+        let mut template_buffer = Vec::with_capacity(batch_size);
+
+        for template in templates {
+            template_buffer.push((template, template_count));
+            template_count += 1;
+
+            if template_buffer.len() >= batch_size {
+                Self::insert_template_batch(tx, file_id, &template_buffer).await?;
+                template_buffer.clear();
+            }
+        }
+
+        if !template_buffer.is_empty() {
+            Self::insert_template_batch(tx, file_id, &template_buffer).await?;
+        }
+
+        Ok(())
+    }
+
     /// Internal helper to fetch a batch from a specific pool.
     ///
     /// This is used when we require read-after-write consistency and must query
@@ -7083,6 +7180,144 @@ mod tests {
         // Should have 2 templates
         let content = manager.get_file_content(file_id).await.unwrap();
         assert_eq!(content.len(), 2);
+    }
+
+    #[sqlx::test]
+    async fn test_create_file_placeholder_with_explicit_id(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FilePlaceholderInput, Purpose};
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = FileId(Uuid::new_v4());
+        manager
+            .create_file_placeholder(FilePlaceholderInput {
+                file_id,
+                metadata: FileMetadata {
+                    filename: Some("placeholder.jsonl".to_string()),
+                    description: Some("reserved before ingest".to_string()),
+                    purpose: Some("batch".to_string()),
+                    expires_after_anchor: None,
+                    expires_after_seconds: None,
+                    size_bytes: Some(123),
+                    uploaded_by: Some("test-user".to_string()),
+                    api_key_id: None,
+                },
+            })
+            .await
+            .expect("Failed to create placeholder file");
+
+        let file = manager
+            .get_file(file_id)
+            .await
+            .expect("Failed to fetch placeholder");
+        assert_eq!(file.id, file_id);
+        assert_eq!(file.name, "placeholder.jsonl");
+        assert_eq!(file.description, Some("reserved before ingest".to_string()));
+        assert_eq!(file.size_bytes, 123);
+        assert_eq!(file.uploaded_by, Some("test-user".to_string()));
+        assert_eq!(file.purpose, Some(Purpose::Batch));
+        assert!(file.size_finalized);
+    }
+
+    #[sqlx::test]
+    async fn test_populate_file_templates_for_existing_file(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FilePlaceholderInput, Purpose};
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = FileId(Uuid::new_v4());
+        manager
+            .create_file_placeholder(FilePlaceholderInput {
+                file_id,
+                metadata: FileMetadata {
+                    filename: Some("ingest.jsonl".to_string()),
+                    description: None,
+                    purpose: Some("batch".to_string()),
+                    expires_after_anchor: None,
+                    expires_after_seconds: None,
+                    size_bytes: Some(456),
+                    uploaded_by: Some("test-user".to_string()),
+                    api_key_id: None,
+                },
+            })
+            .await
+            .expect("Failed to create placeholder file");
+
+        manager
+            .populate_file_templates(
+                file_id,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("ingest-1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/completions".to_string(),
+                        body: r#"{"prompt":"first"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key1".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("ingest-2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/completions".to_string(),
+                        body: r#"{"prompt":"second"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key2".to_string(),
+                    },
+                ],
+            )
+            .await
+            .expect("Failed to populate templates");
+
+        let file = manager
+            .get_file(file_id)
+            .await
+            .expect("Failed to fetch file");
+        assert_eq!(file.purpose, Some(Purpose::Batch));
+
+        let content = manager
+            .get_file_content(file_id)
+            .await
+            .expect("Failed to fetch populated content");
+        assert_eq!(content.len(), 2);
+
+        let rows = sqlx::query(
+            r#"
+            SELECT custom_id, line_number, body_byte_size
+            FROM request_templates
+            WHERE file_id = $1
+            ORDER BY line_number
+            "#,
+        )
+        .bind(*file_id as Uuid)
+        .fetch_all(&pool)
+        .await
+        .expect("Failed to query templates");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get::<Option<String>, _>("custom_id").as_deref(),
+            Some("ingest-1")
+        );
+        assert_eq!(rows[0].get::<i32, _>("line_number"), 0);
+        assert_eq!(
+            rows[0].get::<i64, _>("body_byte_size"),
+            r#"{"prompt":"first"}"#.len() as i64
+        );
+        assert_eq!(
+            rows[1].get::<Option<String>, _>("custom_id").as_deref(),
+            Some("ingest-2")
+        );
+        assert_eq!(rows[1].get::<i32, _>("line_number"), 1);
     }
 
     #[sqlx::test]

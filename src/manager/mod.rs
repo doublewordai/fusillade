@@ -5,7 +5,8 @@
 
 use crate::batch::{
     Batch, BatchId, BatchInput, BatchStatus, File, FileContentItem, FileFilter, FileId,
-    FileStreamItem, FileStreamResult, ListBatchesFilter, OutputFileType, RequestTemplateInput,
+    FilePlaceholderInput, FileStreamItem, FileStreamResult, ListBatchesFilter, OutputFileType,
+    RequestTemplateInput,
 };
 use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
@@ -36,6 +37,16 @@ pub trait Storage: Send + Sync {
         description: Option<String>,
         templates: Vec<RequestTemplateInput>,
     ) -> Result<FileId>;
+
+    /// Create a file row with a caller-supplied ID and full metadata, without templates.
+    async fn create_file_placeholder(&self, input: FilePlaceholderInput) -> Result<()>;
+
+    /// Populate request templates for an existing file.
+    async fn populate_file_templates(
+        &self,
+        file_id: FileId,
+        templates: Vec<RequestTemplateInput>,
+    ) -> Result<()>;
 
     /// Create a new file with templates from a stream.
     ///

@@ -332,6 +332,13 @@ pub struct FileMetadata {
     pub api_key_id: Option<Uuid>,
 }
 
+/// Input parameters for creating a file placeholder with a preallocated ID.
+#[derive(Debug, Clone, Serialize)]
+pub struct FilePlaceholderInput {
+    pub file_id: FileId,
+    pub metadata: FileMetadata,
+}
+
 /// Filter parameters for listing files
 #[derive(Debug, Clone, Default)]
 pub struct FileFilter {
