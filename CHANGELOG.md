@@ -1,5 +1,12 @@
 # Changelog
 
+## [14.2.1](https://github.com/doublewordai/fusillade/compare/fusillade-v14.2.0...fusillade-v14.2.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* pick up errors and replace the 200 status ([#196](https://github.com/doublewordai/fusillade/issues/196)) ([cbf68f5](https://github.com/doublewordai/fusillade/commit/cbf68f5a417e64bbbcbe77c4856ff0ee8e242793))
+
 ## [14.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v14.1.0...fusillade-v14.2.0) (2026-03-31)
 
 
