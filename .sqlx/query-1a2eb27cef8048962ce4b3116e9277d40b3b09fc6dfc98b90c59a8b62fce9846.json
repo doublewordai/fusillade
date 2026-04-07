@@ -15,7 +15,7 @@
         "Text",
         "Uuid",
         "Uuid",
-        "Varchar"
+        "Text"
       ]
     },
     "nullable": []

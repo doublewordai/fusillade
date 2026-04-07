@@ -2070,9 +2070,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 .try_get("api_key_id")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read api_key_id: {}", e)))?;
             let source_connection_id: Option<Uuid> =
-                row.try_get("source_connection_id").unwrap_or(None);
+                row.try_get("source_connection_id").map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read source_connection_id: {}", e))
+                })?;
             let source_external_key: Option<String> =
-                row.try_get("source_external_key").unwrap_or(None);
+                row.try_get("source_external_key").map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read source_external_key: {}", e))
+                })?;
 
             // Calculate size for virtual files if not yet finalized
             if let Some(estimated_size) =
@@ -4834,6 +4838,7 @@ mod tests {
             size_bytes: None,
             uploaded_by: Some("test-user".to_string()),
             api_key_id: None,
+            ..Default::default()
         })];
 
         for i in 0..8000 {
@@ -4906,6 +4911,7 @@ mod tests {
             size_bytes: None,
             uploaded_by: None,
             api_key_id: None,
+            ..Default::default()
         })];
 
         let stream = stream::iter(items);
@@ -4951,6 +4957,7 @@ mod tests {
             size_bytes: None,
             uploaded_by: None,
             api_key_id: None,
+            ..Default::default()
         })];
 
         // Add 3000 templates
@@ -6979,6 +6986,7 @@ mod tests {
                 size_bytes: None,
                 uploaded_by: Some("test-user".to_string()),
                 api_key_id: None,
+                ..Default::default()
             }),
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: Some("stream-1".to_string()),
@@ -7074,6 +7082,7 @@ mod tests {
                 size_bytes: None,
                 uploaded_by: Some("test-user".to_string()),
                 api_key_id: None,
+                ..Default::default()
             }),
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: None,

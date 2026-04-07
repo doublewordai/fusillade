@@ -81,7 +81,7 @@
       {
         "ordinal": 15,
         "name": "source_external_key",
-        "type_info": "Varchar"
+        "type_info": "Text"
       }
     ],
     "parameters": {
