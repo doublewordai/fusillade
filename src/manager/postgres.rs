@@ -4146,7 +4146,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                                         error = %err,
                                         request_id = %id,
                                         custom_id = ?custom_id,
-                                        raw_value = %value,
                                         "Failed to deserialize reasoning_artifact for batch result item"
                                     );
                                     None

@@ -1391,7 +1391,18 @@ mod batch_results_stream {
             Ok(HttpResponse {
                 status: 200,
                 body: r#"{"result":"success1"}"#.to_string(),
-                reasoning_artifact: None,
+                reasoning_artifact: Some(fusillade::request::ReasoningArtifact {
+                    reasoning_tokens: Some(7),
+                    reasoning_text: Some("thinking".to_string()),
+                    structured: Some(serde_json::json!([
+                        {
+                            "type": "reasoning",
+                            "summary": [
+                                { "type": "summary_text", "text": "summarized" }
+                            ]
+                        }
+                    ])),
+                }),
             }),
         );
         http_client.add_response(
@@ -1508,6 +1519,32 @@ mod batch_results_stream {
             );
             assert!(result.response_body.is_some());
         }
+
+        let req_1 = results
+            .iter()
+            .find(|result| result.custom_id.as_deref() == Some("req-1"))
+            .expect("req-1 result should exist");
+        assert_eq!(
+            req_1.reasoning_artifact,
+            Some(fusillade::request::ReasoningArtifact {
+                reasoning_tokens: Some(7),
+                reasoning_text: Some("thinking".to_string()),
+                structured: Some(serde_json::json!([
+                    {
+                        "type": "reasoning",
+                        "summary": [
+                            { "type": "summary_text", "text": "summarized" }
+                        ]
+                    }
+                ])),
+            })
+        );
+
+        let req_2 = results
+            .iter()
+            .find(|result| result.custom_id.as_deref() == Some("req-2"))
+            .expect("req-2 result should exist");
+        assert_eq!(req_2.reasoning_artifact, None);
     }
 
     #[sqlx::test]
