@@ -1,5 +1,16 @@
 # Changelog
 
+## [15.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v14.2.2...fusillade-v15.0.0) (2026-04-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* external connections ([#209](https://github.com/doublewordai/fusillade/issues/209))
+
+### Features
+
+* external connections ([#209](https://github.com/doublewordai/fusillade/issues/209)) ([472bac8](https://github.com/doublewordai/fusillade/commit/472bac88d66e765fba943be774de78a424452339))
+
 ## [14.2.2](https://github.com/doublewordai/fusillade/compare/fusillade-v14.2.1...fusillade-v14.2.2) (2026-04-07)
 
 
