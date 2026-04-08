@@ -672,7 +672,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     async fn get_file_from_pool(&self, file_id: FileId, pool: &PgPool) -> Result<File> {
         let row = sqlx::query!(
             r#"
-            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at, api_key_id
+            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at, api_key_id, source_connection_id, source_external_key
             FROM files
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -711,6 +711,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             created_at: row.created_at,
             updated_at: row.updated_at,
             api_key_id: row.api_key_id,
+            source_connection_id: row.source_connection_id,
+            source_external_key: row.source_external_key,
         })
     }
 }
@@ -1583,6 +1585,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     if meta.api_key_id.is_some() {
                         metadata.api_key_id = meta.api_key_id;
                     }
+                    if meta.source_connection_id.is_some() {
+                        metadata.source_connection_id = meta.source_connection_id;
+                    }
+                    if meta.source_external_key.is_some() {
+                        metadata.source_external_key = meta.source_external_key;
+                    }
                 }
                 FileStreamItem::Template(template) => {
                     // Ensure we have a file ID (create stub if needed)
@@ -1722,6 +1730,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 expires_at = $7,
                 uploaded_by = $8,
                 api_key_id = $9,
+                source_connection_id = COALESCE($10, source_connection_id),
+                source_external_key = COALESCE($11, source_external_key),
                 size_finalized = TRUE,
                 updated_at = NOW()
             WHERE id = $1
@@ -1735,6 +1745,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             expires_at,
             uploaded_by,
             metadata.api_key_id,
+            metadata.source_connection_id,
+            metadata.source_external_key,
         )
         .execute(&mut *tx)
         .await
@@ -1905,6 +1917,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 f.id, f.name, f.description, f.size_bytes, f.size_finalized,
                 f.status, f.error_message, f.purpose, f.expires_at, f.deleted_at,
                 f.uploaded_by, f.created_at, f.updated_at, f.api_key_id,
+                f.source_connection_id, f.source_external_key,
                 b.id as batch_id,
                 b.total_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
@@ -2056,6 +2069,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             let api_key_id: Option<Uuid> = row
                 .try_get("api_key_id")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read api_key_id: {}", e)))?;
+            let source_connection_id: Option<Uuid> =
+                row.try_get("source_connection_id").map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read source_connection_id: {}", e))
+                })?;
+            let source_external_key: Option<String> =
+                row.try_get("source_external_key").map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read source_external_key: {}", e))
+                })?;
 
             // Calculate size for virtual files if not yet finalized
             if let Some(estimated_size) =
@@ -2083,6 +2104,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 created_at,
                 updated_at,
                 api_key_id,
+                source_connection_id,
+                source_external_key,
             };
 
             // Check and mark as expired if needed (passive expiration)
@@ -4815,6 +4838,7 @@ mod tests {
             size_bytes: None,
             uploaded_by: Some("test-user".to_string()),
             api_key_id: None,
+            ..Default::default()
         })];
 
         for i in 0..8000 {
@@ -4887,6 +4911,7 @@ mod tests {
             size_bytes: None,
             uploaded_by: None,
             api_key_id: None,
+            ..Default::default()
         })];
 
         let stream = stream::iter(items);
@@ -4932,6 +4957,7 @@ mod tests {
             size_bytes: None,
             uploaded_by: None,
             api_key_id: None,
+            ..Default::default()
         })];
 
         // Add 3000 templates
@@ -6960,6 +6986,7 @@ mod tests {
                 size_bytes: None,
                 uploaded_by: Some("test-user".to_string()),
                 api_key_id: None,
+                ..Default::default()
             }),
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: Some("stream-1".to_string()),
@@ -7055,6 +7082,7 @@ mod tests {
                 size_bytes: None,
                 uploaded_by: Some("test-user".to_string()),
                 api_key_id: None,
+                ..Default::default()
             }),
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: None,
