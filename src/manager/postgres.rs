@@ -1442,9 +1442,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 "Missing response_body for completed request"
                             ))
                         })?,
-                        reasoning_artifact: row
-                            .reasoning_artifact
-                            .and_then(|value| serde_json::from_value(value).ok()),
+                        reasoning_artifact: row.reasoning_artifact.and_then(|value| {
+                            match serde_json::from_value(value) {
+                                Ok(reasoning_artifact) => Some(reasoning_artifact),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        request_id = %row.id,
+                                        "Failed to deserialize reasoning_artifact for completed request"
+                                    );
+                                    None
+                                }
+                            }
+                        }),
                         claimed_at: row.claimed_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!(
                                 "Missing claimed_at for completed request"
@@ -3209,9 +3219,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 "Missing response_body for completed execution"
                             ))
                         })?,
-                        reasoning_artifact: row
-                            .reasoning_artifact
-                            .and_then(|value| serde_json::from_value(value).ok()),
+                        reasoning_artifact: row.reasoning_artifact.and_then(|value| {
+                            match serde_json::from_value(value) {
+                                Ok(reasoning_artifact) => Some(reasoning_artifact),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        request_id = %row.id,
+                                        "Failed to deserialize reasoning_artifact for completed execution"
+                                    );
+                                    None
+                                }
+                            }
+                        }),
                         claimed_at: row.claimed_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!(
                                 "Missing claimed_at for completed execution"
@@ -4118,8 +4138,21 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                                 serde_json::from_str(body)
                                     .unwrap_or_else(|_| serde_json::Value::String(body.to_string()))
                             });
-                        let reasoning_artifact = reasoning_artifact_opt
-                            .and_then(|value| serde_json::from_value(value).ok());
+                        let reasoning_artifact = reasoning_artifact_opt.and_then(|value| {
+                            match serde_json::from_value(value.clone()) {
+                                Ok(reasoning_artifact) => Some(reasoning_artifact),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        request_id = %id,
+                                        custom_id = ?custom_id,
+                                        raw_value = %value,
+                                        "Failed to deserialize reasoning_artifact for batch result item"
+                                    );
+                                    None
+                                }
+                            }
+                        });
 
                         // Map state to BatchResultStatus
                         let status = match state.as_str() {

@@ -469,7 +469,7 @@ fn merge_reasoning_artifacts(
         (Some(artifact), None) | (None, Some(artifact)) => Some(artifact),
         (Some(body), Some(events)) => Some(ReasoningArtifact {
             reasoning_tokens: body.reasoning_tokens.or(events.reasoning_tokens),
-            reasoning_text: body.reasoning_text.or(events.reasoning_text),
+            reasoning_text: events.reasoning_text.or(body.reasoning_text),
             structured: body.structured.or(events.structured),
         }),
     }
