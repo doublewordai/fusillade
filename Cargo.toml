@@ -1,7 +1,7 @@
 [package]
 name = "fusillade"
 edition = "2024"
-version = "14.2.1"
+version = "15.0.0"
 description = "A daemon implementation for sending batched LLM requests with efficient request coalescing"
 license = "MIT OR Apache-2.0"
 
@@ -30,7 +30,7 @@ thiserror = "2"
 async-trait = "0.1"
 futures = "0.3"
 eventsource-stream = "0.2"
-openai-reassembler = "0.2.0"
+openai-reassembler = "0.3.0"
 parking_lot = "0.12"
 scopeguard = "1"
 humantime = "2"
