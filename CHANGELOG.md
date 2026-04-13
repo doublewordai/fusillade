@@ -1,5 +1,12 @@
 # Changelog
 
+## [15.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v15.0.0...fusillade-v15.1.0) (2026-04-13)
+
+
+### Features
+
+* inject deadline-derived priority into outbound request bodies ([#213](https://github.com/doublewordai/fusillade/issues/213)) ([463d08c](https://github.com/doublewordai/fusillade/commit/463d08c63d96e8053a3ae6e4c572259aa3ddcc2b))
+
 ## [15.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v14.2.2...fusillade-v15.0.0) (2026-04-08)
 
 
