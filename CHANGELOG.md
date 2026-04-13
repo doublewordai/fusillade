@@ -1,5 +1,12 @@
 # Changelog
 
+## [15.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v15.1.0...fusillade-v15.1.1) (2026-04-13)
+
+
+### Bug Fixes
+
+* inject priority under nvext.agent_hints with dynamo sign convention ([#215](https://github.com/doublewordai/fusillade/issues/215)) ([67882e1](https://github.com/doublewordai/fusillade/commit/67882e11fb2e0c4334a6081b8a5b90be03a36669))
+
 ## [15.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v15.0.0...fusillade-v15.1.0) (2026-04-13)
 
 
