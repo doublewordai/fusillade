@@ -94,6 +94,22 @@ pub struct DaemonConfig {
     #[serde(skip, default = "default_model_escalations")]
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
 
+    /// Inject a `"priority"` field into every outbound request body, equal
+    /// to the Unix timestamp (seconds) of the batch SLA deadline
+    /// (`batch_expires_at`). Earlier deadlines produce smaller values.
+    ///
+    /// Using the absolute deadline rather than seconds-remaining means two
+    /// requests with the same deadline share a priority regardless of when
+    /// they were claimed, so the backend can tie-break on arrival time.
+    /// It also leaves the entire negative integer range free for out-of-band
+    /// priority overrides (e.g. operator probes).
+    ///
+    /// Backends must be configured so that lower numeric priority is scheduled
+    /// first (vLLM's default priority queue; SGLang requires
+    /// `--schedule-low-priority-values-first`).
+    #[serde(default)]
+    pub inject_deadline_priority: bool,
+
     /// How long to sleep between claim iterations
     pub claim_interval_ms: u64,
 
@@ -249,6 +265,7 @@ impl Default for DaemonConfig {
             claim_batch_size: 100,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             model_escalations: default_model_escalations(),
+            inject_deadline_priority: false,
             claim_interval_ms: 1000,
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(0),
@@ -784,6 +801,27 @@ where
                 }
             }
 
+            // Inject deadline-derived priority into each request body so
+            // the inference backend can preempt lower-priority work.
+            if self.config.inject_deadline_priority {
+                for request in &mut claimed {
+                    let priority = request.state.batch_expires_at.timestamp();
+
+                    if let Ok(mut json) =
+                        serde_json::from_str::<serde_json::Value>(&request.data.body)
+                        && let Some(obj) = json.as_object_mut()
+                    {
+                        obj.insert(
+                            "priority".to_string(),
+                            serde_json::Value::Number(priority.into()),
+                        );
+                        if let Ok(new_body) = serde_json::to_string(&json) {
+                            request.data.body = new_body;
+                        }
+                    }
+                }
+            }
+
             // Group requests by model for better concurrency control visibility
             let mut by_model: HashMap<String, Vec<_>> = HashMap::new();
             for request in claimed {
@@ -1152,6 +1190,7 @@ mod tests {
             },
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            inject_deadline_priority: false,
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -1332,6 +1371,7 @@ mod tests {
             model_concurrency_limits,
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            inject_deadline_priority: false,
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -1574,6 +1614,7 @@ mod tests {
             },
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            inject_deadline_priority: false,
             max_retries: Some(5),
             stop_before_deadline_ms: None,
             backoff_ms: 10, // Very fast backoff for testing
@@ -1721,6 +1762,7 @@ mod tests {
             model_concurrency_limits: model_concurrency_limits.clone(),
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            inject_deadline_priority: false,
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -1907,6 +1949,7 @@ mod tests {
             },
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            inject_deadline_priority: false,
             max_retries: Some(10_000),
             stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
             backoff_ms: 50,
@@ -2077,6 +2120,7 @@ mod tests {
             },
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            inject_deadline_priority: false,
             max_retries: None,             // No retry limit
             stop_before_deadline_ms: None, // No buffer - should retry until deadline
             backoff_ms: 50,
@@ -2247,6 +2291,7 @@ mod tests {
             },
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            inject_deadline_priority: false,
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -2417,6 +2462,7 @@ mod tests {
             },
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            inject_deadline_priority: false,
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -2575,6 +2621,7 @@ mod tests {
                 m
             },
             model_escalations: Arc::new(dashmap::DashMap::new()),
+            inject_deadline_priority: false,
             max_retries: Some(3),
             stop_before_deadline_ms: None,
             backoff_ms: 100,
@@ -2685,6 +2732,128 @@ mod tests {
         assert_eq!(
             calls[0].api_key, "batch-creator-key",
             "Daemon should use batch creator's API key, not the template's"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_daemon_injects_deadline_priority_into_body(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success"}"#.to_string(),
+            }),
+        );
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            model_concurrency_limits: {
+                let m = Arc::new(dashmap::DashMap::new());
+                m.insert("test-model".to_string(), 10);
+                m
+            },
+            model_escalations: Arc::new(dashmap::DashMap::new()),
+            inject_deadline_priority: true,
+            max_retries: Some(3),
+            stop_before_deadline_ms: None,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            first_chunk_timeout_ms: 5000,
+            chunk_timeout_ms: 5000,
+            body_timeout_ms: 86_400_000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 5000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
+            unclaim_batch_size: 100,
+            batch_metadata_fields: vec![],
+            cancellation_poll_interval_ms: 100,
+            purge_interval_ms: 0,
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
+            throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        let file_id = manager
+            .create_file(
+                "priority-test".to_string(),
+                None,
+                vec![crate::RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"hello"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if http_client.call_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown_token.cancel();
+
+        assert_eq!(http_client.call_count(), 1);
+        let calls = http_client.get_calls();
+        let body: serde_json::Value = serde_json::from_str(&calls[0].body).unwrap();
+        assert!(
+            body.get("priority").is_some(),
+            "Request body should contain a 'priority' field"
+        );
+        let priority = body["priority"].as_i64().unwrap();
+        let expected_deadline = (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp();
+        assert!(
+            (priority - expected_deadline).abs() <= 10,
+            "Priority should be the deadline's Unix timestamp (~{expected_deadline}), got {priority}"
+        );
+        assert_eq!(
+            body["prompt"].as_str().unwrap(),
+            "hello",
+            "Original body fields should be preserved"
         );
     }
 }
