@@ -94,19 +94,20 @@ pub struct DaemonConfig {
     #[serde(skip, default = "default_model_escalations")]
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
 
-    /// Inject a `"priority"` field into every outbound request body, equal
-    /// to the Unix timestamp (seconds) of the batch SLA deadline
-    /// (`batch_expires_at`). Earlier deadlines produce smaller values.
+    /// Inject a deadline-derived priority hint into every outbound request
+    /// body at `nvext.agent_hints.priority` (NVIDIA Dynamo's unified priority
+    /// extension; the field is an `i32` where higher values mean "more
+    /// important" at the API layer, and Dynamo normalizes per backend).
     ///
+    /// The injected value is the negated Unix timestamp (seconds) of the batch
+    /// SLA deadline: more-urgent (earlier) deadlines produce larger numbers.
     /// Using the absolute deadline rather than seconds-remaining means two
     /// requests with the same deadline share a priority regardless of when
-    /// they were claimed, so the backend can tie-break on arrival time.
-    /// It also leaves the entire negative integer range free for out-of-band
-    /// priority overrides (e.g. operator probes).
+    /// they were claimed, so the router can tie-break on arrival time.
     ///
-    /// Backends must be configured so that lower numeric priority is scheduled
-    /// first (vLLM's default priority queue; SGLang requires
-    /// `--schedule-low-priority-values-first`).
+    /// Existing values at `nvext.agent_hints.priority` are overwritten;
+    /// existing `nvext` / `agent_hints` objects are merged into, not
+    /// replaced. Bodies that do not parse as JSON objects are left alone.
     #[serde(default)]
     pub inject_deadline_priority: bool,
 
@@ -801,22 +802,34 @@ where
                 }
             }
 
-            // Inject deadline-derived priority into each request body so
-            // the inference backend can preempt lower-priority work.
+            // Inject deadline-derived priority hint at
+            // nvext.agent_hints.priority (NVIDIA Dynamo's extension; i32,
+            // higher = more important). Negate the deadline timestamp so
+            // earlier deadlines produce larger values.
             if self.config.inject_deadline_priority {
                 for request in &mut claimed {
-                    let priority = request.state.batch_expires_at.timestamp();
+                    let priority: i32 = (-request.state.batch_expires_at.timestamp())
+                        .clamp(i32::MIN as i64, i32::MAX as i64)
+                        as i32;
 
                     if let Ok(mut json) =
                         serde_json::from_str::<serde_json::Value>(&request.data.body)
                         && let Some(obj) = json.as_object_mut()
                     {
-                        obj.insert(
-                            "priority".to_string(),
-                            serde_json::Value::Number(priority.into()),
-                        );
-                        if let Ok(new_body) = serde_json::to_string(&json) {
-                            request.data.body = new_body;
+                        let nvext = obj.entry("nvext").or_insert_with(|| serde_json::json!({}));
+                        if let Some(nvext_obj) = nvext.as_object_mut() {
+                            let agent_hints = nvext_obj
+                                .entry("agent_hints")
+                                .or_insert_with(|| serde_json::json!({}));
+                            if let Some(hints_obj) = agent_hints.as_object_mut() {
+                                hints_obj.insert(
+                                    "priority".to_string(),
+                                    serde_json::Value::Number(priority.into()),
+                                );
+                                if let Ok(new_body) = serde_json::to_string(&json) {
+                                    request.data.body = new_body;
+                                }
+                            }
                         }
                     }
                 }
@@ -2840,20 +2853,23 @@ mod tests {
         assert_eq!(http_client.call_count(), 1);
         let calls = http_client.get_calls();
         let body: serde_json::Value = serde_json::from_str(&calls[0].body).unwrap();
+        let priority = body
+            .pointer("/nvext/agent_hints/priority")
+            .and_then(|v| v.as_i64())
+            .expect("Request body should contain nvext.agent_hints.priority");
+        let expected = -(chrono::Utc::now() + chrono::Duration::hours(24)).timestamp();
         assert!(
-            body.get("priority").is_some(),
-            "Request body should contain a 'priority' field"
-        );
-        let priority = body["priority"].as_i64().unwrap();
-        let expected_deadline = (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp();
-        assert!(
-            (priority - expected_deadline).abs() <= 10,
-            "Priority should be the deadline's Unix timestamp (~{expected_deadline}), got {priority}"
+            (priority - expected).abs() <= 10,
+            "Priority should be the negated deadline Unix timestamp (~{expected}), got {priority}"
         );
         assert_eq!(
             body["prompt"].as_str().unwrap(),
             "hello",
             "Original body fields should be preserved"
+        );
+        assert!(
+            body.get("priority").is_none(),
+            "Top-level `priority` field must NOT be set (Dynamo rejects unknown OpenAI fields)"
         );
     }
 }
