@@ -228,19 +228,36 @@ pub trait Storage: Send + Sync {
     /// The number of requests that were retried.
     async fn retry_failed_requests_for_batch(&self, batch_id: BatchId) -> Result<u64>;
 
-    /// Get request counts grouped by model and completion window.
+    /// Get request counts grouped by model and deadline window.
     ///
-    /// - `windows`: Vec of (label, seconds)
-    /// - `states`: request states to include (e.g. ["pending"], or ["pending","claimed","processing"])
-    /// - `model_filter`: optional model whitelist (empty = all)
-    /// - `strict`: bool. For critical/sensitive operations, set 'true' to use the write pool and avoid read lags.
+    /// Each window is the half-open interval `[now + start_secs, now + end_secs)`
+    /// applied to each request's batch `expires_at`. A request is counted in a
+    /// window if its deadline falls inside that range. Because the end is
+    /// exclusive, adjacent windows (e.g. `(_, Some(0), 3600)` and
+    /// `(_, Some(3600), 86400)`) never double-count a request sitting on the
+    /// boundary.
     ///
-    /// This excludes:
+    /// `start_secs` is optional. When `None`, the lower bound is unbounded
+    /// (the query matches every request with a deadline strictly before
+    /// `now + end_secs`, including overdue ones). Callers that want the
+    /// legacy "due within N, including overdue" semantics pass
+    /// `(label, None, N)`. Callers that specifically want the "future N
+    /// seconds" starting at `now` pass `(label, Some(0), N)`.
+    ///
+    /// - `windows`: Vec of `(label, start_secs, end_secs)`. When `start_secs`
+    ///   is `Some(s)`, `s` must be `<= end_secs`.
+    /// - `states`: request states to include (e.g. `["pending"]`, or
+    ///   `["pending","claimed","processing"]`).
+    /// - `model_filter`: optional model whitelist (empty = all).
+    /// - `strict`: bool. For critical/sensitive operations, set `true` to
+    ///   use the write pool and avoid read lags.
+    ///
+    /// Excludes:
     /// - Requests without a template_id
     /// - Requests in batches being cancelled
-    async fn get_pending_request_counts_by_model_and_completion_window(
+    async fn get_pending_request_counts_by_model_and_window(
         &self,
-        windows: &[(String, i64)],
+        windows: &[(String, Option<i64>, i64)],
         states: &[String],
         model_filter: &[String],
         strict: bool,

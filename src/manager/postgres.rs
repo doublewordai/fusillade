@@ -728,18 +728,38 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 /// If you need counts of all pending requests regardless of claimability, adjust the query
 /// to remove these filters.
 impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManager<P, H> {
-    async fn get_pending_request_counts_by_model_and_completion_window(
+    async fn get_pending_request_counts_by_model_and_window(
         &self,
-        windows: &[(String, i64)], // (label, seconds)
-        states: &[String],         // e.g. ["pending"] or ["pending","claimed","processing"]
-        model_filter: &[String],   // empty = all models
+        windows: &[(String, Option<i64>, i64)], // (label, start_secs, end_secs)
+        states: &[String], // e.g. ["pending"] or ["pending","claimed","processing"]
+        model_filter: &[String], // empty = all models
         strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>> {
         if windows.is_empty() || states.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let (labels, seconds): (Vec<String>, Vec<i64>) = windows.iter().cloned().unzip();
+        // Indicator: i16 instead of bool because `Vec<bool>` doesn't have a
+        // native Postgres type binding via sqlx's `bind`, whereas `int2[]`
+        // does. 1 = lower bound active, 0 = unbounded below.
+        let mut labels: Vec<String> = Vec::with_capacity(windows.len());
+        let mut starts: Vec<i64> = Vec::with_capacity(windows.len());
+        let mut has_starts: Vec<i16> = Vec::with_capacity(windows.len());
+        let mut ends: Vec<i64> = Vec::with_capacity(windows.len());
+        for (label, start, end) in windows {
+            if let Some(start) = start
+                && start > end
+            {
+                return Err(FusilladeError::ValidationError(format!(
+                    "window {:?} has start ({}s) > end ({}s)",
+                    label, start, end
+                )));
+            }
+            labels.push(label.clone());
+            starts.push(start.unwrap_or(0));
+            has_starts.push(if start.is_some() { 1 } else { 0 });
+            ends.push(*end);
+        }
 
         let pool = if strict {
             self.pools.write()
@@ -749,34 +769,37 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let rows = sqlx::query(
             r#"
-            WITH windows(label, window_seconds) AS (
-                SELECT * FROM UNNEST($1::text[], $2::bigint[])
+            WITH windows(label, start_seconds, has_start, end_seconds) AS (
+                SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::int2[], $4::bigint[])
             )
             SELECT
                 r.model as model,
-                w.label as completion_window,
+                w.label as window_label,
                 COUNT(*) FILTER (
-                    WHERE b.expires_at <= NOW() + make_interval(secs => w.window_seconds)
+                    WHERE (w.has_start = 0 OR b.expires_at >= NOW() + make_interval(secs => w.start_seconds))
+                      AND b.expires_at < NOW() + make_interval(secs => w.end_seconds)
                 )::BIGINT as count
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
             CROSS JOIN windows w
-            WHERE r.state = ANY($3)
+            WHERE r.state = ANY($5)
             AND r.template_id IS NOT NULL
             AND b.cancelling_at IS NULL
-            AND (cardinality($4::text[]) = 0 OR r.model = ANY($4))
+            AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
             GROUP BY r.model, w.label
             "#,
         )
         .bind(&labels)
-        .bind(&seconds)
+        .bind(&starts)
+        .bind(&has_starts)
+        .bind(&ends)
         .bind(states)
         .bind(model_filter)
         .fetch_all(pool)
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!(
-                "Failed to get pending request counts by model and completion window: {}",
+                "Failed to get pending request counts by model and window: {}",
                 e
             ))
         })?;
@@ -786,16 +809,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             let model: String = row
                 .try_get("model")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read model: {}", e)))?;
-            let completion_window: String = row.try_get("completion_window").map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to read completion_window: {}", e))
+            let window_label: String = row.try_get("window_label").map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to read window_label: {}", e))
             })?;
             let count: i64 = row
                 .try_get("count")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read count: {}", e)))?;
-            result
-                .entry(model)
-                .or_default()
-                .insert(completion_window, count);
+            result.entry(model).or_default().insert(window_label, count);
         }
 
         Ok(result)
@@ -10353,17 +10373,15 @@ mod tests {
         .await
         .unwrap();
 
-        let windows = vec![("1h".to_string(), 3600), ("4h".to_string(), 14_400)];
+        let windows = vec![
+            ("1h".to_string(), None, 3600),
+            ("4h".to_string(), None, 14_400),
+        ];
         let states = vec!["pending".to_string()];
         let model_filter: Vec<String> = vec![];
 
         let counts = manager
-            .get_pending_request_counts_by_model_and_completion_window(
-                &windows,
-                &states,
-                &model_filter,
-                false,
-            )
+            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, false)
             .await
             .unwrap();
 
@@ -10374,6 +10392,67 @@ mod tests {
         // model-b: 0 within 1h, 2 within 4h
         assert_eq!(*counts.get("model-b").unwrap().get("1h").unwrap(), 0);
         assert_eq!(*counts.get("model-b").unwrap().get("4h").unwrap(), 2);
+
+        // Disjoint bucket covering only 1h..4h should see model-b (3h) but
+        // not model-a (30min, which is outside the range).
+        let disjoint = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[("1h:4h".to_string(), Some(3600), 14_400)],
+                &states,
+                &model_filter,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*disjoint.get("model-a").unwrap().get("1h:4h").unwrap(), 0);
+        assert_eq!(*disjoint.get("model-b").unwrap().get("1h:4h").unwrap(), 2);
+
+        // Inverted range should be rejected.
+        let err = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[("bad".to_string(), Some(7200), 3600)],
+                &states,
+                &model_filter,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("start"));
+
+        // Simulate an overdue batch: push model-a's expires_at 10 minutes
+        // into the past. Shorthand `(None, 3600)` must still count it (this
+        // matches the old "<= now + 3600" semantics which included overdue);
+        // explicit `(Some(0), 3600)` must exclude it.
+        sqlx::query!(
+            "UPDATE batches SET expires_at = $1 WHERE id = $2",
+            now - Duration::minutes(10),
+            *batch_a.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let incl_overdue = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[("1h".to_string(), None, 3600)],
+                &states,
+                &model_filter,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*incl_overdue.get("model-a").unwrap().get("1h").unwrap(), 2);
+
+        let excl_overdue = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[("1h".to_string(), Some(0), 3600)],
+                &states,
+                &model_filter,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*excl_overdue.get("model-a").unwrap().get("1h").unwrap(), 0);
     }
 
     #[sqlx::test]
@@ -10457,17 +10536,12 @@ mod tests {
         .unwrap();
 
         // Window and model filter
-        let windows = vec![("15m".to_string(), 900)];
+        let windows = vec![("15m".to_string(), None, 900)];
         let states = vec!["pending".to_string()];
         let model_filter = vec!["model-a".to_string()];
 
         let counts = manager
-            .get_pending_request_counts_by_model_and_completion_window(
-                &windows,
-                &states,
-                &model_filter,
-                false,
-            )
+            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, false)
             .await
             .unwrap();
 
@@ -10480,12 +10554,7 @@ mod tests {
         let model_filter: Vec<String> = vec![];
 
         let counts_all = manager
-            .get_pending_request_counts_by_model_and_completion_window(
-                &windows,
-                &states,
-                &model_filter,
-                false,
-            )
+            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, false)
             .await
             .unwrap();
 
@@ -10502,12 +10571,7 @@ mod tests {
         .unwrap();
 
         let counts_cancelled = manager
-            .get_pending_request_counts_by_model_and_completion_window(
-                &windows,
-                &states,
-                &model_filter,
-                false,
-            )
+            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, false)
             .await
             .unwrap();
 
@@ -10521,7 +10585,7 @@ mod tests {
             PostgresRequestManager::with_client(TestDbPools::new(pool).await.unwrap(), http_client);
 
         let counts = manager
-            .get_pending_request_counts_by_model_and_completion_window(
+            .get_pending_request_counts_by_model_and_window(
                 &[],
                 &["pending".to_string()],
                 &[],
@@ -10532,8 +10596,8 @@ mod tests {
         assert!(counts.is_empty());
 
         let counts = manager
-            .get_pending_request_counts_by_model_and_completion_window(
-                &[("1h".to_string(), 3600)],
+            .get_pending_request_counts_by_model_and_window(
+                &[("1h".to_string(), None, 3600)],
                 &[],
                 &[],
                 false,
