@@ -2351,8 +2351,8 @@ mod queue_counts {
         let counts = manager
             .get_pending_request_counts_by_model_and_window(
                 &[
-                    ("1h".to_string(), 0, 3600),
-                    ("24h".to_string(), 0, 24 * 3600),
+                    ("1h".to_string(), None, 3600),
+                    ("24h".to_string(), None, 24 * 3600),
                 ],
                 &["pending".to_string()],
                 &[],
