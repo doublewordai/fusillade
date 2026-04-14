@@ -10,7 +10,10 @@ use crate::batch::{
 use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::http::HttpClient;
-use crate::request::{AnyRequest, Claimed, DaemonId, Request, RequestId, RequestState};
+use crate::request::{
+    AnyRequest, Claimed, DaemonId, ListRequestsFilter, Request, RequestDetail, RequestId,
+    RequestListResult, RequestState,
+};
 use async_trait::async_trait;
 use futures::stream::Stream;
 use std::collections::HashMap;
@@ -390,6 +393,18 @@ pub trait DaemonStorage: Send + Sync {
     /// Returns total rows deleted across both tables. Called periodically by
     /// the daemon purge task for right-to-erasure compliance.
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
+
+    /// List individual requests across batches with filtering and pagination.
+    ///
+    /// Supports filtering by creator, completion window, status, model(s),
+    /// date range, and active-first sorting. Uses offset-based pagination.
+    ///
+    /// Note: Token and cost metrics are NOT included — callers should join
+    /// against their own analytics tables for that data.
+    async fn list_requests(&self, filter: ListRequestsFilter) -> Result<RequestListResult>;
+
+    /// Get a single request by ID with full detail (body, response, error).
+    async fn get_request_detail(&self, request_id: RequestId) -> Result<RequestDetail>;
 }
 
 /// Daemon executor trait for runtime orchestration.

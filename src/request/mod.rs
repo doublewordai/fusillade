@@ -5,9 +5,11 @@
 //! - State transition methods
 //! - Value objects (RequestData, etc.)
 
+pub mod query;
 pub mod transitions;
 pub mod types;
 
 // Re-export commonly used types
+pub use query::{ListRequestsFilter, RequestDetail, RequestListResult, RequestSummary};
 pub use transitions::CancellationReason;
 pub use types::*;

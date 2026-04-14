@@ -4535,6 +4535,129 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
 
         Ok(total)
     }
+
+    async fn list_requests(
+        &self,
+        filter: crate::request::ListRequestsFilter,
+    ) -> Result<crate::request::RequestListResult> {
+        let pool = self.pools.read();
+
+        let total_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            WHERE b.deleted_at IS NULL
+              AND ($1::text IS NULL OR b.created_by = $1)
+              AND ($2::text IS NULL OR b.completion_window = $2)
+              AND ($3::text IS NULL OR r.state = $3)
+              AND ($4::text[] IS NULL OR r.model = ANY($4))
+              AND ($5::timestamptz IS NULL OR r.created_at >= $5)
+              AND ($6::timestamptz IS NULL OR r.created_at <= $6)
+            "#,
+        )
+        .bind(filter.created_by.as_deref())
+        .bind(filter.completion_window.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.models.as_deref())
+        .bind(filter.created_after)
+        .bind(filter.created_before)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to count requests: {}", e)))?;
+
+        let order_clause = if filter.active_first {
+            "CASE r.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, r.created_at DESC"
+        } else {
+            "r.created_at DESC"
+        };
+
+        let data: Vec<crate::request::RequestSummary> = sqlx::query_as(&format!(
+            r#"
+            SELECT
+                r.id,
+                r.batch_id,
+                r.model,
+                r.state,
+                r.created_at,
+                r.completed_at,
+                r.failed_at,
+                (CASE
+                    WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
+                    ELSE NULL
+                END)::float8 as duration_ms,
+                r.response_status,
+                NULL::text as created_by_email
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            WHERE b.deleted_at IS NULL
+              AND ($1::text IS NULL OR b.created_by = $1)
+              AND ($2::text IS NULL OR b.completion_window = $2)
+              AND ($3::text IS NULL OR r.state = $3)
+              AND ($4::text[] IS NULL OR r.model = ANY($4))
+              AND ($5::timestamptz IS NULL OR r.created_at >= $5)
+              AND ($6::timestamptz IS NULL OR r.created_at <= $6)
+            ORDER BY {order_clause}
+            LIMIT $7 OFFSET $8
+            "#
+        ))
+        .bind(filter.created_by.as_deref())
+        .bind(filter.completion_window.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.models.as_deref())
+        .bind(filter.created_after)
+        .bind(filter.created_before)
+        .bind(filter.limit)
+        .bind(filter.skip)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list requests: {}", e)))?;
+
+        Ok(crate::request::RequestListResult { data, total_count })
+    }
+
+    async fn get_request_detail(
+        &self,
+        request_id: crate::request::RequestId,
+    ) -> Result<crate::request::RequestDetail> {
+        let pool = self.pools.read();
+
+        let detail: crate::request::RequestDetail = sqlx::query_as(
+            r#"
+            SELECT
+                r.id,
+                r.batch_id,
+                r.model,
+                r.state,
+                r.created_at,
+                r.completed_at,
+                r.failed_at,
+                (CASE
+                    WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
+                    ELSE NULL
+                END)::float8 as duration_ms,
+                r.response_status,
+                COALESCE(t.body, '') as body,
+                r.response_body,
+                r.error,
+                b.completion_window,
+                b.created_by as batch_created_by
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            LEFT JOIN request_templates t ON r.template_id = t.id
+            WHERE r.id = $1 AND b.deleted_at IS NULL
+            "#,
+        )
+        .bind(request_id.0)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to get request detail: {}", e)))?
+        .ok_or_else(|| FusilladeError::Other(anyhow!("Request not found: {}", request_id.0)))?;
+
+        Ok(detail)
+    }
 }
 
 // Implement DaemonExecutor trait
