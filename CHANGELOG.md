@@ -1,5 +1,16 @@
 # Changelog
 
+## [16.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v15.1.1...fusillade-v16.0.0) (2026-04-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* generalise pending-request counts to start/end windows ([#217](https://github.com/doublewordai/fusillade/issues/217))
+
+### Features
+
+* generalise pending-request counts to start/end windows ([#217](https://github.com/doublewordai/fusillade/issues/217)) ([edd7d5e](https://github.com/doublewordai/fusillade/commit/edd7d5ebcdfaa7cacbc78fa3d1ed74f05f5dc6c1))
+
 ## [15.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v15.1.0...fusillade-v15.1.1) (2026-04-13)
 
 
