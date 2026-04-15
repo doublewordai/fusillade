@@ -3385,11 +3385,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
                     ELSE NULL END)::float8 as duration_ms,
                 r.response_status,
-                COALESCE(t.body, '') as body, r.response_body, r.error,
+                t.body, r.response_body, r.error,
                 b.completion_window, b.created_by as batch_created_by
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
-            LEFT JOIN request_templates t ON r.template_id = t.id
+            LEFT JOIN active_request_templates t ON r.template_id = t.id
             WHERE r.id = $1 AND b.deleted_at IS NULL
             "#,
         )
@@ -12109,7 +12109,70 @@ mod tests {
         assert_eq!(detail.batch_id, batch.id.0);
         assert_eq!(detail.completion_window, "1h");
         assert_eq!(detail.batch_created_by, "test-user-id");
-        assert!(detail.body.contains("gpt-4"));
+        assert!(detail.body.as_deref().unwrap().contains("gpt-4"));
+    }
+
+    #[sqlx::test]
+    async fn test_get_request_detail_after_template_purge(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "purge-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("purge-req".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/chat/completions".to_string(),
+                    body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}]}"#
+                        .to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: Some("test-user".to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        // Get request ID before purging
+        let list = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let request_id = crate::request::RequestId(list.data[0].id);
+
+        // Delete file and purge orphaned templates
+        manager.delete_file(file_id).await.unwrap();
+        manager.purge_orphaned_rows(1000).await.unwrap();
+
+        let detail = manager
+            .get_request_detail(request_id)
+            .await
+            .expect("get_request_detail should succeed even after template purge");
+
+        assert_eq!(detail.model, "gpt-4");
+        assert!(detail.body.is_none(), "body should be None when template is purged");
     }
 
     #[sqlx::test]

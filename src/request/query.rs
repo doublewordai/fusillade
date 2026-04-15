@@ -121,7 +121,8 @@ pub struct RequestDetail {
     pub failed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
-    pub body: String,
+    /// `None` when the template has been purged (via file deletion + orphan purge).
+    pub body: Option<String>,
     pub response_body: Option<String>,
     pub error: Option<String>,
     pub completion_window: String,
