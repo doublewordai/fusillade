@@ -7,8 +7,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Default number of rows to return when limit is not specified.
+const DEFAULT_LIMIT: i64 = 50;
+
 /// Filter parameters for listing requests across batches.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ListRequestsFilter {
     /// Filter by batch creator (user ID or org ID)
     pub created_by: Option<String>,
@@ -26,11 +29,30 @@ pub struct ListRequestsFilter {
     pub active_first: bool,
     /// Number of rows to skip (offset pagination)
     pub skip: i64,
-    /// Maximum number of rows to return
+    /// Maximum number of rows to return (defaults to 50)
     pub limit: i64,
 }
 
+impl Default for ListRequestsFilter {
+    fn default() -> Self {
+        Self {
+            created_by: None,
+            completion_window: None,
+            status: None,
+            models: None,
+            created_after: None,
+            created_before: None,
+            active_first: false,
+            skip: 0,
+            limit: DEFAULT_LIMIT,
+        }
+    }
+}
+
 /// Summary of an individual request, suitable for list views.
+///
+/// Note: This type does not include user email or token/cost metrics.
+/// Callers should enrich with data from their own tables (users, analytics).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
 pub struct RequestSummary {
@@ -44,7 +66,6 @@ pub struct RequestSummary {
     pub failed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
-    pub created_by_email: Option<String>,
 }
 
 /// Full detail of an individual request, including body and response.

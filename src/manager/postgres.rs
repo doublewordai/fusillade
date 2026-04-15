@@ -3340,8 +3340,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 (CASE WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
                     THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
                     ELSE NULL END)::float8 as duration_ms,
-                r.response_status,
-                NULL::text as created_by_email
+                r.response_status
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
             WHERE b.deleted_at IS NULL
@@ -11835,7 +11834,8 @@ mod tests {
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/chat/completions".to_string(),
-                        body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}"#.to_string(),
+                        body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}"#
+                            .to_string(),
                         model: "gpt-4".to_string(),
                         api_key: "key".to_string(),
                     },
@@ -11844,7 +11844,8 @@ mod tests {
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/chat/completions".to_string(),
-                        body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"world"}]}"#.to_string(),
+                        body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"world"}]}"#
+                            .to_string(),
                         model: "gpt-4".to_string(),
                         api_key: "key".to_string(),
                     },
@@ -11900,22 +11901,42 @@ mod tests {
         };
 
         // Create 1h batch
-        let file_1h = manager.create_file("1h-file".to_string(), None, vec![template.clone()]).await.unwrap();
-        manager.create_batch(crate::batch::BatchInput {
-            file_id: file_1h,
-            endpoint: "/v1/chat/completions".to_string(),
-            completion_window: "1h".to_string(),
-            metadata: None, created_by: None, api_key_id: None, api_key: None, total_requests: None,
-        }).await.unwrap();
+        let file_1h = manager
+            .create_file("1h-file".to_string(), None, vec![template.clone()])
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_1h,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
 
         // Create 24h batch
-        let file_24h = manager.create_file("24h-file".to_string(), None, vec![template.clone()]).await.unwrap();
-        manager.create_batch(crate::batch::BatchInput {
-            file_id: file_24h,
-            endpoint: "/v1/chat/completions".to_string(),
-            completion_window: "24h".to_string(),
-            metadata: None, created_by: None, api_key_id: None, api_key: None, total_requests: None,
-        }).await.unwrap();
+        let file_24h = manager
+            .create_file("24h-file".to_string(), None, vec![template.clone()])
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_24h,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
 
         // Filter to 1h only
         let result_1h = manager
@@ -11970,13 +11991,23 @@ mod tests {
             })
             .collect();
 
-        let file_id = manager.create_file("pagination-test".to_string(), None, templates).await.unwrap();
-        manager.create_batch(crate::batch::BatchInput {
-            file_id,
-            endpoint: "/v1/chat/completions".to_string(),
-            completion_window: "1h".to_string(),
-            metadata: None, created_by: None, api_key_id: None, api_key: None, total_requests: None,
-        }).await.unwrap();
+        let file_id = manager
+            .create_file("pagination-test".to_string(), None, templates)
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
 
         // Page 1: limit 2, skip 0
         let page1 = manager
@@ -12032,7 +12063,8 @@ mod tests {
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/v1/chat/completions".to_string(),
-                    body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}]}"#.to_string(),
+                    body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}]}"#
+                        .to_string(),
                     model: "gpt-4".to_string(),
                     api_key: "key".to_string(),
                 }],
