@@ -12172,7 +12172,10 @@ mod tests {
             .expect("get_request_detail should succeed even after template purge");
 
         assert_eq!(detail.model, "gpt-4");
-        assert!(detail.body.is_none(), "body should be None when template is purged");
+        assert!(
+            detail.body.is_none(),
+            "body should be None when template is purged"
+        );
     }
 
     #[sqlx::test]
