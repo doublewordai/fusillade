@@ -66,6 +66,8 @@ pub struct RequestSummary {
     pub failed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
+    /// Batch creator ID (user ID or org ID) — for ownership checks and email lookup
+    pub batch_created_by: String,
 }
 
 /// Full detail of an individual request, including body and response.

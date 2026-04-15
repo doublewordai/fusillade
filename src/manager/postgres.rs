@@ -3340,7 +3340,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 (CASE WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
                     THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
                     ELSE NULL END)::float8 as duration_ms,
-                r.response_status
+                r.response_status,
+                b.created_by as batch_created_by
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
             WHERE b.deleted_at IS NULL
