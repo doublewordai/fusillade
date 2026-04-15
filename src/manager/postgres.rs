@@ -2750,7 +2750,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // Exclude batches with a specific completion window (e.g., hide async batches)
         if let Some(ref exclude_window) = exclude_completion_window {
             query_builder.push(" AND b.completion_window != ");
-            query_builder.push_bind(exclude_window.clone());
+            query_builder.push_bind(exclude_window.as_str());
         }
 
         // ORDER BY: when active_first is enabled, sort by the `priority` column
