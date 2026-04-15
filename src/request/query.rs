@@ -17,7 +17,7 @@ pub struct ListRequestsFilter {
     pub created_by: Option<String>,
     /// Filter by batch completion window (e.g., "1h", "24h")
     pub completion_window: Option<String>,
-    /// Filter by request state (pending, processing, completed, failed, canceled)
+    /// Filter by request state (pending, claimed, processing, completed, failed, canceled)
     pub status: Option<String>,
     /// Filter by model(s) — when multiple, matches any.
     /// `None` disables model filtering. `Some(vec![])` matches no rows.
