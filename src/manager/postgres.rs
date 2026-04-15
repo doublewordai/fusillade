@@ -11791,4 +11791,306 @@ mod tests {
             "Full pagination should return all batches in active-first order"
         );
     }
+
+    // =========================================================================
+    // Tests for list_requests and get_request_detail
+    // =========================================================================
+
+    #[sqlx::test]
+    async fn test_list_requests_empty(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let result = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .expect("list_requests should succeed on empty DB");
+
+        assert_eq!(result.total_count, 0);
+        assert!(result.data.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn test_list_requests_returns_requests(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create file + batch (which populates requests)
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req-1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"world"}]}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let _batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: Some("test-user".to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        let result = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .expect("list_requests should succeed");
+
+        assert_eq!(result.total_count, 2);
+        assert_eq!(result.data.len(), 2);
+        assert!(result.data.iter().all(|r| r.model == "gpt-4"));
+        assert!(result.data.iter().all(|r| r.status == "pending"));
+    }
+
+    #[sqlx::test]
+    async fn test_list_requests_filters_by_completion_window(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let template = RequestTemplateInput {
+            custom_id: None,
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: r#"{"model":"gpt-4"}"#.to_string(),
+            model: "gpt-4".to_string(),
+            api_key: "key".to_string(),
+        };
+
+        // Create 1h batch
+        let file_1h = manager.create_file("1h-file".to_string(), None, vec![template.clone()]).await.unwrap();
+        manager.create_batch(crate::batch::BatchInput {
+            file_id: file_1h,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "1h".to_string(),
+            metadata: None, created_by: None, api_key_id: None, api_key: None, total_requests: None,
+        }).await.unwrap();
+
+        // Create 24h batch
+        let file_24h = manager.create_file("24h-file".to_string(), None, vec![template.clone()]).await.unwrap();
+        manager.create_batch(crate::batch::BatchInput {
+            file_id: file_24h,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None, created_by: None, api_key_id: None, api_key: None, total_requests: None,
+        }).await.unwrap();
+
+        // Filter to 1h only
+        let result_1h = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                completion_window: Some("1h".to_string()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result_1h.total_count, 1);
+
+        // Filter to 24h only
+        let result_24h = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                completion_window: Some("24h".to_string()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result_24h.total_count, 1);
+
+        // No filter — both
+        let result_all = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result_all.total_count, 2);
+    }
+
+    #[sqlx::test]
+    async fn test_list_requests_pagination(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let templates: Vec<RequestTemplateInput> = (0..5)
+            .map(|i| RequestTemplateInput {
+                custom_id: Some(format!("req-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                body: format!(r#"{{"model":"gpt-4","prompt":"{}"}}"#, i),
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager.create_file("pagination-test".to_string(), None, templates).await.unwrap();
+        manager.create_batch(crate::batch::BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "1h".to_string(),
+            metadata: None, created_by: None, api_key_id: None, api_key: None, total_requests: None,
+        }).await.unwrap();
+
+        // Page 1: limit 2, skip 0
+        let page1 = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                limit: 2,
+                skip: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page1.total_count, 5);
+        assert_eq!(page1.data.len(), 2);
+
+        // Page 2: limit 2, skip 2
+        let page2 = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                limit: 2,
+                skip: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page2.total_count, 5);
+        assert_eq!(page2.data.len(), 2);
+
+        // Page 3: limit 2, skip 4
+        let page3 = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                limit: 2,
+                skip: 4,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page3.total_count, 5);
+        assert_eq!(page3.data.len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn test_get_request_detail(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "detail-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("detail-req".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/chat/completions".to_string(),
+                    body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}]}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: Some("test-user-id".to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        // Get the request ID from list
+        let list = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(list.data.len(), 1);
+        let request_id = crate::request::RequestId(list.data[0].id);
+
+        // Get detail
+        let detail = manager
+            .get_request_detail(request_id)
+            .await
+            .expect("get_request_detail should succeed");
+
+        assert_eq!(detail.model, "gpt-4");
+        assert_eq!(detail.status, "pending");
+        assert_eq!(detail.batch_id, batch.id.0);
+        assert_eq!(detail.completion_window, "1h");
+        assert_eq!(detail.batch_created_by, "test-user-id");
+        assert!(detail.body.contains("gpt-4"));
+    }
+
+    #[sqlx::test]
+    async fn test_get_request_detail_not_found(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let result = manager
+            .get_request_detail(crate::request::RequestId(uuid::Uuid::new_v4()))
+            .await;
+
+        assert!(result.is_err());
+    }
 }
