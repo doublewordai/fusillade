@@ -2540,6 +2540,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             created_after,
             created_before,
             active_first,
+            exclude_completion_window,
         } = filter;
         let limit = limit.unwrap_or(100);
 
@@ -2744,6 +2745,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     )));
                 }
             }
+        }
+
+        // Exclude batches with a specific completion window (e.g., hide async batches)
+        if let Some(ref exclude_window) = exclude_completion_window {
+            query_builder.push(" AND b.completion_window != ");
+            query_builder.push_bind(exclude_window.clone());
         }
 
         // ORDER BY: when active_first is enabled, sort by the `priority` column
