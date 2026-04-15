@@ -392,6 +392,9 @@ pub struct ListBatchesFilter {
     /// treated as terminal because cancel_batch sets both cancelling_at and
     /// cancelled_at atomically. Default false (pure chronological).
     pub active_first: bool,
+    /// Exclude batches with this completion window (e.g., "1h" to hide async batches).
+    /// When set, batches matching this window are filtered out.
+    pub exclude_completion_window: Option<String>,
 }
 
 /// Items that can be yielded from a file upload stream
