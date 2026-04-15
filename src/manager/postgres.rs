@@ -3303,6 +3303,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Box::pin(ReceiverStream::new(rx))
     }
 
+    #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
     async fn list_requests(
         &self,
         filter: crate::request::ListRequestsFilter,
@@ -3320,37 +3321,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let pool = self.pools.read();
 
-        let total_count: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)::bigint
-            FROM requests r
-            JOIN batches b ON r.batch_id = b.id
-            WHERE b.deleted_at IS NULL
-              AND ($1::text IS NULL OR b.created_by = $1)
-              AND ($2::text IS NULL OR b.completion_window = $2)
-              AND ($3::text IS NULL OR r.state = $3)
-              AND ($4::text[] IS NULL OR r.model = ANY($4))
-              AND ($5::timestamptz IS NULL OR r.created_at >= $5)
-              AND ($6::timestamptz IS NULL OR r.created_at <= $6)
-            "#,
-        )
-        .bind(filter.created_by.as_deref())
-        .bind(filter.completion_window.as_deref())
-        .bind(filter.status.as_deref())
-        .bind(filter.models.as_deref())
-        .bind(filter.created_after)
-        .bind(filter.created_before)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to count requests: {}", e)))?;
-
         let order_clause = if filter.active_first {
             "CASE r.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, r.created_at DESC, r.id DESC"
         } else {
             "r.created_at DESC, r.id DESC"
         };
 
-        let data: Vec<crate::request::RequestSummary> = sqlx::query_as(&format!(
+        let rows: Vec<crate::request::RequestSummaryWithCount> = sqlx::query_as(&format!(
             r#"
             SELECT
                 r.id, r.batch_id, r.model, r.state, r.created_at,
@@ -3359,7 +3336,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
                     ELSE NULL END)::float8 as duration_ms,
                 r.response_status,
-                b.created_by as batch_created_by
+                b.created_by as batch_created_by,
+                COUNT(*) OVER()::bigint as total_count
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
             WHERE b.deleted_at IS NULL
@@ -3385,9 +3363,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to list requests: {}", e)))?;
 
+        let total_count = rows.first().map_or(0, |r| r.total_count);
+        let data = rows.into_iter().map(|r| r.into()).collect();
+
         Ok(crate::request::RequestListResult { data, total_count })
     }
 
+    #[tracing::instrument(skip(self), fields(request_id = %request_id.0))]
     async fn get_request_detail(
         &self,
         request_id: crate::request::RequestId,

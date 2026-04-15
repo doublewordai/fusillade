@@ -10,6 +10,9 @@ pub mod transitions;
 pub mod types;
 
 // Re-export commonly used types
-pub use query::{ListRequestsFilter, RequestDetail, RequestListResult, RequestSummary};
+pub use query::{
+    ListRequestsFilter, RequestDetail, RequestListResult, RequestSummary,
+    RequestSummaryWithCount,
+};
 pub use transitions::CancellationReason;
 pub use types::*;

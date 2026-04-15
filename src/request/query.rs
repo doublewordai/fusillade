@@ -71,6 +71,42 @@ pub struct RequestSummary {
     pub batch_created_by: String,
 }
 
+/// Internal row type that includes the `COUNT(*) OVER()` window function result.
+/// Converted to `RequestSummary` after extracting `total_count`.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
+pub struct RequestSummaryWithCount {
+    pub id: Uuid,
+    pub batch_id: Uuid,
+    pub model: String,
+    #[cfg_attr(feature = "postgres", sqlx(rename = "state"))]
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub failed_at: Option<DateTime<Utc>>,
+    pub duration_ms: Option<f64>,
+    pub response_status: Option<i16>,
+    pub batch_created_by: String,
+    pub total_count: i64,
+}
+
+impl From<RequestSummaryWithCount> for RequestSummary {
+    fn from(r: RequestSummaryWithCount) -> Self {
+        Self {
+            id: r.id,
+            batch_id: r.batch_id,
+            model: r.model,
+            status: r.status,
+            created_at: r.created_at,
+            completed_at: r.completed_at,
+            failed_at: r.failed_at,
+            duration_ms: r.duration_ms,
+            response_status: r.response_status,
+            batch_created_by: r.batch_created_by,
+        }
+    }
+}
+
 /// Full detail of an individual request, including body and response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
