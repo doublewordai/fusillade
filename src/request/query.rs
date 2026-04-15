@@ -19,7 +19,8 @@ pub struct ListRequestsFilter {
     pub completion_window: Option<String>,
     /// Filter by request state (pending, processing, completed, failed, canceled)
     pub status: Option<String>,
-    /// Filter by model(s) — when multiple, matches any
+    /// Filter by model(s) — when multiple, matches any.
+    /// `None` disables model filtering. `Some(vec![])` matches no rows.
     pub models: Option<Vec<String>>,
     /// Only return requests created after this timestamp
     pub created_after: Option<DateTime<Utc>>,

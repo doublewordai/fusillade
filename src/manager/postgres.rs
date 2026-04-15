@@ -3300,6 +3300,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         &self,
         filter: crate::request::ListRequestsFilter,
     ) -> Result<crate::request::RequestListResult> {
+        if filter.skip < 0 {
+            return Err(FusilladeError::ValidationError(
+                "skip must be >= 0".to_string(),
+            ));
+        }
+        if filter.limit <= 0 {
+            return Err(FusilladeError::ValidationError(
+                "limit must be > 0".to_string(),
+            ));
+        }
+
         let pool = self.pools.read();
 
         let total_count: i64 = sqlx::query_scalar(
@@ -3327,9 +3338,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to count requests: {}", e)))?;
 
         let order_clause = if filter.active_first {
-            "CASE r.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, r.created_at DESC"
+            "CASE r.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, r.created_at DESC, r.id DESC"
         } else {
-            "r.created_at DESC"
+            "r.created_at DESC, r.id DESC"
         };
 
         let data: Vec<crate::request::RequestSummary> = sqlx::query_as(&format!(
@@ -3397,7 +3408,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .fetch_optional(pool)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to get request detail: {}", e)))?
-        .ok_or_else(|| FusilladeError::Other(anyhow!("Request not found: {}", request_id.0)))?;
+        .ok_or(FusilladeError::RequestNotFound(request_id))?;
 
         Ok(detail)
     }
