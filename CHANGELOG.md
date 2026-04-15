@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.0.0...fusillade-v16.1.0) (2026-04-15)
+
+
+### Features
+
+* add cross-batch request query methods to Storage trait ([#219](https://github.com/doublewordai/fusillade/issues/219)) ([b403e7d](https://github.com/doublewordai/fusillade/commit/b403e7d59ec8ed1cba4a7d1d50443787dbb45b04))
+
 ## [16.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v15.1.1...fusillade-v16.0.0) (2026-04-14)
 
 
