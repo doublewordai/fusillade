@@ -11792,6 +11792,96 @@ mod tests {
         );
     }
 
+    #[sqlx::test]
+    async fn test_list_batches_exclude_completion_window(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let template = RequestTemplateInput {
+            custom_id: None,
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: "{}".to_string(),
+            model: "gpt-4".to_string(),
+            api_key: "key".to_string(),
+        };
+
+        // Create a 1h batch
+        let file_1h = manager
+            .create_file("1h-file".to_string(), None, vec![template.clone()])
+            .await
+            .unwrap();
+        let batch_1h = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_1h,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        // Create a 24h batch
+        let file_24h = manager
+            .create_file("24h-file".to_string(), None, vec![template.clone()])
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_24h,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        // Exclude 24h — should only return the 1h batch
+        let result = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                exclude_completion_window: Some("24h".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, batch_1h.id);
+        assert_eq!(result[0].completion_window, "1h");
+
+        // Exclude 1h — should only return the 24h batch
+        let result = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                exclude_completion_window: Some("1h".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].completion_window, "24h");
+
+        // No exclusion — both returned
+        let result = manager
+            .list_batches(crate::batch::ListBatchesFilter::default())
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+    }
+
     // =========================================================================
     // Tests for list_requests and get_request_detail
     // =========================================================================
