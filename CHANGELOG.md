@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v16.1.0...fusillade-v16.1.1) (2026-04-16)
+
+
+### Bug Fixes
+
+* fast total_count for list_requests via short-timeout exact + planner estimate ([#221](https://github.com/doublewordai/fusillade/issues/221)) ([868d579](https://github.com/doublewordai/fusillade/commit/868d57976ffd445c0e224b621cfd846854d55c2b))
+
 ## [16.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.0.0...fusillade-v16.1.0) (2026-04-15)
 
 
