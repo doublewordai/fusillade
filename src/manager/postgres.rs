@@ -2980,7 +2980,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let mut results = Vec::new();
 
-        for (id, request_result) in ids.iter().zip(get_results.into_iter()) {
+        for (id, request_result) in ids.iter().zip(get_results) {
             let result = match request_result {
                 Ok(AnyRequest::Failed(req)) => {
                     // Reset to pending state with retry_attempt = 0
