@@ -71,6 +71,56 @@ pub struct RequestSummary {
     pub batch_created_by: String,
 }
 
+/// Internal row shape used previously when `list_requests` computed the total
+/// count via a `COUNT(*) OVER()` window function. Kept for backward
+/// compatibility with the public re-export introduced in v16.1.0; no longer
+/// constructed by this crate.
+#[allow(deprecated)]
+mod deprecated_types {
+    use super::{DateTime, Deserialize, RequestSummary, Serialize, Utc, Uuid};
+
+    #[deprecated(
+        since = "16.1.1",
+        note = "no longer used internally; use RequestSummary and RequestListResult.total_count"
+    )]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
+    pub struct RequestSummaryWithCount {
+        pub id: Uuid,
+        pub batch_id: Uuid,
+        pub model: String,
+        #[cfg_attr(feature = "postgres", sqlx(rename = "state"))]
+        pub status: String,
+        pub created_at: DateTime<Utc>,
+        pub completed_at: Option<DateTime<Utc>>,
+        pub failed_at: Option<DateTime<Utc>>,
+        pub duration_ms: Option<f64>,
+        pub response_status: Option<i16>,
+        pub batch_created_by: String,
+        pub total_count: i64,
+    }
+
+    impl From<RequestSummaryWithCount> for RequestSummary {
+        fn from(r: RequestSummaryWithCount) -> Self {
+            Self {
+                id: r.id,
+                batch_id: r.batch_id,
+                model: r.model,
+                status: r.status,
+                created_at: r.created_at,
+                completed_at: r.completed_at,
+                failed_at: r.failed_at,
+                duration_ms: r.duration_ms,
+                response_status: r.response_status,
+                batch_created_by: r.batch_created_by,
+            }
+        }
+    }
+}
+
+#[allow(deprecated)]
+pub use deprecated_types::RequestSummaryWithCount;
+
 /// Full detail of an individual request, including body and response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
@@ -97,9 +147,11 @@ pub struct RequestDetail {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestListResult {
     pub data: Vec<RequestSummary>,
-    /// Estimated total row count from the query planner (accurate when
-    /// table statistics are current; may diverge by a few percent otherwise).
-    /// Exact counts are not feasible on large tables without prohibitive
-    /// query latency.
+    /// Best-effort total row count for the full query result.
+    ///
+    /// Returns an exact count when the count query completes within a short
+    /// internal timeout; otherwise falls back to a query-planner row estimate.
+    /// Planner estimates are typically within a few percent when table
+    /// statistics are current, but may diverge more if stats are stale.
     pub total_count: i64,
 }

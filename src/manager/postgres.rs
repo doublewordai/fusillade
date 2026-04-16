@@ -3356,16 +3356,28 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 .map_err(|e| {
                     FusilladeError::Other(anyhow!("Failed to set statement_timeout: {}", e))
                 })?;
-            sqlx::query_scalar(&count_sql)
-                .bind(filter.created_by.as_deref())
-                .bind(filter.completion_window.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .fetch_one(&mut *tx)
-                .await
-                .ok()
+            let count_result: std::result::Result<i64, sqlx::Error> =
+                sqlx::query_scalar(&count_sql)
+                    .bind(filter.created_by.as_deref())
+                    .bind(filter.completion_window.as_deref())
+                    .bind(filter.status.as_deref())
+                    .bind(filter.models.as_deref())
+                    .bind(filter.created_after)
+                    .bind(filter.created_before)
+                    .fetch_one(&mut *tx)
+                    .await;
+            match count_result {
+                Ok(n) => Some(n),
+                // SQLSTATE 57014 = query_canceled (statement_timeout fired) —
+                // fall through to the planner estimate fallback.
+                Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => None,
+                Err(e) => {
+                    return Err(FusilladeError::Other(anyhow!(
+                        "Failed to count requests: {}",
+                        e
+                    )));
+                }
+            }
         };
 
         let total_count = if let Some(n) = exact_count {
