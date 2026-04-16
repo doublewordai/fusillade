@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.1.2](https://github.com/doublewordai/fusillade/compare/fusillade-v16.1.1...fusillade-v16.1.2) (2026-04-16)
+
+
+### Bug Fixes
+
+* clippy rust 1.95 ([b954afd](https://github.com/doublewordai/fusillade/commit/b954afd5a9ade0473c6227feda6e25c69a11b104))
+
 ## [16.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v16.1.0...fusillade-v16.1.1) (2026-04-16)
 
 
