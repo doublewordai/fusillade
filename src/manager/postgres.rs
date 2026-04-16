@@ -3321,13 +3321,48 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let pool = self.pools.read();
 
+        // Common predicate — the r.batch_deleted_at/batch_id filter lets the
+        // partial index idx_requests_active_pagination skip requests belonging
+        // to soft-deleted batches without reading their heap pages. Kept the
+        // redundant b.deleted_at IS NULL as defense-in-depth in case the sync
+        // trigger is ever disabled.
+        let where_clause = r#"
+            WHERE r.batch_deleted_at IS NULL
+              AND r.batch_id IS NOT NULL
+              AND b.deleted_at IS NULL
+              AND ($1::text IS NULL OR b.created_by = $1)
+              AND ($2::text IS NULL OR b.completion_window = $2)
+              AND ($3::text IS NULL OR r.state = $3)
+              AND ($4::text[] IS NULL OR r.model = ANY($4))
+              AND ($5::timestamptz IS NULL OR r.created_at >= $5)
+              AND ($6::timestamptz IS NULL OR r.created_at <= $6)
+        "#;
+
+        let total_count: i64 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM requests r
+            JOIN batches b ON r.batch_id = b.id
+            {where_clause}
+            "#
+        ))
+        .bind(filter.created_by.as_deref())
+        .bind(filter.completion_window.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.models.as_deref())
+        .bind(filter.created_after)
+        .bind(filter.created_before)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to count requests: {}", e)))?;
+
         let order_clause = if filter.active_first {
             "CASE r.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, r.created_at DESC, r.id DESC"
         } else {
             "r.created_at DESC, r.id DESC"
         };
 
-        let rows: Vec<crate::request::RequestSummaryWithCount> = sqlx::query_as(&format!(
+        let data: Vec<crate::request::RequestSummary> = sqlx::query_as(&format!(
             r#"
             SELECT
                 r.id, r.batch_id, r.model, r.state, r.created_at,
@@ -3336,17 +3371,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
                     ELSE NULL END)::float8 as duration_ms,
                 r.response_status,
-                b.created_by as batch_created_by,
-                COUNT(*) OVER()::bigint as total_count
+                b.created_by as batch_created_by
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
-            WHERE b.deleted_at IS NULL
-              AND ($1::text IS NULL OR b.created_by = $1)
-              AND ($2::text IS NULL OR b.completion_window = $2)
-              AND ($3::text IS NULL OR r.state = $3)
-              AND ($4::text[] IS NULL OR r.model = ANY($4))
-              AND ($5::timestamptz IS NULL OR r.created_at >= $5)
-              AND ($6::timestamptz IS NULL OR r.created_at <= $6)
+            {where_clause}
             ORDER BY {order_clause}
             LIMIT $7 OFFSET $8
             "#
@@ -3362,9 +3390,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .fetch_all(pool)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to list requests: {}", e)))?;
-
-        let total_count = rows.first().map_or(0, |r| r.total_count);
-        let data = rows.into_iter().map(|r| r.into()).collect();
 
         Ok(crate::request::RequestListResult { data, total_count })
     }
@@ -12266,6 +12291,84 @@ mod tests {
             detail.body.is_none(),
             "body should be None when template is purged"
         );
+    }
+
+    #[sqlx::test]
+    async fn test_list_requests_excludes_soft_deleted_batches(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let template = RequestTemplateInput {
+            custom_id: None,
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: r#"{"model":"gpt-4"}"#.to_string(),
+            model: "gpt-4".to_string(),
+            api_key: "key".to_string(),
+        };
+
+        // Batch A: stays alive
+        let file_a = manager
+            .create_file("alive".to_string(), None, vec![template.clone()])
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_a,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        // Batch B: gets soft-deleted
+        let file_b = manager
+            .create_file("deleted".to_string(), None, vec![template])
+            .await
+            .unwrap();
+        let batch_b = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id: file_b,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        // Before delete: both requests visible
+        let before = manager
+            .list_requests(crate::request::ListRequestsFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(before.total_count, 2);
+
+        // Soft-delete batch B — the sync trigger should propagate deleted_at
+        // to its requests.batch_deleted_at, making them invisible to the query.
+        manager.delete_batch(batch_b.id).await.unwrap();
+
+        let after = manager
+            .list_requests(crate::request::ListRequestsFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            after.total_count, 1,
+            "requests from soft-deleted batches should be filtered out"
+        );
+        assert_eq!(after.data.len(), 1);
     }
 
     #[sqlx::test]
