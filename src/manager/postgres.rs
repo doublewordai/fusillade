@@ -12217,6 +12217,89 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn test_list_requests_active_first_ordering(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a batch with several requests
+        let templates: Vec<RequestTemplateInput> = (0..4)
+            .map(|i| RequestTemplateInput {
+                custom_id: Some(format!("af-{}", i)),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                body: "{}".to_string(),
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file("af-file".to_string(), None, templates)
+            .await
+            .unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        // Force distinct states on the requests so we can verify priority ordering.
+        // Priority mapping in list_requests: processing=0, claimed=1, pending=2, else=3.
+        // Set one each of completed, processing, claimed, pending.
+        let req_ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM requests WHERE batch_id = $1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(*batch.id as uuid::Uuid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(req_ids.len(), 4);
+
+        // Update states directly (bypassing state machine) purely for ordering test.
+        // Indices: [0]=completed, [1]=processing, [2]=claimed, [3]=pending
+        sqlx::query("UPDATE requests SET state='completed', response_status=200, response_body='{}', completed_at=NOW() WHERE id=$1")
+            .bind(req_ids[0])
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE requests SET state='processing', daemon_id=gen_random_uuid(), claimed_at=NOW(), started_at=NOW() WHERE id=$1")
+            .bind(req_ids[1])
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE requests SET state='claimed', daemon_id=gen_random_uuid(), claimed_at=NOW() WHERE id=$1")
+            .bind(req_ids[2])
+            .execute(&pool).await.unwrap();
+        // req_ids[3] stays pending
+
+        let result = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                active_first: true,
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.data.len(), 4);
+        let states: Vec<&str> = result.data.iter().map(|r| r.status.as_str()).collect();
+        // Expected: processing (0), claimed (1), pending (2), completed (3)
+        assert_eq!(
+            states,
+            vec!["processing", "claimed", "pending", "completed"],
+            "active_first must order by state priority"
+        );
+    }
+
+    #[sqlx::test]
     async fn test_get_request_detail(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
