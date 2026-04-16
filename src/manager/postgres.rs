@@ -3338,23 +3338,72 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
               AND ($6::timestamptz IS NULL OR r.created_at <= $6)
         "#;
 
-        let total_count: i64 = sqlx::query_scalar(&format!(
+        // Total count: try exact COUNT(*) with a short statement_timeout so
+        // narrow / small result sets return an accurate number; fall back to
+        // the planner's row estimate (EXPLAIN Plan Rows) when the exact count
+        // would be too slow (e.g., counting tens of millions of rows). The
+        // estimate is accurate within a few percent when table statistics are
+        // up-to-date. See `RequestListResult.total_count` doc for semantics.
+        let count_sql = format!(
             r#"
             SELECT COUNT(*)::bigint
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
             {where_clause}
             "#
-        ))
-        .bind(filter.created_by.as_deref())
-        .bind(filter.completion_window.as_deref())
-        .bind(filter.status.as_deref())
-        .bind(filter.models.as_deref())
-        .bind(filter.created_after)
-        .bind(filter.created_before)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to count requests: {}", e)))?;
+        );
+        let exact_count: Option<i64> = {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin count tx: {}", e)))?;
+            sqlx::query("SET LOCAL statement_timeout = '100ms'")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to set statement_timeout: {}", e))
+                })?;
+            sqlx::query_scalar(&count_sql)
+                .bind(filter.created_by.as_deref())
+                .bind(filter.completion_window.as_deref())
+                .bind(filter.status.as_deref())
+                .bind(filter.models.as_deref())
+                .bind(filter.created_after)
+                .bind(filter.created_before)
+                .fetch_one(&mut *tx)
+                .await
+                .ok()
+        };
+
+        let total_count = if let Some(n) = exact_count {
+            n
+        } else {
+            let plan_json: serde_json::Value = sqlx::query_scalar(&format!(
+                r#"
+                EXPLAIN (FORMAT JSON)
+                SELECT 1
+                FROM requests r
+                JOIN batches b ON r.batch_id = b.id
+                {where_clause}
+                "#
+            ))
+            .bind(filter.created_by.as_deref())
+            .bind(filter.completion_window.as_deref())
+            .bind(filter.status.as_deref())
+            .bind(filter.models.as_deref())
+            .bind(filter.created_after)
+            .bind(filter.created_before)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to estimate count: {}", e)))?;
+
+            plan_json
+                .get(0)
+                .and_then(|p| p.get("Plan"))
+                .and_then(|p| p.get("Plan Rows"))
+                .and_then(|r| r.as_i64())
+                .unwrap_or(0)
+        };
 
         let order_clause = if filter.active_first {
             "CASE r.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, r.created_at DESC, r.id DESC"

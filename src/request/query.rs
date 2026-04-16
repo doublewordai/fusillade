@@ -97,5 +97,9 @@ pub struct RequestDetail {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestListResult {
     pub data: Vec<RequestSummary>,
+    /// Estimated total row count from the query planner (accurate when
+    /// table statistics are current; may diverge by a few percent otherwise).
+    /// Exact counts are not feasible on large tables without prohibitive
+    /// query latency.
     pub total_count: i64,
 }
