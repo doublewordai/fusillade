@@ -3321,15 +3321,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let pool = self.pools.read();
 
-        // Common predicate — the r.batch_deleted_at/batch_id filter lets the
-        // partial index idx_requests_active_pagination skip requests belonging
-        // to soft-deleted batches without reading their heap pages. Kept the
-        // redundant b.deleted_at IS NULL as defense-in-depth in case the sync
-        // trigger is ever disabled.
         let where_clause = r#"
-            WHERE r.batch_deleted_at IS NULL
-              AND r.batch_id IS NOT NULL
-              AND b.deleted_at IS NULL
+            WHERE b.deleted_at IS NULL
               AND ($1::text IS NULL OR b.created_by = $1)
               AND ($2::text IS NULL OR b.completion_window = $2)
               AND ($3::text IS NULL OR r.state = $3)
@@ -12405,8 +12398,8 @@ mod tests {
             .unwrap();
         assert_eq!(before.total_count, 2);
 
-        // Soft-delete batch B — the sync trigger should propagate deleted_at
-        // to its requests.batch_deleted_at, making them invisible to the query.
+        // Soft-delete batch B — its requests should disappear from list_requests
+        // because the WHERE clause filters on b.deleted_at IS NULL.
         manager.delete_batch(batch_b.id).await.unwrap();
 
         let after = manager
