@@ -3321,15 +3321,55 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let pool = self.pools.read();
 
-        let where_clause = r#"
+        // Canonical status derivation (display side) — matches the logic used by
+        // batch status counts (`get_batch_status`, `get_batch`) so list results
+        // agree with batch summaries.
+        //
+        // Requests in cancelling batches are left with `state = 'pending'` in the
+        // row (cancel is an O(1) batch-level operation that intentionally does not
+        // touch child rows). We reproject through this CASE in the SELECT so
+        // callers see the canonical status ("canceled") instead of the raw row
+        // state ("pending").
+        //
+        // The status *filter* is handled separately (see status_predicate below)
+        // using explicit `r.state` predicates so the planner can still use
+        // `idx_requests_state` / `idx_requests_state_model`. The `active_first`
+        // ORDER BY also stays on the raw `r.state` CASE so the expression index
+        // `idx_requests_active_first_sort` remains matchable.
+        const CANONICAL_STATE: &str = "CASE \
+            WHEN r.state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL THEN 'canceled' \
+            ELSE r.state \
+        END";
+
+        // Status filter rewritten as sargable disjuncts.
+        // Default (status IS NULL): exclude canonical-canceled. This hides
+        // orphaned pending rows from cancelling batches (and real canceled rows)
+        // from the default view — they show up when the caller explicitly asks
+        // for `status=canceled`.
+        let status_predicate = r#"(
+            ($3::text IS NULL AND (
+                r.state IN ('completed', 'failed')
+                OR (r.state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NULL)
+            ))
+            OR ($3 = 'canceled' AND (
+                r.state = 'canceled'
+                OR (r.state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)
+            ))
+            OR ($3 IN ('pending', 'claimed', 'processing') AND r.state = $3 AND b.cancelling_at IS NULL)
+            OR ($3 IN ('completed', 'failed') AND r.state = $3)
+        )"#;
+
+        let where_clause = format!(
+            r#"
             WHERE b.deleted_at IS NULL
               AND ($1::text IS NULL OR b.created_by = $1)
               AND ($2::text IS NULL OR b.completion_window = $2)
-              AND ($3::text IS NULL OR r.state = $3)
+              AND {status_predicate}
               AND ($4::text[] IS NULL OR r.model = ANY($4))
               AND ($5::timestamptz IS NULL OR r.created_at >= $5)
               AND ($6::timestamptz IS NULL OR r.created_at <= $6)
-        "#;
+        "#
+        );
 
         // Total count: try exact COUNT(*) with a short statement_timeout so
         // narrow / small result sets return an accurate number; fall back to
@@ -3410,6 +3450,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 .unwrap_or(0)
         };
 
+        // active_first sorts by raw `r.state` so the expression index
+        // `idx_requests_active_first_sort` stays usable (the index is defined on
+        // `CASE state ...`, request-local columns only). Orphaned pending rows
+        // from cancelling batches *are* excluded from the default view by the
+        // status predicate above, so there's no need to demote them via ORDER BY.
         let order_clause = if filter.active_first {
             "CASE r.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, r.created_at DESC, r.id DESC"
         } else {
@@ -3419,7 +3464,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let data: Vec<crate::request::RequestSummary> = sqlx::query_as(&format!(
             r#"
             SELECT
-                r.id, r.batch_id, r.model, r.state, r.created_at,
+                r.id, r.batch_id, r.model,
+                {CANONICAL_STATE} as state,
+                r.created_at,
                 r.completed_at, r.failed_at,
                 (CASE WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
                     THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
@@ -3455,10 +3502,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     ) -> Result<crate::request::RequestDetail> {
         let pool = self.pools.read();
 
+        // Canonical status — see `list_requests` for rationale. A request in a
+        // cancelling batch is reported as "canceled" even though the row's raw
+        // `state` is still "pending" (cancel is a batch-level O(1) operation).
         let detail: crate::request::RequestDetail = sqlx::query_as(
             r#"
             SELECT
-                r.id, r.batch_id, r.model, r.state, r.created_at,
+                r.id, r.batch_id, r.model,
+                CASE
+                    WHEN r.state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL THEN 'canceled'
+                    ELSE r.state
+                END as state,
+                r.created_at,
                 r.completed_at, r.failed_at,
                 (CASE WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
                     THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
@@ -12506,6 +12561,125 @@ mod tests {
             "requests from soft-deleted batches should be filtered out"
         );
         assert_eq!(after.data.len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn test_cancelling_batch_reports_requests_as_canceled(pool: sqlx::PgPool) {
+        // Regression: cancel_batch is a batch-level O(1) operation that sets
+        // cancelling_at/cancelled_at on the batch row but intentionally leaves the
+        // children in state='pending'. Downstream list/detail reads must re-derive
+        // the canonical status through the same CASE the count queries use,
+        // otherwise cancelled batches appear as perpetual pending work.
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "cancel-visibility".to_string(),
+                None,
+                (0..3)
+                    .map(|i| RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: format!(r#"{{"n":{}}}"#, i),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch_id = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap()
+            .id;
+
+        // Before cancel: all three report as pending.
+        let before = manager
+            .list_requests(crate::request::ListRequestsFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(before.total_count, 3);
+        assert!(
+            before.data.iter().all(|r| r.status == "pending"),
+            "expected all pending before cancel, got {:?}",
+            before.data.iter().map(|r| &r.status).collect::<Vec<_>>()
+        );
+
+        manager.cancel_batch(batch_id).await.unwrap();
+
+        // Default list (status IS NULL) excludes canonical-canceled, so the
+        // orphaned pending rows from the cancelled batch should not appear.
+        // This keeps the default view clean when tenants have large numbers
+        // of historical cancelled batches.
+        let default_view = manager
+            .list_requests(crate::request::ListRequestsFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            default_view.total_count, 0,
+            "default list must exclude canonical-canceled rows"
+        );
+        assert!(default_view.data.is_empty());
+
+        // status=pending filter must exclude the cancelled-batch children.
+        let pending_only = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                status: Some("pending".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_only.total_count, 0,
+            "no requests should match status=pending when their batch is cancelling"
+        );
+        assert!(pending_only.data.is_empty());
+
+        // status=canceled filter includes both real canceled rows *and*
+        // orphaned pending/claimed/processing rows from cancelling batches —
+        // the only way to see them in a list view.
+        let canceled_only = manager
+            .list_requests(crate::request::ListRequestsFilter {
+                status: Some("canceled".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(canceled_only.total_count, 3);
+        assert_eq!(canceled_only.data.len(), 3);
+        assert!(
+            canceled_only.data.iter().all(|r| r.status == "canceled"),
+            "status=canceled must project canonical status for display, got {:?}",
+            canceled_only
+                .data
+                .iter()
+                .map(|r| &r.status)
+                .collect::<Vec<_>>()
+        );
+
+        // get_request_detail must report the same canonical canceled status.
+        let detail = manager
+            .get_request_detail(crate::request::RequestId(canceled_only.data[0].id))
+            .await
+            .unwrap();
+        assert_eq!(detail.status, "canceled");
     }
 
     #[sqlx::test]
