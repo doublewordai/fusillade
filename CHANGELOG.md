@@ -1,5 +1,17 @@
 # Changelog
 
+## [16.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.1.3...fusillade-v16.2.0) (2026-04-17)
+
+
+### Features
+
+* add cascade_batch_state_to_requests method ([#229](https://github.com/doublewordai/fusillade/issues/229)) ([dc91537](https://github.com/doublewordai/fusillade/commit/dc91537a46e2e2b1c4ff56bc266fd74c1bd2d9e6))
+
+
+### Bug Fixes
+
+* list_requests/get_request_detail project canonical state on cancel ([#226](https://github.com/doublewordai/fusillade/issues/226)) ([56e97d3](https://github.com/doublewordai/fusillade/commit/56e97d35334a82ed491681220198f46c125e132e))
+
 ## [16.1.3](https://github.com/doublewordai/fusillade/compare/fusillade-v16.1.2...fusillade-v16.1.3) (2026-04-16)
 
 
