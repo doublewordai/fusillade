@@ -2945,7 +2945,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     r#"
                     UPDATE requests
                     SET state = 'failed',
-                        failed_at = COALESCE(failed_at, NOW())
+                        failed_at = COALESCE(failed_at, NOW()),
+                        error = COALESCE(error, 'batch reached terminal state')
                     WHERE batch_id = $1
                       AND state IN ('pending', 'claimed', 'processing')
                     "#,
@@ -5811,6 +5812,102 @@ mod tests {
         assert_eq!(completed_count, 1);
         assert_eq!(failed_count, 1);
         assert_eq!(canceled_count, 3);
+    }
+
+    #[sqlx::test]
+    async fn test_cascade_batch_state_to_requests_failed(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "cascade-failed-test".to_string(),
+                None,
+                (0..4)
+                    .map(|i| RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: format!(r#"{{"n":{}}}"#, i),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests.len(), 4);
+        let req_ids: Vec<RequestId> = requests.iter().map(|r| r.id()).collect();
+
+        // Complete request 0
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = '{"ok":true}',
+                claimed_at = NOW(),
+                started_at = NOW(),
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *req_ids[0] as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Requests 1, 2, 3 remain pending
+
+        // Cascade to failed
+        let rows_updated = manager
+            .cascade_batch_state_to_requests(batch.id, CascadeTargetState::Failed)
+            .await
+            .unwrap();
+        assert_eq!(rows_updated, 3);
+
+        // Verify final states via get_batch_requests (exercises row deserialization)
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests.len(), 4);
+
+        let mut completed_count = 0;
+        let mut failed_count = 0;
+        for req in &requests {
+            match req {
+                AnyRequest::Completed(_) => completed_count += 1,
+                AnyRequest::Failed(_) => failed_count += 1,
+                other => panic!("Unexpected state for request {:?}", other.id()),
+            }
+        }
+        assert_eq!(completed_count, 1);
+        assert_eq!(failed_count, 3);
+
+        // Second cascade is a no-op
+        let rows_updated = manager
+            .cascade_batch_state_to_requests(batch.id, CascadeTargetState::Failed)
+            .await
+            .unwrap();
+        assert_eq!(rows_updated, 0);
     }
 
     #[sqlx::test]
