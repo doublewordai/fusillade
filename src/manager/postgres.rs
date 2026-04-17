@@ -2946,7 +2946,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     UPDATE requests
                     SET state = 'failed',
                         failed_at = COALESCE(failed_at, NOW()),
-                        error = COALESCE(error, '{"type":"TaskTerminated"}')
+                        error = COALESCE(error, '{"type":"BatchTerminated"}'),
+                        response_size = CASE
+                            WHEN COALESCE(response_size, 0) = 0
+                                THEN octet_length(COALESCE(error, '{"type":"BatchTerminated"}'))
+                            ELSE response_size
+                        END
                     WHERE batch_id = $1
                       AND state IN ('pending', 'claimed', 'processing')
                     "#,

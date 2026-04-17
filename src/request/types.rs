@@ -214,6 +214,10 @@ pub enum FailureReason {
     /// This includes invalid header values, malformed URLs, or other builder errors.
     /// These are data errors that will never succeed on retry.
     RequestBuilderError { error: String },
+
+    /// The request's batch reached a terminal state (cancelled, failed, or expired)
+    /// before this request could be processed. Not retriable.
+    BatchTerminated,
 }
 
 impl FailureReason {
@@ -226,6 +230,7 @@ impl FailureReason {
             FailureReason::Timeout { .. } => true,
             FailureReason::TaskTerminated => true,
             FailureReason::RequestBuilderError { .. } => false,
+            FailureReason::BatchTerminated => false,
         }
     }
 
@@ -238,6 +243,7 @@ impl FailureReason {
             FailureReason::Timeout { .. } => "timeout",
             FailureReason::TaskTerminated => "task_terminated",
             FailureReason::RequestBuilderError { .. } => "builder_error",
+            FailureReason::BatchTerminated => "batch_terminated",
         }
     }
 
@@ -272,6 +278,9 @@ impl FailureReason {
                 format!("Request timed out: {}", error)
             }
             FailureReason::TaskTerminated => "HTTP task terminated unexpectedly".to_string(),
+            FailureReason::BatchTerminated => {
+                "Request was not processed because its batch reached a terminal state".to_string()
+            }
             FailureReason::RequestBuilderError { error } => {
                 format!("Failed to build HTTP request: {}", error)
             }
