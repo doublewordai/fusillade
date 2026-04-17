@@ -2941,21 +2941,24 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 .await
             }
             CascadeTargetState::Failed => {
+                let default_error = serde_json::to_string(&FailureReason::BatchTerminated)
+                    .expect("FailureReason serialization cannot fail");
                 sqlx::query!(
                     r#"
                     UPDATE requests
                     SET state = 'failed',
                         failed_at = COALESCE(failed_at, NOW()),
-                        error = COALESCE(error, '{"type":"BatchTerminated"}'),
+                        error = COALESCE(error, $2),
                         response_size = CASE
                             WHEN COALESCE(response_size, 0) = 0
-                                THEN octet_length(COALESCE(error, '{"type":"BatchTerminated"}'))
+                                THEN octet_length(COALESCE(error, $2))
                             ELSE response_size
                         END
                     WHERE batch_id = $1
                       AND state IN ('pending', 'claimed', 'processing')
                     "#,
                     *batch_id as Uuid,
+                    default_error,
                 )
                 .execute(self.pools.write())
                 .await
@@ -5932,12 +5935,28 @@ mod tests {
         for req in &requests {
             match req {
                 AnyRequest::Completed(_) => completed_count += 1,
-                AnyRequest::Failed(_) => failed_count += 1,
+                AnyRequest::Failed(r) => {
+                    assert_eq!(r.state.reason, FailureReason::BatchTerminated);
+                    failed_count += 1;
+                }
                 other => panic!("Unexpected state for request {:?}", other.id()),
             }
         }
         assert_eq!(completed_count, 1);
         assert_eq!(failed_count, 3);
+
+        // Verify response_size is set for cascaded failures
+        let row = sqlx::query!(
+            "SELECT response_size FROM requests WHERE batch_id = $1 AND state = 'failed'",
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let expected_size = serde_json::to_string(&FailureReason::BatchTerminated)
+            .unwrap()
+            .len() as i64;
+        assert_eq!(row.response_size, expected_size);
 
         // Second cascade is a no-op
         let rows_updated = manager
