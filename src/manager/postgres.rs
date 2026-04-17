@@ -36,8 +36,8 @@ use crate::daemon::{
 use crate::error::{FusilladeError, Result};
 use crate::http::HttpClient;
 use crate::request::{
-    Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, Pending, Processing, Request,
-    RequestData, RequestId, RequestState,
+    Canceled, CascadeTargetState, Claimed, Completed, DaemonId, Failed, FailureReason, Pending,
+    Processing, Request, RequestData, RequestId, RequestState,
 };
 
 use super::DaemonExecutor;
@@ -2919,6 +2919,54 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(batch_id = %batch_id, target_state = target_state.as_str()))]
+    async fn cascade_batch_state_to_requests(
+        &self,
+        batch_id: BatchId,
+        target_state: CascadeTargetState,
+    ) -> Result<u64> {
+        let rows_affected = match target_state {
+            CascadeTargetState::Canceled => {
+                sqlx::query!(
+                    r#"
+                    UPDATE requests
+                    SET state = 'canceled',
+                        canceled_at = COALESCE(canceled_at, NOW())
+                    WHERE batch_id = $1
+                      AND state IN ('pending', 'claimed', 'processing')
+                    "#,
+                    *batch_id as Uuid,
+                )
+                .execute(self.pools.write())
+                .await
+            }
+            CascadeTargetState::Failed => {
+                sqlx::query!(
+                    r#"
+                    UPDATE requests
+                    SET state = 'failed',
+                        failed_at = COALESCE(failed_at, NOW())
+                    WHERE batch_id = $1
+                      AND state IN ('pending', 'claimed', 'processing')
+                    "#,
+                    *batch_id as Uuid,
+                )
+                .execute(self.pools.write())
+                .await
+            }
+        }
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to cascade batch state to requests: {}",
+                e
+            ))
+        })?;
+
+        tracing::info!(rows_updated = rows_affected.rows_affected(), "Cascaded batch state to requests");
+
+        Ok(rows_affected.rows_affected())
+    }
+
     async fn delete_batch(&self, batch_id: BatchId) -> Result<()> {
         // Soft-delete the batch by setting deleted_at
         // Also cancel it if not already in a terminal state
@@ -5654,6 +5702,171 @@ mod tests {
         for request in requests {
             assert!(matches!(request, AnyRequest::Pending(_)));
         }
+    }
+
+    #[sqlx::test]
+    async fn test_cascade_batch_state_to_requests(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Create a file with 5 templates
+        let file_id = manager
+            .create_file(
+                "cascade-test".to_string(),
+                None,
+                (0..5)
+                    .map(|i| RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: format!(r#"{{"n":{}}}"#, i),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests.len(), 5);
+        let req_ids: Vec<RequestId> = requests.iter().map(|r| r.id()).collect();
+
+        // Complete request 0
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = '{"ok":true}',
+                claimed_at = NOW(),
+                started_at = NOW(),
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *req_ids[0] as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Fail request 1
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'failed',
+                error = 'test error',
+                failed_at = NOW(),
+                retry_attempt = 1
+            WHERE id = $1
+            "#,
+            *req_ids[1] as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Requests 2, 3, 4 remain pending
+
+        // Cascade to canceled
+        let rows_updated = manager
+            .cascade_batch_state_to_requests(batch.id, CascadeTargetState::Canceled)
+            .await
+            .unwrap();
+        assert_eq!(rows_updated, 3);
+
+        // Verify final states
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests.len(), 5);
+
+        let mut completed_count = 0;
+        let mut failed_count = 0;
+        let mut canceled_count = 0;
+        for req in &requests {
+            match req {
+                AnyRequest::Completed(_) => completed_count += 1,
+                AnyRequest::Failed(_) => failed_count += 1,
+                AnyRequest::Canceled(_) => canceled_count += 1,
+                other => panic!("Unexpected state: {:?}", other.id()),
+            }
+        }
+        assert_eq!(completed_count, 1);
+        assert_eq!(failed_count, 1);
+        assert_eq!(canceled_count, 3);
+    }
+
+    #[sqlx::test]
+    async fn test_cascade_is_idempotent(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "cascade-idempotent-test".to_string(),
+                None,
+                (0..3)
+                    .map(|i| RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: format!(r#"{{"n":{}}}"#, i),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        // First cascade
+        let rows_updated = manager
+            .cascade_batch_state_to_requests(batch.id, CascadeTargetState::Canceled)
+            .await
+            .unwrap();
+        assert_eq!(rows_updated, 3);
+
+        // Second cascade — should be a no-op
+        let rows_updated = manager
+            .cascade_batch_state_to_requests(batch.id, CascadeTargetState::Canceled)
+            .await
+            .unwrap();
+        assert_eq!(rows_updated, 0);
     }
 
     #[sqlx::test]

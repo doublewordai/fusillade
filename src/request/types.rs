@@ -302,6 +302,28 @@ pub struct Canceled {
 
 impl RequestState for Canceled {}
 
+/// Target state for cascading a batch's terminal state to its in-flight requests.
+///
+/// Used by `cascade_batch_state_to_requests` to transition pending/claimed/processing
+/// requests into the appropriate terminal state, updating the correct timestamp column
+/// for each variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CascadeTargetState {
+    /// Cascade to canceled — sets `canceled_at`.
+    Canceled,
+    /// Cascade to failed — sets `failed_at`.
+    Failed,
+}
+
+impl CascadeTargetState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CascadeTargetState::Canceled => "canceled",
+            CascadeTargetState::Failed => "failed",
+        }
+    }
+}
+
 /// Unique identifier for a request in the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
