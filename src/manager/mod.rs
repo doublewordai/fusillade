@@ -11,8 +11,8 @@ use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::http::HttpClient;
 use crate::request::{
-    AnyRequest, Claimed, DaemonId, ListRequestsFilter, Request, RequestDetail, RequestId,
-    RequestListResult, RequestState,
+    AnyRequest, CascadeTargetState, Claimed, DaemonId, ListRequestsFilter, Request, RequestDetail,
+    RequestId, RequestListResult, RequestState,
 };
 use async_trait::async_trait;
 use futures::stream::Stream;
@@ -198,6 +198,20 @@ pub trait Storage: Send + Sync {
 
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
+
+    /// Transition in-flight child requests (pending, claimed, processing) to a
+    /// terminal state after a batch has been cancelled, failed, or expired.
+    ///
+    /// Intended to be called asynchronously by the caller after the batch has
+    /// already reached a terminal state. Requests already in a terminal state
+    /// (completed, failed, canceled) are left untouched.
+    ///
+    /// Returns the number of rows updated.
+    async fn cascade_batch_state_to_requests(
+        &self,
+        batch_id: BatchId,
+        target_state: CascadeTargetState,
+    ) -> Result<u64>;
 
     /// Delete a batch and all its associated requests.
     /// This is a destructive operation that removes the batch and all request data.

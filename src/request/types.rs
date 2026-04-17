@@ -214,6 +214,10 @@ pub enum FailureReason {
     /// This includes invalid header values, malformed URLs, or other builder errors.
     /// These are data errors that will never succeed on retry.
     RequestBuilderError { error: String },
+
+    /// The request's batch reached a terminal state (cancelled, failed, or expired)
+    /// before this request could be processed. Not retriable.
+    BatchTerminated,
 }
 
 impl FailureReason {
@@ -226,6 +230,7 @@ impl FailureReason {
             FailureReason::Timeout { .. } => true,
             FailureReason::TaskTerminated => true,
             FailureReason::RequestBuilderError { .. } => false,
+            FailureReason::BatchTerminated => false,
         }
     }
 
@@ -238,6 +243,7 @@ impl FailureReason {
             FailureReason::Timeout { .. } => "timeout",
             FailureReason::TaskTerminated => "task_terminated",
             FailureReason::RequestBuilderError { .. } => "builder_error",
+            FailureReason::BatchTerminated => "batch_terminated",
         }
     }
 
@@ -272,6 +278,9 @@ impl FailureReason {
                 format!("Request timed out: {}", error)
             }
             FailureReason::TaskTerminated => "HTTP task terminated unexpectedly".to_string(),
+            FailureReason::BatchTerminated => {
+                "Request was not processed because its batch reached a terminal state".to_string()
+            }
             FailureReason::RequestBuilderError { error } => {
                 format!("Failed to build HTTP request: {}", error)
             }
@@ -301,6 +310,28 @@ pub struct Canceled {
 }
 
 impl RequestState for Canceled {}
+
+/// Target state for cascading a batch's terminal state to its in-flight requests.
+///
+/// Used by `cascade_batch_state_to_requests` to transition pending/claimed/processing
+/// requests into the appropriate terminal state, updating the correct timestamp column
+/// for each variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CascadeTargetState {
+    /// Cascade to canceled — sets `canceled_at`.
+    Canceled,
+    /// Cascade to failed — sets `failed_at`.
+    Failed,
+}
+
+impl CascadeTargetState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CascadeTargetState::Canceled => "canceled",
+            CascadeTargetState::Failed => "failed",
+        }
+    }
+}
 
 /// Unique identifier for a request in the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
