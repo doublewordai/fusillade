@@ -2956,13 +2956,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             }
         }
         .map_err(|e| {
-            FusilladeError::Other(anyhow!(
-                "Failed to cascade batch state to requests: {}",
-                e
-            ))
+            FusilladeError::Other(anyhow!("Failed to cascade batch state to requests: {}", e))
         })?;
 
-        tracing::info!(rows_updated = rows_affected.rows_affected(), "Cascaded batch state to requests");
+        tracing::info!(
+            rows_updated = rows_affected.rows_affected(),
+            "Cascaded batch state to requests"
+        );
 
         Ok(rows_affected.rows_affected())
     }
