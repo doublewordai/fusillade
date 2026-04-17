@@ -2946,7 +2946,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     UPDATE requests
                     SET state = 'failed',
                         failed_at = COALESCE(failed_at, NOW()),
-                        error = COALESCE(error, 'batch reached terminal state')
+                        error = COALESCE(error, '{"type":"TaskTerminated"}')
                     WHERE batch_id = $1
                       AND state IN ('pending', 'claimed', 'processing')
                     "#,
@@ -5713,12 +5713,13 @@ mod tests {
             http_client,
         );
 
-        // Create a file with 5 templates
+        // Create a file with 7 templates:
+        // 0=completed, 1=failed, 2=claimed, 3=processing, 4..6=pending
         let file_id = manager
             .create_file(
                 "cascade-test".to_string(),
                 None,
-                (0..5)
+                (0..7)
                     .map(|i| RequestTemplateInput {
                         custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
@@ -5748,7 +5749,7 @@ mod tests {
             .unwrap();
 
         let requests = manager.get_batch_requests(batch.id).await.unwrap();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 7);
         let req_ids: Vec<RequestId> = requests.iter().map(|r| r.id()).collect();
 
         // Complete request 0
@@ -5785,18 +5786,49 @@ mod tests {
         .await
         .unwrap();
 
-        // Requests 2, 3, 4 remain pending
+        // Claim request 2
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'claimed',
+                daemon_id = gen_random_uuid(),
+                claimed_at = NOW()
+            WHERE id = $1
+            "#,
+            *req_ids[2] as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        // Cascade to canceled
+        // Process request 3
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'processing',
+                daemon_id = gen_random_uuid(),
+                claimed_at = NOW(),
+                started_at = NOW()
+            WHERE id = $1
+            "#,
+            *req_ids[3] as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Requests 4, 5, 6 remain pending
+
+        // Cascade to canceled — should transition claimed, processing, and pending
         let rows_updated = manager
             .cascade_batch_state_to_requests(batch.id, CascadeTargetState::Canceled)
             .await
             .unwrap();
-        assert_eq!(rows_updated, 3);
+        assert_eq!(rows_updated, 5);
 
-        // Verify final states
+        // Verify final states via get_batch_requests (exercises deserialization)
         let requests = manager.get_batch_requests(batch.id).await.unwrap();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 7);
 
         let mut completed_count = 0;
         let mut failed_count = 0;
@@ -5811,7 +5843,7 @@ mod tests {
         }
         assert_eq!(completed_count, 1);
         assert_eq!(failed_count, 1);
-        assert_eq!(canceled_count, 3);
+        assert_eq!(canceled_count, 5);
     }
 
     #[sqlx::test]

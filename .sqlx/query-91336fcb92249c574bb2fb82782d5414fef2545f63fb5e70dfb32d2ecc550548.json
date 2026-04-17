@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE requests\n                    SET state = 'failed',\n                        failed_at = COALESCE(failed_at, NOW()),\n                        error = COALESCE(error, '{\"type\":\"TaskTerminated\"}')\n                    WHERE batch_id = $1\n                      AND state IN ('pending', 'claimed', 'processing')\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "91336fcb92249c574bb2fb82782d5414fef2545f63fb5e70dfb32d2ecc550548"
+}
