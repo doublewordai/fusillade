@@ -10,6 +10,15 @@ use uuid::Uuid;
 /// Default number of rows to return when limit is not specified.
 const DEFAULT_LIMIT: i64 = 50;
 
+/// Derive the request type from the batch completion window.
+/// "1h" → "async", everything else → "batch".
+pub fn request_type_from_completion_window(completion_window: &str) -> &'static str {
+    match completion_window {
+        "1h" => "async",
+        _ => "batch",
+    }
+}
+
 /// Filter parameters for listing requests across batches.
 #[derive(Debug, Clone)]
 pub struct ListRequestsFilter {
@@ -26,6 +35,9 @@ pub struct ListRequestsFilter {
     pub created_after: Option<DateTime<Utc>>,
     /// Only return requests created before this timestamp
     pub created_before: Option<DateTime<Utc>>,
+    /// Filter by request type ("async" or "batch"). When set, the query
+    /// uses the partial index for that type, avoiding a full index scan.
+    pub request_type: Option<String>,
     /// Sort active requests (pending/claimed/processing) first
     pub active_first: bool,
     /// Number of rows to skip (offset pagination)
@@ -43,6 +55,7 @@ impl Default for ListRequestsFilter {
             models: None,
             created_after: None,
             created_before: None,
+            request_type: None,
             active_first: false,
             skip: 0,
             limit: DEFAULT_LIMIT,
@@ -67,6 +80,7 @@ pub struct RequestSummary {
     pub failed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
+    pub request_type: String,
     /// Batch creator ID (user ID or org ID) — for ownership checks and email lookup
     pub batch_created_by: String,
 }
@@ -96,6 +110,7 @@ mod deprecated_types {
         pub failed_at: Option<DateTime<Utc>>,
         pub duration_ms: Option<f64>,
         pub response_status: Option<i16>,
+        pub request_type: String,
         pub batch_created_by: String,
         pub total_count: i64,
     }
@@ -112,6 +127,7 @@ mod deprecated_types {
                 failed_at: r.failed_at,
                 duration_ms: r.duration_ms,
                 response_status: r.response_status,
+                request_type: r.request_type,
                 batch_created_by: r.batch_created_by,
             }
         }
@@ -140,6 +156,7 @@ pub struct RequestDetail {
     pub response_body: Option<String>,
     pub error: Option<String>,
     pub completion_window: String,
+    pub request_type: String,
     pub batch_created_by: String,
 }
 

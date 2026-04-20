@@ -4,6 +4,7 @@ use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retr
 use fusillade::http::{HttpResponse, MockHttpClient};
 use fusillade::manager::postgres::PostgresRequestManager;
 use fusillade::manager::{DaemonExecutor, Storage};
+use fusillade::request::ListRequestsFilter;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2385,5 +2386,190 @@ mod queue_counts {
             .insert("24h".to_string(), 2);
 
         assert_eq!(counts, expected);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_populate_batch_sets_request_type(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+        model_concurrency_limits.insert("test-model".to_string(), 10);
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            model_concurrency_limits,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        let template = RequestTemplateInput {
+            custom_id: None,
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/test".to_string(),
+            body: r#"{"prompt":"test"}"#.to_string(),
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+        };
+
+        // Create a batch with completion_window = "1h" → request_type = "async"
+        let file_id_1h = manager
+            .create_file("file-1h".to_string(), None, vec![template.clone()])
+            .await
+            .unwrap();
+        let batch_1h = manager
+            .create_batch(BatchInput {
+                file_id: file_id_1h,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+        let requests_1h = manager.get_batch_requests(batch_1h.id).await.unwrap();
+        assert_eq!(requests_1h.len(), 1);
+        let detail_1h = manager
+            .get_request_detail(requests_1h[0].id().into())
+            .await
+            .unwrap();
+        assert_eq!(detail_1h.request_type, "async");
+
+        // Create a batch with completion_window = "24h" → request_type = "batch"
+        let file_id_24h = manager
+            .create_file("file-24h".to_string(), None, vec![template.clone()])
+            .await
+            .unwrap();
+        let batch_24h = manager
+            .create_batch(BatchInput {
+                file_id: file_id_24h,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+        let requests_24h = manager.get_batch_requests(batch_24h.id).await.unwrap();
+        assert_eq!(requests_24h.len(), 1);
+        let detail_24h = manager
+            .get_request_detail(requests_24h[0].id().into())
+            .await
+            .unwrap();
+        assert_eq!(detail_24h.request_type, "batch");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_requests_filters_by_request_type(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+        model_concurrency_limits.insert("test-model".to_string(), 10);
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            model_concurrency_limits,
+            ..Default::default()
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                http_client.clone(),
+            )
+            .with_config(config),
+        );
+
+        let template = RequestTemplateInput {
+            custom_id: None,
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/test".to_string(),
+            body: r#"{"prompt":"test"}"#.to_string(),
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+        };
+
+        // Create a 1h batch (async) with 1 request
+        let file_id_1h = manager
+            .create_file("file-1h".to_string(), None, vec![template.clone()])
+            .await
+            .unwrap();
+        manager
+            .create_batch(BatchInput {
+                file_id: file_id_1h,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        // Create a 24h batch (batch) with 1 request
+        let file_id_24h = manager
+            .create_file("file-24h".to_string(), None, vec![template.clone()])
+            .await
+            .unwrap();
+        manager
+            .create_batch(BatchInput {
+                file_id: file_id_24h,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        // Filter by request_type = "async" — only the 1h request
+        let async_result = manager
+            .list_requests(ListRequestsFilter {
+                request_type: Some("async".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(async_result.data.len(), 1);
+        assert_eq!(async_result.data[0].request_type, "async");
+
+        // Filter by request_type = "batch" — only the 24h request
+        let batch_result = manager
+            .list_requests(ListRequestsFilter {
+                request_type: Some("batch".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(batch_result.data.len(), 1);
+        assert_eq!(batch_result.data[0].request_type, "batch");
+
+        // No filter — both requests
+        let all_result = manager
+            .list_requests(ListRequestsFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(all_result.data.len(), 2);
     }
 }

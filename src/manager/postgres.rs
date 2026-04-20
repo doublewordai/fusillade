@@ -2361,16 +2361,29 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
             })?;
 
+        // Look up the batch's completion_window to derive request_type
+        let completion_window: String = sqlx::query_scalar!(
+            r#"SELECT completion_window FROM batches WHERE id = $1"#,
+            *batch_id as Uuid,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to fetch batch completion_window: {}", e))
+        })?;
+        let request_type = crate::request::request_type_from_completion_window(&completion_window);
+
         // Bulk insert requests from templates
         let rows_affected = sqlx::query!(
             r#"
-            INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt, model)
-            SELECT $1, id, 'pending', custom_id, 0, model
+            INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt, model, request_type)
+            SELECT $1, id, 'pending', custom_id, 0, model, $3
             FROM request_templates
             WHERE file_id = $2
             "#,
             *batch_id as Uuid,
             *file_id as Uuid,
+            request_type,
         )
         .execute(&mut *tx)
         .await
@@ -3386,6 +3399,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
               AND ($4::text[] IS NULL OR r.model = ANY($4))
               AND ($5::timestamptz IS NULL OR r.created_at >= $5)
               AND ($6::timestamptz IS NULL OR r.created_at <= $6)
+              AND ($7::text IS NULL OR r.request_type = $7)
         "#;
 
         // Total count: try exact COUNT(*) with a short statement_timeout so
@@ -3421,6 +3435,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     .bind(filter.models.as_deref())
                     .bind(filter.created_after)
                     .bind(filter.created_before)
+                    .bind(filter.request_type.as_deref())
                     .fetch_one(&mut *tx)
                     .await;
             match count_result {
@@ -3455,6 +3470,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .bind(filter.models.as_deref())
             .bind(filter.created_after)
             .bind(filter.created_before)
+            .bind(filter.request_type.as_deref())
             .fetch_one(pool)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to estimate count: {}", e)))?;
@@ -3482,12 +3498,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
                     ELSE NULL END)::float8 as duration_ms,
                 r.response_status,
+                r.request_type,
                 b.created_by as batch_created_by
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
             {where_clause}
             ORDER BY {order_clause}
-            LIMIT $7 OFFSET $8
+            LIMIT $8 OFFSET $9
             "#
         ))
         .bind(filter.created_by.as_deref())
@@ -3496,6 +3513,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(filter.models.as_deref())
         .bind(filter.created_after)
         .bind(filter.created_before)
+        .bind(filter.request_type.as_deref())
         .bind(filter.limit)
         .bind(filter.skip)
         .fetch_all(pool)
@@ -3522,7 +3540,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     ELSE NULL END)::float8 as duration_ms,
                 r.response_status,
                 t.body, r.response_body, r.error,
-                b.completion_window, b.created_by as batch_created_by
+                b.completion_window, r.request_type, b.created_by as batch_created_by
             FROM requests r
             JOIN batches b ON r.batch_id = b.id
             LEFT JOIN active_request_templates t ON r.template_id = t.id
