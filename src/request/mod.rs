@@ -12,9 +12,6 @@ pub mod types;
 // Re-export commonly used types
 #[allow(deprecated)]
 pub use query::RequestSummaryWithCount;
-pub use query::{
-    ListRequestsFilter, RequestDetail, RequestListResult, RequestSummary,
-    request_type_from_completion_window,
-};
+pub use query::{ListRequestsFilter, RequestDetail, RequestListResult, RequestSummary};
 pub use transitions::CancellationReason;
 pub use types::*;

@@ -12,7 +12,7 @@ const DEFAULT_LIMIT: i64 = 50;
 
 /// Derive the request type from the batch completion window.
 /// "1h" → "async", everything else → "batch".
-pub fn request_type_from_completion_window(completion_window: &str) -> &'static str {
+pub(crate) fn request_type_from_completion_window(completion_window: &str) -> &'static str {
     match completion_window {
         "1h" => "async",
         _ => "batch",
@@ -35,8 +35,9 @@ pub struct ListRequestsFilter {
     pub created_after: Option<DateTime<Utc>>,
     /// Only return requests created before this timestamp
     pub created_before: Option<DateTime<Utc>>,
-    /// Filter by request type ("async" or "batch"). When set, the query
-    /// uses the partial index for that type, avoiding a full index scan.
+    /// Filter by request type ("async" or "batch"). The existing partial
+    /// index accelerates the `"async"` case; other values fall back to
+    /// the full index.
     pub request_type: Option<String>,
     /// Sort active requests (pending/claimed/processing) first
     pub active_first: bool,

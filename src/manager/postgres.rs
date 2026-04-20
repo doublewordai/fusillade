@@ -2371,7 +2371,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to fetch batch completion_window: {}", e))
         })?;
-        let request_type = crate::request::request_type_from_completion_window(&completion_window);
+        let request_type =
+            crate::request::query::request_type_from_completion_window(&completion_window);
 
         // Bulk insert requests from templates
         let rows_affected = sqlx::query!(
