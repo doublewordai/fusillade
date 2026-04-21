@@ -220,6 +220,15 @@ pub struct DaemonConfig {
     /// exist. Default: 100.
     pub purge_throttle_ms: u64,
 
+    /// Interval for running the retention sweep task (milliseconds).
+    /// Soft-deletes expired batch artifacts; hard-deletes are still handled by
+    /// the purge task. Set to 0 to disable retention sweeps.
+    pub retention_interval_ms: u64,
+
+    /// Maximum number of batches/files to process per retention sweep pass.
+    /// Default: 100.
+    pub retention_batch_size: i64,
+
     /// Interval for emitting per-user throughput metrics via structured logs (milliseconds).
     /// Set to None to disable per-user throughput logging.
     /// Default: 60_000 (1 minute).
@@ -288,6 +297,8 @@ impl Default for DaemonConfig {
             purge_interval_ms: 600_000, // 10 minutes
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            retention_interval_ms: 0,
+            retention_batch_size: 100,
             throughput_log_interval_ms: Some(60_000), // Log per-user throughput every minute
             streamable_endpoints: Vec::new(),
             urgency_weight: 0.0,
@@ -653,6 +664,55 @@ where
                                 tracing::error!(error = %e, "Failed to purge orphaned rows");
                                 break;
                             }
+                        }
+                    }
+                }
+            });
+        }
+
+        if self.config.retention_interval_ms > 0 {
+            let storage = self.storage.clone();
+            let shutdown_token = self.shutdown_token.clone();
+            let retention_interval_ms = self.config.retention_interval_ms;
+            let retention_batch_size = self.config.retention_batch_size;
+
+            tokio::spawn(async move {
+                tracing::info!(
+                    interval_ms = retention_interval_ms,
+                    batch_size = retention_batch_size,
+                    "Retention sweep task started"
+                );
+
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(retention_interval_ms)) => {},
+                        _ = shutdown_token.cancelled() => {
+                            tracing::info!("Shutting down retention sweep task");
+                            break;
+                        }
+                    }
+
+                    match storage.sweep_expired_artifacts(retention_batch_size).await {
+                        Ok(summary) => {
+                            if summary.deleted_batches > 0 {
+                                counter!("fusillade_retention_batches_soft_deleted_total")
+                                    .increment(summary.deleted_batches as u64);
+                            }
+                            if summary.deleted_files > 0 {
+                                counter!("fusillade_retention_files_soft_deleted_total")
+                                    .increment(summary.deleted_files as u64);
+                            }
+                            if summary.deleted_batches > 0 || summary.deleted_files > 0 {
+                                tracing::info!(
+                                    deleted_batches = summary.deleted_batches,
+                                    deleted_files = summary.deleted_files,
+                                    "Retention sweep soft-deleted expired artifacts"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            counter!("fusillade_retention_errors_total").increment(1);
+                            tracing::error!(error = %e, "Failed to sweep expired artifacts");
                         }
                     }
                 }

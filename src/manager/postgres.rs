@@ -16,13 +16,13 @@ use futures::stream::Stream;
 use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::postgres::{PgListener, PgPool};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use super::{DaemonStorage, Storage};
+use super::{DaemonStorage, RetentionSweepSummary, Storage};
 use crate::batch::{
     Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchNotification,
     BatchOutputItem, BatchResponseDetails, BatchStatus, File, FileContentItem, FileId,
@@ -124,6 +124,19 @@ macro_rules! batch_from_dynamic_row {
             api_key_id: $row.get::<Option<Uuid>, _>("api_key_id"),
         }
     };
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DueBatchRow {
+    id: Uuid,
+    file_id: Option<Uuid>,
+    output_file_id: Option<Uuid>,
+    error_file_id: Option<Uuid>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DueFileRow {
+    id: Uuid,
 }
 
 /// Macro for extracting a [`BatchStatus`] from a dynamic query row (PgRow).
@@ -4707,6 +4720,89 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         Ok(daemons)
     }
 
+    async fn sweep_expired_artifacts(&self, batch_size: i64) -> Result<RetentionSweepSummary> {
+        let batch_size = batch_size.max(1);
+
+        let due_batches: Vec<DueBatchRow> = sqlx::query_as(
+            r#"
+            SELECT
+                b.id,
+                b.file_id,
+                b.output_file_id,
+                b.error_file_id
+            FROM batches b
+            WHERE b.deleted_at IS NULL
+              AND COALESCE(b.completed_at, b.failed_at, b.cancelled_at) IS NOT NULL
+              AND b.metadata IS NOT NULL
+              AND (b.metadata ->> $1) IS NOT NULL
+              AND (b.metadata ->> $1) ~ '^[0-9]+$'
+              AND COALESCE(b.completed_at, b.failed_at, b.cancelled_at)
+                    + make_interval(secs => (b.metadata ->> $1)::BIGINT) <= NOW()
+            ORDER BY COALESCE(b.completed_at, b.failed_at, b.cancelled_at) ASC, b.id ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(crate::RETENTION_TTL_METADATA_KEY)
+        .bind(batch_size)
+        .fetch_all(self.pools.write())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to query due batches for retention sweep: {}",
+                e
+            ))
+        })?;
+
+        let due_files: Vec<DueFileRow> = sqlx::query_as(
+            r#"
+            SELECT f.id
+            FROM files f
+            LEFT JOIN batches bi ON bi.file_id = f.id AND bi.deleted_at IS NULL
+            LEFT JOIN batches bo ON bo.output_file_id = f.id AND bo.deleted_at IS NULL
+            LEFT JOIN batches be ON be.error_file_id = f.id AND be.deleted_at IS NULL
+            WHERE f.deleted_at IS NULL
+              AND f.expires_at IS NOT NULL
+              AND f.expires_at <= NOW()
+              AND bi.id IS NULL
+              AND bo.id IS NULL
+              AND be.id IS NULL
+            ORDER BY f.expires_at ASC, f.id ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(batch_size)
+        .fetch_all(self.pools.write())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to query due standalone files for retention sweep: {}",
+                e
+            ))
+        })?;
+
+        let mut summary = RetentionSweepSummary::default();
+        let mut files_to_delete = HashSet::new();
+
+        for batch in due_batches {
+            self.delete_batch(BatchId(batch.id)).await?;
+            summary.deleted_batches += 1;
+            files_to_delete.extend(
+                [batch.file_id, batch.output_file_id, batch.error_file_id]
+                    .into_iter()
+                    .flatten(),
+            );
+        }
+
+        files_to_delete.extend(due_files.into_iter().map(|file| file.id));
+
+        for file_id in files_to_delete {
+            self.delete_file(FileId(file_id)).await?;
+            summary.deleted_files += 1;
+        }
+
+        Ok(summary)
+    }
+
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64> {
         // Step 1: Delete requests whose parent batch has been soft-deleted.
         // Must run before template deletion to prevent ON DELETE SET NULL on
@@ -4770,9 +4866,70 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         })?
         .rows_affected() as i64;
 
-        let total = (requests_deleted + templates_deleted) as u64;
+        // Step 3: Hard-delete soft-deleted batches after their requests are drained.
+        let batches_deleted = sqlx::query(
+            r#"
+            DELETE FROM batches b
+            WHERE b.id IN (
+                SELECT candidate.id
+                FROM batches candidate
+                WHERE candidate.deleted_at IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM requests r
+                      WHERE r.batch_id = candidate.id
+                  )
+                ORDER BY candidate.deleted_at ASC, candidate.id ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            "#,
+        )
+        .bind(batch_size)
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge soft-deleted batches: {}", e)))?
+        .rows_affected() as i64;
+
+        // Step 4: Hard-delete soft-deleted files after templates are drained and
+        // no batch row still references them.
+        let files_deleted = sqlx::query(
+            r#"
+            DELETE FROM files f
+            WHERE f.id IN (
+                SELECT candidate.id
+                FROM files candidate
+                WHERE candidate.deleted_at IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM request_templates rt
+                      WHERE rt.file_id = candidate.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM batches b
+                      WHERE b.file_id = candidate.id
+                         OR b.output_file_id = candidate.id
+                         OR b.error_file_id = candidate.id
+                  )
+                ORDER BY candidate.deleted_at ASC, candidate.id ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            "#,
+        )
+        .bind(batch_size)
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge soft-deleted files: {}", e)))?
+        .rows_affected() as i64;
+
+        let total = (requests_deleted + templates_deleted + batches_deleted + files_deleted) as u64;
         if total > 0 {
-            tracing::info!(requests_deleted, templates_deleted, "Purged orphaned rows");
+            tracing::info!(
+                requests_deleted,
+                templates_deleted,
+                batches_deleted,
+                files_deleted,
+                "Purged soft-deleted rows"
+            );
         }
 
         Ok(total)
@@ -10391,7 +10548,7 @@ mod tests {
         // Delete the file (soft-delete, orphans templates)
         manager.delete_file(file_id).await.unwrap();
 
-        // Purge should hard-delete the orphaned templates
+        // Purge should hard-delete the orphaned templates and then the drained file row
         let deleted = manager.purge_orphaned_rows(1000).await.unwrap();
         assert!(deleted >= 2, "Should have deleted at least 2 templates");
 
@@ -10404,6 +10561,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count_after, 0);
+
+        let file_count: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM files WHERE id = $1",
+            *file_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            file_count, 0,
+            "Drained soft-deleted file should be hard-deleted"
+        );
 
         // Second purge should return 0
         let deleted_again = manager.purge_orphaned_rows(1000).await.unwrap();
@@ -10475,7 +10644,7 @@ mod tests {
         // Delete the batch (soft-delete)
         manager.delete_batch(batch.id).await.unwrap();
 
-        // Purge should hard-delete the orphaned requests
+        // Purge should hard-delete the orphaned requests and then the drained batch row
         let deleted = manager.purge_orphaned_rows(1000).await.unwrap();
         assert!(deleted >= 2, "Should have deleted at least 2 requests");
 
@@ -10488,6 +10657,173 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count_after, 0);
+
+        let batch_count: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM batches WHERE id = $1",
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            batch_count, 0,
+            "Drained soft-deleted batch should be hard-deleted"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_retention_sweep_soft_deletes_then_purge_hard_deletes_batch_artifacts(
+        pool: sqlx::PgPool,
+    ) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let input_file_id = Uuid::new_v4();
+        let output_file_id = Uuid::new_v4();
+        let error_file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let template_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let metadata = serde_json::json!({
+            crate::RETENTION_TTL_METADATA_KEY: "0"
+        });
+
+        sqlx::query(
+            r#"
+            INSERT INTO files (id, name, purpose, status, size_bytes, size_finalized, created_at, updated_at, expires_at)
+            VALUES ($1, 'input.jsonl', 'batch', 'processed', 1, TRUE, NOW() - INTERVAL '2 hours', NOW(), NOW() - INTERVAL '1 hour'),
+                   ($2, 'output.jsonl', 'batch_output', 'processed', 1, TRUE, NOW() - INTERVAL '2 hours', NOW(), NOW() - INTERVAL '1 hour'),
+                   ($3, 'error.jsonl', 'batch_error', 'processed', 1, TRUE, NOW() - INTERVAL '2 hours', NOW(), NOW() - INTERVAL '1 hour')
+            "#,
+        )
+        .bind(input_file_id)
+        .bind(output_file_id)
+        .bind(error_file_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method, created_at, updated_at)
+            VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', '{}', 'req-0', 'POST', NOW(), NOW())
+            "#,
+        )
+        .bind(template_id)
+        .bind(input_file_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO batches (
+                id, created_by, file_id, endpoint, completion_window, expires_at, created_at,
+                total_requests, completed_at, metadata, output_file_id, error_file_id
+            )
+            VALUES (
+                $1, $2, $3, '/v1/chat/completions', '24h', NOW() + INTERVAL '24 hours',
+                NOW() - INTERVAL '2 hours', 1, NOW() - INTERVAL '1 hour', $4, $5, $6
+            )
+            "#,
+        )
+        .bind(batch_id)
+        .bind(Uuid::new_v4().to_string())
+        .bind(input_file_id)
+        .bind(metadata)
+        .bind(output_file_id)
+        .bind(error_file_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO requests (
+                id, batch_id, template_id, endpoint, method, path, body, model, api_key,
+                state, response_status, response_body, response_size, created_at, updated_at, completed_at
+            )
+            VALUES (
+                $1, $2, $3, 'http://test', 'POST', '/v1/chat/completions', '{}', 'test-model', 'test-key',
+                'completed', 200, '{}', 2, NOW() - INTERVAL '2 hours', NOW(), NOW() - INTERVAL '1 hour'
+            )
+            "#,
+        )
+        .bind(request_id)
+        .bind(batch_id)
+        .bind(template_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let summary = crate::manager::DaemonStorage::sweep_expired_artifacts(&manager, 1000)
+            .await
+            .unwrap();
+        assert_eq!(summary.deleted_batches, 1);
+        assert_eq!(summary.deleted_files, 3);
+
+        let soft_deleted_batches: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM batches WHERE id = $1 AND deleted_at IS NOT NULL",
+            batch_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(soft_deleted_batches, 1);
+
+        let soft_deleted_files: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM files WHERE id = ANY($1) AND deleted_at IS NOT NULL",
+            &vec![input_file_id, output_file_id, error_file_id],
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(soft_deleted_files, 3);
+
+        let purged = manager.purge_orphaned_rows(1000).await.unwrap();
+        assert!(
+            purged >= 6,
+            "expected requests/templates/batch/files to be purged"
+        );
+
+        let remaining_requests: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM requests WHERE batch_id = $1",
+            batch_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining_requests, 0);
+
+        let remaining_templates: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM request_templates WHERE file_id = $1",
+            input_file_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining_templates, 0);
+
+        let remaining_batches: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM batches WHERE id = $1",
+            batch_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining_batches, 0);
+
+        let remaining_files: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM files WHERE id = ANY($1)",
+            &vec![input_file_id, output_file_id, error_file_id],
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining_files, 0);
     }
 
     #[sqlx::test]
@@ -10619,7 +10955,7 @@ mod tests {
         assert_eq!(deleted_third, 3);
 
         let deleted_fourth = manager.purge_orphaned_rows(3).await.unwrap();
-        assert_eq!(deleted_fourth, 1, "Only 1 remaining");
+        assert_eq!(deleted_fourth, 2, "Final template plus drained file row");
 
         let deleted_fifth = manager.purge_orphaned_rows(3).await.unwrap();
         assert_eq!(deleted_fifth, 0, "Nothing left to purge");
@@ -10799,8 +11135,8 @@ mod tests {
             total_deleted += d;
         }
         assert_eq!(
-            total_deleted, 10,
-            "Should delete all 5 requests + 5 templates"
+            total_deleted, 12,
+            "Should delete all 5 requests + 5 templates + batch + file"
         );
     }
 

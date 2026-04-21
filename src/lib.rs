@@ -19,8 +19,11 @@ pub use daemon::{Daemon, DaemonConfig, ModelEscalationConfig};
 pub use error::{FusilladeError, Result};
 pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient, StreamReassembler};
 pub use manager::postgres::{PoolProvider, PostgresRequestManager, TestDbPools};
-pub use manager::{DaemonExecutor, Storage};
+pub use manager::{DaemonExecutor, RetentionSweepSummary, Storage};
 pub use request::*;
+
+/// Internal batch metadata key storing artifact retention TTL in whole seconds.
+pub const RETENTION_TTL_METADATA_KEY: &str = "dw_retention_ttl_seconds";
 
 /// Get the fusillade database migrator
 ///

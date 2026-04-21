@@ -124,6 +124,13 @@ mod tests {
                 .collect())
         }
 
+        async fn sweep_expired_artifacts(
+            &self,
+            _batch_size: i64,
+        ) -> Result<crate::manager::RetentionSweepSummary> {
+            Ok(crate::manager::RetentionSweepSummary::default())
+        }
+
         async fn purge_orphaned_rows(&self, _batch_size: i64) -> Result<u64> {
             Ok(0)
         }

@@ -25,6 +25,12 @@ use tokio::task::JoinHandle;
 pub mod postgres;
 mod utils;
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RetentionSweepSummary {
+    pub deleted_batches: usize,
+    pub deleted_files: usize,
+}
+
 /// Storage trait for persisting and querying requests.
 ///
 /// This trait provides atomic operations for request lifecycle management.
@@ -412,11 +418,16 @@ pub trait DaemonStorage: Send + Sync {
         status_filter: Option<DaemonStatus>,
     ) -> Result<Vec<AnyDaemonRecord>>;
 
+    /// Soft-delete expired batch artifacts based on retention policy.
+    ///
+    /// Returns the number of batch and file rows newly soft-deleted in this pass.
+    async fn sweep_expired_artifacts(&self, batch_size: i64) -> Result<RetentionSweepSummary>;
+
     /// Purge orphaned request_templates and requests whose parent (file or batch)
-    /// has been soft-deleted or whose FK is NULL.
+    /// has been soft-deleted, then delete drained soft-deleted batches/files.
     ///
     /// Deletes at most `batch_size` rows from each table per call.
-    /// Returns total rows deleted across both tables. Called periodically by
+    /// Returns total rows deleted across all covered tables. Called periodically by
     /// the daemon purge task for right-to-erasure compliance.
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
 }
