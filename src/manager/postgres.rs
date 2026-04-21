@@ -3392,7 +3392,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let pool = self.pools.read();
 
-        let where_clause = r#"
+        // When service_tier is set, emit a direct equality so Postgres can
+        // match the partial index predicate (service_tier = 'flex').  The
+        // IS NULL OR pattern would prevent partial-index usage.
+        let service_tier_clause = if filter.service_tier.is_some() {
+            "AND r.service_tier = $7"
+        } else {
+            "AND ($7::text IS NULL)" // tautology that consumes the bind slot
+        };
+
+        let where_clause = format!(
+            r#"
             WHERE b.deleted_at IS NULL
               AND ($1::text IS NULL OR b.created_by = $1)
               AND ($2::text IS NULL OR b.completion_window = $2)
@@ -3400,8 +3410,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
               AND ($4::text[] IS NULL OR r.model = ANY($4))
               AND ($5::timestamptz IS NULL OR r.created_at >= $5)
               AND ($6::timestamptz IS NULL OR r.created_at <= $6)
-              AND ($7::text IS NULL OR r.service_tier = $7)
-        "#;
+              {service_tier_clause}
+        "#
+        );
 
         // Total count: try exact COUNT(*) with a short statement_timeout so
         // narrow / small result sets return an accurate number; fall back to
