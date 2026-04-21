@@ -1,12 +1,21 @@
 -- Add column: metadata-only operation in PG11+, instant on any table size.
 -- NULL = batch tier, non-null values = async tiers (flex, etc.).
-ALTER TABLE requests ADD COLUMN service_tier text DEFAULT NULL;
+--
+-- Pre-deploy sequence (run manually before deploying):
+--   1. Run this ADD COLUMN + ADD CONSTRAINT (~60ms)
+--   2. CREATE INDEX CONCURRENTLY x2 (~10min each, no locks)
+--   3. Run backfill script (~22min, no locks)
+--   4. Deploy — migration is a no-op (all IF NOT EXISTS)
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS service_tier text DEFAULT NULL;
 
 -- NOT VALID skips the full-table validation scan.
 -- New inserts are checked immediately; existing rows are validated after
 -- the backfill via a separate VALIDATE CONSTRAINT statement.
-ALTER TABLE requests ADD CONSTRAINT requests_service_tier_check
-  CHECK (service_tier IN ('auto', 'default', 'flex', 'priority')) NOT VALID;
+DO $$ BEGIN
+  ALTER TABLE requests ADD CONSTRAINT requests_service_tier_check
+    CHECK (service_tier IN ('auto', 'default', 'flex', 'priority')) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
 -- Partial index for flex-tier requests with active_first=true ordering.
 --
