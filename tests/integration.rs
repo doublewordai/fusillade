@@ -2390,7 +2390,7 @@ mod queue_counts {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_populate_batch_sets_request_type(pool: sqlx::PgPool) {
+    async fn test_populate_batch_sets_service_tier(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
         model_concurrency_limits.insert("test-model".to_string(), 10);
@@ -2420,7 +2420,7 @@ mod queue_counts {
             api_key: "test-key".to_string(),
         };
 
-        // Create a batch with completion_window = "1h" → request_type = "async"
+        // Create a batch with completion_window = "1h" → service_tier = "flex"
         let file_id_1h = manager
             .create_file("file-1h".to_string(), None, vec![template.clone()])
             .await
@@ -2444,9 +2444,9 @@ mod queue_counts {
             .get_request_detail(requests_1h[0].id().into())
             .await
             .unwrap();
-        assert_eq!(detail_1h.request_type, "async");
+        assert_eq!(detail_1h.service_tier, "flex");
 
-        // Create a batch with completion_window = "24h" → request_type = "batch"
+        // Create a batch with completion_window = "24h" → service_tier = "default"
         let file_id_24h = manager
             .create_file("file-24h".to_string(), None, vec![template.clone()])
             .await
@@ -2470,12 +2470,12 @@ mod queue_counts {
             .get_request_detail(requests_24h[0].id().into())
             .await
             .unwrap();
-        assert_eq!(detail_24h.request_type, "batch");
+        assert_eq!(detail_24h.service_tier, "default");
     }
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_list_requests_filters_by_request_type(pool: sqlx::PgPool) {
+    async fn test_list_requests_filters_by_service_tier(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
         model_concurrency_limits.insert("test-model".to_string(), 10);
@@ -2505,7 +2505,7 @@ mod queue_counts {
             api_key: "test-key".to_string(),
         };
 
-        // Create a 1h batch (async) with 1 request
+        // Create a 1h batch (flex tier) with 1 request
         let file_id_1h = manager
             .create_file("file-1h".to_string(), None, vec![template.clone()])
             .await
@@ -2524,7 +2524,7 @@ mod queue_counts {
             .await
             .unwrap();
 
-        // Create a 24h batch (batch) with 1 request
+        // Create a 24h batch (default tier) with 1 request
         let file_id_24h = manager
             .create_file("file-24h".to_string(), None, vec![template.clone()])
             .await
@@ -2543,27 +2543,27 @@ mod queue_counts {
             .await
             .unwrap();
 
-        // Filter by request_type = "async" — only the 1h request
-        let async_result = manager
+        // Filter by service_tier = "flex" — only the 1h request
+        let flex_result = manager
             .list_requests(ListRequestsFilter {
-                request_type: Some("async".to_string()),
+                service_tier: Some("flex".to_string()),
                 ..Default::default()
             })
             .await
             .unwrap();
-        assert_eq!(async_result.data.len(), 1);
-        assert_eq!(async_result.data[0].request_type, "async");
+        assert_eq!(flex_result.data.len(), 1);
+        assert_eq!(flex_result.data[0].service_tier, "flex");
 
-        // Filter by request_type = "batch" — only the 24h request
-        let batch_result = manager
+        // Filter by service_tier = "default" — only the 24h request
+        let default_result = manager
             .list_requests(ListRequestsFilter {
-                request_type: Some("batch".to_string()),
+                service_tier: Some("default".to_string()),
                 ..Default::default()
             })
             .await
             .unwrap();
-        assert_eq!(batch_result.data.len(), 1);
-        assert_eq!(batch_result.data[0].request_type, "batch");
+        assert_eq!(default_result.data.len(), 1);
+        assert_eq!(default_result.data[0].service_tier, "default");
 
         // No filter — both requests
         let all_result = manager
