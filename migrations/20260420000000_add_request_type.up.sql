@@ -7,7 +7,8 @@ ALTER TABLE requests ADD COLUMN service_tier text NOT NULL DEFAULT 'flex';
 ALTER TABLE requests ADD CONSTRAINT requests_service_tier_check
   CHECK (service_tier IN ('auto', 'default', 'flex', 'priority')) NOT VALID;
 
--- Expression index supporting list_requests filtered to default-tier requests.
+-- Expression index supporting list_requests for default-tier requests when
+-- active_first=true (it does not cover the active_first=false ordering).
 --
 -- NOTE: CREATE INDEX without CONCURRENTLY takes an ACCESS EXCLUSIVE lock for
 -- the duration of the build. On large tables create this CONCURRENTLY ahead
