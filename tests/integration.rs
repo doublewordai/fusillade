@@ -2387,6 +2387,10 @@ mod queue_counts {
 
         assert_eq!(counts, expected);
     }
+}
+
+mod service_tier {
+    use super::*;
 
     #[sqlx::test]
     #[test_log::test]
