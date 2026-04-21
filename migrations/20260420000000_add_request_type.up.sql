@@ -1,5 +1,11 @@
-ALTER TABLE requests ADD COLUMN request_type text NOT NULL DEFAULT 'batch'
-  CHECK (request_type IN ('async', 'batch'));
+-- Add column: metadata-only operation in PG11+, instant on any table size.
+ALTER TABLE requests ADD COLUMN request_type text NOT NULL DEFAULT 'batch';
+
+-- NOT VALID skips the full-table validation scan (was 6m22s on 38M rows).
+-- New inserts are checked immediately; existing rows are validated after
+-- the backfill via a separate VALIDATE CONSTRAINT statement.
+ALTER TABLE requests ADD CONSTRAINT requests_request_type_check
+  CHECK (request_type IN ('async', 'batch')) NOT VALID;
 
 -- Expression index supporting list_requests filtered to async requests.
 --
