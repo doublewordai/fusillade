@@ -7,8 +7,7 @@ ALTER TABLE requests ADD COLUMN service_tier text NOT NULL DEFAULT 'flex';
 ALTER TABLE requests ADD CONSTRAINT requests_service_tier_check
   CHECK (service_tier IN ('auto', 'default', 'flex', 'priority')) NOT VALID;
 
--- Expression index supporting list_requests for default-tier requests when
--- active_first=true (it does not cover the active_first=false ordering).
+-- Partial index for default-tier requests with active_first=true ordering.
 --
 -- NOTE: CREATE INDEX without CONCURRENTLY takes an ACCESS EXCLUSIVE lock for
 -- the duration of the build. On large tables create this CONCURRENTLY ahead
@@ -25,3 +24,13 @@ CREATE INDEX IF NOT EXISTS idx_requests_active_first_default ON requests
     (CASE state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END),
     created_at DESC, id DESC
   ) WHERE service_tier = 'default' AND batch_id IS NOT NULL;
+
+-- Partial index for default-tier requests with active_first=false ordering
+-- (created_at DESC, id DESC).
+--
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_requests_default_created
+--   ON requests (created_at DESC, id DESC)
+--   WHERE service_tier = 'default' AND batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_requests_default_created ON requests
+  USING btree (created_at DESC, id DESC)
+  WHERE service_tier = 'default' AND batch_id IS NOT NULL;

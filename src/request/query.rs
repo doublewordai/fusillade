@@ -36,9 +36,8 @@ pub struct ListRequestsFilter {
     /// Only return requests created before this timestamp
     pub created_before: Option<DateTime<Utc>>,
     /// Filter by service tier ("auto", "default", "flex", "priority").
-    /// The existing partial index accelerates the `"default"` case when
-    /// `active_first = true`; other combinations fall back to the full
-    /// index.
+    /// Partial indexes accelerate the `"default"` case for both
+    /// `active_first` orderings; other tiers fall back to the full index.
     pub service_tier: Option<String>,
     /// Sort active requests (pending/claimed/processing) first
     pub active_first: bool,
