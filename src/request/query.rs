@@ -11,11 +11,11 @@ use uuid::Uuid;
 const DEFAULT_LIMIT: i64 = 50;
 
 /// Derive the service tier from the batch completion window.
-/// "1h" → "default", everything else → "flex".
-pub(crate) fn service_tier_from_completion_window(completion_window: &str) -> &'static str {
+/// "1h" → "flex" (async), everything else → NULL (batch).
+pub(crate) fn service_tier_from_completion_window(completion_window: &str) -> Option<&'static str> {
     match completion_window {
-        "1h" => "default",
-        _ => "flex",
+        "1h" => Some("flex"),
+        _ => None,
     }
 }
 
@@ -36,8 +36,10 @@ pub struct ListRequestsFilter {
     /// Only return requests created before this timestamp
     pub created_before: Option<DateTime<Utc>>,
     /// Filter by service tier ("auto", "default", "flex", "priority").
-    /// Partial indexes accelerate the `"default"` case for both
+    /// Partial indexes accelerate the `"flex"` case for both
     /// `active_first` orderings; other tiers fall back to the full index.
+    /// Batch-tier requests have NULL service_tier and are not filterable
+    /// by this field (use `completion_window` instead).
     pub service_tier: Option<String>,
     /// Sort active requests (pending/claimed/processing) first
     pub active_first: bool,
@@ -81,7 +83,7 @@ pub struct RequestSummary {
     pub failed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
-    pub service_tier: String,
+    pub service_tier: Option<String>,
     /// Batch creator ID (user ID or org ID) — for ownership checks and email lookup
     pub batch_created_by: String,
 }
@@ -111,7 +113,7 @@ mod deprecated_types {
         pub failed_at: Option<DateTime<Utc>>,
         pub duration_ms: Option<f64>,
         pub response_status: Option<i16>,
-        pub service_tier: String,
+        pub service_tier: Option<String>,
         pub batch_created_by: String,
         pub total_count: i64,
     }
@@ -157,7 +159,7 @@ pub struct RequestDetail {
     pub response_body: Option<String>,
     pub error: Option<String>,
     pub completion_window: String,
-    pub service_tier: String,
+    pub service_tier: Option<String>,
     pub batch_created_by: String,
 }
 
