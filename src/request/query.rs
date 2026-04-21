@@ -11,11 +11,11 @@ use uuid::Uuid;
 const DEFAULT_LIMIT: i64 = 50;
 
 /// Derive the service tier from the batch completion window.
-/// "1h" → "flex", everything else → "default".
+/// "1h" → "default", everything else → "flex".
 pub(crate) fn service_tier_from_completion_window(completion_window: &str) -> &'static str {
     match completion_window {
-        "1h" => "flex",
-        _ => "default",
+        "1h" => "default",
+        _ => "flex",
     }
 }
 
@@ -36,8 +36,8 @@ pub struct ListRequestsFilter {
     /// Only return requests created before this timestamp
     pub created_before: Option<DateTime<Utc>>,
     /// Filter by service tier ("auto", "default", "flex", "priority").
-    /// The existing partial index accelerates the `"flex"` case; other
-    /// values fall back to the full index.
+    /// The existing partial index accelerates the `"default"` case;
+    /// other values fall back to the full index.
     pub service_tier: Option<String>,
     /// Sort active requests (pending/claimed/processing) first
     pub active_first: bool,
