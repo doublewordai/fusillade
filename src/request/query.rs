@@ -145,7 +145,8 @@ pub use deprecated_types::RequestSummaryWithCount;
 #[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
 pub struct RequestDetail {
     pub id: Uuid,
-    pub batch_id: Uuid,
+    /// `None` for daemon-managed requests (created via `create_daemon_request`).
+    pub batch_id: Option<Uuid>,
     pub model: String,
     #[cfg_attr(feature = "postgres", sqlx(rename = "state"))]
     pub status: String,
@@ -158,9 +159,11 @@ pub struct RequestDetail {
     pub body: Option<String>,
     pub response_body: Option<String>,
     pub error: Option<String>,
-    pub completion_window: String,
+    /// `None` for daemon-managed requests (no batch).
+    pub completion_window: Option<String>,
     pub service_tier: Option<String>,
-    pub batch_created_by: String,
+    /// `None` for daemon-managed requests (no batch).
+    pub batch_created_by: Option<String>,
 }
 
 /// Input for creating a daemon-managed request (no batch).

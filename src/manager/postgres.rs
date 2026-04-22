@@ -3554,9 +3554,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 t.body, r.response_body, r.error,
                 b.completion_window, r.service_tier, b.created_by as batch_created_by
             FROM requests r
-            JOIN batches b ON r.batch_id = b.id
+            LEFT JOIN batches b ON r.batch_id = b.id
             LEFT JOIN active_request_templates t ON r.template_id = t.id
-            WHERE r.id = $1 AND b.deleted_at IS NULL
+            WHERE r.id = $1 AND (b.deleted_at IS NULL OR r.batch_id IS NULL)
             "#,
         )
         .bind(request_id.0)
