@@ -13,8 +13,7 @@ pub mod types;
 #[allow(deprecated)]
 pub use query::RequestSummaryWithCount;
 pub use query::{
-    CreateDaemonRequestInput, ListRequestsFilter, RequestDetail, RequestListResult,
-    RequestSummary,
+    CreateDaemonRequestInput, ListRequestsFilter, RequestDetail, RequestListResult, RequestSummary,
 };
 pub use transitions::CancellationReason;
 pub use types::*;

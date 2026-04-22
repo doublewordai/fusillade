@@ -3568,10 +3568,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(detail)
     }
 
-    async fn create_daemon_request(
-        &self,
-        input: CreateDaemonRequestInput,
-    ) -> Result<RequestId> {
+    async fn create_daemon_request(&self, input: CreateDaemonRequestInput) -> Result<RequestId> {
         let pool = self.pools.write();
         let id = input.id.unwrap_or_else(Uuid::new_v4);
         let template_id = Uuid::new_v4();
@@ -3640,11 +3637,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(())
     }
 
-    async fn fail_request(
-        &self,
-        request_id: RequestId,
-        error: &str,
-    ) -> Result<()> {
+    async fn fail_request(&self, request_id: RequestId, error: &str) -> Result<()> {
         let pool = self.pools.write();
 
         let error_json = serde_json::json!({

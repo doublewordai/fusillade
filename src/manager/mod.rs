@@ -388,10 +388,7 @@ pub trait Storage: Send + Sync {
     /// Inserts a request template and a request row with `batch_id = NULL` in
     /// "processing" state. Used when an external daemon (e.g., an AI proxy) is
     /// already handling the request and wants to track it in fusillade.
-    async fn create_daemon_request(
-        &self,
-        input: CreateDaemonRequestInput,
-    ) -> Result<RequestId>;
+    async fn create_daemon_request(&self, input: CreateDaemonRequestInput) -> Result<RequestId>;
 
     /// Complete a processing request with the response body.
     ///
@@ -408,11 +405,7 @@ pub trait Storage: Send + Sync {
     ///
     /// Transitions the request from "processing" to "failed" and stores the
     /// error message as a JSON object.
-    async fn fail_request(
-        &self,
-        request_id: RequestId,
-        error: &str,
-    ) -> Result<()>;
+    async fn fail_request(&self, request_id: RequestId, error: &str) -> Result<()>;
 }
 
 /// Daemon lifecycle persistence.
