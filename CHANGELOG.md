@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.3.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.2.0...fusillade-v16.3.0) (2026-04-22)
+
+
+### Features
+
+* add service_tier column to requests table ([#230](https://github.com/doublewordai/fusillade/issues/230)) ([e54d518](https://github.com/doublewordai/fusillade/commit/e54d518cad5f2c11bbea18b7c68af767aa996a3d))
+
 ## [16.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.1.3...fusillade-v16.2.0) (2026-04-17)
 
 
