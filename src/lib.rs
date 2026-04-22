@@ -6,6 +6,8 @@
 //!
 //! Batching system with PostgreSQL storage and background daemon for processing requests.
 
+#[cfg(feature = "postgres")]
+pub mod audit;
 pub mod batch;
 pub mod daemon;
 pub mod error;
@@ -21,6 +23,9 @@ pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient, Stre
 pub use manager::postgres::{PoolProvider, PostgresRequestManager, TestDbPools};
 pub use manager::{DaemonExecutor, Storage};
 pub use request::*;
+
+#[cfg(feature = "postgres")]
+pub use audit::{POSTGRES_APPLICATION_NAME, log_postgres_audit_status, with_application_name};
 
 /// Get the fusillade database migrator
 ///
