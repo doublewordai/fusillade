@@ -10,6 +10,15 @@ use uuid::Uuid;
 /// Default number of rows to return when limit is not specified.
 const DEFAULT_LIMIT: i64 = 50;
 
+/// Derive the service tier from the batch completion window.
+/// "1h" → "flex" (async), everything else → NULL (batch).
+pub(crate) fn service_tier_from_completion_window(completion_window: &str) -> Option<&'static str> {
+    match completion_window {
+        "1h" => Some("flex"),
+        _ => None,
+    }
+}
+
 /// Filter parameters for listing requests across batches.
 #[derive(Debug, Clone)]
 pub struct ListRequestsFilter {
@@ -26,6 +35,12 @@ pub struct ListRequestsFilter {
     pub created_after: Option<DateTime<Utc>>,
     /// Only return requests created before this timestamp
     pub created_before: Option<DateTime<Utc>>,
+    /// Filter by service tier ("auto", "default", "flex", "priority").
+    /// Partial indexes accelerate the `"flex"` case for both
+    /// `active_first` orderings; other tiers fall back to the full index.
+    /// Batch-tier requests have NULL service_tier and are not filterable
+    /// by this field (use `completion_window` instead).
+    pub service_tier: Option<String>,
     /// Sort active requests (pending/claimed/processing) first
     pub active_first: bool,
     /// Number of rows to skip (offset pagination)
@@ -43,6 +58,7 @@ impl Default for ListRequestsFilter {
             models: None,
             created_after: None,
             created_before: None,
+            service_tier: None,
             active_first: false,
             skip: 0,
             limit: DEFAULT_LIMIT,
@@ -67,6 +83,7 @@ pub struct RequestSummary {
     pub failed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
+    pub service_tier: Option<String>,
     /// Batch creator ID (user ID or org ID) — for ownership checks and email lookup
     pub batch_created_by: String,
 }
@@ -96,6 +113,7 @@ mod deprecated_types {
         pub failed_at: Option<DateTime<Utc>>,
         pub duration_ms: Option<f64>,
         pub response_status: Option<i16>,
+        pub service_tier: Option<String>,
         pub batch_created_by: String,
         pub total_count: i64,
     }
@@ -112,6 +130,7 @@ mod deprecated_types {
                 failed_at: r.failed_at,
                 duration_ms: r.duration_ms,
                 response_status: r.response_status,
+                service_tier: r.service_tier,
                 batch_created_by: r.batch_created_by,
             }
         }
@@ -140,6 +159,7 @@ pub struct RequestDetail {
     pub response_body: Option<String>,
     pub error: Option<String>,
     pub completion_window: String,
+    pub service_tier: Option<String>,
     pub batch_created_by: String,
 }
 
