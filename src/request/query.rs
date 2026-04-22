@@ -163,6 +163,31 @@ pub struct RequestDetail {
     pub batch_created_by: String,
 }
 
+/// Input for creating a daemon-managed request (no batch).
+///
+/// Used when a daemon (e.g., an AI proxy) is already processing a request and
+/// wants to track it in fusillade without creating a batch. The request is
+/// created directly in "processing" state with the specified daemon ID.
+#[derive(Debug, Clone)]
+pub struct CreateDaemonRequestInput {
+    /// Pre-generated request ID. If `None`, a new UUID is generated.
+    pub id: Option<Uuid>,
+    /// The request body as a JSON string.
+    pub body: String,
+    /// Model identifier.
+    pub model: String,
+    /// Base URL of the target endpoint (e.g., "http://localhost:3001/ai").
+    pub endpoint: String,
+    /// HTTP method (e.g., "POST").
+    pub method: String,
+    /// API path (e.g., "/v1/responses").
+    pub path: String,
+    /// API key for the request (empty string if none).
+    pub api_key: String,
+    /// The daemon that is processing this request.
+    pub daemon_id: super::DaemonId,
+}
+
 /// Result of a paginated request list query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestListResult {

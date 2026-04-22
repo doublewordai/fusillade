@@ -36,8 +36,8 @@ use crate::daemon::{
 use crate::error::{FusilladeError, Result};
 use crate::http::HttpClient;
 use crate::request::{
-    Canceled, CascadeTargetState, Claimed, Completed, DaemonId, Failed, FailureReason, Pending,
-    Processing, Request, RequestData, RequestId, RequestState,
+    Canceled, CascadeTargetState, Claimed, Completed, CreateDaemonRequestInput, DaemonId, Failed,
+    FailureReason, Pending, Processing, Request, RequestData, RequestId, RequestState,
 };
 
 use super::DaemonExecutor;
@@ -3566,6 +3566,108 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .ok_or(FusilladeError::RequestNotFound(request_id))?;
 
         Ok(detail)
+    }
+
+    async fn create_daemon_request(
+        &self,
+        input: CreateDaemonRequestInput,
+    ) -> Result<RequestId> {
+        let pool = self.pools.write();
+        let id = input.id.unwrap_or_else(Uuid::new_v4);
+        let template_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        // Insert template row (file_id = NULL for daemon-managed requests)
+        sqlx::query(
+            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key)
+             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(template_id)
+        .bind(&input.endpoint)
+        .bind(&input.method)
+        .bind(&input.path)
+        .bind(&input.body)
+        .bind(&input.model)
+        .bind(&input.api_key)
+        .execute(pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert daemon request template: {}", e)))?;
+
+        // Insert request row in processing state (batch_id = NULL)
+        sqlx::query(
+            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at)
+             VALUES ($1, NULL, $2, $3, NULL, 'processing', $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(template_id)
+        .bind(&input.model)
+        .bind(input.daemon_id.0)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert daemon request: {}", e)))?;
+
+        Ok(RequestId(id))
+    }
+
+    async fn complete_request(
+        &self,
+        request_id: RequestId,
+        response_body: &str,
+        status_code: u16,
+    ) -> Result<()> {
+        let pool = self.pools.write();
+        let size = response_body.len() as i64;
+
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'completed',
+                 response_status = $2,
+                 response_body = $3,
+                 response_size = $4,
+                 completed_at = NOW()
+             WHERE id = $1 AND state = 'processing'",
+        )
+        .bind(request_id.0)
+        .bind(status_code as i16)
+        .bind(response_body)
+        .bind(size)
+        .execute(pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete request: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn fail_request(
+        &self,
+        request_id: RequestId,
+        error: &str,
+    ) -> Result<()> {
+        let pool = self.pools.write();
+
+        let error_json = serde_json::json!({
+            "type": "NonRetriableHttpStatus",
+            "status": 500,
+            "message": error,
+        })
+        .to_string();
+
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'failed',
+                 error = $2,
+                 failed_at = NOW()
+             WHERE id = $1 AND state = 'processing'",
+        )
+        .bind(request_id.0)
+        .bind(&error_json)
+        .execute(pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail request: {}", e)))?;
+
+        Ok(())
     }
 }
 
