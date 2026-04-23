@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.4.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.3.0...fusillade-v16.4.0) (2026-04-23)
+
+
+### Features
+
+* request methods for external daemons ([#233](https://github.com/doublewordai/fusillade/issues/233)) ([cffdd56](https://github.com/doublewordai/fusillade/commit/cffdd56608cb812e2b88cc99923f80ee81bd6ffa))
+
 ## [16.3.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.2.0...fusillade-v16.3.0) (2026-04-22)
 
 
