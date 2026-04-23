@@ -3551,11 +3551,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
                     ELSE NULL END)::float8 as duration_ms,
                 r.response_status,
-                t.body, r.response_body, r.error,
+                -- Null out template body when the parent file is soft-deleted
+                -- (preserves existing behavior for batch requests). Daemon-managed
+                -- templates (file_id IS NULL) always return their body.
+                CASE WHEN f.deleted_at IS NULL OR t.file_id IS NULL
+                    THEN t.body ELSE NULL END as body,
+                r.response_body, r.error,
                 b.completion_window, r.service_tier, b.created_by as batch_created_by
             FROM requests r
             LEFT JOIN batches b ON r.batch_id = b.id
-            LEFT JOIN active_request_templates t ON r.template_id = t.id
+            LEFT JOIN request_templates t ON r.template_id = t.id
+            LEFT JOIN files f ON t.file_id = f.id
             WHERE r.id = $1 AND (b.deleted_at IS NULL OR r.batch_id IS NULL)
             "#,
         )
@@ -3574,6 +3580,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let template_id = Uuid::new_v4();
         let now = Utc::now();
 
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
         // Insert template row (file_id = NULL for daemon-managed requests)
         sqlx::query(
             "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key)
@@ -3586,7 +3597,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(&input.body)
         .bind(&input.model)
         .bind(&input.api_key)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert daemon request template: {}", e)))?;
 
@@ -3601,9 +3612,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(input.daemon_id.0)
         .bind(now)
         .bind(now)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert daemon request: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit daemon request transaction: {}", e)))?;
 
         Ok(RequestId(id))
     }
@@ -3617,7 +3632,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let pool = self.pools.write();
         let size = response_body.len() as i64;
 
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE requests
              SET state = 'completed',
                  response_status = $2,
@@ -3634,20 +3649,24 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete request: {}", e)))?;
 
+        if result.rows_affected() == 0 {
+            return Err(FusilladeError::RequestNotFound(request_id));
+        }
+
         Ok(())
     }
 
     async fn fail_request(&self, request_id: RequestId, error: &str) -> Result<()> {
         let pool = self.pools.write();
 
-        let error_json = serde_json::json!({
-            "type": "NonRetriableHttpStatus",
-            "status": 500,
-            "message": error,
-        })
-        .to_string();
+        let reason = FailureReason::NonRetriableHttpStatus {
+            status: 500,
+            body: error.to_string(),
+        };
+        let error_json = serde_json::to_string(&reason)
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to serialize failure reason: {}", e)))?;
 
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE requests
              SET state = 'failed',
                  error = $2,
@@ -3659,6 +3678,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .execute(pool)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail request: {}", e)))?;
+
+        if result.rows_affected() == 0 {
+            return Err(FusilladeError::RequestNotFound(request_id));
+        }
 
         Ok(())
     }
