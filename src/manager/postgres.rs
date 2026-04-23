@@ -12849,9 +12849,9 @@ mod tests {
 
         assert_eq!(detail.model, "gpt-4");
         assert_eq!(detail.status, "pending");
-        assert_eq!(detail.batch_id, batch.id.0);
-        assert_eq!(detail.completion_window, "1h");
-        assert_eq!(detail.batch_created_by, "test-user-id");
+        assert_eq!(detail.batch_id, Some(batch.id.0));
+        assert_eq!(detail.completion_window, Some("1h".to_string()));
+        assert_eq!(detail.batch_created_by, Some("test-user-id".to_string()));
         assert!(detail.body.as_deref().unwrap().contains("gpt-4"));
     }
 
