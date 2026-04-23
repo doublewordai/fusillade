@@ -145,7 +145,8 @@ pub use deprecated_types::RequestSummaryWithCount;
 #[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
 pub struct RequestDetail {
     pub id: Uuid,
-    pub batch_id: Uuid,
+    /// `None` for daemon-managed requests (created via `create_daemon_request`).
+    pub batch_id: Option<Uuid>,
     pub model: String,
     #[cfg_attr(feature = "postgres", sqlx(rename = "state"))]
     pub status: String,
@@ -158,9 +159,36 @@ pub struct RequestDetail {
     pub body: Option<String>,
     pub response_body: Option<String>,
     pub error: Option<String>,
-    pub completion_window: String,
+    /// `None` for daemon-managed requests (no batch).
+    pub completion_window: Option<String>,
     pub service_tier: Option<String>,
-    pub batch_created_by: String,
+    /// `None` for daemon-managed requests (no batch).
+    pub batch_created_by: Option<String>,
+}
+
+/// Input for creating a daemon-managed request (no batch).
+///
+/// Used when a daemon (e.g., an AI proxy) is already processing a request and
+/// wants to track it in fusillade without creating a batch. The request is
+/// created directly in "processing" state with the specified daemon ID.
+#[derive(Debug, Clone)]
+pub struct CreateDaemonRequestInput {
+    /// Pre-generated request ID. If `None`, a new UUID is generated.
+    pub id: Option<Uuid>,
+    /// The request body as a JSON string.
+    pub body: String,
+    /// Model identifier.
+    pub model: String,
+    /// Base URL of the target endpoint (e.g., "http://localhost:3001/ai").
+    pub endpoint: String,
+    /// HTTP method (e.g., "POST").
+    pub method: String,
+    /// API path (e.g., "/v1/responses").
+    pub path: String,
+    /// API key for the request (empty string if none).
+    pub api_key: String,
+    /// The daemon that is processing this request.
+    pub daemon_id: super::DaemonId,
 }
 
 /// Result of a paginated request list query.

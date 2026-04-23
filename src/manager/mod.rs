@@ -11,8 +11,8 @@ use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::http::HttpClient;
 use crate::request::{
-    AnyRequest, CascadeTargetState, Claimed, DaemonId, ListRequestsFilter, Request, RequestDetail,
-    RequestId, RequestListResult, RequestState,
+    AnyRequest, CascadeTargetState, Claimed, CreateDaemonRequestInput, DaemonId,
+    ListRequestsFilter, Request, RequestDetail, RequestId, RequestListResult, RequestState,
 };
 use async_trait::async_trait;
 use futures::stream::Stream;
@@ -382,6 +382,30 @@ pub trait Storage: Send + Sync {
 
     /// Get a single request by ID with full detail (body, response, error).
     async fn get_request_detail(&self, request_id: RequestId) -> Result<RequestDetail>;
+
+    /// Create a request being processed by a daemon, without a batch.
+    ///
+    /// Inserts a request template and a request row with `batch_id = NULL` in
+    /// "processing" state. Used when an external daemon (e.g., an AI proxy) is
+    /// already handling the request and wants to track it in fusillade.
+    async fn create_daemon_request(&self, input: CreateDaemonRequestInput) -> Result<RequestId>;
+
+    /// Complete a processing request with the response body.
+    ///
+    /// Transitions the request from "processing" to "completed" and stores the
+    /// response body and HTTP status code.
+    async fn complete_request(
+        &self,
+        request_id: RequestId,
+        response_body: &str,
+        status_code: u16,
+    ) -> Result<()>;
+
+    /// Fail a processing request with an error message.
+    ///
+    /// Transitions the request from "processing" to "failed" and stores the
+    /// error message as a JSON object.
+    async fn fail_request(&self, request_id: RequestId, error: &str) -> Result<()>;
 }
 
 /// Daemon lifecycle persistence.

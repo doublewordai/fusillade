@@ -36,8 +36,8 @@ use crate::daemon::{
 use crate::error::{FusilladeError, Result};
 use crate::http::HttpClient;
 use crate::request::{
-    Canceled, CascadeTargetState, Claimed, Completed, DaemonId, Failed, FailureReason, Pending,
-    Processing, Request, RequestData, RequestId, RequestState,
+    Canceled, CascadeTargetState, Claimed, Completed, CreateDaemonRequestInput, DaemonId, Failed,
+    FailureReason, Pending, Processing, Request, RequestData, RequestId, RequestState,
 };
 
 use super::DaemonExecutor;
@@ -3551,12 +3551,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
                     ELSE NULL END)::float8 as duration_ms,
                 r.response_status,
-                t.body, r.response_body, r.error,
+                -- Null out template body when the parent file is soft-deleted
+                -- (preserves existing behavior for batch requests). Daemon-managed
+                -- templates (file_id IS NULL) always return their body.
+                CASE WHEN f.deleted_at IS NULL OR t.file_id IS NULL
+                    THEN t.body ELSE NULL END as body,
+                r.response_body, r.error,
                 b.completion_window, r.service_tier, b.created_by as batch_created_by
             FROM requests r
-            JOIN batches b ON r.batch_id = b.id
-            LEFT JOIN active_request_templates t ON r.template_id = t.id
-            WHERE r.id = $1 AND b.deleted_at IS NULL
+            LEFT JOIN batches b ON r.batch_id = b.id
+            LEFT JOIN request_templates t ON r.template_id = t.id
+            LEFT JOIN files f ON t.file_id = f.id
+            WHERE r.id = $1 AND (b.deleted_at IS NULL OR r.batch_id IS NULL)
             "#,
         )
         .bind(request_id.0)
@@ -3566,6 +3572,122 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .ok_or(FusilladeError::RequestNotFound(request_id))?;
 
         Ok(detail)
+    }
+
+    async fn create_daemon_request(&self, input: CreateDaemonRequestInput) -> Result<RequestId> {
+        let pool = self.pools.write();
+        let id = input.id.unwrap_or_else(Uuid::new_v4);
+        let template_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
+        // Insert template row (file_id = NULL for daemon-managed requests)
+        sqlx::query(
+            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key)
+             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(template_id)
+        .bind(&input.endpoint)
+        .bind(&input.method)
+        .bind(&input.path)
+        .bind(&input.body)
+        .bind(&input.model)
+        .bind(&input.api_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert daemon request template: {}", e)))?;
+
+        // Insert request row in processing state (batch_id = NULL)
+        sqlx::query(
+            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at)
+             VALUES ($1, NULL, $2, $3, NULL, 'processing', $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(template_id)
+        .bind(&input.model)
+        .bind(input.daemon_id.0)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert daemon request: {}", e)))?;
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to commit daemon request transaction: {}",
+                e
+            ))
+        })?;
+
+        Ok(RequestId(id))
+    }
+
+    async fn complete_request(
+        &self,
+        request_id: RequestId,
+        response_body: &str,
+        status_code: u16,
+    ) -> Result<()> {
+        let pool = self.pools.write();
+        let size = response_body.len() as i64;
+
+        let result = sqlx::query(
+            "UPDATE requests
+             SET state = 'completed',
+                 response_status = $2,
+                 response_body = $3,
+                 response_size = $4,
+                 completed_at = NOW()
+             WHERE id = $1 AND state = 'processing'",
+        )
+        .bind(request_id.0)
+        .bind(status_code as i16)
+        .bind(response_body)
+        .bind(size)
+        .execute(pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete request: {}", e)))?;
+
+        if result.rows_affected() == 0 {
+            return Err(FusilladeError::RequestNotFound(request_id));
+        }
+
+        Ok(())
+    }
+
+    async fn fail_request(&self, request_id: RequestId, error: &str) -> Result<()> {
+        let pool = self.pools.write();
+
+        let reason = FailureReason::NonRetriableHttpStatus {
+            status: 500,
+            body: error.to_string(),
+        };
+        let error_json = serde_json::to_string(&reason).map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to serialize failure reason: {}", e))
+        })?;
+
+        let result = sqlx::query(
+            "UPDATE requests
+             SET state = 'failed',
+                 error = $2,
+                 failed_at = NOW()
+             WHERE id = $1 AND state = 'processing'",
+        )
+        .bind(request_id.0)
+        .bind(&error_json)
+        .execute(pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail request: {}", e)))?;
+
+        if result.rows_affected() == 0 {
+            return Err(FusilladeError::RequestNotFound(request_id));
+        }
+
+        Ok(())
     }
 }
 
@@ -9795,7 +9917,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let batch = manager
+            let _batch = manager
                 .create_batch(BatchInput {
                     file_id,
                     endpoint: "/v1/chat/completions".to_string(),
@@ -12754,9 +12876,9 @@ mod tests {
 
         assert_eq!(detail.model, "gpt-4");
         assert_eq!(detail.status, "pending");
-        assert_eq!(detail.batch_id, batch.id.0);
-        assert_eq!(detail.completion_window, "1h");
-        assert_eq!(detail.batch_created_by, "test-user-id");
+        assert_eq!(detail.batch_id, Some(batch.id.0));
+        assert_eq!(detail.completion_window, Some("1h".to_string()));
+        assert_eq!(detail.batch_created_by, Some("test-user-id".to_string()));
         assert!(detail.body.as_deref().unwrap().contains("gpt-4"));
     }
 
