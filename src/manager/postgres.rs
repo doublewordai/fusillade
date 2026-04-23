@@ -3616,9 +3616,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert daemon request: {}", e)))?;
 
-        tx.commit()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit daemon request transaction: {}", e)))?;
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to commit daemon request transaction: {}",
+                e
+            ))
+        })?;
 
         Ok(RequestId(id))
     }
@@ -3663,8 +3666,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             status: 500,
             body: error.to_string(),
         };
-        let error_json = serde_json::to_string(&reason)
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to serialize failure reason: {}", e)))?;
+        let error_json = serde_json::to_string(&reason).map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to serialize failure reason: {}", e))
+        })?;
 
         let result = sqlx::query(
             "UPDATE requests
@@ -9913,7 +9917,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let batch = manager
+            let _batch = manager
                 .create_batch(BatchInput {
                     file_id,
                     endpoint: "/v1/chat/completions".to_string(),
