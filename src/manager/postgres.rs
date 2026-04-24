@@ -3519,7 +3519,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         };
 
         let require_tier_clause = if filter.require_service_tier {
-            "AND r.service_tier IS NOT NULL"
+            "AND r.service_tier IN ('flex', 'priority')"
         } else {
             ""
         };
