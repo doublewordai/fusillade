@@ -74,7 +74,7 @@ impl Default for ListRequestsFilter {
 #[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
 pub struct RequestSummary {
     pub id: Uuid,
-    pub batch_id: Uuid,
+    pub batch_id: Option<Uuid>,
     pub model: String,
     #[cfg_attr(feature = "postgres", sqlx(rename = "state"))]
     pub status: String,
@@ -84,8 +84,9 @@ pub struct RequestSummary {
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
     pub service_tier: Option<String>,
-    /// Batch creator ID (user ID or org ID) — for ownership checks and email lookup
-    pub batch_created_by: String,
+    /// Batch or daemon creator ID — for ownership checks and email lookup.
+    /// NULL for daemon-managed requests that don't have a batch.
+    pub batch_created_by: Option<String>,
 }
 
 /// Internal row shape used previously when `list_requests` computed the total
@@ -122,7 +123,7 @@ mod deprecated_types {
         fn from(r: RequestSummaryWithCount) -> Self {
             Self {
                 id: r.id,
-                batch_id: r.batch_id,
+                batch_id: Some(r.batch_id),
                 model: r.model,
                 status: r.status,
                 created_at: r.created_at,
@@ -131,7 +132,7 @@ mod deprecated_types {
                 duration_ms: r.duration_ms,
                 response_status: r.response_status,
                 service_tier: r.service_tier,
-                batch_created_by: r.batch_created_by,
+                batch_created_by: Some(r.batch_created_by),
             }
         }
     }

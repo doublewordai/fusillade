@@ -2249,6 +2249,109 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         self.get_batch_from_pool(batch.id, self.pools.write()).await
     }
 
+    #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
+    async fn create_single_request_batch(
+        &self,
+        input: super::CreateSingleRequestBatchInput,
+    ) -> Result<Batch> {
+        let pool = self.pools.write();
+        let now = Utc::now();
+        let template_id = Uuid::new_v4();
+        let file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+
+        let std_duration =
+            humantime::parse_duration(&input.completion_window).map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Invalid completion_window '{}': {}",
+                    input.completion_window,
+                    e
+                ))
+            })?;
+        let expires_at = now + chrono::Duration::from_std(std_duration).unwrap_or(chrono::Duration::hours(24));
+        let service_tier =
+            crate::request::query::service_tier_from_completion_window(&input.completion_window);
+
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
+        // 1. Create file (no physical file — just a container for the template)
+        sqlx::query(
+            "INSERT INTO files (id, name, purpose, created_at, updated_at)
+             VALUES ($1, 'single_request', 'batch', $2, $2)",
+        )
+        .bind(file_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create file: {}", e)))?;
+
+        // 2. Create template
+        sqlx::query(
+            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key)
+             VALUES ($1, $2, NULL, $3, 'POST', $4, $5, $6, $7)",
+        )
+        .bind(template_id)
+        .bind(file_id)
+        .bind(&input.base_url)
+        .bind(&input.endpoint)
+        .bind(&input.body)
+        .bind(&input.model)
+        .bind(input.api_key.as_deref().unwrap_or(""))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create template: {}", e)))?;
+
+        // 3. Create batch
+        sqlx::query(
+            "INSERT INTO batches (id, file_id, endpoint, completion_window, created_at, expires_at, created_by, total_requests, requests_started_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $5)",
+        )
+        .bind(batch_id)
+        .bind(file_id)
+        .bind(&input.endpoint)
+        .bind(&input.completion_window)
+        .bind(now)
+        .bind(expires_at)
+        .bind(input.created_by.as_deref())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch: {}", e)))?;
+
+        // 4. Create request with caller-specified ID and state.
+        // When initial_state is 'processing', set daemon_id/claimed_at/started_at
+        // to satisfy the processing_fields_check constraint.
+        let (daemon_id, claimed_at, started_at) = if input.initial_state == "processing" {
+            (Some(input.request_id), Some(now), Some(now))
+        } else {
+            (None, None, None)
+        };
+        sqlx::query(
+            "INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, model, service_tier, daemon_id, claimed_at, started_at)
+             VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8, $9)",
+        )
+        .bind(input.request_id)
+        .bind(batch_id)
+        .bind(template_id)
+        .bind(&input.initial_state)
+        .bind(&input.model)
+        .bind(service_tier)
+        .bind(daemon_id)
+        .bind(claimed_at)
+        .bind(started_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create request: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+
+        self.get_batch_from_pool(BatchId(batch_id), pool).await
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn create_batch_record(&self, input: BatchInput) -> Result<Batch> {
         let now = Utc::now();
@@ -3403,8 +3506,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let where_clause = format!(
             r#"
-            WHERE b.deleted_at IS NULL
-              AND ($1::text IS NULL OR b.created_by = $1)
+            WHERE (b.deleted_at IS NULL OR r.batch_id IS NULL)
+              AND ($1::text IS NULL OR b.created_by = $1 OR r.batch_id IS NULL)
               AND ($2::text IS NULL OR b.completion_window = $2)
               AND ($3::text IS NULL OR r.state = $3)
               AND ($4::text[] IS NULL OR r.model = ANY($4))
@@ -3424,7 +3527,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             r#"
             SELECT COUNT(*)::bigint
             FROM requests r
-            JOIN batches b ON r.batch_id = b.id
+            LEFT JOIN batches b ON r.batch_id = b.id
             {where_clause}
             "#
         );
@@ -3472,7 +3575,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 EXPLAIN (FORMAT JSON)
                 SELECT 1
                 FROM requests r
-                JOIN batches b ON r.batch_id = b.id
+                LEFT JOIN batches b ON r.batch_id = b.id
                 {where_clause}
                 "#
             ))
@@ -3513,7 +3616,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 r.service_tier,
                 b.created_by as batch_created_by
             FROM requests r
-            JOIN batches b ON r.batch_id = b.id
+            LEFT JOIN batches b ON r.batch_id = b.id
             {where_clause}
             ORDER BY {order_clause}
             LIMIT $8 OFFSET $9
