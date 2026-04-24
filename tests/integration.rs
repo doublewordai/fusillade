@@ -2550,7 +2550,7 @@ mod service_tier {
         // Filter by service_tier = "flex" — only the 1h request
         let flex_result = manager
             .list_requests(ListRequestsFilter {
-                service_tier: Some("flex".to_string()),
+                service_tiers: Some(vec!["flex".to_string()]),
                 ..Default::default()
             })
             .await

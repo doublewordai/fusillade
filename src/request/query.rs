@@ -36,15 +36,11 @@ pub struct ListRequestsFilter {
     pub created_after: Option<DateTime<Utc>>,
     /// Only return requests created before this timestamp
     pub created_before: Option<DateTime<Utc>>,
-    /// Filter by service tier ("auto", "default", "flex", "priority").
-    /// Partial indexes accelerate the `"flex"` case for both
-    /// `active_first` orderings; other tiers fall back to the full index.
-    /// Batch-tier requests have NULL service_tier and are not filterable
-    /// by this field (use `completion_window` instead).
-    pub service_tier: Option<String>,
-    /// Only include requests that have a non-NULL service_tier.
-    /// Excludes standard batch requests (which have NULL service_tier).
-    pub require_service_tier: bool,
+    /// Filter by service tier(s). When set, only returns requests whose
+    /// `service_tier` matches one of the provided values (e.g., `["flex", "priority"]`).
+    /// Uses `= ANY($7)` which hits the composite `idx_requests_created_tier` index.
+    /// `None` disables tier filtering. `Some(vec![])` matches no rows.
+    pub service_tiers: Option<Vec<String>>,
     /// Sort active requests (pending/claimed/processing) first
     pub active_first: bool,
     /// Number of rows to skip (offset pagination)
@@ -62,8 +58,7 @@ impl Default for ListRequestsFilter {
             models: None,
             created_after: None,
             created_before: None,
-            service_tier: None,
-            require_service_tier: false,
+            service_tiers: None,
             active_first: false,
             skip: 0,
             limit: DEFAULT_LIMIT,
