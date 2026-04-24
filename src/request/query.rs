@@ -15,6 +15,7 @@ const DEFAULT_LIMIT: i64 = 50;
 pub(crate) fn service_tier_from_completion_window(completion_window: &str) -> Option<&'static str> {
     match completion_window {
         "1h" => Some("flex"),
+        "0s" => Some("priority"),
         _ => None,
     }
 }
@@ -41,6 +42,9 @@ pub struct ListRequestsFilter {
     /// Batch-tier requests have NULL service_tier and are not filterable
     /// by this field (use `completion_window` instead).
     pub service_tier: Option<String>,
+    /// Only include requests that have a non-NULL service_tier.
+    /// Excludes standard batch requests (which have NULL service_tier).
+    pub require_service_tier: bool,
     /// Sort active requests (pending/claimed/processing) first
     pub active_first: bool,
     /// Number of rows to skip (offset pagination)
@@ -59,6 +63,7 @@ impl Default for ListRequestsFilter {
             created_after: None,
             created_before: None,
             service_tier: None,
+            require_service_tier: false,
             active_first: false,
             skip: 0,
             limit: DEFAULT_LIMIT,
@@ -74,7 +79,7 @@ impl Default for ListRequestsFilter {
 #[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
 pub struct RequestSummary {
     pub id: Uuid,
-    pub batch_id: Uuid,
+    pub batch_id: Option<Uuid>,
     pub model: String,
     #[cfg_attr(feature = "postgres", sqlx(rename = "state"))]
     pub status: String,
@@ -84,8 +89,9 @@ pub struct RequestSummary {
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
     pub service_tier: Option<String>,
-    /// Batch creator ID (user ID or org ID) — for ownership checks and email lookup
-    pub batch_created_by: String,
+    /// Batch or daemon creator ID — for ownership checks and email lookup.
+    /// NULL for daemon-managed requests that don't have a batch.
+    pub batch_created_by: Option<String>,
 }
 
 /// Internal row shape used previously when `list_requests` computed the total
@@ -122,7 +128,7 @@ mod deprecated_types {
         fn from(r: RequestSummaryWithCount) -> Self {
             Self {
                 id: r.id,
-                batch_id: r.batch_id,
+                batch_id: Some(r.batch_id),
                 model: r.model,
                 status: r.status,
                 created_at: r.created_at,
@@ -131,7 +137,7 @@ mod deprecated_types {
                 duration_ms: r.duration_ms,
                 response_status: r.response_status,
                 service_tier: r.service_tier,
-                batch_created_by: r.batch_created_by,
+                batch_created_by: Some(r.batch_created_by),
             }
         }
     }
@@ -155,7 +161,7 @@ pub struct RequestDetail {
     pub failed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
-    /// `None` when the template has been purged (via file deletion + orphan purge).
+    /// `None` when the template has been purged (file soft-deleted + orphan purge).
     pub body: Option<String>,
     pub response_body: Option<String>,
     pub error: Option<String>,

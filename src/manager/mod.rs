@@ -20,10 +20,36 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
 mod utils;
+
+/// Input for creating a single-request batch with a pre-generated request ID.
+#[derive(Debug, Clone)]
+pub struct CreateSingleRequestBatchInput {
+    /// Pre-generated request UUID. Becomes the request's primary key.
+    pub request_id: Uuid,
+    /// Request body (JSON string).
+    pub body: String,
+    /// Model name for the request.
+    pub model: String,
+    /// Base URL for the daemon to reach the proxy (e.g., `http://localhost:3001/ai`).
+    pub base_url: String,
+    /// API path (e.g., `/v1/responses`, `/v1/chat/completions`).
+    pub endpoint: String,
+    /// Completion window (e.g., `"0s"` for realtime, `"1h"` for flex).
+    pub completion_window: String,
+    /// Initial request state. Use `"pending"` for daemon-processed requests
+    /// (flex) or `"processing"` for externally-managed requests (realtime)
+    /// that the daemon should not claim.
+    pub initial_state: String,
+    /// API key for request execution and batch attribution.
+    pub api_key: Option<String>,
+    /// User/org ID that owns this batch.
+    pub created_by: Option<String>,
+}
 
 /// Storage trait for persisting and querying requests.
 ///
@@ -120,6 +146,22 @@ pub trait Storage: Send + Sync {
     /// If the file has no templates, returns a [`ValidationError`](crate::FusilladeError::ValidationError)
     /// and the caller is responsible for marking the batch as failed.
     async fn populate_batch(&self, batch_id: BatchId, file_id: FileId) -> Result<()>;
+
+    /// Create a single-request batch with a pre-generated request ID.
+    ///
+    /// Atomically creates a file, template, batch, and request in one call.
+    /// The request ID is caller-specified so it can be known upfront without
+    /// a round-trip. Used for tracking realtime and flex responses where the
+    /// caller needs the ID before the request is processed.
+    ///
+    /// The request is created with the caller-specified `initial_state`:
+    /// - `"pending"` — daemon-processed (e.g. flex). The daemon will claim it.
+    /// - `"processing"` — externally-managed (e.g. realtime). The daemon
+    ///   ignores it; the caller completes/fails the row directly.
+    async fn create_single_request_batch(
+        &self,
+        input: CreateSingleRequestBatchInput,
+    ) -> Result<Batch>;
 
     /// Get a batch by ID.
     ///

@@ -19,7 +19,7 @@ pub use daemon::{Daemon, DaemonConfig, ModelEscalationConfig};
 pub use error::{FusilladeError, Result};
 pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient, StreamReassembler};
 pub use manager::postgres::{PoolProvider, PostgresRequestManager, TestDbPools};
-pub use manager::{DaemonExecutor, Storage};
+pub use manager::{CreateSingleRequestBatchInput, DaemonExecutor, Storage};
 pub use request::*;
 
 /// Get the fusillade database migrator
