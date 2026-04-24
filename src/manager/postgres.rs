@@ -3518,6 +3518,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "AND ($7::text IS NULL)" // tautology that consumes the bind slot
         };
 
+        let require_tier_clause = if filter.require_service_tier {
+            "AND r.service_tier IS NOT NULL"
+        } else {
+            ""
+        };
+
         let where_clause = format!(
             r#"
             WHERE (b.deleted_at IS NULL OR r.batch_id IS NULL)
@@ -3528,6 +3534,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
               AND ($5::timestamptz IS NULL OR r.created_at >= $5)
               AND ($6::timestamptz IS NULL OR r.created_at <= $6)
               {service_tier_clause}
+              {require_tier_clause}
         "#
         );
 

@@ -15,6 +15,7 @@ const DEFAULT_LIMIT: i64 = 50;
 pub(crate) fn service_tier_from_completion_window(completion_window: &str) -> Option<&'static str> {
     match completion_window {
         "1h" => Some("flex"),
+        "0s" => Some("priority"),
         _ => None,
     }
 }
@@ -41,6 +42,9 @@ pub struct ListRequestsFilter {
     /// Batch-tier requests have NULL service_tier and are not filterable
     /// by this field (use `completion_window` instead).
     pub service_tier: Option<String>,
+    /// Only include requests that have a non-NULL service_tier.
+    /// Excludes standard batch requests (which have NULL service_tier).
+    pub require_service_tier: bool,
     /// Sort active requests (pending/claimed/processing) first
     pub active_first: bool,
     /// Number of rows to skip (offset pagination)
@@ -59,6 +63,7 @@ impl Default for ListRequestsFilter {
             created_after: None,
             created_before: None,
             service_tier: None,
+            require_service_tier: false,
             active_first: false,
             skip: 0,
             limit: DEFAULT_LIMIT,
