@@ -154,9 +154,10 @@ pub trait Storage: Send + Sync {
     /// a round-trip. Used for tracking realtime and flex responses where the
     /// caller needs the ID before the request is processed.
     ///
-    /// The request is created in `pending` state. For realtime requests
-    /// (completion_window `0s`), the caller proxies via an external daemon
-    /// and completes the row via the outlet handler.
+    /// The request is created with the caller-specified `initial_state`:
+    /// - `"pending"` — daemon-processed (e.g. flex). The daemon will claim it.
+    /// - `"processing"` — externally-managed (e.g. realtime). The daemon
+    ///   ignores it; the caller completes/fails the row directly.
     async fn create_single_request_batch(
         &self,
         input: CreateSingleRequestBatchInput,

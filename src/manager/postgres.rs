@@ -2267,10 +2267,22 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 e
             ))
         })?;
-        let expires_at =
-            now + chrono::Duration::from_std(std_duration).unwrap_or(chrono::Duration::hours(24));
+        let expires_in = chrono::Duration::from_std(std_duration).map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Invalid completion_window duration '{}': {}",
+                input.completion_window,
+                e
+            ))
+        })?;
+        let expires_at = now.checked_add_signed(expires_in).ok_or_else(|| {
+            FusilladeError::ValidationError(format!(
+                "completion_window '{}' causes datetime overflow",
+                input.completion_window
+            ))
+        })?;
         let service_tier =
             crate::request::query::service_tier_from_completion_window(&input.completion_window);
+        let body_byte_size = input.body.len() as i64;
 
         let mut tx = pool
             .begin()
@@ -2288,10 +2300,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to create file: {}", e)))?;
 
-        // 2. Create template
+        // 2. Create template (with body_byte_size for accurate stats)
         sqlx::query(
-            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key)
-             VALUES ($1, $2, NULL, $3, 'POST', $4, $5, $6, $7)",
+            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
+             VALUES ($1, $2, NULL, $3, 'POST', $4, $5, $6, $7, $8)",
         )
         .bind(template_id)
         .bind(file_id)
@@ -2300,6 +2312,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(&input.body)
         .bind(&input.model)
         .bind(input.api_key.as_deref().unwrap_or(""))
+        .bind(body_byte_size)
         .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to create template: {}", e)))?;
@@ -2315,16 +2328,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(&input.completion_window)
         .bind(now)
         .bind(expires_at)
-        .bind(input.created_by.as_deref())
+        .bind(input.created_by.as_deref().unwrap_or(""))
         .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch: {}", e)))?;
 
         // 4. Create request with caller-specified ID and state.
         // When initial_state is 'processing', set daemon_id/claimed_at/started_at
-        // to satisfy the processing_fields_check constraint.
+        // to satisfy the processing_fields_check constraint. Uses a zero UUID as
+        // a sentinel daemon_id since no real daemon is processing the request.
         let (daemon_id, claimed_at, started_at) = if input.initial_state == "processing" {
-            (Some(input.request_id), Some(now), Some(now))
+            (Some(Uuid::nil()), Some(now), Some(now))
         } else {
             (None, None, None)
         };
@@ -3507,7 +3521,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let where_clause = format!(
             r#"
             WHERE (b.deleted_at IS NULL OR r.batch_id IS NULL)
-              AND ($1::text IS NULL OR b.created_by = $1 OR r.batch_id IS NULL)
+              AND ($1::text IS NULL OR b.created_by = $1)
               AND ($2::text IS NULL OR b.completion_window = $2)
               AND ($3::text IS NULL OR r.state = $3)
               AND ($4::text[] IS NULL OR r.model = ANY($4))
