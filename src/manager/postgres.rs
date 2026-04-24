@@ -2260,15 +2260,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let file_id = Uuid::new_v4();
         let batch_id = Uuid::new_v4();
 
-        let std_duration =
-            humantime::parse_duration(&input.completion_window).map_err(|e| {
-                FusilladeError::Other(anyhow!(
-                    "Invalid completion_window '{}': {}",
-                    input.completion_window,
-                    e
-                ))
-            })?;
-        let expires_at = now + chrono::Duration::from_std(std_duration).unwrap_or(chrono::Duration::hours(24));
+        let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Invalid completion_window '{}': {}",
+                input.completion_window,
+                e
+            ))
+        })?;
+        let expires_at =
+            now + chrono::Duration::from_std(std_duration).unwrap_or(chrono::Duration::hours(24));
         let service_tier =
             crate::request::query::service_tier_from_completion_window(&input.completion_window);
 

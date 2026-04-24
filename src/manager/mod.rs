@@ -10,7 +10,6 @@ use crate::batch::{
 use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::http::HttpClient;
-use uuid::Uuid;
 use crate::request::{
     AnyRequest, CascadeTargetState, Claimed, CreateDaemonRequestInput, DaemonId,
     ListRequestsFilter, Request, RequestDetail, RequestId, RequestListResult, RequestState,
@@ -21,6 +20,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -157,7 +157,10 @@ pub trait Storage: Send + Sync {
     /// The request is created in `pending` state. For realtime requests
     /// (completion_window `0s`), the caller proxies via an external daemon
     /// and completes the row via the outlet handler.
-    async fn create_single_request_batch(&self, input: CreateSingleRequestBatchInput) -> Result<Batch>;
+    async fn create_single_request_batch(
+        &self,
+        input: CreateSingleRequestBatchInput,
+    ) -> Result<Batch>;
 
     /// Get a batch by ID.
     ///
