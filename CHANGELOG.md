@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.5.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.4.0...fusillade-v16.5.0) (2026-04-24)
+
+
+### Features
+
+* create single request batch ([#236](https://github.com/doublewordai/fusillade/issues/236)) ([02ca49d](https://github.com/doublewordai/fusillade/commit/02ca49d5b5212b7b97cb761be646a52f8310c389))
+
 ## [16.4.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.3.0...fusillade-v16.4.0) (2026-04-23)
 
 
