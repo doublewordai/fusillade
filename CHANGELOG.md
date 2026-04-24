@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.5.1](https://github.com/doublewordai/fusillade/compare/fusillade-v16.5.0...fusillade-v16.5.1) (2026-04-24)
+
+
+### Bug Fixes
+
+* index for priority requests ([#238](https://github.com/doublewordai/fusillade/issues/238)) ([b7e5f33](https://github.com/doublewordai/fusillade/commit/b7e5f33c3a2ad51a560161672df1c6707c519f01))
+
 ## [16.5.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.4.0...fusillade-v16.5.0) (2026-04-24)
 
 
