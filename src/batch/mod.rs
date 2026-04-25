@@ -392,9 +392,11 @@ pub struct ListBatchesFilter {
     /// treated as terminal because cancel_batch sets both cancelling_at and
     /// cancelled_at atomically. Default false (pure chronological).
     pub active_first: bool,
-    /// Exclude batches with this completion window (e.g., "1h" to hide async batches).
-    /// When set, batches matching this window are filtered out.
-    pub exclude_completion_window: Option<String>,
+    /// Only return batches whose completion window matches any value in this
+    /// list (e.g., `["24h"]` for batch tier, `["1h"]` for flex, `["0s"]` for
+    /// realtime tracking rows). `None` disables the filter; `Some(vec![])`
+    /// matches no rows.
+    pub completion_windows: Option<Vec<String>>,
 }
 
 /// Items that can be yielded from a file upload stream

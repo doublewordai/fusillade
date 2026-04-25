@@ -2258,7 +2258,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let now = Utc::now();
         let template_id = Uuid::new_v4();
         let file_id = Uuid::new_v4();
-        let batch_id = Uuid::new_v4();
+        let batch_id = input.batch_id;
 
         let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -2671,7 +2671,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             created_after,
             created_before,
             active_first,
-            exclude_completion_window,
+            completion_windows,
         } = filter;
         let limit = limit.unwrap_or(100);
 
@@ -2878,10 +2878,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             }
         }
 
-        // Exclude batches with a specific completion window (e.g., hide async batches)
-        if let Some(ref exclude_window) = exclude_completion_window {
-            query_builder.push(" AND b.completion_window != ");
-            query_builder.push_bind(exclude_window.as_str());
+        // Restrict to a specific set of completion windows (e.g., ["24h"] for
+        // batch tier, ["1h"] for flex, ["0s"] for realtime tracking rows).
+        // Uses idx_batches_completion_window. An empty vec returns no rows.
+        if let Some(ref windows) = completion_windows {
+            query_builder.push(" AND b.completion_window = ANY(");
+            query_builder.push_bind(windows.as_slice());
+            query_builder.push(")");
         }
 
         // ORDER BY: when active_first is enabled, sort by the `priority` column
@@ -12502,7 +12505,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_list_batches_exclude_completion_window(pool: sqlx::PgPool) {
+    async fn test_list_batches_completion_windows(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -12557,10 +12560,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Exclude 24h — should only return the 1h batch
+        // Restrict to 1h — should only return the 1h batch
         let result = manager
             .list_batches(crate::batch::ListBatchesFilter {
-                exclude_completion_window: Some("24h".to_string()),
+                completion_windows: Some(vec!["1h".to_string()]),
                 ..Default::default()
             })
             .await
@@ -12570,10 +12573,10 @@ mod tests {
         assert_eq!(result[0].id, batch_1h.id);
         assert_eq!(result[0].completion_window, "1h");
 
-        // Exclude 1h — should only return the 24h batch
+        // Restrict to 24h — should only return the 24h batch
         let result = manager
             .list_batches(crate::batch::ListBatchesFilter {
-                exclude_completion_window: Some("1h".to_string()),
+                completion_windows: Some(vec!["24h".to_string()]),
                 ..Default::default()
             })
             .await
@@ -12582,13 +12585,35 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].completion_window, "24h");
 
-        // No exclusion — both returned
+        // Allow both windows — both returned
+        let result = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                completion_windows: Some(vec!["1h".to_string(), "24h".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+
+        // No filter — both returned
         let result = manager
             .list_batches(crate::batch::ListBatchesFilter::default())
             .await
             .unwrap();
 
         assert_eq!(result.len(), 2);
+
+        // Empty vec — matches nothing
+        let result = manager
+            .list_batches(crate::batch::ListBatchesFilter {
+                completion_windows: Some(vec![]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 0);
     }
 
     // =========================================================================
@@ -13168,6 +13193,7 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let batch = manager
             .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
+                batch_id: uuid::Uuid::new_v4(),
                 request_id,
                 body: r#"{"model":"gpt-4","input":"hi"}"#.to_string(),
                 model: "gpt-4".to_string(),
@@ -13207,6 +13233,7 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let _batch = manager
             .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
+                batch_id: uuid::Uuid::new_v4(),
                 request_id,
                 body: r#"{"model":"gpt-4","input":"hi"}"#.to_string(),
                 model: "gpt-4".to_string(),
@@ -13240,6 +13267,7 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let _batch = manager
             .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
+                batch_id: uuid::Uuid::new_v4(),
                 request_id,
                 body: r#"{"input":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),
@@ -13272,6 +13300,7 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let _batch = manager
             .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
+                batch_id: uuid::Uuid::new_v4(),
                 request_id,
                 body: r#"{"input":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),
@@ -13318,6 +13347,7 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let _batch = manager
             .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
+                batch_id: uuid::Uuid::new_v4(),
                 request_id,
                 body: r#"{"input":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),
@@ -13365,6 +13395,7 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let _batch = manager
             .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
+                batch_id: uuid::Uuid::new_v4(),
                 request_id,
                 body: r#"{"input":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),
