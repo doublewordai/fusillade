@@ -13,6 +13,7 @@ use crate::http::HttpClient;
 use crate::request::{
     AnyRequest, CascadeTargetState, Claimed, CreateDaemonRequestInput, DaemonId,
     ListRequestsFilter, Request, RequestDetail, RequestId, RequestListResult, RequestState,
+    ServiceTierFilter,
 };
 use async_trait::async_trait;
 use futures::stream::Stream;
@@ -313,6 +314,9 @@ pub trait Storage: Send + Sync {
     /// - `states`: request states to include (e.g. `["pending"]`, or
     ///   `["pending","claimed","processing"]`).
     /// - `model_filter`: optional model whitelist (empty = all).
+    /// - `service_tier_filter`: filter on `service_tier`. `Any` (default) applies
+    ///   no filter; `Include`/`Exclude` use `Option<String>` where `None`
+    ///   represents the batch tier (`service_tier IS NULL`).
     /// - `strict`: bool. For critical/sensitive operations, set `true` to
     ///   use the write pool and avoid read lags.
     ///
@@ -324,6 +328,7 @@ pub trait Storage: Send + Sync {
         windows: &[(String, Option<i64>, i64)],
         states: &[String],
         model_filter: &[String],
+        service_tier_filter: &ServiceTierFilter,
         strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>>;
     ///

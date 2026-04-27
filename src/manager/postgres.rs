@@ -38,6 +38,7 @@ use crate::http::HttpClient;
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateDaemonRequestInput, DaemonId, Failed,
     FailureReason, Pending, Processing, Request, RequestData, RequestId, RequestState,
+    ServiceTierFilter,
 };
 
 use super::DaemonExecutor;
@@ -733,6 +734,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         windows: &[(String, Option<i64>, i64)], // (label, start_secs, end_secs)
         states: &[String], // e.g. ["pending"] or ["pending","claimed","processing"]
         model_filter: &[String], // empty = all models
+        service_tier_filter: &ServiceTierFilter,
         strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>> {
         if windows.is_empty() || states.is_empty() {
@@ -761,6 +763,22 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ends.push(*end);
         }
 
+        // Translate the service_tier filter into (named_tiers, include_null,
+        // mode) where mode is 'any' | 'include' | 'exclude'. The SQL branches
+        // on $9 so each variant short-circuits to a single predicate.
+        let (tier_names, tier_include_null, tier_mode): (Vec<String>, bool, &str) =
+            match service_tier_filter {
+                ServiceTierFilter::Any => (Vec::new(), true, "any"),
+                ServiceTierFilter::Include(tiers) => {
+                    let (names, has_null) = ServiceTierFilter::split(tiers);
+                    (names, has_null, "include")
+                }
+                ServiceTierFilter::Exclude(tiers) => {
+                    let (names, has_null) = ServiceTierFilter::split(tiers);
+                    (names, has_null, "exclude")
+                }
+            };
+
         let pool = if strict {
             self.pools.write()
         } else {
@@ -786,6 +804,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             AND r.template_id IS NOT NULL
             AND b.cancelling_at IS NULL
             AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
+            AND (
+                $9 = 'any'
+                OR ($9 = 'include' AND (
+                    (r.service_tier IS NOT NULL AND r.service_tier = ANY($7))
+                    OR ($8 AND r.service_tier IS NULL)
+                ))
+                OR ($9 = 'exclude' AND (
+                    (r.service_tier IS NULL AND NOT $8)
+                    OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($7))
+                ))
+            )
             GROUP BY r.model, w.label
             "#,
         )
@@ -795,6 +824,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(&ends)
         .bind(states)
         .bind(model_filter)
+        .bind(&tier_names)
+        .bind(tier_include_null)
+        .bind(tier_mode)
         .fetch_all(pool)
         .await
         .map_err(|e| {
@@ -11199,7 +11231,13 @@ mod tests {
         let model_filter: Vec<String> = vec![];
 
         let counts = manager
-            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, false)
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                false,
+            )
             .await
             .unwrap();
 
@@ -11218,6 +11256,7 @@ mod tests {
                 &[("1h:4h".to_string(), Some(3600), 14_400)],
                 &states,
                 &model_filter,
+                &ServiceTierFilter::Any,
                 false,
             )
             .await
@@ -11231,6 +11270,7 @@ mod tests {
                 &[("bad".to_string(), Some(7200), 3600)],
                 &states,
                 &model_filter,
+                &ServiceTierFilter::Any,
                 false,
             )
             .await
@@ -11255,6 +11295,7 @@ mod tests {
                 &[("1h".to_string(), None, 3600)],
                 &states,
                 &model_filter,
+                &ServiceTierFilter::Any,
                 false,
             )
             .await
@@ -11266,6 +11307,7 @@ mod tests {
                 &[("1h".to_string(), Some(0), 3600)],
                 &states,
                 &model_filter,
+                &ServiceTierFilter::Any,
                 false,
             )
             .await
@@ -11359,7 +11401,13 @@ mod tests {
         let model_filter = vec!["model-a".to_string()];
 
         let counts = manager
-            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, false)
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                false,
+            )
             .await
             .unwrap();
 
@@ -11372,7 +11420,13 @@ mod tests {
         let model_filter: Vec<String> = vec![];
 
         let counts_all = manager
-            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, false)
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                false,
+            )
             .await
             .unwrap();
 
@@ -11389,7 +11443,13 @@ mod tests {
         .unwrap();
 
         let counts_cancelled = manager
-            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, false)
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                false,
+            )
             .await
             .unwrap();
 
@@ -11407,6 +11467,7 @@ mod tests {
                 &[],
                 &["pending".to_string()],
                 &[],
+                &ServiceTierFilter::Any,
                 false,
             )
             .await
@@ -11418,6 +11479,154 @@ mod tests {
                 &[("1h".to_string(), None, 3600)],
                 &[],
                 &[],
+                &ServiceTierFilter::Any,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(counts.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn test_pending_request_counts_service_tier_filter(pool: sqlx::PgPool) {
+        use chrono::Duration;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Three batches for the same model with different completion windows,
+        // which derive different service_tier values:
+        //   "24h" → NULL (batch tier)
+        //   "1h"  → "flex"
+        //   "0s"  → "priority"
+        let mut batch_ids = Vec::new();
+        for (label, completion_window) in [("batch", "24h"), ("flex", "1h"), ("priority", "0s")] {
+            let file_id = manager
+                .create_file(
+                    format!("file-{label}"),
+                    None,
+                    vec![RequestTemplateInput {
+                        custom_id: Some(label.to_string()),
+                        endpoint: "/v1/chat/completions".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"input":"x"}"#.to_string(),
+                        model: "model-a".to_string(),
+                        api_key: "k".to_string(),
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let batch = manager
+                .create_batch(BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: completion_window.to_string(),
+                    metadata: None,
+                    created_by: None,
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+            batch_ids.push(batch.id);
+        }
+
+        // Pin all expires_at to a known future time so the window predicate
+        // matches deterministically and is independent of completion_window.
+        let now = Utc::now();
+        for batch_id in &batch_ids {
+            sqlx::query!(
+                "UPDATE batches SET expires_at = $1 WHERE id = $2",
+                now + Duration::minutes(30),
+                **batch_id as Uuid
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let windows = vec![("1h".to_string(), None, 3600)];
+        let states = vec!["pending".to_string()];
+        let model_filter: Vec<String> = vec![];
+
+        // Any: all three rows counted.
+        let counts = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 3);
+
+        // Exclude("priority"): batch + flex.
+        let counts = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Exclude(vec![Some("priority".to_string())]),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 2);
+
+        // Include only batch tier (None represents NULL).
+        let counts = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Include(vec![None]),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 1);
+
+        // Include batch + flex.
+        let counts = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Include(vec![None, Some("flex".to_string())]),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 2);
+
+        // Exclude batch tier (None represents NULL): flex + priority.
+        let counts = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Exclude(vec![None]),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 2);
+
+        // Empty Include matches nothing.
+        let counts = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Include(vec![]),
                 false,
             )
             .await

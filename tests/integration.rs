@@ -4,7 +4,7 @@ use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retr
 use fusillade::http::{HttpResponse, MockHttpClient};
 use fusillade::manager::postgres::PostgresRequestManager;
 use fusillade::manager::{DaemonExecutor, Storage};
-use fusillade::request::ListRequestsFilter;
+use fusillade::request::{ListRequestsFilter, ServiceTierFilter};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2357,6 +2357,7 @@ mod queue_counts {
                 ],
                 &["pending".to_string()],
                 &[],
+                &ServiceTierFilter::Any,
                 false,
             )
             .await
