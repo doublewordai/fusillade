@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.6.1](https://github.com/doublewordai/fusillade/compare/fusillade-v16.6.0...fusillade-v16.6.1) (2026-04-27)
+
+
+### Bug Fixes
+
+* filter service_tier in queue monitoring query ([#243](https://github.com/doublewordai/fusillade/issues/243)) ([05fe2f0](https://github.com/doublewordai/fusillade/commit/05fe2f03b82a57e0506d932199a5379742f17a6e))
+
 ## [16.6.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.5.1...fusillade-v16.6.0) (2026-04-27)
 
 
