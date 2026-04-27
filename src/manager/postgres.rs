@@ -2258,7 +2258,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let now = Utc::now();
         let template_id = Uuid::new_v4();
         let file_id = Uuid::new_v4();
-        let batch_id = input.batch_id;
+        let batch_id = input.batch_id.unwrap_or_else(Uuid::new_v4);
 
         let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -13193,7 +13193,7 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let batch = manager
             .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: uuid::Uuid::new_v4(),
+                batch_id: None,
                 request_id,
                 body: r#"{"model":"gpt-4","input":"hi"}"#.to_string(),
                 model: "gpt-4".to_string(),
@@ -13233,7 +13233,7 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let _batch = manager
             .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: uuid::Uuid::new_v4(),
+                batch_id: None,
                 request_id,
                 body: r#"{"model":"gpt-4","input":"hi"}"#.to_string(),
                 model: "gpt-4".to_string(),
@@ -13267,7 +13267,7 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let _batch = manager
             .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: uuid::Uuid::new_v4(),
+                batch_id: None,
                 request_id,
                 body: r#"{"input":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),
@@ -13300,7 +13300,7 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let _batch = manager
             .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: uuid::Uuid::new_v4(),
+                batch_id: None,
                 request_id,
                 body: r#"{"input":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),
@@ -13347,7 +13347,7 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let _batch = manager
             .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: uuid::Uuid::new_v4(),
+                batch_id: None,
                 request_id,
                 body: r#"{"input":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),
@@ -13395,7 +13395,7 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let _batch = manager
             .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: uuid::Uuid::new_v4(),
+                batch_id: None,
                 request_id,
                 body: r#"{"input":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),

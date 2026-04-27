@@ -29,10 +29,11 @@ mod utils;
 /// Input for creating a single-request batch with a pre-generated request ID.
 #[derive(Debug, Clone)]
 pub struct CreateSingleRequestBatchInput {
-    /// Pre-generated batch UUID. Becomes the batch's primary key. Provided by
-    /// the caller so the same id can be set on outbound proxy headers (e.g.
-    /// `x-fusillade-batch-id`) before the row exists.
-    pub batch_id: Uuid,
+    /// Optional pre-generated batch UUID. When `Some`, becomes the batch's
+    /// primary key — useful when the caller needs to attach the id to
+    /// outbound proxy headers (e.g. `x-fusillade-batch-id`) before the row
+    /// exists. When `None`, a fresh UUID is generated internally.
+    pub batch_id: Option<Uuid>,
     /// Pre-generated request UUID. Becomes the request's primary key.
     pub request_id: Uuid,
     /// Request body (JSON string).
