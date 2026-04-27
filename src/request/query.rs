@@ -20,6 +20,38 @@ pub(crate) fn service_tier_from_completion_window(completion_window: &str) -> Op
     }
 }
 
+/// Filter on `service_tier`.
+///
+/// `None` in the inner vec represents the batch tier (`service_tier IS NULL`);
+/// named strings match specific tier values such as `"flex"` or `"priority"`.
+///
+/// `Default` is `Any` — no filter applied.
+#[derive(Debug, Clone, Default)]
+pub enum ServiceTierFilter {
+    /// No filter — match all tiers including batch (NULL).
+    #[default]
+    Any,
+    /// Match only rows whose tier is in this set. Empty matches nothing.
+    Include(Vec<Option<String>>),
+    /// Match all tiers except those in this set.
+    Exclude(Vec<Option<String>>),
+}
+
+impl ServiceTierFilter {
+    /// Split a list of `Option<String>` tiers into (named_tiers, includes_null).
+    pub(crate) fn split(tiers: &[Option<String>]) -> (Vec<String>, bool) {
+        let mut names = Vec::with_capacity(tiers.len());
+        let mut has_null = false;
+        for t in tiers {
+            match t {
+                Some(s) => names.push(s.clone()),
+                None => has_null = true,
+            }
+        }
+        (names, has_null)
+    }
+}
+
 /// Filter parameters for listing requests across batches.
 #[derive(Debug, Clone)]
 pub struct ListRequestsFilter {

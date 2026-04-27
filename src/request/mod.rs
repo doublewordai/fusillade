@@ -14,6 +14,7 @@ pub mod types;
 pub use query::RequestSummaryWithCount;
 pub use query::{
     CreateDaemonRequestInput, ListRequestsFilter, RequestDetail, RequestListResult, RequestSummary,
+    ServiceTierFilter,
 };
 pub use transitions::CancellationReason;
 pub use types::*;
