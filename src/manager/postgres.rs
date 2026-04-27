@@ -3803,11 +3803,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(())
     }
 
-    async fn fail_request(&self, request_id: RequestId, error: &str) -> Result<()> {
+    async fn fail_request(
+        &self,
+        request_id: RequestId,
+        error: &str,
+        status_code: u16,
+    ) -> Result<()> {
         let pool = self.pools.write();
 
         let reason = FailureReason::NonRetriableHttpStatus {
-            status: 500,
+            status: status_code,
             body: error.to_string(),
         };
         let error_json = serde_json::to_string(&reason).map_err(|e| {
@@ -13572,7 +13577,11 @@ mod tests {
 
         // Fail the request
         manager
-            .fail_request(crate::request::RequestId(request_id), "upstream timeout")
+            .fail_request(
+                crate::request::RequestId(request_id),
+                "upstream timeout",
+                504,
+            )
             .await
             .expect("fail should succeed");
 
@@ -13589,7 +13598,7 @@ mod tests {
                 .expect("error should be valid FailureReason JSON");
         assert!(matches!(
             error,
-            crate::request::FailureReason::NonRetriableHttpStatus { status: 500, .. }
+            crate::request::FailureReason::NonRetriableHttpStatus { status: 504, .. }
         ));
     }
 
