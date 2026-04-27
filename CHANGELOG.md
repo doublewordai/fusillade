@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.6.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.5.1...fusillade-v16.6.0) (2026-04-27)
+
+
+### Features
+
+* filter batches by completion window ([#240](https://github.com/doublewordai/fusillade/issues/240)) ([a68f449](https://github.com/doublewordai/fusillade/commit/a68f449ad2d0dd1b0b4204ba2ac0e4cd115369d4))
+
 ## [16.5.1](https://github.com/doublewordai/fusillade/compare/fusillade-v16.5.0...fusillade-v16.5.1) (2026-04-24)
 
 
