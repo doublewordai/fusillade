@@ -453,11 +453,16 @@ pub trait Storage: Send + Sync {
         status_code: u16,
     ) -> Result<()>;
 
-    /// Fail a processing request with an error message.
+    /// Fail a processing request with an error message and HTTP status code.
     ///
     /// Transitions the request from "processing" to "failed" and stores the
-    /// error message as a JSON object.
-    async fn fail_request(&self, request_id: RequestId, error: &str) -> Result<()>;
+    /// error as a `NonRetriableHttpStatus` JSON object with the given status code.
+    async fn fail_request(
+        &self,
+        request_id: RequestId,
+        error: &str,
+        status_code: u16,
+    ) -> Result<()>;
 }
 
 /// Daemon lifecycle persistence.
