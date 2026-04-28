@@ -12,6 +12,7 @@ pub mod error;
 pub mod http;
 pub mod manager;
 pub mod request;
+pub mod response_step;
 
 // Re-export commonly used types
 pub use batch::*;
@@ -19,8 +20,13 @@ pub use daemon::{Daemon, DaemonConfig, ModelEscalationConfig};
 pub use error::{FusilladeError, Result};
 pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient, StreamReassembler};
 pub use manager::postgres::{PoolProvider, PostgresRequestManager, TestDbPools};
+#[cfg(feature = "postgres")]
+pub use manager::response_step::PostgresResponseStepManager;
 pub use manager::{CreateSingleRequestBatchInput, DaemonExecutor, Storage};
 pub use request::*;
+pub use response_step::{
+    CreateStepInput, ResponseStep, ResponseStepStore, StepId, StepKind, StepState,
+};
 
 /// Get the fusillade database migrator
 ///
