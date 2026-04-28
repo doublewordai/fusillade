@@ -88,6 +88,12 @@ pub struct PostgresRequestManager<P: PoolProvider, H: HttpClient> {
     config: DaemonConfig,
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
+    /// Optional override for the daemon's per-claim processor. `None` uses
+    /// [`DefaultRequestProcessor`] inside the daemon, preserving the
+    /// existing batch path. `Some(_)` is threaded through to
+    /// [`Daemon::with_processor`] when [`run`](Self::run) starts the
+    /// background worker.
+    processor: Option<Arc<dyn crate::processor::RequestProcessor<Self, H>>>,
 }
 
 /// Macro for extracting a [`Batch`] from a dynamic query row (PgRow).
@@ -172,6 +178,7 @@ impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> 
             config,
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
+            processor: None,
         }
     }
 }
@@ -196,7 +203,22 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             config: DaemonConfig::default(),
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
+            processor: None,
         }
+    }
+
+    /// Override the daemon's per-claim processor.
+    ///
+    /// By default the manager runs the daemon with
+    /// [`DefaultRequestProcessor`], preserving the existing batch path. Use
+    /// this builder to plug in a custom [`RequestProcessor`] (e.g. dwctl's
+    /// multi-step Open Responses dispatcher).
+    pub fn with_processor(
+        mut self,
+        processor: Arc<dyn crate::processor::RequestProcessor<Self, H>>,
+    ) -> Self {
+        self.processor = Some(processor);
+        self
     }
 
     /// Set a custom daemon configuration.
@@ -5100,12 +5122,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> DaemonExecutor<H> for PostgresReq
     ) -> Result<JoinHandle<Result<()>>> {
         tracing::info!("Starting PostgreSQL request manager daemon");
 
-        let daemon = Arc::new(Daemon::new(
+        let mut daemon = Daemon::new(
             self.clone(),
             self.http_client.clone(),
             self.config.clone(),
             shutdown_token,
-        ));
+        );
+        if let Some(processor) = self.processor.clone() {
+            daemon = daemon.with_processor(processor);
+        }
+        let daemon = Arc::new(daemon);
 
         let handle = tokio::spawn(async move {
             // Daemon will poll for cancelled batches periodically

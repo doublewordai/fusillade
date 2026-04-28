@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod error;
 pub mod http;
 pub mod manager;
+pub mod processor;
 pub mod request;
 pub mod response_step;
 
@@ -23,6 +24,7 @@ pub use manager::postgres::{PoolProvider, PostgresRequestManager, TestDbPools};
 #[cfg(feature = "postgres")]
 pub use manager::response_step::PostgresResponseStepManager;
 pub use manager::{CreateSingleRequestBatchInput, DaemonExecutor, Storage};
+pub use processor::{CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry};
 pub use request::*;
 pub use response_step::{
     CreateStepInput, ResponseStep, ResponseStepStore, StepId, StepKind, StepState,
