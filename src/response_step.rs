@@ -68,7 +68,11 @@ impl StepKind {
     }
 }
 
-/// Lifecycle state of a step. Mirrors `requests.state` values exactly.
+/// Lifecycle state of a step.
+///
+/// Mirrors a subset of the `requests.state` lifecycle. `claimed` is omitted
+/// because steps do not carry their own lease — serialized access is provided
+/// by the parent request's lease, held by the worker driving the chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepState {
@@ -168,8 +172,11 @@ pub trait ResponseStepStore: Send + Sync {
     /// The `UNIQUE (request_id, parent_step_id, prev_step_id, step_kind)`
     /// constraint is the idempotency safety net: a re-running transition
     /// function under crash recovery will not produce duplicate successor
-    /// rows. Implementations should surface that as a typed conflict so
-    /// callers can fall back to reading the existing row.
+    /// rows. The conflict is reported through the store's normal error
+    /// path; callers that need idempotent recovery should detect the
+    /// duplicate via [`ResponseStepStore::list_scope`] (which is the
+    /// authoritative way to find the existing frontier under recovery)
+    /// rather than relying on parsing this error.
     async fn create_step(&self, input: CreateStepInput) -> Result<StepId>;
 
     /// Fetch a single step by id. Returns `None` if not present.

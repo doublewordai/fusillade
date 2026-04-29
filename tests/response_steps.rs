@@ -263,6 +263,63 @@ async fn fail_step_records_error_payload(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test]
+async fn cancel_step_records_canceled_at_and_blocks_terminal_transitions(pool: sqlx::PgPool) {
+    let request_id = insert_parent_request(&pool).await;
+    let pools = TestDbPools::new(pool).await.unwrap();
+    let store = PostgresResponseStepManager::new(pools);
+
+    // Cancel directly from `pending` (the most common path: a request is
+    // canceled before its first step has been claimed by a worker).
+    let pending_id = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id,
+            prev_step_id: None,
+            parent_step_id: None,
+            step_kind: StepKind::ModelCall,
+            step_sequence: 1,
+            request_payload: json!({}),
+        })
+        .await
+        .unwrap();
+
+    store.cancel_step(pending_id).await.unwrap();
+    let s = store.get_step(pending_id).await.unwrap().unwrap();
+    assert_eq!(s.state, StepState::Canceled);
+    assert!(s.canceled_at.is_some());
+    assert!(s.started_at.is_none());
+
+    // Subsequent terminal transitions are rejected (canceled is terminal).
+    let err = store.complete_step(pending_id, json!({"x": 1})).await;
+    assert!(err.is_err(), "complete_step on canceled step must fail");
+    let err = store.fail_step(pending_id, json!({"x": 1})).await;
+    assert!(err.is_err(), "fail_step on canceled step must fail");
+    let err = store.cancel_step(pending_id).await;
+    assert!(err.is_err(), "second cancel_step must fail");
+
+    // Cancel after `processing` works too — this is the path taken when a
+    // batch is canceled while a worker is mid-flight.
+    let processing_id = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id,
+            prev_step_id: Some(pending_id),
+            parent_step_id: None,
+            step_kind: StepKind::ToolCall,
+            step_sequence: 2,
+            request_payload: json!({}),
+        })
+        .await
+        .unwrap();
+    store.mark_step_processing(processing_id).await.unwrap();
+    store.cancel_step(processing_id).await.unwrap();
+    let s = store.get_step(processing_id).await.unwrap().unwrap();
+    assert_eq!(s.state, StepState::Canceled);
+    assert!(s.started_at.is_some());
+    assert!(s.canceled_at.is_some());
+}
+
+#[sqlx::test]
 async fn requeue_for_retry_increments_attempt(pool: sqlx::PgPool) {
     let request_id = insert_parent_request(&pool).await;
     let pools = TestDbPools::new(pool).await.unwrap();

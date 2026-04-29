@@ -18,11 +18,17 @@ CREATE TABLE IF NOT EXISTS response_steps (
     -- Linear predecessor within a single chain (NULL = first step in its
     -- scope). Scope is (request_id, parent_step_id): the chain restarts
     -- inside each nested sub-loop.
-    prev_step_id    UUID NULL REFERENCES response_steps(id),
+    --
+    -- ON DELETE CASCADE so a parent-row delete (or a manual single-row
+    -- delete in the chain) does not leave dangling pointers. The cascade
+    -- from `requests` already deletes every step in one statement, but
+    -- being explicit here keeps individual-step deletes safe too.
+    prev_step_id    UUID NULL REFERENCES response_steps(id) ON DELETE CASCADE,
 
     -- Nesting pointer for sub-agent loops (NULL = top-level step in the
-    -- user-visible response).
-    parent_step_id  UUID NULL REFERENCES response_steps(id),
+    -- user-visible response). ON DELETE CASCADE for the same reason as
+    -- prev_step_id.
+    parent_step_id  UUID NULL REFERENCES response_steps(id) ON DELETE CASCADE,
 
     step_kind       TEXT NOT NULL,
 
@@ -58,6 +64,61 @@ CREATE TABLE IF NOT EXISTS response_steps (
     CONSTRAINT response_steps_state_check
         CHECK (state IN ('pending', 'processing',
                          'completed', 'failed', 'canceled')),
+
+    -- State field-presence invariants, mirroring the `requests` table.
+    -- These backstop partial-update bugs that would otherwise leave a row
+    -- in an inconsistent shape (e.g., `completed` with no
+    -- `response_payload`).
+    CONSTRAINT response_steps_pending_fields_check CHECK (
+        state <> 'pending' OR (
+            started_at IS NULL
+            AND completed_at IS NULL
+            AND failed_at IS NULL
+            AND canceled_at IS NULL
+            AND response_payload IS NULL
+            AND error IS NULL
+        )
+    ),
+    CONSTRAINT response_steps_processing_fields_check CHECK (
+        state <> 'processing' OR (
+            started_at IS NOT NULL
+            AND completed_at IS NULL
+            AND failed_at IS NULL
+            AND canceled_at IS NULL
+            AND response_payload IS NULL
+            AND error IS NULL
+        )
+    ),
+    CONSTRAINT response_steps_completed_fields_check CHECK (
+        state <> 'completed' OR (
+            started_at IS NOT NULL
+            AND completed_at IS NOT NULL
+            AND failed_at IS NULL
+            AND canceled_at IS NULL
+            AND response_payload IS NOT NULL
+            AND error IS NULL
+        )
+    ),
+    -- `failed` and `canceled` are reachable from either `pending` or
+    -- `processing`, so `started_at` may be NULL on these rows. We do not
+    -- require it.
+    CONSTRAINT response_steps_failed_fields_check CHECK (
+        state <> 'failed' OR (
+            completed_at IS NULL
+            AND failed_at IS NOT NULL
+            AND canceled_at IS NULL
+            AND response_payload IS NULL
+            AND error IS NOT NULL
+        )
+    ),
+    CONSTRAINT response_steps_canceled_fields_check CHECK (
+        state <> 'canceled' OR (
+            completed_at IS NULL
+            AND failed_at IS NULL
+            AND canceled_at IS NOT NULL
+            AND response_payload IS NULL
+        )
+    ),
 
     -- Idempotency safety net for crash recovery: a re-running transition
     -- function must not produce duplicate successor rows. Recovery
