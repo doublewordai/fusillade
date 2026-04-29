@@ -25,6 +25,8 @@ use uuid::Uuid;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod response_step;
 mod utils;
 
 /// Input for creating a single-request batch with a pre-generated request ID.

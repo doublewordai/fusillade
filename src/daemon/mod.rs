@@ -16,6 +16,7 @@ use crate::batch::BatchId;
 use crate::error::Result;
 use crate::http::{HttpClient, HttpResponse};
 use crate::manager::{DaemonStorage, Storage};
+use crate::processor::{DefaultRequestProcessor, RequestProcessor};
 use crate::request::{DaemonId, RequestCompletionResult};
 
 pub mod transitions;
@@ -314,6 +315,12 @@ where
     storage: Arc<S>,
     http_client: Arc<H>,
     config: DaemonConfig,
+    /// Per-claim processing hook. Defaults to [`DefaultRequestProcessor`],
+    /// which preserves the existing fire-and-store pipeline byte-for-byte.
+    /// Override via [`Daemon::with_processor`] to inject custom orchestration
+    /// (e.g. multi-step Open Responses loops) without changing any other
+    /// daemon behavior.
+    processor: Arc<dyn RequestProcessor<S, H>>,
     requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
     /// Per-user in-flight request counts across all models, used to prioritise
     /// users with fewer active requests during claim (per-user fair scheduling).
@@ -334,6 +341,10 @@ where
     H: HttpClient + 'static,
 {
     /// Create a new daemon.
+    ///
+    /// Uses [`DefaultRequestProcessor`] for per-claim processing, preserving
+    /// today's pipeline behavior. To inject custom orchestration, chain
+    /// [`Daemon::with_processor`] after this.
     pub fn new(
         storage: Arc<S>,
         http_client: Arc<H>,
@@ -345,6 +356,7 @@ where
             storage,
             http_client,
             config,
+            processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
             user_requests_in_flight: Arc::new(dashmap::DashMap::new()),
             user_throughput: Arc::new(dashmap::DashMap::new()),
@@ -353,6 +365,24 @@ where
             shutdown_token,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    /// Override the per-claim processing hook.
+    ///
+    /// Returns `self` for chained construction:
+    ///
+    /// ```ignore
+    /// let daemon = Daemon::new(storage, http, config, shutdown)
+    ///     .with_processor(Arc::new(my_custom_processor));
+    /// ```
+    ///
+    /// The provided processor is invoked once per claimed request in place
+    /// of the default fire-and-store path. The daemon continues to own
+    /// metrics, cancellation token plumbing, retry persistence, and the
+    /// outer processing span.
+    pub fn with_processor(mut self, processor: Arc<dyn RequestProcessor<S, H>>) -> Self {
+        self.processor = processor;
+        self
     }
 
     /// Run the daemon loop.
@@ -874,6 +904,7 @@ where
                         .unwrap_or_default();
                     let storage = self.storage.clone();
                     let http_client = (*self.http_client).clone();
+                    let processor = self.processor.clone();
                     let retry_config = (&self.config).into();
                     let requests_in_flight = self.requests_in_flight.clone();
                     let user_throughput = self.user_throughput.clone();
@@ -949,30 +980,19 @@ where
                             }
                         });
 
-                        // Duration span covering the claimed state (from claim to process start)
-                        let retry_attempt = request.state.retry_attempt;
-                        let processing = async {
-                            tracing::debug!("Sending batch request to inference endpoint");
-                            request.process(
-                                http_client,
-                                storage.as_ref()
-                            ).await
-                        }.instrument(tracing::info_span!(
-                            "fusillade.state.claimed",
-                            otel.name = "fusillade.state.claimed",
-                            request_id = %request_id,
-                            daemon_id = %daemon_id,
-                            retry_attempt,
-                        )).await?;
+                        // Capture retry attempt and batch expiry before moving the
+                        // request into the processor. retry_attempt is preserved
+                        // unchanged across Claimed -> Processing -> terminal, so a
+                        // single capture suffices for downstream metrics.
+                        let retry_attempt_at_completion = request.state.retry_attempt;
+                        let batch_expires_at = request.state.batch_expires_at;
 
-                        // Capture retry attempt count before completion (not preserved in Completed state)
-                        let retry_attempt_at_completion = processing.state.retry_attempt;
-                        // Capture batch expiry time for SLA missed completion tracking
-                        let batch_expires_at = processing.state.batch_expires_at;
-
-                        // Duration span covering the processing state (HTTP in-flight)
-                        let completion_result = async {
-                            let cancellation = async {
+                        // Build the cancellation future the daemon owns. The
+                        // processor observes this without needing to know about
+                        // the underlying tokens — keeping shutdown ordering a
+                        // daemon concern.
+                        let cancellation: crate::processor::CancellationFuture =
+                            Box::pin(async move {
                                 tokio::select! {
                                     _ = batch_cancellation_token.cancelled() => {
                                         crate::request::transitions::CancellationReason::User
@@ -981,17 +1001,22 @@ where
                                         crate::request::transitions::CancellationReason::Shutdown
                                     }
                                 }
-                            };
+                            });
 
-                            processing.complete(storage.as_ref(), |response| {
-                                (should_retry)(response)
-                            }, cancellation).await
-                        }.instrument(tracing::info_span!(
-                            "fusillade.state.processing",
-                            otel.name = "fusillade.state.processing",
-                            request_id = %request_id,
-                            retry_attempt = retry_attempt_at_completion
-                        )).await;
+                        // Hand the per-claim work to the processor. The default
+                        // impl emits the same fusillade.state.claimed and
+                        // fusillade.state.processing spans the daemon used to
+                        // emit inline, so observability is unchanged for the
+                        // batch path.
+                        let completion_result = processor
+                            .process(
+                                request,
+                                http_client,
+                                storage.as_ref(),
+                                should_retry.clone(),
+                                cancellation,
+                            )
+                            .await;
 
                         match completion_result {
                             Ok(RequestCompletionResult::Completed(completed)) => {

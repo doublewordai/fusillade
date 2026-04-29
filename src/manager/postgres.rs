@@ -88,6 +88,20 @@ pub struct PostgresRequestManager<P: PoolProvider, H: HttpClient> {
     config: DaemonConfig,
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
+    /// Optional override for the daemon's per-claim processor. `None` uses
+    /// [`DefaultRequestProcessor`] inside the daemon, preserving the
+    /// existing batch path. `Some(_)` is threaded through to
+    /// [`Daemon::with_processor`] when [`run`](Self::run) starts the
+    /// background worker.
+    ///
+    /// Wrapped in a [`OnceLock`] to support late wiring: in production
+    /// `dwctl` constructs the manager first (so the response-store can
+    /// reference it), then constructs the processor (which needs the
+    /// response-store), then injects the processor here via
+    /// [`set_processor`](Self::set_processor) before the daemon starts.
+    /// The builder-style [`with_processor`](Self::with_processor) remains
+    /// available for tests and consumers that don't have a cycle.
+    processor: std::sync::OnceLock<Arc<dyn crate::processor::RequestProcessor<Self, H>>>,
 }
 
 /// Macro for extracting a [`Batch`] from a dynamic query row (PgRow).
@@ -172,6 +186,7 @@ impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> 
             config,
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
+            processor: std::sync::OnceLock::new(),
         }
     }
 }
@@ -196,7 +211,42 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             config: DaemonConfig::default(),
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
+            processor: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Override the daemon's per-claim processor.
+    ///
+    /// By default the manager runs the daemon with
+    /// [`DefaultRequestProcessor`], preserving the existing batch path. Use
+    /// this builder to plug in a custom [`RequestProcessor`] (e.g. dwctl's
+    /// multi-step Open Responses dispatcher).
+    pub fn with_processor(
+        self,
+        processor: Arc<dyn crate::processor::RequestProcessor<Self, H>>,
+    ) -> Self {
+        // Builder form: use OnceLock::set, ignore the result because by
+        // construction we're the only writer here.
+        let _ = self.processor.set(processor);
+        self
+    }
+
+    /// Inject the per-claim processor after the manager has already been
+    /// Arc-wrapped. Returns `Err` if a processor is already set (callers
+    /// should set it exactly once).
+    ///
+    /// This is the late-wiring entry point: dwctl needs the manager to
+    /// exist before it can build a `FusilladeResponseStore`, which in
+    /// turn is needed to build the `DwctlRequestProcessor`. After all
+    /// three are constructed, this method attaches the processor before
+    /// `run()` starts the daemon.
+    pub fn set_processor(
+        &self,
+        processor: Arc<dyn crate::processor::RequestProcessor<Self, H>>,
+    ) -> std::result::Result<(), &'static str> {
+        self.processor
+            .set(processor)
+            .map_err(|_| "processor already set")
     }
 
     /// Set a custom daemon configuration.
@@ -5100,12 +5150,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> DaemonExecutor<H> for PostgresReq
     ) -> Result<JoinHandle<Result<()>>> {
         tracing::info!("Starting PostgreSQL request manager daemon");
 
-        let daemon = Arc::new(Daemon::new(
+        let mut daemon = Daemon::new(
             self.clone(),
             self.http_client.clone(),
             self.config.clone(),
             shutdown_token,
-        ));
+        );
+        if let Some(processor) = self.processor.get().cloned() {
+            daemon = daemon.with_processor(processor);
+        }
+        let daemon = Arc::new(daemon);
 
         let handle = tokio::spawn(async move {
             // Daemon will poll for cancelled batches periodically
