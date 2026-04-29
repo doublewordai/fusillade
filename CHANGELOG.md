@@ -1,5 +1,17 @@
 # Changelog
 
+## [16.7.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.6.1...fusillade-v16.7.0) (2026-04-29)
+
+
+### Features
+
+* add response_steps storage layer for multi-step responses ([#248](https://github.com/doublewordai/fusillade/issues/248)) ([4e3251f](https://github.com/doublewordai/fusillade/commit/4e3251f205b2b18bcc74e5f6e60dce6a42796298))
+
+
+### Bug Fixes
+
+* accept status code in fail_request ([#245](https://github.com/doublewordai/fusillade/issues/245)) ([4f02841](https://github.com/doublewordai/fusillade/commit/4f02841c1a31b6c1785b05f8e9e1fe8fab239c87))
+
 ## [16.6.1](https://github.com/doublewordai/fusillade/compare/fusillade-v16.6.0...fusillade-v16.6.1) (2026-04-27)
 
 
