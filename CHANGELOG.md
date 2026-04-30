@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.8.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.7.0...fusillade-v16.8.0) (2026-04-30)
+
+
+### Features
+
+* re-anchor response_steps.request_id to per-step sub-request ([#249](https://github.com/doublewordai/fusillade/issues/249)) ([a8b3ca9](https://github.com/doublewordai/fusillade/commit/a8b3ca9784f4deb290a78cac06b7c78493d7df99))
+
 ## [16.7.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.6.1...fusillade-v16.7.0) (2026-04-29)
 
 
