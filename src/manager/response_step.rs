@@ -140,7 +140,10 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
             .fetch_optional(pool)
             .await
             .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to fetch response_step by request_id: {}", e))
+                FusilladeError::Other(anyhow!(
+                    "Failed to fetch response_step by request_id: {}",
+                    e
+                ))
             })?;
 
         row.as_ref().map(step_from_row).transpose()

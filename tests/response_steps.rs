@@ -264,7 +264,13 @@ async fn get_step_by_request_finds_model_call_owner(pool: sqlx::PgPool) {
 
     // A non-step-bound request (e.g. a single-step chat/completions row) returns None.
     let unrelated = insert_request(&pool).await;
-    assert!(store.get_step_by_request(unrelated).await.unwrap().is_none());
+    assert!(
+        store
+            .get_step_by_request(unrelated)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[sqlx::test]
