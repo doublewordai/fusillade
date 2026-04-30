@@ -114,10 +114,24 @@ impl StepState {
 }
 
 /// A row from the `response_steps` table.
+///
+/// `request_id` is `Some` for `model_call` steps (each model_call has a
+/// dedicated `requests` row created for its upstream HTTP fire) and `None`
+/// for `tool_call` steps (tool dispatch lives outside `requests`; the
+/// per-tool analytics live in `tool_call_analytics`).
+///
+/// `parent_step_id` is the chain identifier — it points at the head
+/// (root) step of the user-visible response. It is `None` only on the
+/// head itself.
+///
+/// `prev_step_id` is a tree edge: the step that immediately precedes
+/// this one. Multiple steps may share a `prev_step_id` (parallel
+/// tool_calls; or, when sub-agent dispatch is wired, the sub-agent's
+/// head + the outer continuation after a tool_call).
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseStep {
     pub id: StepId,
-    pub request_id: RequestId,
+    pub request_id: Option<RequestId>,
     pub prev_step_id: Option<StepId>,
     pub parent_step_id: Option<StepId>,
     pub step_kind: StepKind,
@@ -137,12 +151,18 @@ pub struct ResponseStep {
 
 /// Input to [`ResponseStepStore::create_step`].
 ///
-/// `step_sequence` is monotonic per `request_id` across all nesting levels and
-/// doubles as the `Last-Event-ID` cursor for top-level events. Callers
-/// (the orchestration loop) are responsible for picking the next sequence
-/// value — the storage layer does not enforce monotonicity beyond what the
-/// `UNIQUE (request_id, parent_step_id, prev_step_id, step_kind)` constraint
-/// implicitly provides.
+/// `step_sequence` is monotonic per chain (head step) across the whole
+/// response tree. Callers (the orchestration loop) are responsible for
+/// picking the next sequence value.
+///
+/// Idempotency under crash recovery is the caller's responsibility:
+/// walk the existing chain via [`ResponseStepStore::list_chain`] and
+/// only emit successors that aren't already present. There is no
+/// database-side unique constraint on `(parent_step_id, prev_step_id,
+/// step_kind)` — branching is intrinsic to the data model (a model_call
+/// returning multiple `tool_calls` emits sibling rows with that exact
+/// tuple identical), so any uniqueness on those columns rejects
+/// ordinary parallel tool dispatch.
 #[derive(Debug, Clone)]
 pub struct CreateStepInput {
     /// Optional pre-generated step UUID. When `Some`, becomes the step's
@@ -150,7 +170,9 @@ pub struct CreateStepInput {
     /// before the row is committed (e.g., emitting an SSE event with the
     /// step id while the row is still being inserted).
     pub id: Option<Uuid>,
-    pub request_id: RequestId,
+    /// FK to `requests.id` for the upstream HTTP fire this step
+    /// represents. `None` on `tool_call` steps.
+    pub request_id: Option<RequestId>,
     pub prev_step_id: Option<StepId>,
     pub parent_step_id: Option<StepId>,
     pub step_kind: StepKind,
@@ -169,36 +191,28 @@ pub struct CreateStepInput {
 pub trait ResponseStepStore: Send + Sync {
     /// Insert a new step in `pending` state.
     ///
-    /// The `UNIQUE (request_id, parent_step_id, prev_step_id, step_kind)`
-    /// constraint is the idempotency safety net: a re-running transition
-    /// function under crash recovery will not produce duplicate successor
-    /// rows. The conflict is reported through the store's normal error
-    /// path; callers that need idempotent recovery should detect the
-    /// duplicate via [`ResponseStepStore::list_scope`] (which is the
-    /// authoritative way to find the existing frontier under recovery)
-    /// rather than relying on parsing this error.
+    /// No database-side idempotency constraint. Callers that need
+    /// idempotent recovery should walk the chain first via
+    /// [`ResponseStepStore::list_chain`] and skip emission of
+    /// successors that already exist.
     async fn create_step(&self, input: CreateStepInput) -> Result<StepId>;
 
     /// Fetch a single step by id. Returns `None` if not present.
     async fn get_step(&self, id: StepId) -> Result<Option<ResponseStep>>;
 
-    /// List every step for a request, ordered by `step_sequence`.
-    ///
-    /// Includes both top-level and nested (sub-agent) steps. Callers that
-    /// only want the user-visible chain should filter on
-    /// `parent_step_id IS NULL`.
-    async fn list_chain(&self, request_id: RequestId) -> Result<Vec<ResponseStep>>;
+    /// Fetch the step (if any) whose `request_id` matches the given
+    /// fusillade request id. Used by analytics + outlet plumbing to
+    /// resolve "which step does this upstream HTTP fire belong to".
+    /// Returns `None` for `tool_call` steps (which don't carry a
+    /// `request_id`) and for any non-multi-step fusillade row.
+    async fn get_step_by_request(&self, request_id: RequestId) -> Result<Option<ResponseStep>>;
 
-    /// List steps inside a specific scope ordered by `step_sequence`.
+    /// List every step in a response chain identified by its head step.
     ///
-    /// `scope_parent` selects the chain: `None` = the top-level chain
-    /// (user-visible response), `Some(step_id)` = the sub-loop spawned by
-    /// that tool_call step.
-    async fn list_scope(
-        &self,
-        request_id: RequestId,
-        scope_parent: Option<StepId>,
-    ) -> Result<Vec<ResponseStep>>;
+    /// Includes the head itself + every descendant (parallel tool_calls
+    /// and any future sub-agent recursion via `prev_step_id` branching).
+    /// Ordered by `step_sequence`.
+    async fn list_chain(&self, head_step_id: StepId) -> Result<Vec<ResponseStep>>;
 
     /// Mark a `pending` step as `processing`, recording `started_at`.
     ///

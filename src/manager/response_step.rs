@@ -27,7 +27,7 @@ pub use sqlx_pool_router::PoolProvider;
 ///
 /// All read methods on this impl route through the **write/primary**
 /// pool. The orchestration loop reads its own freshly-written rows on
-/// every iteration (e.g., `list_scope` after `create_step` to confirm the
+/// every iteration (e.g., `list_chain` after `create_step` to confirm the
 /// frontier under crash recovery), and read-replica lag would surface as
 /// `None` or stale rows. The dashboard, if it ever queries the
 /// `response_steps` table, should grow a separate replica-routed read
@@ -55,7 +55,7 @@ fn step_from_row(row: &sqlx::postgres::PgRow) -> Result<ResponseStep> {
 
     Ok(ResponseStep {
         id: StepId(row.get("id")),
-        request_id: RequestId(row.get("request_id")),
+        request_id: row.get::<Option<Uuid>, _>("request_id").map(RequestId),
         prev_step_id: row.get::<Option<Uuid>, _>("prev_step_id").map(StepId),
         parent_step_id: row.get::<Option<Uuid>, _>("parent_step_id").map(StepId),
         step_kind: kind,
@@ -102,7 +102,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
              VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(id)
-        .bind(input.request_id.0)
+        .bind(input.request_id.map(|r| r.0))
         .bind(input.prev_step_id.map(|s| s.0))
         .bind(input.parent_step_id.map(|s| s.0))
         .bind(input.step_kind.as_str())
@@ -128,38 +128,49 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         row.as_ref().map(step_from_row).transpose()
     }
 
-    async fn list_chain(&self, request_id: RequestId) -> Result<Vec<ResponseStep>> {
+    async fn get_step_by_request(&self, request_id: RequestId) -> Result<Option<ResponseStep>> {
+        // Uses response_steps_request_id_unique partial index for O(log n) lookup.
         let pool = self.pools.write();
         let query = format!(
-            "SELECT {} FROM response_steps WHERE request_id = $1 ORDER BY step_sequence ASC",
+            "SELECT {} FROM response_steps WHERE request_id = $1",
             STEP_COLUMNS
         );
-        let rows = sqlx::query(&query)
+        let row = sqlx::query(&query)
             .bind(request_id.0)
-            .fetch_all(pool)
+            .fetch_optional(pool)
             .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to list response_steps: {}", e)))?;
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to fetch response_step by request_id: {}",
+                    e
+                ))
+            })?;
 
-        rows.iter().map(step_from_row).collect()
+        row.as_ref().map(step_from_row).transpose()
     }
 
-    async fn list_scope(
-        &self,
-        request_id: RequestId,
-        scope_parent: Option<StepId>,
-    ) -> Result<Vec<ResponseStep>> {
+    async fn list_chain(&self, head_step_id: StepId) -> Result<Vec<ResponseStep>> {
+        // Returns the head + every descendant. The two arms each hit a
+        // different index, so they're written as a UNION ALL rather than
+        // an OR predicate (which can degenerate into a bitmap-or that
+        // ignores one of the indexes under planner pressure):
+        //   * head:        primary key lookup on `id`
+        //   * descendants: partial index `response_steps_chain_walk`
+        //                  on (parent_step_id, step_sequence) WHERE
+        //                  parent_step_id IS NOT NULL
+        // The two sets are disjoint (the head's parent_step_id is NULL
+        // by invariant, and descendants have a distinct id), so UNION
+        // ALL — cheaper than UNION's dedup — is correct.
         let pool = self.pools.write();
-        // Postgres treats NULL parent_step_id as its own group; use IS NOT
-        // DISTINCT FROM so a NULL parameter matches NULL rows.
         let query = format!(
-            "SELECT {} FROM response_steps \
-             WHERE request_id = $1 AND parent_step_id IS NOT DISTINCT FROM $2 \
+            "SELECT {cols} FROM response_steps WHERE id = $1 \
+             UNION ALL \
+             SELECT {cols} FROM response_steps WHERE parent_step_id = $1 \
              ORDER BY step_sequence ASC",
-            STEP_COLUMNS
+            cols = STEP_COLUMNS
         );
         let rows = sqlx::query(&query)
-            .bind(request_id.0)
-            .bind(scope_parent.map(|s| s.0))
+            .bind(head_step_id.0)
             .fetch_all(pool)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list response_steps: {}", e)))?;

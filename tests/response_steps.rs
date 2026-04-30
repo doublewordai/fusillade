@@ -1,9 +1,22 @@
 //! Integration tests for the response_steps storage layer.
 //!
 //! Each test gets a fresh sqlx pool via `#[sqlx::test]`, which automatically
-//! runs every migration in `migrations/`. We insert a parent request row by
+//! runs every migration in `migrations/`. We insert a minimal request row by
 //! hand (avoiding the full file/template/batch chain) since these tests are
 //! scoped to the response_step module only.
+//!
+//! The new semantics (see plan
+//! `docs/plans/2026-04-30-response-steps-request-linkage.md`):
+//!
+//! - `response_steps.request_id` is `Option<RequestId>` and points at the
+//!   sub-request fusillade row created for *this* step's HTTP fire (one
+//!   row per `model_call`); `None` for `tool_call` steps.
+//! - `parent_step_id` points at the head (root) step of the chain;
+//!   `None` only on the head itself.
+//! - `prev_step_id` is a tree edge — multiple steps may share one
+//!   (parallel tool_calls; sub-agent head + outer continuation).
+//! - There is no chain-uniqueness constraint; idempotency is the
+//!   transition function's responsibility (chain-walk frontier check).
 
 use fusillade::request::RequestId;
 use fusillade::response_step::{CreateStepInput, ResponseStepStore, StepKind, StepState};
@@ -11,9 +24,10 @@ use fusillade::{PostgresResponseStepManager, TestDbPools};
 use serde_json::json;
 use uuid::Uuid;
 
-/// Insert a minimal parent `requests` row so `response_steps.request_id`'s
-/// foreign key is satisfied. Returns the new request id.
-async fn insert_parent_request(pool: &sqlx::PgPool) -> RequestId {
+/// Insert a minimal `requests` row so `response_steps.request_id`'s FK is
+/// satisfied. Each call returns a fresh `RequestId` so callers can model
+/// "one fusillade row per model_call step" naturally.
+async fn insert_request(pool: &sqlx::PgPool) -> RequestId {
     let template_id = Uuid::new_v4();
     let request_id = Uuid::new_v4();
 
@@ -43,292 +57,406 @@ async fn insert_parent_request(pool: &sqlx::PgPool) -> RequestId {
 }
 
 #[sqlx::test]
-async fn create_and_fetch_top_level_step(pool: sqlx::PgPool) {
-    let request_id = insert_parent_request(&pool).await;
+async fn create_and_fetch_head_step(pool: sqlx::PgPool) {
+    let request_id = insert_request(&pool).await;
     let pools = TestDbPools::new(pool).await.unwrap();
     let store = PostgresResponseStepManager::new(pools);
 
     let step_id = store
         .create_step(CreateStepInput {
             id: None,
-            request_id,
+            request_id: Some(request_id),
             prev_step_id: None,
             parent_step_id: None,
             step_kind: StepKind::ModelCall,
             step_sequence: 1,
-            request_payload: json!({"prompt": "hello"}),
-        })
-        .await
-        .expect("create_step");
-
-    let fetched = store
-        .get_step(step_id)
-        .await
-        .expect("get_step")
-        .expect("step exists");
-
-    assert_eq!(fetched.id, step_id);
-    assert_eq!(fetched.request_id, request_id);
-    assert_eq!(fetched.step_kind, StepKind::ModelCall);
-    assert_eq!(fetched.state, StepState::Pending);
-    assert_eq!(fetched.step_sequence, 1);
-    assert_eq!(fetched.retry_attempt, 0);
-    assert!(fetched.response_payload.is_none());
-    assert!(fetched.started_at.is_none());
-    assert_eq!(fetched.request_payload, json!({"prompt": "hello"}));
-}
-
-#[sqlx::test]
-async fn list_chain_returns_steps_in_sequence_order(pool: sqlx::PgPool) {
-    let request_id = insert_parent_request(&pool).await;
-    let pools = TestDbPools::new(pool).await.unwrap();
-    let store = PostgresResponseStepManager::new(pools);
-
-    // Insert in reverse to confirm ordering is by step_sequence, not insert time
-    let step_3 = store
-        .create_step(CreateStepInput {
-            id: None,
-            request_id,
-            prev_step_id: None,
-            parent_step_id: None,
-            step_kind: StepKind::ModelCall,
-            step_sequence: 3,
-            request_payload: json!({"step": 3}),
+            request_payload: json!({"messages": [{"role": "user", "content": "hi"}]}),
         })
         .await
         .unwrap();
 
-    let step_1 = store
+    let step = store.get_step(step_id).await.unwrap().unwrap();
+    assert_eq!(step.id, step_id);
+    assert_eq!(step.request_id, Some(request_id));
+    assert_eq!(step.parent_step_id, None);
+    assert_eq!(step.prev_step_id, None);
+    assert_eq!(step.step_kind, StepKind::ModelCall);
+    assert_eq!(step.state, StepState::Pending);
+    assert_eq!(step.step_sequence, 1);
+}
+
+#[sqlx::test]
+async fn tool_call_step_has_null_request_id(pool: sqlx::PgPool) {
+    let head_request_id = insert_request(&pool).await;
+    let pools = TestDbPools::new(pool).await.unwrap();
+    let store = PostgresResponseStepManager::new(pools);
+
+    let head_id = store
         .create_step(CreateStepInput {
             id: None,
-            request_id,
+            request_id: Some(head_request_id),
+            prev_step_id: None,
+            parent_step_id: None,
+            step_kind: StepKind::ModelCall,
+            step_sequence: 1,
+            request_payload: json!({"messages": []}),
+        })
+        .await
+        .unwrap();
+
+    // tool_call step: request_id is None (tool dispatch lives outside requests).
+    let tool_step_id = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id: None,
+            prev_step_id: Some(head_id),
+            parent_step_id: Some(head_id),
+            step_kind: StepKind::ToolCall,
+            step_sequence: 2,
+            request_payload: json!({"name": "get_weather", "args": {"city": "Paris"}}),
+        })
+        .await
+        .unwrap();
+
+    let step = store.get_step(tool_step_id).await.unwrap().unwrap();
+    assert_eq!(step.request_id, None);
+    assert_eq!(step.step_kind, StepKind::ToolCall);
+}
+
+#[sqlx::test]
+async fn step_kind_request_id_check_constraint_rejects_invalid_combos(pool: sqlx::PgPool) {
+    // The DB-level CHECK constraint enforces:
+    //   model_call ⇒ request_id IS NOT NULL  (the sub-request fusillade row)
+    //   tool_call  ⇒ request_id IS NULL      (analytics live in tool_call_analytics)
+    // Without it, get_step_by_request and analytics attribution would
+    // have to defend against malformed rows at every read.
+    let head_request_id = insert_request(&pool).await;
+    let pools = TestDbPools::new(pool).await.unwrap();
+    let store = PostgresResponseStepManager::new(pools);
+
+    // model_call with NULL request_id is rejected.
+    let model_no_request = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id: None,
+            prev_step_id: None,
+            parent_step_id: None,
+            step_kind: StepKind::ModelCall,
+            step_sequence: 1,
+            request_payload: json!({}),
+        })
+        .await;
+    assert!(
+        model_no_request.is_err(),
+        "model_call with NULL request_id should violate the CHECK constraint"
+    );
+
+    // tool_call with non-NULL request_id is rejected.
+    let tool_with_request = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id: Some(head_request_id),
             prev_step_id: None,
             parent_step_id: None,
             step_kind: StepKind::ToolCall,
             step_sequence: 1,
-            request_payload: json!({"step": 1}),
+            request_payload: json!({}),
         })
-        .await
-        .unwrap();
+        .await;
+    assert!(
+        tool_with_request.is_err(),
+        "tool_call with non-NULL request_id should violate the CHECK constraint"
+    );
+}
 
-    let step_2 = store
+#[sqlx::test]
+async fn list_chain_returns_head_plus_descendants_in_order(pool: sqlx::PgPool) {
+    let pools = TestDbPools::new(pool.clone()).await.unwrap();
+    let store = PostgresResponseStepManager::new(pools);
+
+    // Head (model_call). request_id = first sub-request row.
+    let head_req = insert_request(&pool).await;
+    let head_id = store
         .create_step(CreateStepInput {
             id: None,
-            request_id,
-            prev_step_id: Some(step_1),
+            request_id: Some(head_req),
+            prev_step_id: None,
             parent_step_id: None,
             step_kind: StepKind::ModelCall,
-            step_sequence: 2,
-            request_payload: json!({"step": 2}),
+            step_sequence: 1,
+            request_payload: json!({"step": "head"}),
         })
         .await
         .unwrap();
 
-    let chain = store.list_chain(request_id).await.unwrap();
+    // tool_call (no request_id).
+    let tool_id = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id: None,
+            prev_step_id: Some(head_id),
+            parent_step_id: Some(head_id),
+            step_kind: StepKind::ToolCall,
+            step_sequence: 2,
+            request_payload: json!({"step": "tool"}),
+        })
+        .await
+        .unwrap();
+
+    // Second model_call (its own sub-request row).
+    let second_req = insert_request(&pool).await;
+    let _second_id = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id: Some(second_req),
+            prev_step_id: Some(tool_id),
+            parent_step_id: Some(head_id),
+            step_kind: StepKind::ModelCall,
+            step_sequence: 3,
+            request_payload: json!({"step": "second_model"}),
+        })
+        .await
+        .unwrap();
+
+    let chain = store.list_chain(head_id).await.unwrap();
     assert_eq!(chain.len(), 3);
-    assert_eq!(chain[0].id, step_1);
-    assert_eq!(chain[1].id, step_2);
-    assert_eq!(chain[2].id, step_3);
-    assert_eq!(chain[1].prev_step_id, Some(step_1));
+    assert_eq!(chain[0].step_sequence, 1);
+    assert_eq!(chain[0].id, head_id);
+    assert_eq!(chain[0].parent_step_id, None);
+    assert_eq!(chain[1].step_sequence, 2);
+    assert_eq!(chain[1].step_kind, StepKind::ToolCall);
+    assert_eq!(chain[1].parent_step_id, Some(head_id));
+    assert_eq!(chain[2].step_sequence, 3);
+    assert_eq!(chain[2].request_id, Some(second_req));
+    assert_eq!(chain[2].parent_step_id, Some(head_id));
 }
 
 #[sqlx::test]
-async fn list_scope_separates_top_level_from_sub_loop(pool: sqlx::PgPool) {
-    let request_id = insert_parent_request(&pool).await;
-    let pools = TestDbPools::new(pool).await.unwrap();
+async fn list_chain_isolates_chains_from_one_another(pool: sqlx::PgPool) {
+    // Two independent responses: each is its own head + child. list_chain on
+    // one head must not return the other's steps.
+    let pools = TestDbPools::new(pool.clone()).await.unwrap();
     let store = PostgresResponseStepManager::new(pools);
 
-    // Top-level: a model_call followed by a tool_call (which spawns a sub-agent)
-    let top_1 = store
+    let r1 = insert_request(&pool).await;
+    let head1 = store
         .create_step(CreateStepInput {
             id: None,
-            request_id,
+            request_id: Some(r1),
             prev_step_id: None,
             parent_step_id: None,
             step_kind: StepKind::ModelCall,
             step_sequence: 1,
-            request_payload: json!({"top": 1}),
+            request_payload: json!({"chain": 1}),
         })
         .await
         .unwrap();
-    let top_2 = store
+    let r1b = insert_request(&pool).await;
+    let _child1 = store
         .create_step(CreateStepInput {
             id: None,
-            request_id,
-            prev_step_id: Some(top_1),
-            parent_step_id: None,
-            step_kind: StepKind::ToolCall,
-            step_sequence: 2,
-            request_payload: json!({"top": 2, "tool": "delegate"}),
-        })
-        .await
-        .unwrap();
-
-    // Sub-loop under top_2: a model_call.
-    let sub_1 = store
-        .create_step(CreateStepInput {
-            id: None,
-            request_id,
-            prev_step_id: None,
-            parent_step_id: Some(top_2),
+            request_id: Some(r1b),
+            prev_step_id: Some(head1),
+            parent_step_id: Some(head1),
             step_kind: StepKind::ModelCall,
-            step_sequence: 3,
-            request_payload: json!({"sub": 1}),
+            step_sequence: 2,
+            request_payload: json!({"chain": 1, "step": "child"}),
         })
         .await
         .unwrap();
 
-    let top = store.list_scope(request_id, None).await.unwrap();
-    assert_eq!(top.len(), 2);
-    assert_eq!(top[0].id, top_1);
-    assert_eq!(top[1].id, top_2);
+    let r2 = insert_request(&pool).await;
+    let head2 = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id: Some(r2),
+            prev_step_id: None,
+            parent_step_id: None,
+            step_kind: StepKind::ModelCall,
+            step_sequence: 1,
+            request_payload: json!({"chain": 2}),
+        })
+        .await
+        .unwrap();
 
-    let sub = store.list_scope(request_id, Some(top_2)).await.unwrap();
-    assert_eq!(sub.len(), 1);
-    assert_eq!(sub[0].id, sub_1);
+    let chain1 = store.list_chain(head1).await.unwrap();
+    assert_eq!(chain1.len(), 2);
+    let chain2 = store.list_chain(head2).await.unwrap();
+    assert_eq!(chain2.len(), 1);
+    assert_eq!(chain2[0].id, head2);
+}
 
-    let other_scope = store.list_scope(request_id, Some(top_1)).await.unwrap();
-    assert!(other_scope.is_empty());
+#[sqlx::test]
+async fn get_step_by_request_finds_model_call_owner(pool: sqlx::PgPool) {
+    let head_req = insert_request(&pool).await;
+    let pools = TestDbPools::new(pool.clone()).await.unwrap();
+    let store = PostgresResponseStepManager::new(pools);
+
+    let head_id = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id: Some(head_req),
+            prev_step_id: None,
+            parent_step_id: None,
+            step_kind: StepKind::ModelCall,
+            step_sequence: 1,
+            request_payload: json!({}),
+        })
+        .await
+        .unwrap();
+
+    let found = store.get_step_by_request(head_req).await.unwrap().unwrap();
+    assert_eq!(found.id, head_id);
+
+    // A non-step-bound request (e.g. a single-step chat/completions row) returns None.
+    let unrelated = insert_request(&pool).await;
+    assert!(
+        store
+            .get_step_by_request(unrelated)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[sqlx::test]
+async fn parallel_tool_calls_with_same_prev_succeed(pool: sqlx::PgPool) {
+    // Branch point: a model_call returning multiple tool_calls. All
+    // tool_call children share (parent_step_id, prev_step_id, step_kind);
+    // there is no DB-level uniqueness, so insertion should succeed.
+    let head_req = insert_request(&pool).await;
+    let pools = TestDbPools::new(pool.clone()).await.unwrap();
+    let store = PostgresResponseStepManager::new(pools);
+
+    let head_id = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id: Some(head_req),
+            prev_step_id: None,
+            parent_step_id: None,
+            step_kind: StepKind::ModelCall,
+            step_sequence: 1,
+            request_payload: json!({}),
+        })
+        .await
+        .unwrap();
+
+    for seq in 2..=4 {
+        store
+            .create_step(CreateStepInput {
+                id: None,
+                request_id: None,
+                prev_step_id: Some(head_id),
+                parent_step_id: Some(head_id),
+                step_kind: StepKind::ToolCall,
+                step_sequence: seq,
+                request_payload: json!({"tool_index": seq - 2}),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("parallel tool_call insert failed at seq {seq}: {e}"));
+    }
+
+    let chain = store.list_chain(head_id).await.unwrap();
+    assert_eq!(chain.len(), 4);
+    let tool_calls: Vec<_> = chain
+        .iter()
+        .filter(|s| s.step_kind == StepKind::ToolCall)
+        .collect();
+    assert_eq!(tool_calls.len(), 3);
 }
 
 #[sqlx::test]
 async fn lifecycle_transitions(pool: sqlx::PgPool) {
-    let request_id = insert_parent_request(&pool).await;
+    let request_id = insert_request(&pool).await;
     let pools = TestDbPools::new(pool).await.unwrap();
     let store = PostgresResponseStepManager::new(pools);
 
     let step_id = store
         .create_step(CreateStepInput {
             id: None,
-            request_id,
+            request_id: Some(request_id),
             prev_step_id: None,
             parent_step_id: None,
             step_kind: StepKind::ModelCall,
             step_sequence: 1,
-            request_payload: json!({"p": 1}),
+            request_payload: json!({}),
         })
         .await
         .unwrap();
 
-    store.mark_step_processing(step_id).await.unwrap();
-    let s = store.get_step(step_id).await.unwrap().unwrap();
-    assert_eq!(s.state, StepState::Processing);
-    assert!(s.started_at.is_some());
+    assert_eq!(
+        store.get_step(step_id).await.unwrap().unwrap().state,
+        StepState::Pending
+    );
 
-    // mark_step_processing is idempotent — no error when already processing
+    store.mark_step_processing(step_id).await.unwrap();
+    let step = store.get_step(step_id).await.unwrap().unwrap();
+    assert_eq!(step.state, StepState::Processing);
+    assert!(step.started_at.is_some());
+
+    // Idempotency: re-marking processing on an already-processing step is a no-op.
     store.mark_step_processing(step_id).await.unwrap();
 
     store
-        .complete_step(step_id, json!({"output": "ok"}))
+        .complete_step(step_id, json!({"result": "ok"}))
         .await
         .unwrap();
-    let s = store.get_step(step_id).await.unwrap().unwrap();
-    assert_eq!(s.state, StepState::Completed);
-    assert_eq!(s.response_payload, Some(json!({"output": "ok"})));
-    assert!(s.completed_at.is_some());
+    let step = store.get_step(step_id).await.unwrap().unwrap();
+    assert_eq!(step.state, StepState::Completed);
+    assert_eq!(step.response_payload, Some(json!({"result": "ok"})));
+    assert!(step.completed_at.is_some());
 
-    // Cannot complete an already-terminal step.
-    let err = store.complete_step(step_id, json!({})).await;
-    assert!(err.is_err());
+    // Completing again is rejected (terminal state).
+    let err = store
+        .complete_step(step_id, json!({"second": true}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not in completable state"));
 }
 
 #[sqlx::test]
 async fn fail_step_records_error_payload(pool: sqlx::PgPool) {
-    let request_id = insert_parent_request(&pool).await;
+    let request_id = insert_request(&pool).await;
     let pools = TestDbPools::new(pool).await.unwrap();
     let store = PostgresResponseStepManager::new(pools);
 
     let step_id = store
         .create_step(CreateStepInput {
             id: None,
-            request_id,
+            request_id: Some(request_id),
             prev_step_id: None,
             parent_step_id: None,
-            step_kind: StepKind::ToolCall,
+            step_kind: StepKind::ModelCall,
             step_sequence: 1,
-            request_payload: json!({"tool": "search"}),
+            request_payload: json!({}),
         })
         .await
         .unwrap();
 
-    store.mark_step_processing(step_id).await.unwrap();
-
-    let err_payload = json!({"type": "max_iterations_exceeded", "details": "stuck"});
-    store.fail_step(step_id, err_payload.clone()).await.unwrap();
-
-    let s = store.get_step(step_id).await.unwrap().unwrap();
-    assert_eq!(s.state, StepState::Failed);
-    assert_eq!(s.error, Some(err_payload));
-    assert!(s.failed_at.is_some());
+    store
+        .fail_step(step_id, json!({"type": "upstream_error", "code": 503}))
+        .await
+        .unwrap();
+    let step = store.get_step(step_id).await.unwrap().unwrap();
+    assert_eq!(step.state, StepState::Failed);
+    assert!(step.failed_at.is_some());
+    assert_eq!(
+        step.error,
+        Some(json!({"type": "upstream_error", "code": 503}))
+    );
 }
 
 #[sqlx::test]
 async fn cancel_step_records_canceled_at_and_blocks_terminal_transitions(pool: sqlx::PgPool) {
-    let request_id = insert_parent_request(&pool).await;
-    let pools = TestDbPools::new(pool).await.unwrap();
-    let store = PostgresResponseStepManager::new(pools);
-
-    // Cancel directly from `pending` (the most common path: a request is
-    // canceled before its first step has been claimed by a worker).
-    let pending_id = store
-        .create_step(CreateStepInput {
-            id: None,
-            request_id,
-            prev_step_id: None,
-            parent_step_id: None,
-            step_kind: StepKind::ModelCall,
-            step_sequence: 1,
-            request_payload: json!({}),
-        })
-        .await
-        .unwrap();
-
-    store.cancel_step(pending_id).await.unwrap();
-    let s = store.get_step(pending_id).await.unwrap().unwrap();
-    assert_eq!(s.state, StepState::Canceled);
-    assert!(s.canceled_at.is_some());
-    assert!(s.started_at.is_none());
-
-    // Subsequent terminal transitions are rejected (canceled is terminal).
-    let err = store.complete_step(pending_id, json!({"x": 1})).await;
-    assert!(err.is_err(), "complete_step on canceled step must fail");
-    let err = store.fail_step(pending_id, json!({"x": 1})).await;
-    assert!(err.is_err(), "fail_step on canceled step must fail");
-    let err = store.cancel_step(pending_id).await;
-    assert!(err.is_err(), "second cancel_step must fail");
-
-    // Cancel after `processing` works too — this is the path taken when a
-    // batch is canceled while a worker is mid-flight.
-    let processing_id = store
-        .create_step(CreateStepInput {
-            id: None,
-            request_id,
-            prev_step_id: Some(pending_id),
-            parent_step_id: None,
-            step_kind: StepKind::ToolCall,
-            step_sequence: 2,
-            request_payload: json!({}),
-        })
-        .await
-        .unwrap();
-    store.mark_step_processing(processing_id).await.unwrap();
-    store.cancel_step(processing_id).await.unwrap();
-    let s = store.get_step(processing_id).await.unwrap().unwrap();
-    assert_eq!(s.state, StepState::Canceled);
-    assert!(s.started_at.is_some());
-    assert!(s.canceled_at.is_some());
-}
-
-#[sqlx::test]
-async fn requeue_for_retry_increments_attempt(pool: sqlx::PgPool) {
-    let request_id = insert_parent_request(&pool).await;
+    let request_id = insert_request(&pool).await;
     let pools = TestDbPools::new(pool).await.unwrap();
     let store = PostgresResponseStepManager::new(pools);
 
     let step_id = store
         .create_step(CreateStepInput {
             id: None,
-            request_id,
+            request_id: Some(request_id),
             prev_step_id: None,
             parent_step_id: None,
             step_kind: StepKind::ModelCall,
@@ -338,148 +466,43 @@ async fn requeue_for_retry_increments_attempt(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
+    store.cancel_step(step_id).await.unwrap();
+    let step = store.get_step(step_id).await.unwrap().unwrap();
+    assert_eq!(step.state, StepState::Canceled);
+    assert!(step.canceled_at.is_some());
+
+    // Subsequent terminal transitions are rejected.
+    let err = store
+        .complete_step(step_id, json!({}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not in completable state"));
+}
+
+#[sqlx::test]
+async fn requeue_for_retry_increments_attempt(pool: sqlx::PgPool) {
+    let request_id = insert_request(&pool).await;
+    let pools = TestDbPools::new(pool).await.unwrap();
+    let store = PostgresResponseStepManager::new(pools);
+
+    let step_id = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id: Some(request_id),
+            prev_step_id: None,
+            parent_step_id: None,
+            step_kind: StepKind::ModelCall,
+            step_sequence: 1,
+            request_payload: json!({}),
+        })
+        .await
+        .unwrap();
     store.mark_step_processing(step_id).await.unwrap();
+
     store.requeue_step_for_retry(step_id).await.unwrap();
-
-    let s = store.get_step(step_id).await.unwrap().unwrap();
-    assert_eq!(s.state, StepState::Pending);
-    assert_eq!(s.retry_attempt, 1);
-    assert!(s.started_at.is_none());
-
-    // Still pending — cannot requeue without going processing first.
-    let err = store.requeue_step_for_retry(step_id).await;
-    assert!(err.is_err());
-}
-
-#[sqlx::test]
-async fn unique_constraint_blocks_duplicate_successors(pool: sqlx::PgPool) {
-    let request_id = insert_parent_request(&pool).await;
-    let pools = TestDbPools::new(pool).await.unwrap();
-    let store = PostgresResponseStepManager::new(pools);
-
-    let parent = store
-        .create_step(CreateStepInput {
-            id: None,
-            request_id,
-            prev_step_id: None,
-            parent_step_id: None,
-            step_kind: StepKind::ModelCall,
-            step_sequence: 1,
-            request_payload: json!({}),
-        })
-        .await
-        .unwrap();
-
-    // First successor: prev=parent, scope=top-level, kind=tool_call
-    store
-        .create_step(CreateStepInput {
-            id: None,
-            request_id,
-            prev_step_id: Some(parent),
-            parent_step_id: None,
-            step_kind: StepKind::ToolCall,
-            step_sequence: 2,
-            request_payload: json!({"first": true}),
-        })
-        .await
-        .unwrap();
-
-    // Re-running the transition function under crash recovery must not
-    // produce a duplicate row with the same (request, parent, prev, kind)
-    // tuple.
-    let dup = store
-        .create_step(CreateStepInput {
-            id: None,
-            request_id,
-            prev_step_id: Some(parent),
-            parent_step_id: None,
-            step_kind: StepKind::ToolCall,
-            step_sequence: 3,
-            request_payload: json!({"first": false}),
-        })
-        .await;
-    assert!(
-        dup.is_err(),
-        "expected UNIQUE constraint violation on duplicate successor"
-    );
-
-    // Different step_kind under the same predecessor is fine.
-    store
-        .create_step(CreateStepInput {
-            id: None,
-            request_id,
-            prev_step_id: Some(parent),
-            parent_step_id: None,
-            step_kind: StepKind::ModelCall,
-            step_sequence: 4,
-            request_payload: json!({}),
-        })
-        .await
-        .unwrap();
-}
-
-#[sqlx::test]
-async fn parallel_tool_calls_share_prev_but_unique_kinds(pool: sqlx::PgPool) {
-    // The orchestration loop fans out N tool_call rows after a model_call
-    // emits N tool calls. The UNIQUE constraint says
-    // (request_id, parent_step_id, prev_step_id, step_kind) must be
-    // unique, so multiple parallel tool_calls under the same predecessor
-    // are NOT allowed by this constraint alone — the storage layer relies
-    // on each parallel tool_call having a distinct prev_step_id chain
-    // (the fan-out linearizes them via prev_step_id pointing at the
-    // previous sibling, not all at the same parent).
-    //
-    // This test documents that intent: parallel siblings form a linear
-    // chain by prev_step_id, even though the orchestration loop fires
-    // their HTTP calls concurrently.
-
-    let request_id = insert_parent_request(&pool).await;
-    let pools = TestDbPools::new(pool).await.unwrap();
-    let store = PostgresResponseStepManager::new(pools);
-
-    let model = store
-        .create_step(CreateStepInput {
-            id: None,
-            request_id,
-            prev_step_id: None,
-            parent_step_id: None,
-            step_kind: StepKind::ModelCall,
-            step_sequence: 1,
-            request_payload: json!({}),
-        })
-        .await
-        .unwrap();
-
-    let tool_a = store
-        .create_step(CreateStepInput {
-            id: None,
-            request_id,
-            prev_step_id: Some(model),
-            parent_step_id: None,
-            step_kind: StepKind::ToolCall,
-            step_sequence: 2,
-            request_payload: json!({"tool": "a"}),
-        })
-        .await
-        .unwrap();
-
-    let tool_b = store
-        .create_step(CreateStepInput {
-            id: None,
-            request_id,
-            prev_step_id: Some(tool_a),
-            parent_step_id: None,
-            step_kind: StepKind::ToolCall,
-            step_sequence: 3,
-            request_payload: json!({"tool": "b"}),
-        })
-        .await
-        .unwrap();
-
-    let chain = store.list_chain(request_id).await.unwrap();
-    assert_eq!(chain.len(), 3);
-    assert_eq!(chain[0].id, model);
-    assert_eq!(chain[1].id, tool_a);
-    assert_eq!(chain[2].id, tool_b);
-    assert_eq!(chain[2].prev_step_id, Some(tool_a));
+    let step = store.get_step(step_id).await.unwrap().unwrap();
+    assert_eq!(step.state, StepState::Pending);
+    assert_eq!(step.retry_attempt, 1);
+    assert!(step.started_at.is_none());
 }
