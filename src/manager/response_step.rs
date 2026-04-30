@@ -150,15 +150,24 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     }
 
     async fn list_chain(&self, head_step_id: StepId) -> Result<Vec<ResponseStep>> {
-        // Returns the head + every descendant. The head row is fetched
-        // via PK lookup; descendants via the partial chain_walk index on
-        // (parent_step_id, step_sequence) WHERE parent_step_id IS NOT NULL.
+        // Returns the head + every descendant. The two arms each hit a
+        // different index, so they're written as a UNION ALL rather than
+        // an OR predicate (which can degenerate into a bitmap-or that
+        // ignores one of the indexes under planner pressure):
+        //   * head:        primary key lookup on `id`
+        //   * descendants: partial index `response_steps_chain_walk`
+        //                  on (parent_step_id, step_sequence) WHERE
+        //                  parent_step_id IS NOT NULL
+        // The two sets are disjoint (the head's parent_step_id is NULL
+        // by invariant, and descendants have a distinct id), so UNION
+        // ALL — cheaper than UNION's dedup — is correct.
         let pool = self.pools.write();
         let query = format!(
-            "SELECT {} FROM response_steps \
-             WHERE id = $1 OR parent_step_id = $1 \
+            "SELECT {cols} FROM response_steps WHERE id = $1 \
+             UNION ALL \
+             SELECT {cols} FROM response_steps WHERE parent_step_id = $1 \
              ORDER BY step_sequence ASC",
-            STEP_COLUMNS
+            cols = STEP_COLUMNS
         );
         let rows = sqlx::query(&query)
             .bind(head_step_id.0)

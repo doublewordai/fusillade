@@ -124,6 +124,52 @@ async fn tool_call_step_has_null_request_id(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test]
+async fn step_kind_request_id_check_constraint_rejects_invalid_combos(pool: sqlx::PgPool) {
+    // The DB-level CHECK constraint enforces:
+    //   model_call ⇒ request_id IS NOT NULL  (the sub-request fusillade row)
+    //   tool_call  ⇒ request_id IS NULL      (analytics live in tool_call_analytics)
+    // Without it, get_step_by_request and analytics attribution would
+    // have to defend against malformed rows at every read.
+    let head_request_id = insert_request(&pool).await;
+    let pools = TestDbPools::new(pool).await.unwrap();
+    let store = PostgresResponseStepManager::new(pools);
+
+    // model_call with NULL request_id is rejected.
+    let model_no_request = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id: None,
+            prev_step_id: None,
+            parent_step_id: None,
+            step_kind: StepKind::ModelCall,
+            step_sequence: 1,
+            request_payload: json!({}),
+        })
+        .await;
+    assert!(
+        model_no_request.is_err(),
+        "model_call with NULL request_id should violate the CHECK constraint"
+    );
+
+    // tool_call with non-NULL request_id is rejected.
+    let tool_with_request = store
+        .create_step(CreateStepInput {
+            id: None,
+            request_id: Some(head_request_id),
+            prev_step_id: None,
+            parent_step_id: None,
+            step_kind: StepKind::ToolCall,
+            step_sequence: 1,
+            request_payload: json!({}),
+        })
+        .await;
+    assert!(
+        tool_with_request.is_err(),
+        "tool_call with non-NULL request_id should violate the CHECK constraint"
+    );
+}
+
+#[sqlx::test]
 async fn list_chain_returns_head_plus_descendants_in_order(pool: sqlx::PgPool) {
     let pools = TestDbPools::new(pool.clone()).await.unwrap();
     let store = PostgresResponseStepManager::new(pools);

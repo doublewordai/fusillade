@@ -16,6 +16,21 @@
 ALTER TABLE response_steps
     ALTER COLUMN request_id DROP NOT NULL;
 
+-- 1a. Enforce the per-kind nullability invariant at the DB level so
+-- get_step_by_request and analytics attribution can rely on it
+-- without runtime defensiveness:
+--   model_call ⇒ request_id IS NOT NULL  (the sub-request row this
+--                step's HTTP fire created — 1:1 with http_analytics)
+--   tool_call  ⇒ request_id IS NULL      (tool dispatch lives outside
+--                fusillade.requests; analytics live in
+--                tool_call_analytics keyed on response_step_id)
+ALTER TABLE response_steps
+    ADD CONSTRAINT response_steps_request_id_step_kind_check
+    CHECK (
+        (step_kind = 'model_call' AND request_id IS NOT NULL) OR
+        (step_kind = 'tool_call'  AND request_id IS NULL)
+    );
+
 -- 2. Drop the chain idempotency constraint.
 --
 -- Branching is intrinsic to the data model: a model_call returning

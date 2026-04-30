@@ -20,4 +20,7 @@ ALTER TABLE response_steps
     UNIQUE NULLS NOT DISTINCT (request_id, parent_step_id, prev_step_id, step_kind);
 
 ALTER TABLE response_steps
+    DROP CONSTRAINT response_steps_request_id_step_kind_check;
+
+ALTER TABLE response_steps
     ALTER COLUMN request_id SET NOT NULL;
