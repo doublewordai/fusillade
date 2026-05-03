@@ -1139,6 +1139,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         LIMIT m.capacity
                         FOR UPDATE OF r3 SKIP LOCKED
                     ) r2
+                    -- FAIRNESS POLICY (claim ordering):
+                    --   score = (1 - urgency_weight) * normalized_user_active_count
+                    --         + urgency_weight       * normalized_deadline_proximity
+                    --   normalized_user_active_count = active_count / max_active_across_users
+                    --   normalized_deadline_proximity = clamp(seconds_to_expiry / 86400, 0, 1)
+                    -- Lower score wins. urgency_weight = 0 -> pure user-fairness.
+                    --
+                    -- The depth-reporting counterpart lives in
+                    -- get_effective_pending_request_counts_by_model_and_window.
+                    -- Any change here MUST be reflected there (and vice versa)
+                    -- to keep the depth signal directionally aligned with the
+                    -- order this query actually claims rows in.
+                    -- Drift detector: test_effective_counts_track_claim_order.
                     ORDER BY
                         (1.0 - $8::DOUBLE PRECISION)
                             * COALESCE(up.active_count, 0)::DOUBLE PRECISION
