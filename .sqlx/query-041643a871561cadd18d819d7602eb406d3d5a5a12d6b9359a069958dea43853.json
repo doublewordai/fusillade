@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH windows(label, start_seconds, has_start, end_seconds) AS (\n                SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::int2[], $4::bigint[])\n            ),\n            per_user AS (\n                SELECT\n                    r.model AS model,\n                    w.label AS window_label,\n                    b.created_by AS user_id,\n                    COUNT(*) FILTER (\n                        WHERE (w.has_start = 0 OR b.expires_at >= NOW() + make_interval(secs => w.start_seconds))\n                          AND b.expires_at < NOW() + make_interval(secs => w.end_seconds)\n                    )::BIGINT AS user_count\n                FROM requests r\n                JOIN batches b ON r.batch_id = b.id\n                CROSS JOIN windows w\n                WHERE r.state = ANY($5)\n                  AND r.template_id IS NOT NULL\n                  AND b.cancelling_at IS NULL\n                  AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))\n                  AND (\n                    $9 = 'any'\n                    OR ($9 = 'include' AND (\n                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($7))\n                        OR ($8 AND r.service_tier IS NULL)\n                    ))\n                    OR ($9 = 'exclude' AND (\n                        (r.service_tier IS NULL AND NOT $8)\n                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($7))\n                    ))\n                  )\n                GROUP BY r.model, w.label, b.created_by\n            ),\n            non_zero AS (\n                SELECT * FROM per_user WHERE user_count > 0\n            ),\n            bucket_share AS (\n                SELECT\n                    model,\n                    window_label,\n                    GREATEST(1::BIGINT, CEIL(SUM(user_count)::FLOAT8 / COUNT(*))::BIGINT) AS fair_share\n                FROM non_zero\n                GROUP BY model, window_label\n            )\n            SELECT\n                nz.model AS \"model!\",\n                nz.window_label AS \"window_label!\",\n                SUM(LEAST(nz.user_count, bs.fair_share))::BIGINT AS \"count!\"\n            FROM non_zero nz\n            JOIN bucket_share bs USING (model, window_label)\n            GROUP BY nz.model, nz.window_label\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "model!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "window_label!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Int8Array",
+        "Int2Array",
+        "Int8Array",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "041643a871561cadd18d819d7602eb406d3d5a5a12d6b9359a069958dea43853"
+}
