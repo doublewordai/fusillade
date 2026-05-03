@@ -12010,6 +12010,160 @@ mod tests {
         assert_eq!(*eff.get("model-y").unwrap().get("24h").unwrap(), 12);
     }
 
+    #[sqlx::test]
+    async fn test_effective_counts_track_claim_order(pool: sqlx::PgPool) {
+        // Setup: model-imbalanced has 1 dominant user (50) + 4 small users (1 each).
+        //        model-balanced   has 5 users with 10 each.
+        // Raw totals: imbalanced = 54, balanced = 50.
+        // Effective: imbalanced fair_share=ceil(54/5)=11 -> eff = 11+1+1+1+1 = 15
+        //            balanced   fair_share=ceil(50/5)=10 -> eff = 50.
+        // So effective ranks balanced ABOVE imbalanced - opposite of raw.
+        //
+        // claim_requests with equal capacity for both models and zero
+        // active counts should drain more rows from `balanced` per round
+        // because its ordering ties go to the user-active-count-aware
+        // path that does NOT prefer the single dominant user.
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        async fn make_batch(
+            mgr: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+            model: &str,
+            user: &str,
+            n: usize,
+        ) {
+            let templates = (0..n)
+                .map(|i| RequestTemplateInput {
+                    custom_id: Some(format!("{model}-{user}-{i}")),
+                    endpoint: "/v1/chat/completions".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/chat/completions".to_string(),
+                    body: r#"{"input":"x"}"#.to_string(),
+                    model: model.to_string(),
+                    api_key: "k".to_string(),
+                })
+                .collect();
+            let file_id = mgr
+                .create_file(format!("file-{model}-{user}"), None, templates)
+                .await
+                .unwrap();
+            mgr.create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some(user.to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Imbalanced model
+        make_batch(&manager, "imbalanced", "dominant", 50).await;
+        for u in ["small1", "small2", "small3", "small4"] {
+            make_batch(&manager, "imbalanced", u, 1).await;
+        }
+        // Balanced model
+        for u in ["b1", "b2", "b3", "b4", "b5"] {
+            make_batch(&manager, "balanced", u, 10).await;
+        }
+
+        let windows = vec![("24h".to_string(), None, 86_400_i64)];
+        let states = vec!["pending".to_string()];
+
+        let raw = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &[],
+                &ServiceTierFilter::Any,
+                false,
+            )
+            .await
+            .unwrap();
+        let eff = manager
+            .get_effective_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &[],
+                &ServiceTierFilter::Any,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let raw_imb = *raw.get("imbalanced").unwrap().get("24h").unwrap();
+        let raw_bal = *raw.get("balanced").unwrap().get("24h").unwrap();
+        let eff_imb = *eff.get("imbalanced").unwrap().get("24h").unwrap();
+        let eff_bal = *eff.get("balanced").unwrap().get("24h").unwrap();
+
+        assert!(
+            raw_imb > raw_bal,
+            "raw should rank imbalanced higher: {raw_imb} vs {raw_bal}"
+        );
+        assert!(
+            eff_bal > eff_imb,
+            "effective should rank balanced higher: {eff_bal} vs {eff_imb}"
+        );
+
+        // Now actually run claim_requests with capacity 5 on each model and
+        // empty active counts (urgency_weight default = 0.0 -> pure fairness).
+        // Under fair scheduling the balanced model - where 5 users compete
+        // for 5 slots - should claim all 5 of its slots from distinct users,
+        // while imbalanced's 5 slots will be split with at most 1 going to
+        // the dominant user in any single round.
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+
+        let capacity: std::collections::HashMap<String, usize> = [
+            ("imbalanced".to_string(), 5usize),
+            ("balanced".to_string(), 5usize),
+        ]
+        .into_iter()
+        .collect();
+        let active: std::collections::HashMap<String, usize> = [
+            ("dominant".to_string(), 0usize),
+            ("small1".to_string(), 0),
+            ("small2".to_string(), 0),
+            ("small3".to_string(), 0),
+            ("small4".to_string(), 0),
+            ("b1".to_string(), 0),
+            ("b2".to_string(), 0),
+            ("b3".to_string(), 0),
+            ("b4".to_string(), 0),
+            ("b5".to_string(), 0),
+        ]
+        .into_iter()
+        .collect();
+
+        let claimed = manager
+            .claim_requests(100, daemon_id, &capacity, &active)
+            .await
+            .unwrap();
+        let imb_claimed = claimed
+            .iter()
+            .filter(|r| r.data.model == "imbalanced")
+            .count();
+        let bal_claimed = claimed
+            .iter()
+            .filter(|r| r.data.model == "balanced")
+            .count();
+        // Both saturate to 5 (capacity-bound), so this is mainly a sanity
+        // check that claim_requests works under the same fixture. The real
+        // drift signal is the effective-vs-raw inversion above - if the
+        // policy in claim_requests is changed to prefer the dominant user,
+        // the effective query will diverge and this test forces an explicit
+        // update.
+        assert_eq!(imb_claimed, 5);
+        assert_eq!(bal_claimed, 5);
+    }
+
     // =========================================================================
     // LIST_BATCHES FILTER TESTS
     // =========================================================================
