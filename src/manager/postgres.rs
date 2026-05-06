@@ -853,11 +853,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             WHERE r.state = ANY($5)
             AND r.template_id IS NOT NULL
             AND b.cancelling_at IS NULL
-            -- Row-level upper bound: a row that expires after every window's
-            -- end can't contribute to any window's COUNT FILTER, so prune it
-            -- here. Without this, the join reads every active+templated
-            -- request and only filters inside the aggregate.
-            AND b.expires_at < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
             AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
             AND (
                 $9 = 'any'
