@@ -14,6 +14,20 @@ pub enum FusilladeError {
     #[error("Request not found: {0}")]
     RequestNotFound(RequestId),
 
+    /// Request exists but is not in the expected state for the requested
+    /// operation (e.g., completing an already-completed or failed request).
+    ///
+    /// Distinct from [`RequestNotFound`] so callers can be properly idempotent
+    /// against concurrent writers — e.g. a complete-then-complete race where
+    /// the second caller should treat "already completed" as success rather
+    /// than synthesizing a new row.
+    #[error("Request {id} is in state '{current_state}', expected one of: {expected}")]
+    RequestStateConflict {
+        id: RequestId,
+        current_state: String,
+        expected: &'static str,
+    },
+
     /// Cancelled request
     #[error("Request cancelled: {0}")]
     RequestCancelled(RequestId),
