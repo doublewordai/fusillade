@@ -2586,14 +2586,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch state: {}", e)))?;
 
-        if row.cancelling_at.is_some() {
-            return Err(FusilladeError::ValidationError(
-                "batch was cancelled before population".to_string(),
-            ));
-        }
         if row.batch_deleted_at.is_some() {
             return Err(FusilladeError::ValidationError(
                 "batch was deleted before population".to_string(),
+            ));
+        }
+        if row.cancelling_at.is_some() {
+            return Err(FusilladeError::ValidationError(
+                "batch was cancelled before population".to_string(),
             ));
         }
         if row.file_deleted_at.is_some() {
