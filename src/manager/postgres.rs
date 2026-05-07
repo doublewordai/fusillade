@@ -2565,16 +2565,44 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
             })?;
 
-        // Look up the batch's completion_window to derive service_tier
-        let completion_window: String = sqlx::query_scalar!(
-            r#"SELECT completion_window FROM batches WHERE id = $1"#,
+        // Bail out if the batch (or its source file) has been cancelled or
+        // deleted in the window since the batch was created — otherwise the
+        // INSERT below can FK-violate against templates the purger has
+        // already removed.
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                b.completion_window,
+                b.cancelling_at,
+                b.deleted_at AS batch_deleted_at,
+                (SELECT deleted_at FROM files WHERE id = $2) AS file_deleted_at
+            FROM batches b
+            WHERE b.id = $1
+            "#,
             *batch_id as Uuid,
+            *file_id as Uuid,
         )
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to fetch batch completion_window: {}", e))
-        })?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch state: {}", e)))?;
+
+        if row.batch_deleted_at.is_some() {
+            return Err(FusilladeError::ValidationError(
+                "batch was deleted before population".to_string(),
+            ));
+        }
+        if row.cancelling_at.is_some() {
+            return Err(FusilladeError::ValidationError(
+                "batch was cancelled before population".to_string(),
+            ));
+        }
+        if row.file_deleted_at.is_some() {
+            return Err(FusilladeError::ValidationError(
+                "source file was deleted before batch population".to_string(),
+            ));
+        }
+
+        let completion_window = row.completion_window;
         let service_tier =
             crate::request::query::service_tier_from_completion_window(&completion_window);
 
@@ -5932,6 +5960,107 @@ mod tests {
         for request in requests {
             assert!(request.is_pending());
         }
+    }
+
+    // populate_batch is invoked from a background task in dwctl, so the batch
+    // and the source file may have been deleted between batch creation and
+    // population. Without these guards, a concurrent purge of templates whose
+    // file was soft-deleted causes the INSERT to violate
+    // requests_template_id_fkey, and dwctl retries the task forever.
+
+    async fn populate_guard_setup(
+        pool: sqlx::PgPool,
+    ) -> (
+        Arc<PostgresRequestManager<TestDbPools, MockHttpClient>>,
+        FileId,
+        BatchId,
+    ) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            TestDbPools::new(pool).await.unwrap(),
+            http_client,
+        ));
+
+        let file_id = manager
+            .create_file(
+                "populate-guard".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"1"}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch_record(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        (manager, file_id, batch.id)
+    }
+
+    #[sqlx::test]
+    async fn test_populate_batch_rejects_when_source_file_deleted(pool: sqlx::PgPool) {
+        let (manager, file_id, batch_id) = populate_guard_setup(pool).await;
+
+        manager.delete_file(file_id).await.unwrap();
+
+        let err = manager
+            .populate_batch(batch_id, file_id)
+            .await
+            .expect_err("populate_batch should fail after source file deleted");
+        assert!(
+            matches!(err, FusilladeError::ValidationError(_)),
+            "expected ValidationError so the dwctl task is marked Fatal, got: {err:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_populate_batch_rejects_when_batch_cancelled(pool: sqlx::PgPool) {
+        let (manager, file_id, batch_id) = populate_guard_setup(pool).await;
+
+        manager.cancel_batch(batch_id).await.unwrap();
+
+        let err = manager
+            .populate_batch(batch_id, file_id)
+            .await
+            .expect_err("populate_batch should fail after batch cancelled");
+        assert!(
+            matches!(err, FusilladeError::ValidationError(_)),
+            "expected ValidationError, got: {err:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_populate_batch_rejects_when_batch_deleted(pool: sqlx::PgPool) {
+        let (manager, file_id, batch_id) = populate_guard_setup(pool).await;
+
+        manager.delete_batch(batch_id).await.unwrap();
+
+        let err = manager
+            .populate_batch(batch_id, file_id)
+            .await
+            .expect_err("populate_batch should fail after batch deleted");
+        assert!(
+            matches!(err, FusilladeError::ValidationError(_)),
+            "expected ValidationError, got: {err:?}"
+        );
     }
 
     // =========================================================================
