@@ -1,5 +1,13 @@
 # Changelog
 
+## [16.8.1](https://github.com/doublewordai/fusillade/compare/fusillade-v16.8.0...fusillade-v16.8.1) (2026-05-07)
+
+
+### Bug Fixes
+
+* filter out-of-window requests before joining to batches table, keep batch_id in active batches index so we can use it to join to requests ([#252](https://github.com/doublewordai/fusillade/issues/252)) ([8bbd3a7](https://github.com/doublewordai/fusillade/commit/8bbd3a7e42e95ce0af6b2edee83b5b79e119da2a))
+* stop underway creating requests for deleted batches or files ([#254](https://github.com/doublewordai/fusillade/issues/254)) ([3f93fa7](https://github.com/doublewordai/fusillade/commit/3f93fa76dcf6c3e178b8e68e625d35d0d3753f42))
+
 ## [16.8.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.7.0...fusillade-v16.8.0) (2026-04-30)
 
 
