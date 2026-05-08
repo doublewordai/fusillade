@@ -55,10 +55,8 @@ impl ServiceTierFilter {
 /// Filter parameters for listing requests across batches.
 #[derive(Debug, Clone)]
 pub struct ListRequestsFilter {
-    /// Filter by batch creator (user ID or org ID)
+    /// Filter by request creator (user ID or org ID)
     pub created_by: Option<String>,
-    /// Filter by batch completion window (e.g., "1h", "24h")
-    pub completion_window: Option<String>,
     /// Filter by request state (pending, claimed, processing, completed, failed, canceled)
     pub status: Option<String>,
     /// Filter by model(s) — when multiple, matches any.
@@ -85,7 +83,6 @@ impl Default for ListRequestsFilter {
     fn default() -> Self {
         Self {
             created_by: None,
-            completion_window: None,
             status: None,
             models: None,
             created_after: None,
@@ -116,9 +113,10 @@ pub struct RequestSummary {
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
     pub service_tier: Option<String>,
-    /// Batch or daemon creator ID — for ownership checks and email lookup.
-    /// NULL for daemon-managed requests that don't have a batch.
-    pub batch_created_by: Option<String>,
+    /// Creator ID (user or org) for ownership checks and email lookup.
+    /// Sourced from `requests.created_by` for batchless rows or
+    /// `batches.created_by` for rows that belong to a batch.
+    pub created_by: Option<String>,
 }
 
 /// Internal row shape used previously when `list_requests` computed the total
@@ -164,7 +162,7 @@ mod deprecated_types {
                 duration_ms: r.duration_ms,
                 response_status: r.response_status,
                 service_tier: r.service_tier,
-                batch_created_by: Some(r.batch_created_by),
+                created_by: Some(r.batch_created_by),
             }
         }
     }
@@ -178,7 +176,8 @@ pub use deprecated_types::RequestSummaryWithCount;
 #[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
 pub struct RequestDetail {
     pub id: Uuid,
-    /// `None` for daemon-managed requests (created via `create_daemon_request`).
+    /// `None` for batchless responses (created via `create_realtime` /
+    /// `create_flex`).
     pub batch_id: Option<Uuid>,
     pub model: String,
     #[cfg_attr(feature = "postgres", sqlx(rename = "state"))]
@@ -192,22 +191,22 @@ pub struct RequestDetail {
     pub body: Option<String>,
     pub response_body: Option<String>,
     pub error: Option<String>,
-    /// `None` for daemon-managed requests (no batch).
-    pub completion_window: Option<String>,
     pub service_tier: Option<String>,
-    /// `None` for daemon-managed requests (no batch).
-    pub batch_created_by: Option<String>,
+    /// Creator ID (user or org). Sourced from `requests.created_by` for
+    /// batchless rows or `batches.created_by` for rows that belong to a batch.
+    pub created_by: Option<String>,
 }
 
-/// Input for creating a daemon-managed request (no batch).
+/// Input for creating a realtime response that the proxy is already handling.
 ///
-/// Used when a daemon (e.g., an AI proxy) is already processing a request and
-/// wants to track it in fusillade without creating a batch. The request is
-/// created directly in "processing" state with the specified daemon ID.
+/// Inserts a request template (no parent file) and a request row in
+/// `processing` state with `batch_id = NULL` and `daemon_id = Uuid::nil()`.
+/// The proxy completes/fails the row directly via `complete_request` /
+/// `fail_request`; the daemon never claims it.
 #[derive(Debug, Clone)]
-pub struct CreateDaemonRequestInput {
-    /// Pre-generated request ID. If `None`, a new UUID is generated.
-    pub id: Option<Uuid>,
+pub struct CreateRealtimeInput {
+    /// Pre-generated request ID. Becomes the request's primary key.
+    pub request_id: Uuid,
     /// The request body as a JSON string.
     pub body: String,
     /// Model identifier.
@@ -218,10 +217,35 @@ pub struct CreateDaemonRequestInput {
     pub method: String,
     /// API path (e.g., "/v1/responses").
     pub path: String,
-    /// API key for the request (empty string if none).
+    /// API key for the request.
     pub api_key: String,
-    /// The daemon that is processing this request.
-    pub daemon_id: super::DaemonId,
+    /// User/org ID that owns this request.
+    pub created_by: String,
+}
+
+/// Input for creating a flex (async) response that the daemon will process.
+///
+/// Inserts a request template (no parent file) and a request row in `pending`
+/// state with `batch_id = NULL`. The daemon claims and processes it like any
+/// other pending request.
+#[derive(Debug, Clone)]
+pub struct CreateFlexInput {
+    /// Pre-generated request ID. Becomes the request's primary key.
+    pub request_id: Uuid,
+    /// The request body as a JSON string.
+    pub body: String,
+    /// Model identifier.
+    pub model: String,
+    /// Base URL of the target endpoint (e.g., "http://localhost:3001/ai").
+    pub endpoint: String,
+    /// HTTP method (e.g., "POST").
+    pub method: String,
+    /// API path (e.g., "/v1/responses").
+    pub path: String,
+    /// API key for the request.
+    pub api_key: String,
+    /// User/org ID that owns this request.
+    pub created_by: String,
 }
 
 /// Result of a paginated request list query.

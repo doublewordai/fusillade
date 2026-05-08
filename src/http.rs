@@ -663,7 +663,7 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
-            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
             template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             custom_id: None,
             endpoint: "https://api.example.com".to_string(),
@@ -708,7 +708,7 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
-            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
             template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             custom_id: None,
             endpoint: "https://api.example.com".to_string(),
@@ -736,7 +736,7 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
-            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
             template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             custom_id: None,
             endpoint: "https://api.example.com".to_string(),
@@ -767,7 +767,7 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
-            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
             template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             custom_id: None,
             endpoint: "https://api.example.com".to_string(),
@@ -821,7 +821,7 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
-            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
             template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             custom_id: None,
             endpoint: "https://api.example.com".to_string(),
@@ -934,7 +934,7 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
-            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
             template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             custom_id: None,
             endpoint: format!("http://{}", addr),
@@ -988,7 +988,7 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
-            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
             template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             custom_id: None,
             endpoint: format!("http://{}", addr),
@@ -1036,7 +1036,7 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
-            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
             template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             custom_id: None,
             endpoint: format!("http://{}", addr),
@@ -1106,7 +1106,7 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
-            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
             template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             custom_id: None,
             endpoint: format!("http://{}", addr),
@@ -1143,7 +1143,7 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
-            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
             template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             custom_id: Some("invalid\ncustom_id".to_string()), // Contains newline
             endpoint: "https://api.example.com".to_string(),
@@ -1205,7 +1205,7 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
-            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
             template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             custom_id: None,
             endpoint: format!("http://{}", addr),

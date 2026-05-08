@@ -71,8 +71,9 @@ pub struct RequestData {
     /// The ID with which the request was submitted.
     pub id: RequestId,
 
-    /// The batch this execution belongs to
-    pub batch_id: BatchId,
+    /// The batch this execution belongs to. `None` for batchless responses
+    /// (created via `create_realtime` / `create_flex`).
+    pub batch_id: Option<BatchId>,
 
     /// The template this execution was created from
     pub template_id: TemplateId,

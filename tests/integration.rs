@@ -2445,11 +2445,15 @@ mod service_tier {
             .unwrap();
         let requests_1h = manager.get_batch_requests(batch_1h.id).await.unwrap();
         assert_eq!(requests_1h.len(), 1);
-        let detail_1h = manager
-            .get_request_detail(requests_1h[0].id().into())
-            .await
-            .unwrap();
-        assert_eq!(detail_1h.service_tier, Some("flex".to_string()));
+        // get_request_detail is scoped to batchless responses now, so query
+        // the batched row's service_tier directly.
+        let tier_1h: Option<String> =
+            sqlx::query_scalar("SELECT service_tier FROM requests WHERE batch_id = $1")
+                .bind(*batch_1h.id as uuid::Uuid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tier_1h, Some("flex".to_string()));
 
         // Create a batch with completion_window = "24h" → service_tier = NULL
         let file_id_24h = manager
@@ -2471,11 +2475,13 @@ mod service_tier {
             .unwrap();
         let requests_24h = manager.get_batch_requests(batch_24h.id).await.unwrap();
         assert_eq!(requests_24h.len(), 1);
-        let detail_24h = manager
-            .get_request_detail(requests_24h[0].id().into())
-            .await
-            .unwrap();
-        assert_eq!(detail_24h.service_tier, None);
+        let tier_24h: Option<String> =
+            sqlx::query_scalar("SELECT service_tier FROM requests WHERE batch_id = $1")
+                .bind(*batch_24h.id as uuid::Uuid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tier_24h, None);
     }
 
     #[sqlx::test]
@@ -2500,55 +2506,36 @@ mod service_tier {
             .with_config(config),
         );
 
-        let template = RequestTemplateInput {
-            custom_id: None,
-            endpoint: "https://api.example.com".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/test".to_string(),
-            body: r#"{"prompt":"test"}"#.to_string(),
-            model: "test-model".to_string(),
-            api_key: "test-key".to_string(),
-        };
-
-        // Create a 1h batch (flex tier) with 1 request
-        let file_id_1h = manager
-            .create_file("file-1h".to_string(), None, vec![template.clone()])
+        // list_requests is scoped to batchless responses, so create one of
+        // each tier via the batchless insert methods.
+        manager
+            .create_flex(fusillade::CreateFlexInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: r#"{"prompt":"test"}"#.to_string(),
+                model: "test-model".to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "tier-user".to_string(),
+            })
             .await
             .unwrap();
         manager
-            .create_batch(BatchInput {
-                file_id: file_id_1h,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "1h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
+            .create_realtime(fusillade::CreateRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: r#"{"prompt":"test"}"#.to_string(),
+                model: "test-model".to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "tier-user".to_string(),
             })
             .await
             .unwrap();
 
-        // Create a 24h batch (batch tier, NULL) with 1 request
-        let file_id_24h = manager
-            .create_file("file-24h".to_string(), None, vec![template.clone()])
-            .await
-            .unwrap();
-        manager
-            .create_batch(BatchInput {
-                file_id: file_id_24h,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .unwrap();
-
-        // Filter by service_tier = "flex" — only the 1h request
+        // Filter by service_tier = "flex" — only the flex row
         let flex_result = manager
             .list_requests(ListRequestsFilter {
                 service_tiers: Some(vec!["flex".to_string()]),
