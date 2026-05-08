@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.8.2](https://github.com/doublewordai/fusillade/compare/fusillade-v16.8.1...fusillade-v16.8.2) (2026-05-08)
+
+
+### Bug Fixes
+
+* distinguish RequestNotFound from RequestStateConflict in complete/fail ([#255](https://github.com/doublewordai/fusillade/issues/255)) ([327fe1b](https://github.com/doublewordai/fusillade/commit/327fe1bdcfdbf3d8186b934699986a3fbedb9137))
+
 ## [16.8.1](https://github.com/doublewordai/fusillade/compare/fusillade-v16.8.0...fusillade-v16.8.1) (2026-05-07)
 
 
