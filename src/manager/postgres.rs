@@ -3862,28 +3862,45 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let pool = self.pools.write();
         let size = response_body.len() as i64;
 
-        let result = sqlx::query(
-            "UPDATE requests
-             SET state = 'completed',
-                 response_status = $2,
-                 response_body = $3,
-                 response_size = $4,
-                 completed_at = NOW()
-             WHERE id = $1 AND state = 'processing'",
+        // Try the UPDATE; if it doesn't match, surface whether the row is
+        // missing or just in the wrong state. The previous "0 rows → NotFound"
+        // signal collapsed those cases together, which made callers unable to
+        // distinguish a genuine missing row from a row that another writer had
+        // already moved out of 'processing'. Concurrent completers (zombie
+        // task replays, duplicate enqueues) hit the wrong-state case routinely.
+        let row: Option<(bool, Option<String>)> = sqlx::query_as(
+            "WITH updated AS (
+                 UPDATE requests
+                    SET state = 'completed',
+                        response_status = $2,
+                        response_body = $3,
+                        response_size = $4,
+                        completed_at = NOW()
+                  WHERE id = $1 AND state = 'processing'
+                 RETURNING 1
+             )
+             SELECT EXISTS(SELECT 1 FROM updated) AS matched,
+                    (SELECT state FROM requests WHERE id = $1) AS current_state
+             WHERE EXISTS(SELECT 1 FROM requests WHERE id = $1)",
         )
         .bind(request_id.0)
         .bind(status_code as i16)
         .bind(response_body)
         .bind(size)
-        .execute(pool)
+        .fetch_optional(pool)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete request: {}", e)))?;
 
-        if result.rows_affected() == 0 {
-            return Err(FusilladeError::RequestNotFound(request_id));
+        match row {
+            Some((true, _)) => Ok(()),
+            Some((false, Some(current_state))) => Err(FusilladeError::RequestStateConflict {
+                id: request_id,
+                current_state,
+                expected: "processing",
+            }),
+            // Fallback: row vanished between the CTE and the SELECT, or no row exists.
+            Some((false, None)) | None => Err(FusilladeError::RequestNotFound(request_id)),
         }
-
-        Ok(())
     }
 
     async fn fail_request(
@@ -3903,26 +3920,36 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         })?;
 
         let error_size = error_json.len() as i64;
-        let result = sqlx::query(
-            "UPDATE requests
-             SET state = 'failed',
-                 error = $2,
-                 response_size = $3,
-                 failed_at = NOW()
-             WHERE id = $1 AND state = 'processing'",
+        let row: Option<(bool, Option<String>)> = sqlx::query_as(
+            "WITH updated AS (
+                 UPDATE requests
+                    SET state = 'failed',
+                        error = $2,
+                        response_size = $3,
+                        failed_at = NOW()
+                  WHERE id = $1 AND state = 'processing'
+                 RETURNING 1
+             )
+             SELECT EXISTS(SELECT 1 FROM updated) AS matched,
+                    (SELECT state FROM requests WHERE id = $1) AS current_state
+             WHERE EXISTS(SELECT 1 FROM requests WHERE id = $1)",
         )
         .bind(request_id.0)
         .bind(&error_json)
         .bind(error_size)
-        .execute(pool)
+        .fetch_optional(pool)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail request: {}", e)))?;
 
-        if result.rows_affected() == 0 {
-            return Err(FusilladeError::RequestNotFound(request_id));
+        match row {
+            Some((true, _)) => Ok(()),
+            Some((false, Some(current_state))) => Err(FusilladeError::RequestStateConflict {
+                id: request_id,
+                current_state,
+                expected: "processing",
+            }),
+            Some((false, None)) | None => Err(FusilladeError::RequestNotFound(request_id)),
         }
-
-        Ok(())
     }
 }
 
