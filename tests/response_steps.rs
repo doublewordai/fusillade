@@ -44,8 +44,8 @@ async fn insert_request(pool: &sqlx::PgPool) -> RequestId {
 
     sqlx::query(
         "INSERT INTO requests \
-         (id, batch_id, template_id, model, custom_id, state) \
-         VALUES ($1, NULL, $2, 'test-model', NULL, 'pending')",
+         (id, batch_id, template_id, model, custom_id, state, created_by) \
+         VALUES ($1, NULL, $2, 'test-model', NULL, 'pending', 'test-user')",
     )
     .bind(request_id)
     .bind(template_id)

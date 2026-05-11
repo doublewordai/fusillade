@@ -2445,8 +2445,8 @@ mod service_tier {
             .unwrap();
         let requests_1h = manager.get_batch_requests(batch_1h.id).await.unwrap();
         assert_eq!(requests_1h.len(), 1);
-        // get_request_detail is scoped to batchless responses now, so query
-        // the batched row's service_tier directly.
+        // Query the batched row's service_tier directly — get_batch_requests
+        // doesn't surface service_tier, and we only need the one field here.
         let tier_1h: Option<String> =
             sqlx::query_scalar("SELECT service_tier FROM requests WHERE batch_id = $1")
                 .bind(*batch_1h.id as uuid::Uuid)

@@ -3684,7 +3684,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FROM requests r
             LEFT JOIN request_templates t ON r.template_id = t.id
             LEFT JOIN files f ON t.file_id = f.id
-            WHERE r.id = $1 AND r.created_by IS NOT NULL
+            WHERE r.id = $1
             "#,
         )
         .bind(request_id.0)
