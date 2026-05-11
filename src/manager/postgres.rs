@@ -1096,13 +1096,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
                 if let Some(batch_uuid) = row.batch_id {
                     let parsed_metadata =
-                        parsed_metadata_cache
-                            .entry(batch_uuid)
-                            .or_insert_with(|| {
-                                row.batch_metadata
-                                    .as_deref()
-                                    .and_then(|s| serde_json::from_str(s).ok())
-                            });
+                        parsed_metadata_cache.entry(batch_uuid).or_insert_with(|| {
+                            row.batch_metadata
+                                .as_deref()
+                                .and_then(|s| serde_json::from_str(s).ok())
+                        });
 
                     for field_name in &self.config.batch_metadata_fields {
                         // First check if it's a known column field
@@ -10040,7 +10038,8 @@ mod tests {
 
         assert_eq!(claimed.len(), 1);
         assert_eq!(
-            claimed[0].data.batch_id, Some(batch1.id),
+            claimed[0].data.batch_id,
+            Some(batch1.id),
             "First claim should be from most urgent batch (30 min expiration)"
         );
         assert_eq!(claimed[0].data.custom_id, Some("urgent-1".to_string()));
@@ -10053,7 +10052,8 @@ mod tests {
 
         assert_eq!(claimed2.len(), 1);
         assert_eq!(
-            claimed2[0].data.batch_id, Some(batch2.id),
+            claimed2[0].data.batch_id,
+            Some(batch2.id),
             "Second claim should be from medium priority batch (2 hour expiration)"
         );
         assert_eq!(claimed2[0].data.custom_id, Some("medium-1".to_string()));
@@ -10066,7 +10066,8 @@ mod tests {
 
         assert_eq!(claimed3.len(), 1);
         assert_eq!(
-            claimed3[0].data.batch_id, Some(batch3.id),
+            claimed3[0].data.batch_id,
+            Some(batch3.id),
             "Third claim should be from no-SLA batch (NULL expiration)"
         );
         assert_eq!(claimed3[0].data.custom_id, Some("no-sla-1".to_string()));
@@ -10196,7 +10197,8 @@ mod tests {
         assert_eq!(claimed.len(), 3);
         for req in &claimed {
             assert_eq!(
-                req.data.batch_id, Some(urgent_batch.id),
+                req.data.batch_id,
+                Some(urgent_batch.id),
                 "All claimed requests should come from the urgent batch (earliest expires_at), \
                  but got one from a filler batch — indicates non-FIFO ordering"
             );
@@ -10401,7 +10403,8 @@ mod tests {
 
         assert_eq!(claimed.len(), 1);
         assert_eq!(
-            claimed[0].data.batch_id, Some(urgent_batch.id),
+            claimed[0].data.batch_id,
+            Some(urgent_batch.id),
             "Urgent batch (earlier deadline) should be claimed first when user priority is equal"
         );
     }
@@ -10481,7 +10484,8 @@ mod tests {
 
         assert_eq!(claimed.len(), 1);
         assert_eq!(
-            claimed[0].data.batch_id, Some(batch_a),
+            claimed[0].data.batch_id,
+            Some(batch_a),
             "With urgency_weight=0.5 and equal user activity, \
              the 1hr SLA batch should be claimed before the 24hr batch"
         );
@@ -13257,7 +13261,10 @@ mod tests {
             .purge_orphaned_rows(1000)
             .await
             .expect("purge should succeed");
-        assert_eq!(purged, 0, "purge must not touch batchless realtime templates");
+        assert_eq!(
+            purged, 0,
+            "purge must not touch batchless realtime templates"
+        );
 
         let detail = manager
             .get_request_detail(crate::request::RequestId(request_id))
@@ -13265,7 +13272,10 @@ mod tests {
             .expect("get_request_detail should succeed after purge");
 
         assert_eq!(detail.model, "gpt-4");
-        assert!(detail.body.is_some(), "body should still be present after purge");
+        assert!(
+            detail.body.is_some(),
+            "body should still be present after purge"
+        );
     }
 
     #[sqlx::test]
