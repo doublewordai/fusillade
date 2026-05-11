@@ -254,6 +254,7 @@ pub struct DaemonConfig {
     /// Synthetic deadline applied to batchless flex responses when the daemon
     /// orders claims. Batched rows have `batches.expires_at`; batchless rows
     /// fall back to `created_at + flex_expiry_ms`. Default 1h (legacy flex SLA).
+    #[serde(default = "default_flex_expiry_ms")]
     pub flex_expiry_ms: u64,
 }
 
@@ -264,6 +265,10 @@ fn default_batch_metadata_fields() -> Vec<String> {
         "created_at".to_string(),
         "completion_window".to_string(),
     ]
+}
+
+fn default_flex_expiry_ms() -> u64 {
+    3_600_000 // 1 hour
 }
 
 impl Default for DaemonConfig {
@@ -297,7 +302,7 @@ impl Default for DaemonConfig {
             throughput_log_interval_ms: Some(60_000), // Log per-user throughput every minute
             streamable_endpoints: Vec::new(),
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000, // 1 hour
+            flex_expiry_ms: default_flex_expiry_ms(),
         }
     }
 }

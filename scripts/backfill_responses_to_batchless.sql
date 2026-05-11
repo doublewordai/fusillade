@@ -1,19 +1,48 @@
--- One-shot cleanup that converts pre-existing realtime/flex responses from
--- virtual-batch storage into the new batchless shape introduced in migration
--- 20260507000000.
+-- Post-deploy work for migration 20260507000000. Two things live here that
+-- can't go inside the migration itself:
 --
--- Background. Until that migration, every response (priority/realtime and
--- flex) was stored as a single-row "virtual" batch: a fresh `files` row with
--- name='single_request' and purpose='batch', a `batches` row pointing at it,
--- and one `requests` row pointing at the batch. The new code path inserts
--- those responses without a batch — `requests.created_by` is set on the row
--- itself and `requests.batch_id` is NULL.
+--   A. CREATE INDEX CONCURRENTLY for the two partial indexes that back the
+--      per-user listing query. CONCURRENTLY can't run in a transaction, and
+--      sqlx wraps every migration in one, so the index DDL lives here and
+--      runs in autocommit. Each statement is its own implicit transaction.
+--   B. A one-shot data conversion for pre-existing realtime/flex responses
+--      stored as single-row "virtual" batches (a `files` row with
+--      name='single_request' and purpose='batch', a `batches` row, and a
+--      `requests` row). The new code path inserts those responses directly
+--      with `requests.created_by` set and `batch_id` NULL; this script
+--      converts the old shape so old rows appear in the new listing.
 --
--- The migration adds the column and relaxes the NOT NULL but doesn't migrate
--- existing data, so anyone who deploys it ends up with their old responses
--- invisible to the new listing query (which scopes on `r.created_by != ''`).
--- Run this script once post-deploy to fix that.
+-- Run with psql (NOT inside `BEGIN; ... COMMIT;`) once after deploying the
+-- migration. Both sections are idempotent:
+--   - CREATE INDEX uses IF NOT EXISTS.
+--   - The data conversion's WHERE clauses match nothing on a second pass.
 --
+-- =========================================================================
+-- A. Per-user listing indexes (CONCURRENTLY, outside any transaction).
+-- =========================================================================
+-- Two partial indexes covering the active-first and recency sort orderings
+-- of list_requests, scoped to batchless rows. Batched rows (created_by IS
+-- NULL) still go through the existing batch-driven path and are excluded.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_requests_user_active_sort
+ON requests (
+    created_by,
+    (CASE state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END),
+    created_at DESC,
+    id DESC,
+    service_tier
+) WHERE created_by IS NOT NULL;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_requests_user_created_sort
+ON requests (
+    created_by,
+    created_at DESC,
+    id DESC,
+    service_tier
+) WHERE created_by IS NOT NULL;
+
+-- =========================================================================
+-- B. Virtual-batch -> batchless response data conversion.
+-- =========================================================================
 -- Behaviour:
 --   1. Hard-delete request rows whose virtual batch was soft-deleted
 --      (`b.deleted_at IS NOT NULL`). The pre-migration listing filtered
@@ -21,13 +50,18 @@
 --      the tombstone.
 --   2. For live virtual batches, copy `b.created_by` onto the request and
 --      null out `batch_id`. The row then satisfies the new listing's
---      `r.created_by != ''` predicate and stops joining batches.
+--      `r.created_by IS NOT NULL` predicate (and the XOR CHECK that
+--      requires exactly one of batch_id/created_by to be set).
 --   3. Virtual `batches` and `files` rows are intentionally left in place;
 --      they're orphan rows now (no children) but harmless. A separate
 --      cleanup pass can prune them later.
 --
--- Idempotent: re-running is a no-op once all virtual-batch responses have
--- been processed (the WHERE clauses match nothing on a second pass).
+-- Distinguishing virtual batches from genuine user-uploaded ones:
+-- `files.name = 'single_request'` alone is user-collidable (file names come
+-- from clients). The legacy `create_single_request_batch` path also leaves
+-- `files.uploaded_by` NULL (the upload API always sets it) and produces
+-- batches with exactly `total_requests = 1`. Requiring all three together
+-- makes a real user batch effectively impossible to match by accident.
 
 BEGIN;
 
@@ -38,6 +72,8 @@ WHERE batch_id IN (
     JOIN files f ON b.file_id = f.id
     WHERE f.name = 'single_request'
       AND f.purpose = 'batch'
+      AND f.uploaded_by IS NULL
+      AND b.total_requests = 1
       AND b.deleted_at IS NOT NULL
 );
 
@@ -49,6 +85,8 @@ JOIN files f ON b.file_id = f.id
 WHERE r.batch_id = b.id
   AND f.name = 'single_request'
   AND f.purpose = 'batch'
+  AND f.uploaded_by IS NULL
+  AND b.total_requests = 1
   AND b.deleted_at IS NULL;
 
 COMMIT;

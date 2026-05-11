@@ -5,6 +5,7 @@
 DROP INDEX IF EXISTS idx_requests_user_active_sort;
 DROP INDEX IF EXISTS idx_requests_user_created_sort;
 
+ALTER TABLE requests DROP CONSTRAINT IF EXISTS requests_attribution_xor;
 ALTER TABLE requests DROP COLUMN IF EXISTS created_by;
 
 -- Restore the original views (inner-join variants).

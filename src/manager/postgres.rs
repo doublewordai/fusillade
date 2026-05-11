@@ -3529,11 +3529,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let pool = self.pools.read();
 
         // Listing is scoped to batchless rows (responses) — those carry
-        // `created_by` directly. Real-batch rows have created_by = '' and are
-        // filtered out so the planner can use the partial index
+        // `created_by` directly. Real-batch rows have created_by IS NULL and
+        // are filtered out so the planner can use the partial index
         // `idx_requests_user_*_sort`.
         let where_clause = r#"
-            WHERE r.created_by != ''
+            WHERE r.created_by IS NOT NULL
               AND ($1::text IS NULL OR r.created_by = $1)
               AND ($2::text IS NULL OR r.state = $2)
               AND ($3::text[] IS NULL OR r.model = ANY($3))
@@ -3684,7 +3684,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FROM requests r
             LEFT JOIN request_templates t ON r.template_id = t.id
             LEFT JOIN files f ON t.file_id = f.id
-            WHERE r.id = $1 AND r.created_by != ''
+            WHERE r.id = $1 AND r.created_by IS NOT NULL
             "#,
         )
         .bind(request_id.0)
@@ -3730,6 +3730,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // processing immediately. daemon_id = nil sentinel keeps the daemon
         // from claiming or unclaiming it; service_tier = 'priority' matches
         // the legacy "0s" completion_window mapping.
+        // Empty-string created_by is a contract violation (the API guarantees
+        // a real user); coerce to NULL so the XOR CHECK rejects it loudly
+        // rather than letting a phantom-user row slip into the listing.
+        let created_by = Some(input.created_by.as_str()).filter(|s| !s.is_empty());
         sqlx::query(
             "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by, daemon_id, claimed_at, started_at)
              VALUES ($1, NULL, $2, $3, NULL, 'processing', 0, 'priority', $4, $5, $6, $6)",
@@ -3737,7 +3741,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(input.request_id)
         .bind(template_id)
         .bind(&input.model)
-        .bind(&input.created_by)
+        .bind(created_by)
         .bind(Uuid::nil())
         .bind(now)
         .execute(&mut *tx)
@@ -3783,6 +3787,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         // Pending row — the daemon will claim and process it like any other
         // pending request.
+        // Empty-string created_by is a contract violation (the API guarantees
+        // a real user); coerce to NULL so the XOR CHECK rejects it loudly
+        // rather than letting a phantom-user row slip into the listing.
+        let created_by = Some(input.created_by.as_str()).filter(|s| !s.is_empty());
         sqlx::query(
             "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by)
              VALUES ($1, NULL, $2, $3, NULL, 'pending', 0, 'flex', $4)",
@@ -3790,7 +3798,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(input.request_id)
         .bind(template_id)
         .bind(&input.model)
-        .bind(&input.created_by)
+        .bind(created_by)
         .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert flex request: {}", e)))?;
@@ -13217,16 +13225,18 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_get_request_detail_after_template_purge(pool: sqlx::PgPool) {
+    async fn test_purge_preserves_batchless_request_detail(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             http_client,
         );
 
-        // Batchless responses use templates with file_id IS NULL, so this test
-        // exercises the "purge orphaned templates" cleanup path against a
-        // template that has no parent file.
+        // Batchless realtime responses store their template with file_id = NULL.
+        // purge_orphaned_rows only deletes templates whose parent file is
+        // soft-deleted; templates with NULL file_id must be left alone, otherwise
+        // get_request_detail would lose its template-side payload (body, etc.).
+        // This test pins that invariant.
         let request_id = uuid::Uuid::new_v4();
         manager
             .create_realtime(crate::request::CreateRealtimeInput {
@@ -13243,13 +13253,19 @@ mod tests {
             .await
             .unwrap();
 
+        let purged = manager
+            .purge_orphaned_rows(1000)
+            .await
+            .expect("purge should succeed");
+        assert_eq!(purged, 0, "purge must not touch batchless realtime templates");
+
         let detail = manager
             .get_request_detail(crate::request::RequestId(request_id))
             .await
-            .expect("get_request_detail should succeed");
+            .expect("get_request_detail should succeed after purge");
 
         assert_eq!(detail.model, "gpt-4");
-        assert!(detail.body.is_some(), "body should be present");
+        assert!(detail.body.is_some(), "body should still be present after purge");
     }
 
     #[sqlx::test]
@@ -13470,7 +13486,7 @@ mod tests {
     #[sqlx::test]
     async fn test_list_requests_excludes_batched_rows(pool: sqlx::PgPool) {
         // list_requests is now scoped to batchless responses (rows where
-        // r.created_by != ''). Batched rows must not appear.
+        // r.created_by IS NOT NULL). Batched rows must not appear.
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),

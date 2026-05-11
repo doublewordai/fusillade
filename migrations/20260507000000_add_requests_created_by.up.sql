@@ -8,29 +8,26 @@
 -- responses (one batch per response, used as a workaround) into batchless
 -- requests carrying their own created_by.
 
-ALTER TABLE requests ADD COLUMN IF NOT EXISTS created_by TEXT NOT NULL DEFAULT '';
+-- Nullable rather than NOT NULL: batched rows leave this NULL (attribution
+-- lives on batches.created_by); batchless responses populate it directly.
+-- The XOR CHECK below makes that invariant explicit at write time.
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS created_by TEXT;
 
 ALTER TABLE requests ALTER COLUMN batch_id DROP NOT NULL;
 
--- Two partial indexes covering the active-first and recency sort orderings of
--- list_requests, scoped to rows that own a created_by directly (i.e. the new
--- batchless responses; rows belonging to real batches still go through the
--- existing batch-driven path). Empty-string created_by ('') represents an
--- unattributed row and is excluded from the per-user listing indexes.
-CREATE INDEX IF NOT EXISTS idx_requests_user_active_sort ON requests (
-    created_by,
-    (CASE state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END),
-    created_at DESC,
-    id DESC,
-    service_tier
-) WHERE created_by != '';
+-- Exactly one of (batch_id, created_by) is non-NULL: batched rows attribute
+-- via the batch, batchless rows attribute via the request. Rejects both-set
+-- (data corruption) and both-NULL (orphaned row).
+ALTER TABLE requests ADD CONSTRAINT requests_attribution_xor
+    CHECK ((batch_id IS NULL) <> (created_by IS NULL));
 
-CREATE INDEX IF NOT EXISTS idx_requests_user_created_sort ON requests (
-    created_by,
-    created_at DESC,
-    id DESC,
-    service_tier
-) WHERE created_by != '';
+-- The two partial indexes that back the per-user listing query
+-- (idx_requests_user_active_sort, idx_requests_user_created_sort) are created
+-- by `scripts/backfill_responses_to_batchless.sql`, not here, so they can be
+-- built with CONCURRENTLY against a live `requests` table — Postgres rejects
+-- CONCURRENTLY inside a transaction, and sqlx wraps every migration in one.
+-- Without those indexes the listing falls back to a seq scan but still
+-- returns correct results.
 
 -- Update active_request_templates to include templates without a parent file.
 -- Batchless responses use templates with file_id IS NULL; the daemon's
