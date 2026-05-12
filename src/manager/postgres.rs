@@ -63,7 +63,16 @@ use super::utils::{
 /// Returns `Cow::Borrowed(body)` when nothing needs to change (not JSON, not
 /// a JSON object, or neither field present) so the common case stays
 /// allocation-free.
+///
+/// Cheap substring pre-check first: if neither key name appears anywhere in
+/// the body we skip the JSON parse entirely. A substring hit on either
+/// `service_tier` or `background` in a value (rather than as a top-level key)
+/// is a false positive — we'll parse, find nothing to strip, and still return
+/// borrowed — but it never produces a wrong result.
 fn sanitize_outbound_body(body: &str) -> std::borrow::Cow<'_, str> {
+    if !body.contains("service_tier") && !body.contains("background") {
+        return std::borrow::Cow::Borrowed(body);
+    }
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
         return std::borrow::Cow::Borrowed(body);
     };
@@ -5326,6 +5335,17 @@ mod tests {
             assert_eq!(cleaned.as_ref(), raw);
             assert!(matches!(cleaned, std::borrow::Cow::Borrowed(_)));
         }
+    }
+
+    #[test]
+    fn test_sanitize_outbound_body_substring_in_value_is_safe_passthrough() {
+        // The key names appear inside string *values* but not as top-level
+        // keys. The cheap substring pre-check lets us into the parse path,
+        // but stripping must still find nothing and return a borrow.
+        let raw = r#"{"model":"gpt-4","input":"tell me about service_tier and background"}"#;
+        let cleaned = sanitize_outbound_body(raw);
+        assert_eq!(cleaned.as_ref(), raw);
+        assert!(matches!(cleaned, std::borrow::Cow::Borrowed(_)));
     }
 
     #[sqlx::test]
