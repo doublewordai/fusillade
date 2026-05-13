@@ -97,6 +97,12 @@ impl Default for ListRequestsFilter {
 
 /// Summary of an individual request, suitable for list views.
 ///
+/// **Row scope: batchless-only.** `list_requests` filters
+/// `WHERE r.created_by IS NOT NULL` so the planner can use the partial
+/// index `idx_requests_user_*_sort`. Batched rows are not returned here.
+/// For batched-row attribution, fetch the row's `batches.created_by`
+/// separately or use `RequestDetail` (which joins batches).
+///
 /// Note: This type does not include user email or token/cost metrics.
 /// Callers should enrich with data from their own tables (users, analytics).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,9 +120,9 @@ pub struct RequestSummary {
     pub response_status: Option<i16>,
     pub service_tier: Option<String>,
     /// Creator ID (user or org) for ownership checks and email lookup.
-    /// Sourced from `requests.created_by` for batchless rows or
-    /// `batches.created_by` for rows that belong to a batch.
-    pub created_by: Option<String>,
+    /// Always set: `list_requests` only returns rows where
+    /// `requests.created_by IS NOT NULL` (see struct-level docs).
+    pub created_by: String,
 }
 
 /// Internal row shape used previously when `list_requests` computed the total
@@ -162,7 +168,7 @@ mod deprecated_types {
                 duration_ms: r.duration_ms,
                 response_status: r.response_status,
                 service_tier: r.service_tier,
-                created_by: Some(r.batch_created_by),
+                created_by: r.batch_created_by,
             }
         }
     }
@@ -172,6 +178,12 @@ mod deprecated_types {
 pub use deprecated_types::RequestSummaryWithCount;
 
 /// Full detail of an individual request, including body and response.
+///
+/// **Row scope: batchless-only.** `get_request_detail` filters
+/// `WHERE r.created_by IS NOT NULL`. Per-row inspection of batched
+/// requests goes through `get_batch_results_stream` / `BatchResultItem`
+/// instead. Used by the dashboard's response-detail page and the Open
+/// Responses API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
 pub struct RequestDetail {
@@ -192,9 +204,9 @@ pub struct RequestDetail {
     pub response_body: Option<String>,
     pub error: Option<String>,
     pub service_tier: Option<String>,
-    /// Creator ID (user or org). Sourced from `requests.created_by` for
-    /// batchless rows or `batches.created_by` for rows that belong to a batch.
-    pub created_by: Option<String>,
+    /// Creator ID (user or org). Always set: `get_request_detail` only
+    /// returns rows where `requests.created_by IS NOT NULL`.
+    pub created_by: String,
 }
 
 /// Input for creating a realtime response that the proxy is already handling.

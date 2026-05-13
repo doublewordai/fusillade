@@ -3682,7 +3682,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FROM requests r
             LEFT JOIN request_templates t ON r.template_id = t.id
             LEFT JOIN files f ON t.file_id = f.id
-            WHERE r.id = $1
+            WHERE r.id = $1 AND r.created_by IS NOT NULL
             "#,
         )
         .bind(request_id.0)
@@ -13224,7 +13224,7 @@ mod tests {
 
         assert_eq!(detail.model, "gpt-4");
         assert_eq!(detail.status, "processing");
-        assert_eq!(detail.created_by, Some("test-user-id".to_string()));
+        assert_eq!(detail.created_by, "test-user-id");
         assert!(detail.body.as_deref().unwrap().contains("gpt-4"));
     }
 
@@ -13327,7 +13327,7 @@ mod tests {
         assert_eq!(detail.status, "pending");
         assert_eq!(detail.service_tier, Some("flex".to_string()));
         assert_eq!(detail.batch_id, None);
-        assert_eq!(detail.created_by, Some("user-123".to_string()));
+        assert_eq!(detail.created_by, "user-123");
         assert!(detail.body.is_some());
     }
 
@@ -13361,7 +13361,7 @@ mod tests {
         assert_eq!(detail.status, "processing");
         assert_eq!(detail.service_tier, Some("priority".to_string()));
         assert_eq!(detail.batch_id, None);
-        assert_eq!(detail.created_by, Some("user-456".to_string()));
+        assert_eq!(detail.created_by, "user-456");
     }
 
     #[sqlx::test]
@@ -13490,7 +13490,7 @@ mod tests {
         assert!(result.data.iter().any(|r| r.id == request_id));
         let found = result.data.iter().find(|r| r.id == request_id).unwrap();
         assert_eq!(found.service_tier, Some("priority".to_string()));
-        assert_eq!(found.created_by, Some("user-abc".to_string()));
+        assert_eq!(found.created_by, "user-abc");
     }
 
     #[sqlx::test]
