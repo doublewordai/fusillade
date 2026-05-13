@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.8.3](https://github.com/doublewordai/fusillade/compare/fusillade-v16.8.2...fusillade-v16.8.3) (2026-05-13)
+
+
+### Bug Fixes
+
+* strip service_tier and background from stored bodies ([#260](https://github.com/doublewordai/fusillade/issues/260)) ([f27d3ab](https://github.com/doublewordai/fusillade/commit/f27d3ab6f23f9b3b9d4aa3c39943d382d2d6b423))
+
 ## [16.8.2](https://github.com/doublewordai/fusillade/compare/fusillade-v16.8.1...fusillade-v16.8.2) (2026-05-08)
 
 
