@@ -47,6 +47,49 @@ use super::utils::{
     estimate_output_file_size,
 };
 
+/// Strip fusillade-routing-only fields from a request body before storing it
+/// in `request_templates`. The daemon sends the stored body verbatim, so this
+/// is the single chokepoint that decides what goes on the wire.
+///
+/// `service_tier` and `background` describe how an inbound request should be
+/// *queued* by the caller (e.g. flex tier → daemon-claimed pending row;
+/// background=true → caller returns 202 immediately to its own caller).
+/// Forwarding them to the upstream model API is at best meaningless and at
+/// worst harmful: an upstream that itself recognises these fields will
+/// re-queue the request and immediately return a 202 stub, which the
+/// daemon then stores as the request's final response — the caller sees an
+/// empty result even though no model ever ran.
+///
+/// Returns `Cow::Borrowed(body)` when nothing needs to change (not JSON, not
+/// a JSON object, or neither field present) so the common case stays
+/// allocation-free.
+///
+/// Cheap substring pre-check first: if neither key name appears anywhere in
+/// the body we skip the JSON parse entirely. A substring hit on either
+/// `service_tier` or `background` in a value (rather than as a top-level key)
+/// is a false positive — we'll parse, find nothing to strip, and still return
+/// borrowed — but it never produces a wrong result.
+fn sanitize_outbound_body(body: &str) -> std::borrow::Cow<'_, str> {
+    if !body.contains("service_tier") && !body.contains("background") {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return std::borrow::Cow::Borrowed(body);
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return std::borrow::Cow::Borrowed(body);
+    };
+    // Bitwise OR so both removals run regardless of which is present.
+    let stripped = obj.remove("service_tier").is_some() | obj.remove("background").is_some();
+    if !stripped {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    match serde_json::to_string(&value) {
+        Ok(cleaned) => std::borrow::Cow::Owned(cleaned),
+        Err(_) => std::borrow::Cow::Borrowed(body),
+    }
+}
+
 /// PostgreSQL implementation of the Storage and DaemonExecutor traits.
 ///
 /// This manager uses PostgreSQL for persistent storage and runs a daemon for processing requests.
@@ -2352,6 +2395,124 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         self.get_batch_from_pool(batch.id, self.pools.write()).await
     }
 
+    #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
+    async fn create_single_request_batch(
+        &self,
+        input: super::CreateSingleRequestBatchInput,
+    ) -> Result<Batch> {
+        let pool = self.pools.write();
+        let now = Utc::now();
+        let template_id = Uuid::new_v4();
+        let file_id = Uuid::new_v4();
+        let batch_id = input.batch_id.unwrap_or_else(Uuid::new_v4);
+
+        let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Invalid completion_window '{}': {}",
+                input.completion_window,
+                e
+            ))
+        })?;
+        let expires_in = chrono::Duration::from_std(std_duration).map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Invalid completion_window duration '{}': {}",
+                input.completion_window,
+                e
+            ))
+        })?;
+        let expires_at = now.checked_add_signed(expires_in).ok_or_else(|| {
+            FusilladeError::ValidationError(format!(
+                "completion_window '{}' causes datetime overflow",
+                input.completion_window
+            ))
+        })?;
+        let service_tier =
+            crate::request::query::service_tier_from_completion_window(&input.completion_window);
+        let stored_body = sanitize_outbound_body(&input.body);
+        let body_byte_size = stored_body.len() as i64;
+
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
+        // 1. Create file (no physical file — just a container for the template)
+        sqlx::query(
+            "INSERT INTO files (id, name, purpose, created_at, updated_at)
+             VALUES ($1, 'single_request', 'batch', $2, $2)",
+        )
+        .bind(file_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create file: {}", e)))?;
+
+        // 2. Create template (with body_byte_size for accurate stats)
+        sqlx::query(
+            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
+             VALUES ($1, $2, NULL, $3, 'POST', $4, $5, $6, $7, $8)",
+        )
+        .bind(template_id)
+        .bind(file_id)
+        .bind(&input.base_url)
+        .bind(&input.endpoint)
+        .bind(stored_body.as_ref())
+        .bind(&input.model)
+        .bind(input.api_key.as_deref().unwrap_or(""))
+        .bind(body_byte_size)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create template: {}", e)))?;
+
+        // 3. Create batch
+        sqlx::query(
+            "INSERT INTO batches (id, file_id, endpoint, completion_window, created_at, expires_at, created_by, total_requests, requests_started_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $5)",
+        )
+        .bind(batch_id)
+        .bind(file_id)
+        .bind(&input.endpoint)
+        .bind(&input.completion_window)
+        .bind(now)
+        .bind(expires_at)
+        .bind(input.created_by.as_deref().unwrap_or(""))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch: {}", e)))?;
+
+        // 4. Create request with caller-specified ID and state.
+        // When initial_state is 'processing', set daemon_id/claimed_at/started_at
+        // to satisfy the processing_fields_check constraint. Uses a zero UUID as
+        // a sentinel daemon_id since no real daemon is processing the request.
+        let (daemon_id, claimed_at, started_at) = if input.initial_state == "processing" {
+            (Some(Uuid::nil()), Some(now), Some(now))
+        } else {
+            (None, None, None)
+        };
+        sqlx::query(
+            "INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, model, service_tier, daemon_id, claimed_at, started_at)
+             VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8, $9)",
+        )
+        .bind(input.request_id)
+        .bind(batch_id)
+        .bind(template_id)
+        .bind(&input.initial_state)
+        .bind(&input.model)
+        .bind(service_tier)
+        .bind(daemon_id)
+        .bind(claimed_at)
+        .bind(started_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create request: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+
+        self.get_batch_from_pool(BatchId(batch_id), pool).await
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn create_batch_record(&self, input: BatchInput) -> Result<Batch> {
         let now = Utc::now();
@@ -3705,7 +3866,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
-        let body_byte_size = input.body.len() as i64;
+        // Insert template row (file_id = NULL for daemon-managed requests)
+        let stored_body = sanitize_outbound_body(&input.body);
+        let body_byte_size = stored_body.len() as i64;
         sqlx::query(
             "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
              VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8)",
@@ -3714,7 +3877,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(&input.endpoint)
         .bind(&input.method)
         .bind(&input.path)
-        .bind(&input.body)
+        .bind(stored_body.as_ref())
         .bind(&input.model)
         .bind(&input.api_key)
         .bind(body_byte_size)
@@ -4195,12 +4358,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         let endpoints: Vec<&str> = templates.iter().map(|(t, _)| t.endpoint.as_str()).collect();
         let methods: Vec<&str> = templates.iter().map(|(t, _)| t.method.as_str()).collect();
         let paths: Vec<&str> = templates.iter().map(|(t, _)| t.path.as_str()).collect();
-        let bodies: Vec<&str> = templates.iter().map(|(t, _)| t.body.as_str()).collect();
+        // Borrow when the body is already clean (the common case); only the
+        // rows that actually carry service_tier / background pay an
+        // allocation here.
+        let stored_bodies: Vec<std::borrow::Cow<'_, str>> = templates
+            .iter()
+            .map(|(t, _)| sanitize_outbound_body(&t.body))
+            .collect();
+        let bodies: Vec<&str> = stored_bodies.iter().map(AsRef::as_ref).collect();
         let models: Vec<&str> = templates.iter().map(|(t, _)| t.model.as_str()).collect();
         let api_keys: Vec<&str> = templates.iter().map(|(t, _)| t.api_key.as_str()).collect();
         let line_numbers: Vec<i32> = templates.iter().map(|(_, line)| *line).collect();
-        let body_byte_sizes: Vec<i64> =
-            templates.iter().map(|(t, _)| t.body.len() as i64).collect();
+        let body_byte_sizes: Vec<i64> = stored_bodies.iter().map(|b| b.len() as i64).collect();
 
         sqlx::query!(
             r#"
@@ -5204,6 +5373,103 @@ mod tests {
             FileStreamResult::Success(file_id) => file_id,
             FileStreamResult::Aborted => panic!("Expected stream creation success, got abort"),
         }
+    }
+
+    // =========================================================================
+    // sanitize_outbound_body — unit tests for the storage-layer body strip
+    // =========================================================================
+
+    #[test]
+    fn test_sanitize_outbound_body_strips_both_fields() {
+        let raw = r#"{"model":"gpt-4","input":"hi","service_tier":"flex","background":true}"#;
+        let cleaned = sanitize_outbound_body(raw);
+        let parsed: serde_json::Value = serde_json::from_str(cleaned.as_ref()).expect("valid JSON");
+        assert_eq!(parsed["model"], "gpt-4");
+        assert_eq!(parsed["input"], "hi");
+        assert!(parsed.get("service_tier").is_none());
+        assert!(parsed.get("background").is_none());
+        // Re-allocation only happens when stripping is needed.
+        assert!(matches!(cleaned, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_sanitize_outbound_body_borrows_when_nothing_to_strip() {
+        let raw = r#"{"model":"gpt-4","input":"hi"}"#;
+        let cleaned = sanitize_outbound_body(raw);
+        assert_eq!(cleaned.as_ref(), raw);
+        // No keys to strip — must be a borrow, no allocation in the hot path.
+        assert!(matches!(cleaned, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_sanitize_outbound_body_non_object_passthrough() {
+        for raw in ["[1,2,3]", "\"plain string\"", "42", "not json at all"] {
+            let cleaned = sanitize_outbound_body(raw);
+            assert_eq!(cleaned.as_ref(), raw);
+            assert!(matches!(cleaned, std::borrow::Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn test_sanitize_outbound_body_substring_in_value_is_safe_passthrough() {
+        // The key names appear inside string *values* but not as top-level
+        // keys. The cheap substring pre-check lets us into the parse path,
+        // but stripping must still find nothing and return a borrow.
+        let raw = r#"{"model":"gpt-4","input":"tell me about service_tier and background"}"#;
+        let cleaned = sanitize_outbound_body(raw);
+        assert_eq!(cleaned.as_ref(), raw);
+        assert!(matches!(cleaned, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[sqlx::test]
+    async fn test_create_single_request_batch_strips_routing_fields_from_stored_body(
+        pool: sqlx::PgPool,
+    ) {
+        // End-to-end check: when a /v1/responses request is queued through
+        // create_single_request_batch, the body stored in request_templates
+        // (and therefore what the daemon will fire upstream) must not contain
+        // service_tier or background.
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let request_id = uuid::Uuid::new_v4();
+        manager
+            .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
+                batch_id: None,
+                request_id,
+                body: r#"{"model":"gpt-4","input":"hi","service_tier":"flex","background":true}"#
+                    .to_string(),
+                model: "gpt-4".to_string(),
+                base_url: "http://localhost:3001/ai".to_string(),
+                endpoint: "/v1/responses".to_string(),
+                completion_window: "1h".to_string(),
+                initial_state: "pending".to_string(),
+                api_key: None,
+                created_by: Some("user-123".to_string()),
+            })
+            .await
+            .expect("create_single_request_batch should succeed");
+
+        let detail = manager
+            .get_request_detail(crate::request::RequestId(request_id))
+            .await
+            .expect("request should exist");
+        let stored = detail.body.expect("stored body should be present");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stored).expect("stored body parses as JSON");
+        assert_eq!(parsed["model"], "gpt-4");
+        assert_eq!(parsed["input"], "hi");
+        assert!(
+            parsed.get("service_tier").is_none(),
+            "service_tier should be stripped before storage; got: {stored}"
+        );
+        assert!(
+            parsed.get("background").is_none(),
+            "background should be stripped before storage; got: {stored}"
+        );
     }
 
     // =========================================================================
