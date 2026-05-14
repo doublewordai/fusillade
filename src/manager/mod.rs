@@ -333,6 +333,40 @@ pub trait Storage: Send + Sync {
         service_tier_filter: &ServiceTierFilter,
         strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>>;
+
+    /// Like `get_pending_request_counts_by_model_and_window`, but each user's
+    /// contribution to a (model, window) bucket is capped at that bucket's
+    /// average pending count.
+    ///
+    /// # Policy
+    ///
+    /// For each (model, window) bucket:
+    /// - Let `p_u` = pending count for user `u` in this bucket (`p_u > 0`).
+    /// - Let `U` = number of such users.
+    /// - Let `T` = `sum(p_u)`.
+    /// - `fair_share = max(1, ceil(T / U))`.
+    /// - `effective(u) = min(p_u, fair_share)`.
+    /// - `effective_count = sum(effective(u))`.
+    ///
+    /// Reduces to `T` when demand is balanced. Caps a single dominant user
+    /// at the bucket average so the count does not over-state demand a fair
+    /// scheduler will throttle.
+    ///
+    /// **Contract with `claim_requests`:** this method MUST stay directionally
+    /// aligned with the per-user fairness ordering applied by
+    /// `claim_requests`. If you change the fairness policy in either place,
+    /// update the other and the drift-detector integration test.
+    ///
+    /// All other parameters and exclusions match
+    /// `get_pending_request_counts_by_model_and_window`.
+    async fn get_effective_pending_request_counts_by_model_and_window(
+        &self,
+        windows: &[(String, Option<i64>, i64)],
+        states: &[String],
+        model_filter: &[String],
+        service_tier_filter: &ServiceTierFilter,
+        strict: bool,
+    ) -> Result<HashMap<String, HashMap<String, i64>>>;
     ///
     /// Cancel one or more individual pending or in-progress requests.
     ///
