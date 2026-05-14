@@ -19,7 +19,10 @@ pub mod response_step;
 pub use batch::*;
 pub use daemon::{Daemon, DaemonConfig, ModelEscalationConfig};
 pub use error::{FusilladeError, Result};
-pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient, StreamReassembler};
+pub use http::{
+    HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient, StreamEvent, StreamEventCallback,
+    StreamReassembler,
+};
 pub use manager::postgres::{PoolProvider, PostgresRequestManager, TestDbPools};
 #[cfg(feature = "postgres")]
 pub use manager::response_step::PostgresResponseStepManager;
