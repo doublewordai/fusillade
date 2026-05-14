@@ -24,8 +24,18 @@ ALTER TABLE requests ALTER COLUMN batch_id DROP NOT NULL;
 -- empty-string `created_by` to NULL before insert so the CHECK rejects it
 -- loudly, rather than letting a phantom-user row land in the per-user
 -- listing.
+--
+-- `NOT VALID` skips the full-table scan that the constraint addition would
+-- otherwise trigger. Pre-migration every row has `batch_id NOT NULL` and
+-- `created_by` doesn't exist (just added above), so the constraint is
+-- trivially satisfied by every existing row — there's nothing to verify.
+-- New writes still get the check enforced. A separate `ALTER TABLE
+-- ... VALIDATE CONSTRAINT requests_attribution_xor` (which only takes
+-- SHARE UPDATE EXCLUSIVE, no read/write blocking) can be run later if
+-- formal validation is wanted; on the deploy-time path it's a no-op since
+-- the data is known-clean.
 ALTER TABLE requests ADD CONSTRAINT requests_attribution_xor
-    CHECK ((batch_id IS NULL) <> (created_by IS NULL));
+    CHECK ((batch_id IS NULL) <> (created_by IS NULL)) NOT VALID;
 
 -- The two partial indexes that back the per-user listing query
 -- (idx_requests_user_active_sort, idx_requests_user_created_sort) are created
