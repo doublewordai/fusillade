@@ -1,5 +1,12 @@
 # Changelog
 
+## [17.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v17.0.0...fusillade-v17.0.1) (2026-05-14)
+
+
+### Bug Fixes
+
+* unslow the new constraint ([2c61c3a](https://github.com/doublewordai/fusillade/commit/2c61c3a4af4c10d509142e966d754be58dde4bdf))
+
 ## [17.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.8.3...fusillade-v17.0.0) (2026-05-14)
 
 
