@@ -90,3 +90,18 @@ WHERE r.batch_id = b.id
   AND b.deleted_at IS NULL;
 
 COMMIT;
+
+-- =========================================================================
+-- C. Refresh table statistics so the planner uses the new partial indexes.
+-- =========================================================================
+-- The migration's `ADD COLUMN created_by` left the planner without a
+-- histogram for the new column, and section B above just mass-updated
+-- existing rows to populate it. Without an ANALYZE, the planner estimates
+-- predicates against `created_by` return ~1 row, which silently picks the
+-- wrong index for the per-user listing query (observed 1200ms vs 0.3ms
+-- after ANALYZE on a 285k-row staging dataset).
+--
+-- ANALYZE only samples (default 30k rows) and takes SHARE UPDATE EXCLUSIVE
+-- — doesn't block reads/writes. Runs outside a transaction (the BEGIN/COMMIT
+-- above closed) so stats become visible immediately on completion.
+ANALYZE requests;
