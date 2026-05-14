@@ -23,7 +23,7 @@ pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient, Stre
 pub use manager::postgres::{PoolProvider, PostgresRequestManager, TestDbPools};
 #[cfg(feature = "postgres")]
 pub use manager::response_step::PostgresResponseStepManager;
-pub use manager::{CreateSingleRequestBatchInput, DaemonExecutor, Storage};
+pub use manager::{DaemonExecutor, Storage};
 pub use processor::{CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry};
 pub use request::*;
 pub use response_step::{

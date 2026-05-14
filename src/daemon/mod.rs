@@ -250,6 +250,12 @@ pub struct DaemonConfig {
     /// Default: `0.0` (backward-compatible, pure user-fairness).
     #[serde(default)]
     pub urgency_weight: f64,
+
+    /// Synthetic deadline applied to batchless flex responses when the daemon
+    /// orders claims. Batched rows have `batches.expires_at`; batchless rows
+    /// fall back to `created_at + flex_expiry_ms`. Default 1h (legacy flex SLA).
+    #[serde(default = "default_flex_expiry_ms")]
+    pub flex_expiry_ms: u64,
 }
 
 fn default_batch_metadata_fields() -> Vec<String> {
@@ -259,6 +265,10 @@ fn default_batch_metadata_fields() -> Vec<String> {
         "created_at".to_string(),
         "completion_window".to_string(),
     ]
+}
+
+fn default_flex_expiry_ms() -> u64 {
+    3_600_000 // 1 hour
 }
 
 impl Default for DaemonConfig {
@@ -292,6 +302,7 @@ impl Default for DaemonConfig {
             throughput_log_interval_ms: Some(60_000), // Log per-user throughput every minute
             streamable_endpoints: Vec::new(),
             urgency_weight: 0.0,
+            flex_expiry_ms: default_flex_expiry_ms(),
         }
     }
 }
@@ -888,7 +899,7 @@ where
 
                     tracing::trace!(
                         request_id = %request_id,
-                        batch_id = %batch_id,
+                        batch_id = ?batch_id,
                         model = %model,
                         "Spawning processing task"
                     );
@@ -915,10 +926,14 @@ where
                     let shutdown_token = self.shutdown_token.clone();
                     let cancellation_tokens = self.cancellation_tokens.clone();
 
-                    // Get or create a cancellation token for this batch
-                    // All requests in a batch share the same token
-                    let batch_cancellation_token =
-                        cancellation_tokens.entry(batch_id).or_default().clone();
+                    // Get or create a cancellation token for this batch.
+                    // All requests in a batch share the same token. Batchless
+                    // responses don't participate in batch cancel and so get a
+                    // standalone token that only the shutdown path can fire.
+                    let batch_cancellation_token = match batch_id {
+                        Some(bid) => cancellation_tokens.entry(bid).or_default().clone(),
+                        None => tokio_util::sync::CancellationToken::new(),
+                    };
 
                     // Increment per-model in-flight counter and gauge
                     requests_in_flight
@@ -942,7 +957,7 @@ where
                         trace_id = tracing::field::Empty,
                         otel.name = "fusillade.process_request",
                         request_id = %request_id,
-                        batch_id = %batch_id,
+                        batch_id = ?batch_id,
                         model = %model,
                         outcome = tracing::field::Empty,
                     );
@@ -1039,7 +1054,7 @@ where
                                     counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success").increment(1);
                                     tracing::warn!(
                                         request_id = %request_id,
-                                        batch_id = %batch_id,
+                                        batch_id = ?batch_id,
                                         "Request completed successfully after SLA"
                                     );
                                 }
@@ -1066,7 +1081,7 @@ where
                                             if let Err(e) = storage.persist(&pending).await {
                                                 tracing::error!(
                                                     request_id = %request_id,
-                                                    batch_id = %batch_id,
+                                                    batch_id = ?batch_id,
                                                     retry_attempt = pending.state.retry_attempt,
                                                     error = %e,
                                                     "Failed to persist retry — request orphaned in processing state"
@@ -1080,7 +1095,7 @@ where
                                             ).increment(1);
                                             tracing::info!(
                                                 request_id = %request_id,
-                                                batch_id = %batch_id,
+                                                batch_id = ?batch_id,
                                                 retry_attempt = retry_attempt + 1,
                                                 "request.retry_persisted"
                                             );
@@ -1090,7 +1105,7 @@ where
                                             if let Err(e) = storage.persist(&*failed).await {
                                                 tracing::error!(
                                                     request_id = %request_id,
-                                                    batch_id = %batch_id,
+                                                    batch_id = ?batch_id,
                                                     retry_attempt,
                                                     error = %e,
                                                     "Failed to persist terminal failure — request orphaned in processing state"
@@ -1112,14 +1127,14 @@ where
                                                 counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
                                                 tracing::warn!(
                                                     request_id = %request_id,
-                                                    batch_id = %batch_id,
+                                                    batch_id = ?batch_id,
                                                     "Request failed permanently after SLA"
                                                 );
                                             }
 
                                             tracing::warn!(
                                                 request_id = %request_id,
-                                                batch_id = %batch_id,
+                                                batch_id = ?batch_id,
                                                 retry_attempt,
                                                 failure_reason = %failed.state.reason.metric_label(),
                                                 error = %failed.state.reason.to_error_message(),
@@ -1143,14 +1158,14 @@ where
                                         counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
                                         tracing::warn!(
                                             request_id = %request_id,
-                                            batch_id = %batch_id,
+                                            batch_id = ?batch_id,
                                             "Request failed with non-retriable error after SLA"
                                         );
                                     }
 
                                     tracing::warn!(
                                         request_id = %request_id,
-                                        batch_id = %batch_id,
+                                        batch_id = ?batch_id,
                                         failure_reason = %failed.state.reason.metric_label(),
                                         error = %failed.state.reason.to_error_message(),
                                         "request.terminal_failure"
@@ -1252,6 +1267,7 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
+            flex_expiry_ms: 3_600_000,
         };
 
         let manager = Arc::new(
@@ -1433,6 +1449,7 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
+            flex_expiry_ms: 3_600_000,
         };
 
         let manager = Arc::new(
@@ -1676,6 +1693,7 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
+            flex_expiry_ms: 3_600_000,
         };
 
         let manager = Arc::new(
@@ -1824,6 +1842,7 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
+            flex_expiry_ms: 3_600_000,
         };
 
         let manager = Arc::new(
@@ -2011,6 +2030,7 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
+            flex_expiry_ms: 3_600_000,
         };
 
         let manager = Arc::new(
@@ -2182,6 +2202,7 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
+            flex_expiry_ms: 3_600_000,
         };
 
         let manager = Arc::new(
@@ -2358,6 +2379,7 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
+            flex_expiry_ms: 3_600_000,
         };
 
         let manager = Arc::new(
@@ -2529,6 +2551,7 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
+            flex_expiry_ms: 3_600_000,
         };
 
         let manager = Arc::new(
@@ -2683,6 +2706,7 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
+            flex_expiry_ms: 3_600_000,
         };
 
         let manager = Arc::new(
@@ -2818,6 +2842,7 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
+            flex_expiry_ms: 3_600_000,
         };
 
         let manager = Arc::new(

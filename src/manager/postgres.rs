@@ -36,9 +36,9 @@ use crate::daemon::{
 use crate::error::{FusilladeError, Result};
 use crate::http::HttpClient;
 use crate::request::{
-    Canceled, CascadeTargetState, Claimed, Completed, CreateDaemonRequestInput, DaemonId, Failed,
-    FailureReason, Pending, Processing, Request, RequestData, RequestId, RequestState,
-    ServiceTierFilter,
+    Canceled, CascadeTargetState, Claimed, Completed, CreateFlexInput, CreateRealtimeInput,
+    DaemonId, Failed, FailureReason, Pending, Processing, Request, RequestData, RequestId,
+    RequestState, ServiceTierFilter,
 };
 
 use super::DaemonExecutor;
@@ -1006,55 +1006,66 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .collect();
 
         // Single query claims across all models using LATERAL.
-        // The active_batch_ids CTE pre-filters batches to avoid orphaned pending
-        // requests from cancelled/deleted batches consuming the inner LIMIT.
+        //
+        // Eligibility: pending rows whose `not_before` has passed AND either
+        //   - have no parent batch (batchless flex responses), or
+        //   - have a parent batch in a non-terminal, non-cancelling state.
+        //
+        // The claim path needs each row's deadline. Batched rows have
+        // `b.expires_at`; batchless rows don't, so we synthesize one as
+        // `r.created_at + ($9 ms)` from `flex_expiry_ms`. Computed once in
+        // the LATERAL as `effective_expires_at` and threaded through
+        // `to_claim` so the value is referenced (not re-derived) below.
+        let flex_expiry_ms = self.config.flex_expiry_ms as i64;
         let rows = sqlx::query!(
             r#"
-            WITH active_batch_ids AS MATERIALIZED (
-                SELECT b.id, b.expires_at, b.created_by
-                FROM batches b
-                WHERE b.cancelling_at IS NULL
-                    AND b.deleted_at IS NULL
-                    AND b.completed_at IS NULL
-                    AND b.failed_at IS NULL
-                    AND b.cancelled_at IS NULL
-                    AND EXISTS (
-                        SELECT 1 FROM requests r
-                        WHERE r.batch_id = b.id
-                            AND r.state = 'pending'
-                    )
-            ),
-            user_priority AS (
+            WITH user_priority AS (
                 SELECT * FROM unnest($6::TEXT[], $7::BIGINT[]) AS u(user_id, active_count)
             ),
             to_claim AS (
-                SELECT claimed.id, claimed.template_id, claimed.batch_id
+                SELECT claimed.id, claimed.template_id, claimed.batch_id, claimed.effective_expires_at
                 FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
                 CROSS JOIN LATERAL (
-                    SELECT r2.id, r2.template_id, r2.batch_id
-                    FROM active_batch_ids ab
-                    LEFT JOIN user_priority up ON ab.created_by = up.user_id
-                    CROSS JOIN LATERAL (
-                        SELECT r3.id, r3.template_id, r3.batch_id
-                        FROM requests r3
-                        WHERE r3.state = 'pending'
-                            AND r3.model = m.model
-                            AND r3.template_id IS NOT NULL
-                            AND r3.batch_id = ab.id
-                            AND (r3.not_before IS NULL OR r3.not_before <= $3)
-                        LIMIT m.capacity
-                        FOR UPDATE OF r3 SKIP LOCKED
-                    ) r2
+                    SELECT r.id, r.template_id, r.batch_id,
+                           COALESCE(b.expires_at,
+                                    r.created_at + ($9::BIGINT * interval '1 millisecond'))
+                               AS effective_expires_at
+                    FROM requests r
+                    LEFT JOIN batches b ON r.batch_id = b.id
+                    LEFT JOIN user_priority up
+                        ON COALESCE(r.created_by, b.created_by) = up.user_id
+                    WHERE r.state = 'pending'
+                        AND r.model = m.model
+                        AND r.template_id IS NOT NULL
+                        AND (r.not_before IS NULL OR r.not_before <= $3)
+                        AND (
+                            r.batch_id IS NULL
+                            OR (
+                                b.cancelling_at IS NULL
+                                AND b.deleted_at IS NULL
+                                AND b.completed_at IS NULL
+                                AND b.failed_at IS NULL
+                                AND b.cancelled_at IS NULL
+                            )
+                        )
                     ORDER BY
+                        -- Postgres doesn't allow SELECT-list aliases in ORDER BY
+                        -- when FOR UPDATE is in play, so the deadline expression
+                        -- is repeated here. The synthesized window for batchless
+                        -- rows still lives in exactly one constant ($9 from
+                        -- DaemonConfig.flex_expiry_ms).
                         (1.0 - $8::DOUBLE PRECISION)
                             * COALESCE(up.active_count, 0)::DOUBLE PRECISION
                             / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
                         + $8::DOUBLE PRECISION
-                            * LEAST(GREATEST(EXTRACT(EPOCH FROM ab.expires_at - $3), 0.0) / 86400.0, 1.0)
+                            * LEAST(GREATEST(EXTRACT(EPOCH FROM
+                                COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond'))
+                                - $3), 0.0) / 86400.0, 1.0)
                         ASC,
-                        ab.expires_at ASC,
-                        ab.id ASC
+                        COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond')) ASC,
+                        COALESCE(b.id, r.id) ASC
                     LIMIT m.capacity
+                    FOR UPDATE OF r SKIP LOCKED
                 ) claimed
                 LIMIT $2::BIGINT
             )
@@ -1065,25 +1076,27 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 claimed_at = $3
             FROM to_claim tc
             JOIN active_request_templates t ON tc.template_id = t.id
-            JOIN batches b ON tc.batch_id = b.id
+            LEFT JOIN batches b ON tc.batch_id = b.id
             WHERE r.id = tc.id
-            RETURNING r.id, r.batch_id as "batch_id!", r.template_id as "template_id!", r.retry_attempt,
+            RETURNING r.id,
+                      r.batch_id,
+                      r.template_id as "template_id!", r.retry_attempt,
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
                       t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
-                      b.expires_at as batch_expires_at,
-                      b.id::TEXT as "batch_id_str!",
-                      b.file_id::TEXT as "batch_file_id!",
-                      b.endpoint as "batch_endpoint!",
-                      b.completion_window as "batch_completion_window!",
+                      tc.effective_expires_at as "batch_expires_at!",
+                      COALESCE(b.id::TEXT, '') as "batch_id_str!",
+                      COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
+                      COALESCE(b.endpoint, t.endpoint) as "batch_endpoint!",
+                      COALESCE(b.completion_window, '1h') as "batch_completion_window!",
                       b.metadata::TEXT as "batch_metadata",
                       b.output_file_id::TEXT as "batch_output_file_id",
                       b.error_file_id::TEXT as "batch_error_file_id",
-                      b.created_by as "batch_created_by!",
-                      to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_created_at!",
-                      to_char(b.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_expires_at_str",
+                      COALESCE(b.created_by, r.created_by, '') as "batch_created_by!",
+                      to_char(COALESCE(b.created_at, r.created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_created_at!",
+                      to_char(tc.effective_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_expires_at_str",
                       to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_cancelling_at",
                       b.errors::TEXT as "batch_errors",
-                      b.total_requests::TEXT as "batch_total_requests!"
+                      COALESCE(b.total_requests::TEXT, '1') as "batch_total_requests!"
             "#,
             *daemon_id as Uuid,
             limit as i64,
@@ -1093,6 +1106,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             &user_ids_arr,
             &user_counts_arr,
             self.config.urgency_weight,
+            flex_expiry_ms,
         )
         .fetch_all(self.pools.write())
         .await
@@ -1118,44 +1132,46 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             > = std::collections::HashMap::new();
 
             all_claimed.extend(rows.into_iter().map(|row| {
-                // Build batch metadata HashMap from configured fields
+                // Batch metadata is only meaningful for rows that belong to a
+                // batch; batchless responses leave it empty so the daemon's
+                // HTTP path doesn't emit empty `x-fusillade-batch-*` headers.
                 let mut batch_metadata = std::collections::HashMap::new();
 
-                // Get or parse the metadata JSON for this batch
-                let parsed_metadata =
-                    parsed_metadata_cache
-                        .entry(row.batch_id)
-                        .or_insert_with(|| {
+                if let Some(batch_uuid) = row.batch_id {
+                    let parsed_metadata =
+                        parsed_metadata_cache.entry(batch_uuid).or_insert_with(|| {
                             row.batch_metadata
                                 .as_deref()
                                 .and_then(|s| serde_json::from_str(s).ok())
                         });
 
-                for field_name in &self.config.batch_metadata_fields {
-                    // First check if it's a known column field
-                    let value: Option<&str> = match field_name.as_str() {
-                        "id" => Some(&row.batch_id_str),
-                        "file_id" => Some(&row.batch_file_id),
-                        "endpoint" => Some(&row.batch_endpoint),
-                        "completion_window" => Some(&row.batch_completion_window),
-                        "metadata" => row.batch_metadata.as_deref(),
-                        "output_file_id" => row.batch_output_file_id.as_deref(),
-                        "error_file_id" => row.batch_error_file_id.as_deref(),
-                        "created_by" => Some(&row.batch_created_by),
-                        "created_at" => Some(&row.batch_created_at),
-                        "expires_at" => row.batch_expires_at_str.as_deref(),
-                        "cancelling_at" => row.batch_cancelling_at.as_deref(),
-                        "errors" => row.batch_errors.as_deref(),
-                        "total_requests" => Some(&row.batch_total_requests),
-                        _ => None,
-                    };
+                    for field_name in &self.config.batch_metadata_fields {
+                        // First check if it's a known column field
+                        let value: Option<&str> = match field_name.as_str() {
+                            "id" => Some(&row.batch_id_str),
+                            "file_id" => Some(&row.batch_file_id),
+                            "endpoint" => Some(&row.batch_endpoint),
+                            "completion_window" => Some(&row.batch_completion_window),
+                            "metadata" => row.batch_metadata.as_deref(),
+                            "output_file_id" => row.batch_output_file_id.as_deref(),
+                            "error_file_id" => row.batch_error_file_id.as_deref(),
+                            "created_by" => Some(&row.batch_created_by),
+                            "created_at" => Some(&row.batch_created_at),
+                            "expires_at" => row.batch_expires_at_str.as_deref(),
+                            "cancelling_at" => row.batch_cancelling_at.as_deref(),
+                            "errors" => row.batch_errors.as_deref(),
+                            "total_requests" => Some(&row.batch_total_requests),
+                            _ => None,
+                        };
 
-                    if let Some(v) = value {
-                        batch_metadata.insert(field_name.clone(), v.to_string());
-                    } else if let Some(metadata_json) = parsed_metadata.as_ref() {
-                        // Fall back to extracting from metadata JSON for unknown field names
-                        if let Some(v) = metadata_json.get(field_name).and_then(|v| v.as_str()) {
+                        if let Some(v) = value {
                             batch_metadata.insert(field_name.clone(), v.to_string());
+                        } else if let Some(metadata_json) = parsed_metadata.as_ref() {
+                            // Fall back to extracting from metadata JSON for unknown field names
+                            if let Some(v) = metadata_json.get(field_name).and_then(|v| v.as_str())
+                            {
+                                batch_metadata.insert(field_name.clone(), v.to_string());
+                            }
                         }
                     }
                 }
@@ -1169,7 +1185,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     },
                     data: RequestData {
                         id: RequestId(row.id),
-                        batch_id: BatchId(row.batch_id),
+                        batch_id: row.batch_id.map(BatchId),
                         template_id: TemplateId(row.template_id),
                         custom_id: row.custom_id,
                         endpoint: row.endpoint,
@@ -1479,7 +1495,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     Some(api_key),
                 ) => RequestData {
                     id: request_id,
-                    batch_id: BatchId(row.batch_id),
+                    batch_id: Some(BatchId(row.batch_id)),
                     template_id: TemplateId(template_id),
                     custom_id: row.custom_id,
                     endpoint,
@@ -2377,124 +2393,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             return Err(e);
         }
         self.get_batch_from_pool(batch.id, self.pools.write()).await
-    }
-
-    #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
-    async fn create_single_request_batch(
-        &self,
-        input: super::CreateSingleRequestBatchInput,
-    ) -> Result<Batch> {
-        let pool = self.pools.write();
-        let now = Utc::now();
-        let template_id = Uuid::new_v4();
-        let file_id = Uuid::new_v4();
-        let batch_id = input.batch_id.unwrap_or_else(Uuid::new_v4);
-
-        let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
-            FusilladeError::Other(anyhow!(
-                "Invalid completion_window '{}': {}",
-                input.completion_window,
-                e
-            ))
-        })?;
-        let expires_in = chrono::Duration::from_std(std_duration).map_err(|e| {
-            FusilladeError::Other(anyhow!(
-                "Invalid completion_window duration '{}': {}",
-                input.completion_window,
-                e
-            ))
-        })?;
-        let expires_at = now.checked_add_signed(expires_in).ok_or_else(|| {
-            FusilladeError::ValidationError(format!(
-                "completion_window '{}' causes datetime overflow",
-                input.completion_window
-            ))
-        })?;
-        let service_tier =
-            crate::request::query::service_tier_from_completion_window(&input.completion_window);
-        let stored_body = sanitize_outbound_body(&input.body);
-        let body_byte_size = stored_body.len() as i64;
-
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
-
-        // 1. Create file (no physical file — just a container for the template)
-        sqlx::query(
-            "INSERT INTO files (id, name, purpose, created_at, updated_at)
-             VALUES ($1, 'single_request', 'batch', $2, $2)",
-        )
-        .bind(file_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create file: {}", e)))?;
-
-        // 2. Create template (with body_byte_size for accurate stats)
-        sqlx::query(
-            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
-             VALUES ($1, $2, NULL, $3, 'POST', $4, $5, $6, $7, $8)",
-        )
-        .bind(template_id)
-        .bind(file_id)
-        .bind(&input.base_url)
-        .bind(&input.endpoint)
-        .bind(stored_body.as_ref())
-        .bind(&input.model)
-        .bind(input.api_key.as_deref().unwrap_or(""))
-        .bind(body_byte_size)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create template: {}", e)))?;
-
-        // 3. Create batch
-        sqlx::query(
-            "INSERT INTO batches (id, file_id, endpoint, completion_window, created_at, expires_at, created_by, total_requests, requests_started_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $5)",
-        )
-        .bind(batch_id)
-        .bind(file_id)
-        .bind(&input.endpoint)
-        .bind(&input.completion_window)
-        .bind(now)
-        .bind(expires_at)
-        .bind(input.created_by.as_deref().unwrap_or(""))
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch: {}", e)))?;
-
-        // 4. Create request with caller-specified ID and state.
-        // When initial_state is 'processing', set daemon_id/claimed_at/started_at
-        // to satisfy the processing_fields_check constraint. Uses a zero UUID as
-        // a sentinel daemon_id since no real daemon is processing the request.
-        let (daemon_id, claimed_at, started_at) = if input.initial_state == "processing" {
-            (Some(Uuid::nil()), Some(now), Some(now))
-        } else {
-            (None, None, None)
-        };
-        sqlx::query(
-            "INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, model, service_tier, daemon_id, claimed_at, started_at)
-             VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8, $9)",
-        )
-        .bind(input.request_id)
-        .bind(batch_id)
-        .bind(template_id)
-        .bind(&input.initial_state)
-        .bind(&input.model)
-        .bind(service_tier)
-        .bind(daemon_id)
-        .bind(claimed_at)
-        .bind(started_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create request: {}", e)))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
-
-        self.get_batch_from_pool(BatchId(batch_id), pool).await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -3475,7 +3373,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     Some(api_key),
                 ) => RequestData {
                     id: request_id,
-                    batch_id: BatchId(row.batch_id),
+                    batch_id: Some(BatchId(row.batch_id)),
                     template_id: TemplateId(template_id),
                     custom_id: row.custom_id,
                     endpoint,
@@ -3671,15 +3569,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let pool = self.pools.read();
 
+        // Listing is scoped to batchless rows (responses) — those carry
+        // `created_by` directly. Real-batch rows have created_by IS NULL and
+        // are filtered out so the planner can use the partial index
+        // `idx_requests_user_*_sort`.
         let where_clause = r#"
-            WHERE (b.deleted_at IS NULL OR r.batch_id IS NULL)
-              AND ($1::text IS NULL OR b.created_by = $1)
-              AND ($2::text IS NULL OR b.completion_window = $2)
-              AND ($3::text IS NULL OR r.state = $3)
-              AND ($4::text[] IS NULL OR r.model = ANY($4))
-              AND ($5::timestamptz IS NULL OR r.created_at >= $5)
-              AND ($6::timestamptz IS NULL OR r.created_at <= $6)
-              AND ($7::text[] IS NULL OR r.service_tier = ANY($7))
+            WHERE r.created_by IS NOT NULL
+              AND ($1::text IS NULL OR r.created_by = $1)
+              AND ($2::text IS NULL OR r.state = $2)
+              AND ($3::text[] IS NULL OR r.model = ANY($3))
+              AND ($4::timestamptz IS NULL OR r.created_at >= $4)
+              AND ($5::timestamptz IS NULL OR r.created_at <= $5)
+              AND ($6::text[] IS NULL OR r.service_tier = ANY($6))
         "#
         .to_string();
 
@@ -3693,7 +3594,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             r#"
             SELECT COUNT(*)::bigint
             FROM requests r
-            LEFT JOIN batches b ON r.batch_id = b.id
             {where_clause}
             "#
         );
@@ -3711,7 +3611,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             let count_result: std::result::Result<i64, sqlx::Error> =
                 sqlx::query_scalar(&count_sql)
                     .bind(filter.created_by.as_deref())
-                    .bind(filter.completion_window.as_deref())
                     .bind(filter.status.as_deref())
                     .bind(filter.models.as_deref())
                     .bind(filter.created_after)
@@ -3741,12 +3640,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 EXPLAIN (FORMAT JSON)
                 SELECT 1
                 FROM requests r
-                LEFT JOIN batches b ON r.batch_id = b.id
                 {where_clause}
                 "#
             ))
             .bind(filter.created_by.as_deref())
-            .bind(filter.completion_window.as_deref())
             .bind(filter.status.as_deref())
             .bind(filter.models.as_deref())
             .bind(filter.created_after)
@@ -3780,16 +3677,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     ELSE NULL END)::float8 as duration_ms,
                 r.response_status,
                 r.service_tier,
-                b.created_by as batch_created_by
+                r.created_by
             FROM requests r
-            LEFT JOIN batches b ON r.batch_id = b.id
             {where_clause}
             ORDER BY {order_clause}
-            LIMIT $8 OFFSET $9
+            LIMIT $7 OFFSET $8
             "#
         ))
         .bind(filter.created_by.as_deref())
-        .bind(filter.completion_window.as_deref())
         .bind(filter.status.as_deref())
         .bind(filter.models.as_deref())
         .bind(filter.created_after)
@@ -3820,18 +3715,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
                     ELSE NULL END)::float8 as duration_ms,
                 r.response_status,
-                -- Null out template body when the parent file is soft-deleted
-                -- (preserves existing behavior for batch requests). Daemon-managed
-                -- templates (file_id IS NULL) always return their body.
+                -- Null out template body when the parent file is soft-deleted.
+                -- Batchless responses use templates with file_id IS NULL, which
+                -- always return their body.
                 CASE WHEN f.deleted_at IS NULL OR t.file_id IS NULL
                     THEN t.body ELSE NULL END as body,
                 r.response_body, r.error,
-                b.completion_window, r.service_tier, b.created_by as batch_created_by
+                r.service_tier, r.created_by
             FROM requests r
-            LEFT JOIN batches b ON r.batch_id = b.id
             LEFT JOIN request_templates t ON r.template_id = t.id
             LEFT JOIN files f ON t.file_id = f.id
-            WHERE r.id = $1 AND (b.deleted_at IS NULL OR r.batch_id IS NULL)
+            WHERE r.id = $1 AND r.created_by IS NOT NULL
             "#,
         )
         .bind(request_id.0)
@@ -3843,9 +3737,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(detail)
     }
 
-    async fn create_daemon_request(&self, input: CreateDaemonRequestInput) -> Result<RequestId> {
+    #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
+    async fn create_realtime(&self, input: CreateRealtimeInput) -> Result<RequestId> {
         let pool = self.pools.write();
-        let id = input.id.unwrap_or_else(Uuid::new_v4);
         let template_id = Uuid::new_v4();
         let now = Utc::now();
 
@@ -3871,31 +3765,93 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(body_byte_size)
         .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert daemon request template: {}", e)))?;
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to insert realtime template: {}", e))
+        })?;
 
-        // Insert request row in processing state (batch_id = NULL)
+        // The proxy is already handling this request, so the row enters
+        // processing immediately. daemon_id = nil sentinel keeps the daemon
+        // from claiming or unclaiming it; service_tier = 'priority' matches
+        // the legacy "0s" completion_window mapping.
+        // Empty-string created_by is a contract violation (the API guarantees
+        // a real user); coerce to NULL so the XOR CHECK rejects it loudly
+        // rather than letting a phantom-user row slip into the listing.
+        let created_by = Some(input.created_by.as_str()).filter(|s| !s.is_empty());
         sqlx::query(
-            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at)
-             VALUES ($1, NULL, $2, $3, NULL, 'processing', $4, $5, $6)",
+            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by, daemon_id, claimed_at, started_at)
+             VALUES ($1, NULL, $2, $3, NULL, 'processing', 0, 'priority', $4, $5, $6, $6)",
         )
-        .bind(id)
+        .bind(input.request_id)
         .bind(template_id)
         .bind(&input.model)
-        .bind(input.daemon_id.0)
-        .bind(now)
+        .bind(created_by)
+        .bind(Uuid::nil())
         .bind(now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert daemon request: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert realtime request: {}", e)))?;
 
         tx.commit().await.map_err(|e| {
             FusilladeError::Other(anyhow!(
-                "Failed to commit daemon request transaction: {}",
+                "Failed to commit realtime request transaction: {}",
                 e
             ))
         })?;
 
-        Ok(RequestId(id))
+        Ok(RequestId(input.request_id))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
+    async fn create_flex(&self, input: CreateFlexInput) -> Result<RequestId> {
+        let pool = self.pools.write();
+        let template_id = Uuid::new_v4();
+
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
+        let stored_body = sanitize_outbound_body(&input.body);
+        let body_byte_size = stored_body.len() as i64;
+        sqlx::query(
+            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
+             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(template_id)
+        .bind(&input.endpoint)
+        .bind(&input.method)
+        .bind(&input.path)
+        .bind(stored_body.as_ref())
+        .bind(&input.model)
+        .bind(&input.api_key)
+        .bind(body_byte_size)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert flex template: {}", e)))?;
+
+        // Pending row — the daemon will claim and process it like any other
+        // pending request.
+        // Empty-string created_by is a contract violation (the API guarantees
+        // a real user); coerce to NULL so the XOR CHECK rejects it loudly
+        // rather than letting a phantom-user row slip into the listing.
+        let created_by = Some(input.created_by.as_str()).filter(|s| !s.is_empty());
+        sqlx::query(
+            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by)
+             VALUES ($1, NULL, $2, $3, NULL, 'pending', 0, 'flex', $4)",
+        )
+        .bind(input.request_id)
+        .bind(template_id)
+        .bind(&input.model)
+        .bind(created_by)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert flex request: {}", e)))?;
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to commit flex request transaction: {}", e))
+        })?;
+
+        Ok(RequestId(input.request_id))
     }
 
     async fn complete_request(
@@ -5349,13 +5305,11 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_create_single_request_batch_strips_routing_fields_from_stored_body(
-        pool: sqlx::PgPool,
-    ) {
+    async fn test_create_flex_strips_routing_fields_from_stored_body(pool: sqlx::PgPool) {
         // End-to-end check: when a /v1/responses request is queued through
-        // create_single_request_batch, the body stored in request_templates
-        // (and therefore what the daemon will fire upstream) must not contain
-        // service_tier or background.
+        // create_flex, the body stored in request_templates (and therefore
+        // what the daemon will fire upstream) must not contain service_tier
+        // or background.
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -5364,21 +5318,19 @@ mod tests {
 
         let request_id = uuid::Uuid::new_v4();
         manager
-            .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: None,
+            .create_flex(crate::request::CreateFlexInput {
                 request_id,
                 body: r#"{"model":"gpt-4","input":"hi","service_tier":"flex","background":true}"#
                     .to_string(),
                 model: "gpt-4".to_string(),
-                base_url: "http://localhost:3001/ai".to_string(),
-                endpoint: "/v1/responses".to_string(),
-                completion_window: "1h".to_string(),
-                initial_state: "pending".to_string(),
-                api_key: None,
-                created_by: Some("user-123".to_string()),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: "test-key".to_string(),
+                created_by: "user-123".to_string(),
             })
             .await
-            .expect("create_single_request_batch should succeed");
+            .expect("create_flex should succeed");
 
         let detail = manager
             .get_request_detail(crate::request::RequestId(request_id))
@@ -10231,7 +10183,8 @@ mod tests {
 
         assert_eq!(claimed.len(), 1);
         assert_eq!(
-            claimed[0].data.batch_id, batch1.id,
+            claimed[0].data.batch_id,
+            Some(batch1.id),
             "First claim should be from most urgent batch (30 min expiration)"
         );
         assert_eq!(claimed[0].data.custom_id, Some("urgent-1".to_string()));
@@ -10244,7 +10197,8 @@ mod tests {
 
         assert_eq!(claimed2.len(), 1);
         assert_eq!(
-            claimed2[0].data.batch_id, batch2.id,
+            claimed2[0].data.batch_id,
+            Some(batch2.id),
             "Second claim should be from medium priority batch (2 hour expiration)"
         );
         assert_eq!(claimed2[0].data.custom_id, Some("medium-1".to_string()));
@@ -10257,7 +10211,8 @@ mod tests {
 
         assert_eq!(claimed3.len(), 1);
         assert_eq!(
-            claimed3[0].data.batch_id, batch3.id,
+            claimed3[0].data.batch_id,
+            Some(batch3.id),
             "Third claim should be from no-SLA batch (NULL expiration)"
         );
         assert_eq!(claimed3[0].data.custom_id, Some("no-sla-1".to_string()));
@@ -10387,7 +10342,8 @@ mod tests {
         assert_eq!(claimed.len(), 3);
         for req in &claimed {
             assert_eq!(
-                req.data.batch_id, urgent_batch.id,
+                req.data.batch_id,
+                Some(urgent_batch.id),
                 "All claimed requests should come from the urgent batch (earliest expires_at), \
                  but got one from a filler batch — indicates non-FIFO ordering"
             );
@@ -10592,7 +10548,8 @@ mod tests {
 
         assert_eq!(claimed.len(), 1);
         assert_eq!(
-            claimed[0].data.batch_id, urgent_batch.id,
+            claimed[0].data.batch_id,
+            Some(urgent_batch.id),
             "Urgent batch (earlier deadline) should be claimed first when user priority is equal"
         );
     }
@@ -10672,7 +10629,8 @@ mod tests {
 
         assert_eq!(claimed.len(), 1);
         assert_eq!(
-            claimed[0].data.batch_id, batch_a,
+            claimed[0].data.batch_id,
+            Some(batch_a),
             "With urgency_weight=0.5 and equal user activity, \
              the 1hr SLA batch should be claimed before the 24hr batch"
         );
@@ -13225,50 +13183,24 @@ mod tests {
             http_client,
         );
 
-        // Create file + batch (which populates requests)
-        let file_id = manager
-            .create_file(
-                "test-file".to_string(),
-                None,
-                vec![
-                    RequestTemplateInput {
-                        custom_id: Some("req-1".to_string()),
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/v1/chat/completions".to_string(),
-                        body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}"#
-                            .to_string(),
-                        model: "gpt-4".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                    RequestTemplateInput {
-                        custom_id: Some("req-2".to_string()),
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/v1/chat/completions".to_string(),
-                        body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"world"}]}"#
-                            .to_string(),
-                        model: "gpt-4".to_string(),
-                        api_key: "key".to_string(),
-                    },
-                ],
-            )
-            .await
-            .expect("Failed to create file");
-
-        let _batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "1h".to_string(),
-                metadata: None,
-                created_by: Some("test-user".to_string()),
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .expect("Failed to create batch");
+        for body in [
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}"#,
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"world"}]}"#,
+        ] {
+            manager
+                .create_realtime(crate::request::CreateRealtimeInput {
+                    request_id: uuid::Uuid::new_v4(),
+                    body: body.to_string(),
+                    model: "gpt-4".to_string(),
+                    endpoint: "http://localhost:3001/ai".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/responses".to_string(),
+                    api_key: String::new(),
+                    created_by: "test-user".to_string(),
+                })
+                .await
+                .expect("create_realtime should succeed");
+        }
 
         let result = manager
             .list_requests(crate::request::ListRequestsFilter {
@@ -13281,96 +13213,7 @@ mod tests {
         assert_eq!(result.total_count, 2);
         assert_eq!(result.data.len(), 2);
         assert!(result.data.iter().all(|r| r.model == "gpt-4"));
-        assert!(result.data.iter().all(|r| r.status == "pending"));
-    }
-
-    #[sqlx::test]
-    async fn test_list_requests_filters_by_completion_window(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client,
-        );
-
-        let template = RequestTemplateInput {
-            custom_id: None,
-            endpoint: "https://api.example.com".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/chat/completions".to_string(),
-            body: r#"{"model":"gpt-4"}"#.to_string(),
-            model: "gpt-4".to_string(),
-            api_key: "key".to_string(),
-        };
-
-        // Create 1h batch
-        let file_1h = manager
-            .create_file("1h-file".to_string(), None, vec![template.clone()])
-            .await
-            .unwrap();
-        manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_1h,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "1h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .unwrap();
-
-        // Create 24h batch
-        let file_24h = manager
-            .create_file("24h-file".to_string(), None, vec![template.clone()])
-            .await
-            .unwrap();
-        manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_24h,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .unwrap();
-
-        // Filter to 1h only
-        let result_1h = manager
-            .list_requests(crate::request::ListRequestsFilter {
-                completion_window: Some("1h".to_string()),
-                limit: 10,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(result_1h.total_count, 1);
-
-        // Filter to 24h only
-        let result_24h = manager
-            .list_requests(crate::request::ListRequestsFilter {
-                completion_window: Some("24h".to_string()),
-                limit: 10,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(result_24h.total_count, 1);
-
-        // No filter — both
-        let result_all = manager
-            .list_requests(crate::request::ListRequestsFilter {
-                limit: 10,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(result_all.total_count, 2);
+        assert!(result.data.iter().all(|r| r.status == "processing"));
     }
 
     #[sqlx::test]
@@ -13381,35 +13224,21 @@ mod tests {
             http_client,
         );
 
-        let templates: Vec<RequestTemplateInput> = (0..5)
-            .map(|i| RequestTemplateInput {
-                custom_id: Some(format!("req-{}", i)),
-                endpoint: "https://api.example.com".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
-                body: format!(r#"{{"model":"gpt-4","prompt":"{}"}}"#, i),
-                model: "gpt-4".to_string(),
-                api_key: "key".to_string(),
-            })
-            .collect();
-
-        let file_id = manager
-            .create_file("pagination-test".to_string(), None, templates)
-            .await
-            .unwrap();
-        manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "1h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .unwrap();
+        for i in 0..5 {
+            manager
+                .create_realtime(crate::request::CreateRealtimeInput {
+                    request_id: uuid::Uuid::new_v4(),
+                    body: format!(r#"{{"model":"gpt-4","prompt":"{}"}}"#, i),
+                    model: "gpt-4".to_string(),
+                    endpoint: "http://localhost".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/responses".to_string(),
+                    api_key: String::new(),
+                    created_by: "pagination-user".to_string(),
+                })
+                .await
+                .unwrap();
+        }
 
         // Page 1: limit 2, skip 0
         let page1 = manager
@@ -13456,61 +13285,39 @@ mod tests {
             http_client,
         );
 
-        // Create a batch with several requests
-        let templates: Vec<RequestTemplateInput> = (0..4)
-            .map(|i| RequestTemplateInput {
-                custom_id: Some(format!("af-{}", i)),
-                endpoint: "https://api.example.com".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
-                body: "{}".to_string(),
-                model: "gpt-4".to_string(),
-                api_key: "key".to_string(),
-            })
-            .collect();
-
-        let file_id = manager
-            .create_file("af-file".to_string(), None, templates)
-            .await
-            .unwrap();
-        let batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "1h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .unwrap();
+        // Create four batchless responses we can mutate into distinct states.
+        let mut req_ids: Vec<uuid::Uuid> = Vec::new();
+        for _ in 0..4 {
+            let id = uuid::Uuid::new_v4();
+            manager
+                .create_realtime(crate::request::CreateRealtimeInput {
+                    request_id: id,
+                    body: "{}".to_string(),
+                    model: "gpt-4".to_string(),
+                    endpoint: "http://localhost".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/responses".to_string(),
+                    api_key: String::new(),
+                    created_by: "af-user".to_string(),
+                })
+                .await
+                .unwrap();
+            req_ids.push(id);
+        }
 
         // Force distinct states on the requests so we can verify priority ordering.
         // Priority mapping in list_requests: processing=0, claimed=1, pending=2, else=3.
-        // Set one each of completed, processing, claimed, pending.
-        let req_ids: Vec<uuid::Uuid> = sqlx::query_scalar(
-            "SELECT id FROM requests WHERE batch_id = $1 ORDER BY created_at ASC, id ASC",
-        )
-        .bind(*batch.id as uuid::Uuid)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(req_ids.len(), 4);
-
-        // Update states directly (bypassing state machine) purely for ordering test.
         // Indices: [0]=completed, [1]=processing, [2]=claimed, [3]=pending
         sqlx::query("UPDATE requests SET state='completed', response_status=200, response_body='{}', completed_at=NOW() WHERE id=$1")
             .bind(req_ids[0])
             .execute(&pool).await.unwrap();
-        sqlx::query("UPDATE requests SET state='processing', daemon_id=gen_random_uuid(), claimed_at=NOW(), started_at=NOW() WHERE id=$1")
-            .bind(req_ids[1])
-            .execute(&pool).await.unwrap();
-        sqlx::query("UPDATE requests SET state='claimed', daemon_id=gen_random_uuid(), claimed_at=NOW() WHERE id=$1")
+        // [1] is already processing (create_realtime default).
+        sqlx::query("UPDATE requests SET state='claimed', daemon_id=gen_random_uuid(), claimed_at=NOW(), started_at=NULL WHERE id=$1")
             .bind(req_ids[2])
             .execute(&pool).await.unwrap();
-        // req_ids[3] stays pending
+        sqlx::query("UPDATE requests SET state='pending', daemon_id=NULL, claimed_at=NULL, started_at=NULL WHERE id=$1")
+            .bind(req_ids[3])
+            .execute(&pool).await.unwrap();
 
         let result = manager
             .list_requests(crate::request::ListRequestsFilter {
@@ -13539,205 +13346,81 @@ mod tests {
             http_client,
         );
 
-        let file_id = manager
-            .create_file(
-                "detail-test".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("detail-req".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/chat/completions".to_string(),
-                    body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}]}"#
-                        .to_string(),
-                    model: "gpt-4".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "1h".to_string(),
-                metadata: None,
-                created_by: Some("test-user-id".to_string()),
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
+        let request_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id,
+                body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}]}"#
+                    .to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "test-user-id".to_string(),
             })
             .await
             .unwrap();
 
-        // Get the request ID from list
-        let list = manager
-            .list_requests(crate::request::ListRequestsFilter {
-                limit: 10,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(list.data.len(), 1);
-        let request_id = crate::request::RequestId(list.data[0].id);
-
-        // Get detail
         let detail = manager
-            .get_request_detail(request_id)
+            .get_request_detail(crate::request::RequestId(request_id))
             .await
             .expect("get_request_detail should succeed");
 
         assert_eq!(detail.model, "gpt-4");
-        assert_eq!(detail.status, "pending");
-        assert_eq!(detail.batch_id, Some(batch.id.0));
-        assert_eq!(detail.completion_window, Some("1h".to_string()));
-        assert_eq!(detail.batch_created_by, Some("test-user-id".to_string()));
+        assert_eq!(detail.status, "processing");
+        assert_eq!(detail.created_by, "test-user-id");
         assert!(detail.body.as_deref().unwrap().contains("gpt-4"));
     }
 
     #[sqlx::test]
-    async fn test_get_request_detail_after_template_purge(pool: sqlx::PgPool) {
+    async fn test_purge_preserves_batchless_request_detail(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             http_client,
         );
 
-        let file_id = manager
-            .create_file(
-                "purge-test".to_string(),
-                None,
-                vec![RequestTemplateInput {
-                    custom_id: Some("purge-req".to_string()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/chat/completions".to_string(),
-                    body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}]}"#
-                        .to_string(),
-                    model: "gpt-4".to_string(),
-                    api_key: "key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
+        // Batchless realtime responses store their template with file_id = NULL.
+        // purge_orphaned_rows only deletes templates whose parent file is
+        // soft-deleted; templates with NULL file_id must be left alone, otherwise
+        // get_request_detail would lose its template-side payload (body, etc.).
+        // This test pins that invariant.
+        let request_id = uuid::Uuid::new_v4();
         manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "1h".to_string(),
-                metadata: None,
-                created_by: Some("test-user".to_string()),
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id,
+                body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}]}"#
+                    .to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "test-user".to_string(),
             })
             .await
             .unwrap();
 
-        // Get request ID before purging
-        let list = manager
-            .list_requests(crate::request::ListRequestsFilter {
-                limit: 10,
-                ..Default::default()
-            })
+        let purged = manager
+            .purge_orphaned_rows(1000)
             .await
-            .unwrap();
-        let request_id = crate::request::RequestId(list.data[0].id);
-
-        // Delete file and purge orphaned templates
-        manager.delete_file(file_id).await.unwrap();
-        manager.purge_orphaned_rows(1000).await.unwrap();
+            .expect("purge should succeed");
+        assert_eq!(
+            purged, 0,
+            "purge must not touch batchless realtime templates"
+        );
 
         let detail = manager
-            .get_request_detail(request_id)
+            .get_request_detail(crate::request::RequestId(request_id))
             .await
-            .expect("get_request_detail should succeed even after template purge");
+            .expect("get_request_detail should succeed after purge");
 
         assert_eq!(detail.model, "gpt-4");
         assert!(
-            detail.body.is_none(),
-            "body should be None when template is purged"
+            detail.body.is_some(),
+            "body should still be present after purge"
         );
-    }
-
-    #[sqlx::test]
-    async fn test_list_requests_excludes_soft_deleted_batches(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client,
-        );
-
-        let template = RequestTemplateInput {
-            custom_id: None,
-            endpoint: "https://api.example.com".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/chat/completions".to_string(),
-            body: r#"{"model":"gpt-4"}"#.to_string(),
-            model: "gpt-4".to_string(),
-            api_key: "key".to_string(),
-        };
-
-        // Batch A: stays alive
-        let file_a = manager
-            .create_file("alive".to_string(), None, vec![template.clone()])
-            .await
-            .unwrap();
-        manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_a,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "1h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .unwrap();
-
-        // Batch B: gets soft-deleted
-        let file_b = manager
-            .create_file("deleted".to_string(), None, vec![template])
-            .await
-            .unwrap();
-        let batch_b = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id: file_b,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "1h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .unwrap();
-
-        // Before delete: both requests visible
-        let before = manager
-            .list_requests(crate::request::ListRequestsFilter::default())
-            .await
-            .unwrap();
-        assert_eq!(before.total_count, 2);
-
-        // Soft-delete batch B — its requests should disappear from list_requests
-        // because the WHERE clause filters on b.deleted_at IS NULL.
-        manager.delete_batch(batch_b.id).await.unwrap();
-
-        let after = manager
-            .list_requests(crate::request::ListRequestsFilter::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            after.total_count, 1,
-            "requests from soft-deleted batches should be filtered out"
-        );
-        assert_eq!(after.data.len(), 1);
     }
 
     #[sqlx::test]
@@ -13756,11 +13439,11 @@ mod tests {
     }
 
     // =========================================================================
-    // create_single_request_batch tests
+    // create_realtime / create_flex tests
     // =========================================================================
 
     #[sqlx::test]
-    async fn test_create_single_request_batch_pending(pool: sqlx::PgPool) {
+    async fn test_create_flex_pending(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -13768,39 +13451,33 @@ mod tests {
         );
 
         let request_id = uuid::Uuid::new_v4();
-        let batch = manager
-            .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: None,
+        manager
+            .create_flex(crate::request::CreateFlexInput {
                 request_id,
                 body: r#"{"model":"gpt-4","input":"hi"}"#.to_string(),
                 model: "gpt-4".to_string(),
-                base_url: "http://localhost:3001/ai".to_string(),
-                endpoint: "/v1/responses".to_string(),
-                completion_window: "1h".to_string(),
-                initial_state: "pending".to_string(),
-                api_key: None,
-                created_by: Some("user-123".to_string()),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-123".to_string(),
             })
             .await
-            .expect("create_single_request_batch should succeed");
+            .expect("create_flex should succeed");
 
-        // Verify batch was created
-        assert_eq!(batch.total_requests, 1);
-
-        // Verify request exists with correct state and service_tier
         let detail = manager
             .get_request_detail(crate::request::RequestId(request_id))
             .await
             .expect("request should exist");
         assert_eq!(detail.status, "pending");
         assert_eq!(detail.service_tier, Some("flex".to_string()));
-        assert_eq!(detail.batch_id, Some(batch.id.0));
-        assert_eq!(detail.batch_created_by, Some("user-123".to_string()));
+        assert_eq!(detail.batch_id, None);
+        assert_eq!(detail.created_by, "user-123");
         assert!(detail.body.is_some());
     }
 
     #[sqlx::test]
-    async fn test_create_single_request_batch_processing(pool: sqlx::PgPool) {
+    async fn test_create_realtime_processing(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -13808,33 +13485,32 @@ mod tests {
         );
 
         let request_id = uuid::Uuid::new_v4();
-        let _batch = manager
-            .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: None,
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
                 request_id,
                 body: r#"{"model":"gpt-4","input":"hi"}"#.to_string(),
                 model: "gpt-4".to_string(),
-                base_url: "http://localhost:3001/ai".to_string(),
-                endpoint: "/v1/responses".to_string(),
-                completion_window: "0s".to_string(),
-                initial_state: "processing".to_string(),
-                api_key: None,
-                created_by: Some("user-456".to_string()),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-456".to_string(),
             })
             .await
-            .expect("create_single_request_batch should succeed");
+            .expect("create_realtime should succeed");
 
-        // Verify request is in processing state with sentinel daemon_id
         let detail = manager
             .get_request_detail(crate::request::RequestId(request_id))
             .await
             .expect("request should exist");
         assert_eq!(detail.status, "processing");
         assert_eq!(detail.service_tier, Some("priority".to_string()));
+        assert_eq!(detail.batch_id, None);
+        assert_eq!(detail.created_by, "user-456");
     }
 
     #[sqlx::test]
-    async fn test_create_single_request_batch_without_created_by(pool: sqlx::PgPool) {
+    async fn test_create_realtime_complete_lifecycle(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -13842,56 +13518,20 @@ mod tests {
         );
 
         let request_id = uuid::Uuid::new_v4();
-        let _batch = manager
-            .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: None,
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
                 request_id,
                 body: r#"{"input":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),
-                base_url: "http://localhost:3001/ai".to_string(),
-                endpoint: "/v1/responses".to_string(),
-                completion_window: "1h".to_string(),
-                initial_state: "pending".to_string(),
-                api_key: None,
-                created_by: None,
-            })
-            .await
-            .expect("should succeed with created_by=None");
-
-        // Should be created with empty created_by (not NULL)
-        let detail = manager
-            .get_request_detail(crate::request::RequestId(request_id))
-            .await
-            .expect("request should exist");
-        assert_eq!(detail.batch_created_by, Some("".to_string()));
-    }
-
-    #[sqlx::test]
-    async fn test_create_single_request_batch_complete_lifecycle(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client,
-        );
-
-        let request_id = uuid::Uuid::new_v4();
-        let _batch = manager
-            .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: None,
-                request_id,
-                body: r#"{"input":"test"}"#.to_string(),
-                model: "gpt-4".to_string(),
-                base_url: "http://localhost:3001/ai".to_string(),
-                endpoint: "/v1/responses".to_string(),
-                completion_window: "0s".to_string(),
-                initial_state: "processing".to_string(),
-                api_key: None,
-                created_by: Some("user-789".to_string()),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-789".to_string(),
             })
             .await
             .expect("create should succeed");
 
-        // Complete the request
         manager
             .complete_request(
                 crate::request::RequestId(request_id),
@@ -13914,7 +13554,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_create_single_request_batch_fail_lifecycle(pool: sqlx::PgPool) {
+    async fn test_create_realtime_fail_lifecycle(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -13922,23 +13562,20 @@ mod tests {
         );
 
         let request_id = uuid::Uuid::new_v4();
-        let _batch = manager
-            .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: None,
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
                 request_id,
                 body: r#"{"input":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),
-                base_url: "http://localhost:3001/ai".to_string(),
-                endpoint: "/v1/responses".to_string(),
-                completion_window: "0s".to_string(),
-                initial_state: "processing".to_string(),
-                api_key: None,
-                created_by: Some("user-789".to_string()),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-789".to_string(),
             })
             .await
             .expect("create should succeed");
 
-        // Fail the request
         manager
             .fail_request(
                 crate::request::RequestId(request_id),
@@ -13955,7 +13592,6 @@ mod tests {
         assert_eq!(detail.status, "failed");
         assert!(detail.failed_at.is_some());
 
-        // Verify error is valid FailureReason JSON
         let error: crate::request::FailureReason =
             serde_json::from_str(detail.error.as_ref().unwrap())
                 .expect("error should be valid FailureReason JSON");
@@ -13966,7 +13602,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_create_single_request_batch_shows_in_list_requests(pool: sqlx::PgPool) {
+    async fn test_create_realtime_shows_in_list_requests(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -13974,23 +13610,20 @@ mod tests {
         );
 
         let request_id = uuid::Uuid::new_v4();
-        let _batch = manager
-            .create_single_request_batch(crate::manager::CreateSingleRequestBatchInput {
-                batch_id: None,
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
                 request_id,
                 body: r#"{"input":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),
-                base_url: "http://localhost:3001/ai".to_string(),
-                endpoint: "/v1/responses".to_string(),
-                completion_window: "0s".to_string(),
-                initial_state: "processing".to_string(),
-                api_key: None,
-                created_by: Some("user-abc".to_string()),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-abc".to_string(),
             })
             .await
             .expect("create should succeed");
 
-        // Should appear in list_requests when filtering by service tiers
         let result = manager
             .list_requests(crate::request::ListRequestsFilter {
                 service_tiers: Some(vec!["flex".to_string(), "priority".to_string()]),
@@ -14002,6 +13635,67 @@ mod tests {
         assert!(result.data.iter().any(|r| r.id == request_id));
         let found = result.data.iter().find(|r| r.id == request_id).unwrap();
         assert_eq!(found.service_tier, Some("priority".to_string()));
-        assert_eq!(found.batch_created_by, Some("user-abc".to_string()));
+        assert_eq!(found.created_by, "user-abc");
+    }
+
+    #[sqlx::test]
+    async fn test_list_requests_excludes_batched_rows(pool: sqlx::PgPool) {
+        // list_requests is now scoped to batchless responses (rows where
+        // r.created_by IS NOT NULL). Batched rows must not appear.
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let template = RequestTemplateInput {
+            custom_id: None,
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: r#"{"model":"gpt-4"}"#.to_string(),
+            model: "gpt-4".to_string(),
+            api_key: "key".to_string(),
+        };
+        let file_id = manager
+            .create_file("batched".to_string(), None, vec![template])
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: Some("batched-user".to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        // Realtime row that should appear
+        let realtime_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: realtime_id,
+                body: r#"{"input":"x"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "realtime-user".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let result = manager
+            .list_requests(crate::request::ListRequestsFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(result.total_count, 1);
+        assert_eq!(result.data[0].id, realtime_id);
     }
 }

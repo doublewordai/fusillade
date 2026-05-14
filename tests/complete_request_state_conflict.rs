@@ -9,8 +9,8 @@
 
 use fusillade::manager::Storage;
 use fusillade::{
-    CreateSingleRequestBatchInput, FusilladeError, MockHttpClient, PostgresRequestManager,
-    RequestId, TestDbPools,
+    CreateRealtimeInput, FusilladeError, MockHttpClient, PostgresRequestManager, RequestId,
+    TestDbPools,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -22,18 +22,16 @@ async fn manager(pool: sqlx::PgPool) -> Arc<PostgresRequestManager<TestDbPools, 
     ))
 }
 
-fn processing_input(request_id: Uuid) -> CreateSingleRequestBatchInput {
-    CreateSingleRequestBatchInput {
-        batch_id: None,
+fn processing_input(request_id: Uuid) -> CreateRealtimeInput {
+    CreateRealtimeInput {
         request_id,
         body: r#"{"messages":[]}"#.to_string(),
         model: "test-model".to_string(),
-        base_url: "http://localhost".to_string(),
-        endpoint: "/v1/chat/completions".to_string(),
-        completion_window: "0s".to_string(),
-        initial_state: "processing".to_string(),
-        api_key: None,
-        created_by: None,
+        endpoint: "http://localhost".to_string(),
+        method: "POST".to_string(),
+        path: "/v1/chat/completions".to_string(),
+        api_key: "test-key".to_string(),
+        created_by: "test-user".to_string(),
     }
 }
 
@@ -41,9 +39,7 @@ fn processing_input(request_id: Uuid) -> CreateSingleRequestBatchInput {
 async fn complete_request_succeeds_for_processing_row(pool: sqlx::PgPool) {
     let m = manager(pool).await;
     let id = Uuid::new_v4();
-    m.create_single_request_batch(processing_input(id))
-        .await
-        .unwrap();
+    m.create_realtime(processing_input(id)).await.unwrap();
 
     m.complete_request(RequestId(id), r#"{"ok":true}"#, 200)
         .await
@@ -54,9 +50,7 @@ async fn complete_request_succeeds_for_processing_row(pool: sqlx::PgPool) {
 async fn complete_request_returns_state_conflict_when_already_completed(pool: sqlx::PgPool) {
     let m = manager(pool).await;
     let id = Uuid::new_v4();
-    m.create_single_request_batch(processing_input(id))
-        .await
-        .unwrap();
+    m.create_realtime(processing_input(id)).await.unwrap();
     m.complete_request(RequestId(id), r#"{"ok":true}"#, 200)
         .await
         .unwrap();
@@ -84,9 +78,7 @@ async fn complete_request_returns_state_conflict_when_already_completed(pool: sq
 async fn complete_request_returns_state_conflict_when_already_failed(pool: sqlx::PgPool) {
     let m = manager(pool).await;
     let id = Uuid::new_v4();
-    m.create_single_request_batch(processing_input(id))
-        .await
-        .unwrap();
+    m.create_realtime(processing_input(id)).await.unwrap();
     m.fail_request(RequestId(id), "boom", 500).await.unwrap();
 
     let err = m
@@ -122,9 +114,7 @@ async fn complete_request_returns_not_found_for_missing_row(pool: sqlx::PgPool) 
 async fn fail_request_returns_state_conflict_when_already_completed(pool: sqlx::PgPool) {
     let m = manager(pool).await;
     let id = Uuid::new_v4();
-    m.create_single_request_batch(processing_input(id))
-        .await
-        .unwrap();
+    m.create_realtime(processing_input(id)).await.unwrap();
     m.complete_request(RequestId(id), r#"{"ok":true}"#, 200)
         .await
         .unwrap();

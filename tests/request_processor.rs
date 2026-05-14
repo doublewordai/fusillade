@@ -23,7 +23,9 @@ use fusillade::manager::{DaemonExecutor, Storage};
 use fusillade::processor::{
     CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry,
 };
-use fusillade::request::{Claimed, Completed, Failed, Request, RequestCompletionResult};
+use fusillade::request::{
+    AnyRequest, Claimed, Completed, Failed, Request, RequestCompletionResult,
+};
 use tokio_util::sync::CancellationToken;
 
 fn fast_test_config() -> DaemonConfig {
@@ -86,18 +88,33 @@ async fn wait_until_completed(
 ) {
     let start = std::time::Instant::now();
     loop {
-        let detail = manager.get_request_detail(request_id).await.unwrap();
-        if detail.status == "completed" || detail.status == "failed" {
+        let req = fetch_any_request(manager, request_id).await;
+        let variant = req.variant();
+        if variant == "Completed" || variant == "Failed" {
             return;
         }
         if start.elapsed() > Duration::from_secs(5) {
             panic!(
                 "Timeout waiting for request to reach terminal state, last={:?}",
-                detail.status
+                variant
             );
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+async fn fetch_any_request(
+    manager: &Arc<PostgresRequestManager<TestDbPools, MockHttpClient>>,
+    request_id: fusillade::request::RequestId,
+) -> AnyRequest {
+    manager
+        .get_requests(vec![request_id])
+        .await
+        .expect("get_requests")
+        .into_iter()
+        .next()
+        .expect("one result")
+        .expect("request found")
 }
 
 #[sqlx::test]
@@ -125,10 +142,10 @@ async fn default_processor_preserves_batch_path(pool: sqlx::PgPool) {
     let request_id = submit_one_request(&manager).await;
     wait_until_completed(&manager, request_id).await;
 
-    let detail = manager.get_request_detail(request_id).await.unwrap();
-    assert_eq!(detail.status, "completed");
-    let body = detail.response_body.unwrap_or_default();
-    assert!(body.contains("\"ok\":true"));
+    let AnyRequest::Completed(req) = fetch_any_request(&manager, request_id).await else {
+        panic!("expected Completed variant");
+    };
+    assert!(req.state.response_body.contains("\"ok\":true"));
 
     shutdown_token.cancel();
 }
@@ -199,8 +216,10 @@ async fn custom_processor_is_invoked(pool: sqlx::PgPool) {
         1,
         "processor must be invoked exactly once for a single claimed request"
     );
-    let detail = manager.get_request_detail(request_id).await.unwrap();
-    assert_eq!(detail.status, "completed");
+    assert!(matches!(
+        fetch_any_request(&manager, request_id).await,
+        AnyRequest::Completed(_)
+    ));
 
     shutdown_token.cancel();
 }
@@ -266,9 +285,10 @@ async fn custom_processor_can_synthesize_terminal_failure(pool: sqlx::PgPool) {
     let request_id = submit_one_request(&manager).await;
     wait_until_completed(&manager, request_id).await;
 
-    let detail = manager.get_request_detail(request_id).await.unwrap();
-    assert_eq!(detail.status, "failed");
-    let err = detail.error.unwrap_or_default();
+    let AnyRequest::Failed(req) = fetch_any_request(&manager, request_id).await else {
+        panic!("expected Failed variant");
+    };
+    let err = req.state.reason.to_error_message();
     assert!(
         err.contains("synthetic test failure"),
         "expected synthesized failure body in error: {err}"

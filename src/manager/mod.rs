@@ -11,7 +11,7 @@ use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::http::HttpClient;
 use crate::request::{
-    AnyRequest, CascadeTargetState, Claimed, CreateDaemonRequestInput, DaemonId,
+    AnyRequest, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput, DaemonId,
     ListRequestsFilter, Request, RequestDetail, RequestId, RequestListResult, RequestState,
     ServiceTierFilter,
 };
@@ -21,43 +21,12 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use uuid::Uuid;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod response_step;
 mod utils;
-
-/// Input for creating a single-request batch with a pre-generated request ID.
-#[derive(Debug, Clone)]
-pub struct CreateSingleRequestBatchInput {
-    /// Optional pre-generated batch UUID. When `Some`, becomes the batch's
-    /// primary key — useful when the caller needs to attach the id to
-    /// outbound proxy headers (e.g. `x-fusillade-batch-id`) before the row
-    /// exists. When `None`, a fresh UUID is generated internally.
-    pub batch_id: Option<Uuid>,
-    /// Pre-generated request UUID. Becomes the request's primary key.
-    pub request_id: Uuid,
-    /// Request body (JSON string).
-    pub body: String,
-    /// Model name for the request.
-    pub model: String,
-    /// Base URL for the daemon to reach the proxy (e.g., `http://localhost:3001/ai`).
-    pub base_url: String,
-    /// API path (e.g., `/v1/responses`, `/v1/chat/completions`).
-    pub endpoint: String,
-    /// Completion window (e.g., `"0s"` for realtime, `"1h"` for flex).
-    pub completion_window: String,
-    /// Initial request state. Use `"pending"` for daemon-processed requests
-    /// (flex) or `"processing"` for externally-managed requests (realtime)
-    /// that the daemon should not claim.
-    pub initial_state: String,
-    /// API key for request execution and batch attribution.
-    pub api_key: Option<String>,
-    /// User/org ID that owns this batch.
-    pub created_by: Option<String>,
-}
 
 /// Storage trait for persisting and querying requests.
 ///
@@ -154,22 +123,6 @@ pub trait Storage: Send + Sync {
     /// If the file has no templates, returns a [`ValidationError`](crate::FusilladeError::ValidationError)
     /// and the caller is responsible for marking the batch as failed.
     async fn populate_batch(&self, batch_id: BatchId, file_id: FileId) -> Result<()>;
-
-    /// Create a single-request batch with a pre-generated request ID.
-    ///
-    /// Atomically creates a file, template, batch, and request in one call.
-    /// The request ID is caller-specified so it can be known upfront without
-    /// a round-trip. Used for tracking realtime and flex responses where the
-    /// caller needs the ID before the request is processed.
-    ///
-    /// The request is created with the caller-specified `initial_state`:
-    /// - `"pending"` — daemon-processed (e.g. flex). The daemon will claim it.
-    /// - `"processing"` — externally-managed (e.g. realtime). The daemon
-    ///   ignores it; the caller completes/fails the row directly.
-    async fn create_single_request_batch(
-        &self,
-        input: CreateSingleRequestBatchInput,
-    ) -> Result<Batch>;
 
     /// Get a batch by ID.
     ///
@@ -437,12 +390,20 @@ pub trait Storage: Send + Sync {
     /// Get a single request by ID with full detail (body, response, error).
     async fn get_request_detail(&self, request_id: RequestId) -> Result<RequestDetail>;
 
-    /// Create a request being processed by a daemon, without a batch.
+    /// Create a realtime response that the proxy is already handling.
     ///
-    /// Inserts a request template and a request row with `batch_id = NULL` in
-    /// "processing" state. Used when an external daemon (e.g., an AI proxy) is
-    /// already handling the request and wants to track it in fusillade.
-    async fn create_daemon_request(&self, input: CreateDaemonRequestInput) -> Result<RequestId>;
+    /// Inserts a request template (no parent file) and a request row with
+    /// `batch_id = NULL` in `processing` state. The proxy completes/fails
+    /// the row directly via `complete_request` / `fail_request`; the daemon
+    /// never claims it.
+    async fn create_realtime(&self, input: CreateRealtimeInput) -> Result<RequestId>;
+
+    /// Create a flex (async) response that the daemon will process.
+    ///
+    /// Inserts a request template (no parent file) and a request row with
+    /// `batch_id = NULL` in `pending` state. The daemon claims and processes
+    /// it via the standard flex pipeline.
+    async fn create_flex(&self, input: CreateFlexInput) -> Result<RequestId>;
 
     /// Complete a processing request with the response body.
     ///
