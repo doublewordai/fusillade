@@ -188,8 +188,9 @@ pub use deprecated_types::RequestSummaryWithCount;
 #[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
 pub struct RequestDetail {
     pub id: Uuid,
-    /// `None` for batchless responses (created via `create_realtime` /
-    /// `create_flex`).
+    /// Always `None` — this query is scoped to batchless rows only.
+    /// Per-row inspection of batched requests uses
+    /// `get_batch_results_stream` / `BatchResultItem`.
     pub batch_id: Option<Uuid>,
     pub model: String,
     #[cfg_attr(feature = "postgres", sqlx(rename = "state"))]

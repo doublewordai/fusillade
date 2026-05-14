@@ -18,6 +18,12 @@ ALTER TABLE requests ALTER COLUMN batch_id DROP NOT NULL;
 -- Exactly one of (batch_id, created_by) is non-NULL: batched rows attribute
 -- via the batch, batchless rows attribute via the request. Rejects both-set
 -- (data corruption) and both-NULL (orphaned row).
+--
+-- The XOR also serves as a guard against an API contract violation: the
+-- batchless-row creators (`create_realtime`, `create_flex`) coerce an
+-- empty-string `created_by` to NULL before insert so the CHECK rejects it
+-- loudly, rather than letting a phantom-user row land in the per-user
+-- listing.
 ALTER TABLE requests ADD CONSTRAINT requests_attribution_xor
     CHECK ((batch_id IS NULL) <> (created_by IS NULL));
 
