@@ -1,5 +1,16 @@
 # Changelog
 
+## [17.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v16.8.3...fusillade-v17.0.0) (2026-05-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* Remove virtual batches ([#259](https://github.com/doublewordai/fusillade/issues/259))
+
+### Features
+
+* Remove virtual batches ([#259](https://github.com/doublewordai/fusillade/issues/259)) ([4c1d352](https://github.com/doublewordai/fusillade/commit/4c1d35211957d1858a61fd73b97b69d558b3913b))
+
 ## [16.8.3](https://github.com/doublewordai/fusillade/compare/fusillade-v16.8.2...fusillade-v16.8.3) (2026-05-13)
 
 
