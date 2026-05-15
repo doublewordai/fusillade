@@ -28,6 +28,68 @@ pub struct HttpResponse {
     pub body: String,
 }
 
+/// One Server-Sent Event parsed from an upstream streaming response.
+///
+/// Field shape mirrors the SSE wire format (RFC 8895 / WHATWG): every
+/// event has an `event` type, a `data` payload, an `id` cursor for
+/// reconnection, and an optional `retry` hint. For LLM streams the
+/// `data` field carries a JSON chunk per token; `event` is typically
+/// empty.
+///
+/// The string fields are borrowed from the underlying SSE event
+/// buffer to keep per-chunk overhead near zero — a single LLM response
+/// emits hundreds of these. Callbacks that need to store an event
+/// beyond the invocation should clone the fields they care about
+/// (typically only `data` needs parsing/forwarding for token-delta
+/// extraction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamEvent<'a> {
+    pub event: &'a str,
+    pub data: &'a str,
+    pub id: &'a str,
+    pub retry: Option<Duration>,
+}
+
+impl<'a> From<&'a eventsource_stream::Event> for StreamEvent<'a> {
+    fn from(e: &'a eventsource_stream::Event) -> Self {
+        Self {
+            event: &e.event,
+            data: &e.data,
+            id: &e.id,
+            retry: e.retry,
+        }
+    }
+}
+
+/// Sink invoked once per SSE event as the streaming HTTP client reads
+/// chunks from an upstream response, before reassembly. Consumers that
+/// need live access to model token deltas (e.g. forwarding to a
+/// client-facing SSE channel) plug an implementation into
+/// [`HttpClient::execute_with_event_callback`].
+///
+/// `on_event` is intentionally synchronous: it runs inline in the
+/// chunk-read loop between successive `stream.next()` calls. The
+/// `chunk_timeout` only wraps `stream.next()` itself — callback time
+/// is *not* measured against it — but the overall `body_timeout` does
+/// cover the loop body, so a slow callback eats into that budget and
+/// can trip a `BodyTimeout` failure for the whole response.
+/// Implementations that need to do async work should dispatch via
+/// `tokio::sync::mpsc::UnboundedSender::send` (sync, never blocks) or
+/// `tokio::spawn` a fire-and-forget task — anything that returns to
+/// the caller in microseconds.
+///
+/// # Panics
+///
+/// A panic inside `on_event` will unwind through fusillade's streaming
+/// loop and fail the request (it surfaces to the trait caller as an
+/// HTTP-client error and may be classified as retriable by upstream
+/// retry policy). Implementations should be panic-free; catch
+/// expected errors inside the callback and degrade gracefully rather
+/// than letting them propagate.
+pub trait StreamEventCallback: Send + Sync {
+    fn on_event(&self, event: &StreamEvent<'_>);
+}
+
 /// Minimal representation of a provider error embedded in an SSE stream.
 /// Used to detect and extract error status codes from events before reassembly.
 #[derive(serde::Deserialize)]
@@ -67,6 +129,29 @@ pub trait HttpClient: Send + Sync + Clone {
     /// - The request times out (either waiting for headers or between body chunks)
     /// - The URL is invalid
     async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse>;
+
+    /// As [`execute`], but invokes `on_event` for each SSE event read
+    /// from a streaming upstream response, in arrival order, before
+    /// reassembly.
+    ///
+    /// `on_event` is only fired for streaming responses (paths that the
+    /// implementation classifies as streamable). Non-streaming responses
+    /// never invoke the callback.
+    ///
+    /// The default implementation delegates to [`execute`] and discards
+    /// `on_event`. Implementations that read SSE chunk-by-chunk
+    /// (notably [`ReqwestHttpClient`]) override this so consumers like
+    /// onwards' multi-step loop can forward token deltas to a
+    /// client-facing SSE channel as they arrive, while still benefiting
+    /// from this client's header stamping and stream reassembly.
+    async fn execute_with_event_callback(
+        &self,
+        request: &RequestData,
+        api_key: &str,
+        _on_event: Option<Arc<dyn StreamEventCallback>>,
+    ) -> Result<HttpResponse> {
+        self.execute(request, api_key).await
+    }
 }
 
 // ============================================================================
@@ -146,12 +231,33 @@ impl Default for ReqwestHttpClient {
 /// Long but finite fallback timeout (24 hours) used when no explicit timeout is configured.
 const ONE_DAY_DURATION: Duration = Duration::from_secs(86_400);
 
+/// Invoke an optional [`StreamEventCallback`] for one SSE event,
+/// borrowing the underlying [`eventsource_stream::Event`] (no
+/// per-chunk clone). Pulled into a free function so the streaming
+/// loop's "first event" and "subsequent events" branches stay
+/// identical at the call site.
+fn fire_callback(on_event: Option<&dyn StreamEventCallback>, event: &eventsource_stream::Event) {
+    if let Some(cb) = on_event {
+        cb.on_event(&StreamEvent::from(event));
+    }
+}
+
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
-    #[tracing::instrument(name = "fusillade.execute", skip(self, request, api_key), fields(
+    async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse> {
+        self.execute_with_event_callback(request, api_key, None)
+            .await
+    }
+
+    #[tracing::instrument(name = "fusillade.execute", skip(self, request, api_key, on_event), fields(
         otel.name = %format!("{} {}", request.method, request.path),
     ))]
-    async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse> {
+    async fn execute_with_event_callback(
+        &self,
+        request: &RequestData,
+        api_key: &str,
+        on_event: Option<Arc<dyn StreamEventCallback>>,
+    ) -> Result<HttpResponse> {
         let url = format!("{}{}", request.endpoint, request.path);
         let span = tracing::Span::current();
         span.set_attribute("otel.kind", "Client");
@@ -237,7 +343,7 @@ impl HttpClient for ReqwestHttpClient {
         span.set_attribute("fusillade.streaming", stream);
         if stream {
             req = req.header("X-Fusillade-Stream", "true");
-            self.execute_streaming(request, req, &url).await
+            self.execute_streaming(request, req, &url, on_event).await
         } else {
             self.execute_non_streaming(request, req, &url).await
         }
@@ -304,6 +410,7 @@ impl ReqwestHttpClient {
         request: &RequestData,
         req: reqwest::RequestBuilder,
         url: &str,
+        on_event: Option<Arc<dyn StreamEventCallback>>,
     ) -> Result<HttpResponse> {
         use eventsource_stream::Eventsource;
         use futures::StreamExt;
@@ -348,15 +455,24 @@ impl ReqwestHttpClient {
             ))
         })??;
 
-        // Phase 2: collect all SSE events with per-event and total body timeouts.
+        // Phase 2: collect all SSE events with per-event and total body
+        // timeouts. If `on_event` is set, fire it per event in arrival
+        // order via `fire_callback` before stashing into the reassembly
+        // vec. The callback runs outside `stream.next()`, so its time
+        // counts against `body_timeout` (not `chunk_timeout`) — see the
+        // `StreamEventCallback` trait docs for the rationale.
         let collected = tokio::time::timeout(self.body_timeout, async {
             let mut events: Vec<eventsource_stream::Event> = Vec::new();
             if let Some(event) = first_event {
+                fire_callback(on_event.as_deref(), &event);
                 events.push(event);
             }
             loop {
                 match tokio::time::timeout(self.chunk_timeout, stream.next()).await {
-                    Ok(Some(Ok(event))) => events.push(event),
+                    Ok(Some(Ok(event))) => {
+                        fire_callback(on_event.as_deref(), &event);
+                        events.push(event);
+                    }
                     Ok(Some(Err(e))) => {
                         return Err(anyhow::anyhow!("SSE parse error from {}: {}", url, e).into());
                     }
@@ -1233,5 +1349,141 @@ mod tests {
         assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
         assert_eq!(body["usage"]["total_tokens"], 7);
+    }
+
+    /// Captures every event's `data` field into a shared Vec. Used by
+    /// the streaming callback tests below. `StreamEvent` itself is
+    /// borrowed from fusillade's per-chunk parse buffer, so the test
+    /// pulls out the owned fields it actually wants to assert on.
+    struct CapturingCallback {
+        data: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl StreamEventCallback for CapturingCallback {
+        fn on_event(&self, event: &StreamEvent<'_>) {
+            self.data.lock().push(event.data.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_callback_fires_per_sse_event() {
+        use axum::{Router, http::StatusCode, routing::post};
+
+        // Same SSE payload as `test_streaming_reassembles_sse_into_json`
+        // so we get a known 3-event stream (two delta chunks + [DONE]).
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let sse = concat!(
+                    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n",
+                    "data: [DONE]\n\n",
+                );
+                (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    sse,
+                )
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: format!("http://{}", addr),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#.to_string(),
+            model: "gpt-4".to_string(),
+            api_key: "".to_string(),
+            created_by: String::new(),
+            batch_metadata: std::collections::HashMap::new(),
+        };
+
+        let client = ReqwestHttpClient::new(
+            ONE_DAY_DURATION,
+            ONE_DAY_DURATION,
+            ONE_DAY_DURATION,
+            vec!["/v1/chat/completions".to_string()],
+        );
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let callback: Arc<dyn StreamEventCallback> = Arc::new(CapturingCallback {
+            data: captured.clone(),
+        });
+        let response = client
+            .execute_with_event_callback(&request, "", Some(callback))
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+
+        // Reassembly is unchanged by the callback path.
+        let body: serde_json::Value =
+            serde_json::from_str(&response.body).expect("reassembled body should be valid JSON");
+        assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
+
+        // Callback fired in arrival order for every SSE event, including
+        // the terminal `[DONE]` marker (fusillade hands it through so
+        // consumers can detect end-of-stream without re-parsing).
+        let data = captured.lock().clone();
+        assert_eq!(data.len(), 3, "got events: {:?}", data);
+        assert!(data[0].contains("\"content\":\"Hello\""));
+        assert!(data[1].contains("\"content\":\" world\""));
+        assert_eq!(data[2], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn test_callback_not_invoked_for_non_streaming_request() {
+        use axum::{Router, http::StatusCode, routing::post};
+
+        // Path is *not* in the streamable_endpoints list, so the client
+        // takes the non-streaming branch. The callback must not fire.
+        let app = Router::new().route(
+            "/test",
+            post(|| async { (StatusCode::OK, r#"{"ok":true}"#) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: format!("http://{}", addr),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            body: "{}".to_string(),
+            model: "test-model".to_string(),
+            api_key: "".to_string(),
+            created_by: String::new(),
+            batch_metadata: std::collections::HashMap::new(),
+        };
+
+        let client = ReqwestHttpClient::default(); // no streamable_endpoints
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let callback: Arc<dyn StreamEventCallback> = Arc::new(CapturingCallback {
+            data: captured.clone(),
+        });
+        client
+            .execute_with_event_callback(&request, "", Some(callback))
+            .await
+            .unwrap();
+
+        assert!(
+            captured.lock().is_empty(),
+            "callback fired on a non-streaming response: {:?}",
+            captured.lock()
+        );
     }
 }
