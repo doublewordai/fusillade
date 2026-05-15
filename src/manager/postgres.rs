@@ -2980,7 +2980,25 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.api_key_id,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
-                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
+                -- `total_requests` is conserved once population finishes
+                -- (rows inserted at batch creation, never deleted), so
+                -- completed is derivable. Skipping the 'completed' scan
+                -- in the LATERAL saves the bulk of the work on terminal
+                -- batches, which can have millions of completed rows.
+                --
+                -- The `requests_started_at IS NULL` guard handles the
+                -- validating window: `total_requests` is set at batch
+                -- creation but request rows haven't been inserted yet,
+                -- so all the LATERAL counts are zero. Without the guard,
+                -- `total - 0 - 0 - 0 - 0` would report the missing rows
+                -- as completed instead of 0.
+                CASE WHEN b.requests_started_at IS NULL THEN 0
+                     ELSE GREATEST(b.total_requests
+                         - COALESCE(counts.pending, 0)
+                         - COALESCE(counts.in_progress, 0)
+                         - COALESCE(counts.failed, 0)
+                         - COALESCE(counts.canceled, 0), 0)
+                END::BIGINT as completed_requests,
                 COALESCE(counts.failed, 0)::BIGINT as failed_requests,
                 COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM filtered b
@@ -2988,11 +3006,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 SELECT
                     COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
-                    COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
                     COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
                 FROM requests
                 WHERE batch_id = b.id
+                  -- Skip the 'completed' slice — it's typically the bulk
+                  -- of the index for terminal batches and we derive
+                  -- the count arithmetically above. Enumerated states
+                  -- let `idx_requests_batch_state` do narrow range
+                  -- probes instead of a full scan.
+                  AND state = ANY(ARRAY['pending', 'claimed', 'processing', 'failed', 'canceled'])
             ) counts ON TRUE
             "#,
         );
