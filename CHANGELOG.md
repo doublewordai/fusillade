@@ -1,5 +1,13 @@
 # Changelog
 
+## [17.0.2](https://github.com/doublewordai/fusillade/compare/fusillade-v17.0.1...fusillade-v17.0.2) (2026-05-15)
+
+
+### Bug Fixes
+
+* add analysis to migration script ([b28b53b](https://github.com/doublewordai/fusillade/commit/b28b53b7ed98068054c16005cf4b2642ce8150f5))
+* speed up batch page query by not counting completed ([#266](https://github.com/doublewordai/fusillade/issues/266)) ([1814fea](https://github.com/doublewordai/fusillade/commit/1814fea87bc590b6a52a1982c4a9362a6a950f1b))
+
 ## [17.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v17.0.0...fusillade-v17.0.1) (2026-05-14)
 
 
