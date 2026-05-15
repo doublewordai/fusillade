@@ -2980,16 +2980,25 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.api_key_id,
                 COALESCE(counts.pending, 0)::BIGINT as pending_requests,
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
-                -- `total_requests` is conserved (rows inserted at batch
-                -- creation, never deleted), so completed is derivable.
-                -- Skipping the 'completed' scan in the LATERAL below saves
-                -- the bulk of the work on terminal batches, which can
-                -- have millions of completed rows.
-                GREATEST(b.total_requests
-                    - COALESCE(counts.pending, 0)
-                    - COALESCE(counts.in_progress, 0)
-                    - COALESCE(counts.failed, 0)
-                    - COALESCE(counts.canceled, 0), 0)::BIGINT as completed_requests,
+                -- `total_requests` is conserved once population finishes
+                -- (rows inserted at batch creation, never deleted), so
+                -- completed is derivable. Skipping the 'completed' scan
+                -- in the LATERAL saves the bulk of the work on terminal
+                -- batches, which can have millions of completed rows.
+                --
+                -- The `requests_started_at IS NULL` guard handles the
+                -- validating window: `total_requests` is set at batch
+                -- creation but request rows haven't been inserted yet,
+                -- so all the LATERAL counts are zero. Without the guard,
+                -- `total - 0 - 0 - 0 - 0` would report the missing rows
+                -- as completed instead of 0.
+                CASE WHEN b.requests_started_at IS NULL THEN 0
+                     ELSE GREATEST(b.total_requests
+                         - COALESCE(counts.pending, 0)
+                         - COALESCE(counts.in_progress, 0)
+                         - COALESCE(counts.failed, 0)
+                         - COALESCE(counts.canceled, 0), 0)
+                END::BIGINT as completed_requests,
                 COALESCE(counts.failed, 0)::BIGINT as failed_requests,
                 COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
             FROM filtered b
