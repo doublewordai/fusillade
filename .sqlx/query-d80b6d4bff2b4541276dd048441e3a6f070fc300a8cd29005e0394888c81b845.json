@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests\n            SET state = CASE\n                    WHEN state IN ('completed', 'failed', 'canceled') THEN state\n                    ELSE 'canceled'\n                END,\n                canceled_at = COALESCE(canceled_at, NOW())\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d80b6d4bff2b4541276dd048441e3a6f070fc300a8cd29005e0394888c81b845"
+}

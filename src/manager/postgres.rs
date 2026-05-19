@@ -3225,6 +3225,62 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(())
     }
 
+    async fn delete_request(&self, request_id: RequestId) -> Result<()> {
+        // Right-to-erasure: cancel in-flight work first, then hard-delete the
+        // row. response_steps are removed via ON DELETE CASCADE. Escalation /
+        // supersession self-references on requests are ON DELETE SET NULL, so
+        // any sibling row that pointed at this one has its pointer cleared.
+        //
+        // The cancel step exists so a daemon mid-update on this row sees a
+        // terminal state on its next state check and exits cleanly. It is
+        // *not* required for correctness — the DELETE below would succeed
+        // either way, leaving the daemon's eventual UPDATE as a no-op
+        // (0 rows affected) when the row is gone.
+        let mut tx = self
+            .pools
+            .write()
+            .begin()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
+        // updated_at is maintained by the update_requests_updated_at trigger;
+        // canceled_at must be non-null when state='canceled' (CHECK constraint).
+        let cancelled = sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = CASE
+                    WHEN state IN ('completed', 'failed', 'canceled') THEN state
+                    ELSE 'canceled'
+                END,
+                canceled_at = COALESCE(canceled_at, NOW())
+            WHERE id = $1
+            "#,
+            *request_id as Uuid,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel request: {}", e)))?
+        .rows_affected();
+
+        if cancelled == 0 {
+            return Err(FusilladeError::RequestNotFound(request_id));
+        }
+
+        sqlx::query!(
+            r#"DELETE FROM requests WHERE id = $1"#,
+            *request_id as Uuid,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete request: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+
+        Ok(())
+    }
+
     async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
         tracing::debug!(count = ids.len(), "Retrying failed requests");
 
@@ -11449,6 +11505,120 @@ mod tests {
         assert_eq!(
             total_deleted, 10,
             "Should delete all 5 requests + 5 templates"
+        );
+    }
+
+    // =========================================================================
+    // DELETE REQUEST
+    // =========================================================================
+    // Tests for delete_request: right-to-erasure on a single request row.
+    // Cancels in-flight work, then hard-deletes; response_steps cascade via FK.
+
+    #[sqlx::test]
+    async fn test_delete_request_batchless(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let request_id = manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: r#"{"model":"gpt-4","messages":[]}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-1".to_string(),
+            })
+            .await
+            .unwrap();
+
+        manager.delete_request(request_id).await.unwrap();
+
+        let count: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "count!" FROM requests WHERE id = $1"#,
+            *request_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "Request row should be hard-deleted");
+    }
+
+    #[sqlx::test]
+    async fn test_delete_request_not_found(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let bogus = crate::request::RequestId(uuid::Uuid::new_v4());
+        let err = manager
+            .delete_request(bogus)
+            .await
+            .expect_err("delete on non-existent id should error");
+
+        assert!(
+            matches!(err, FusilladeError::RequestNotFound(id) if id == bogus),
+            "expected RequestNotFound, got {err:?}",
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_delete_request_cascades_response_steps(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let request_id = manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: r#"{"model":"gpt-4","messages":[]}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-1".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Insert a response_step row that references the request directly,
+        // exercising the ON DELETE CASCADE FK.
+        let step_id = uuid::Uuid::new_v4();
+        sqlx::query!(
+            r#"
+            INSERT INTO response_steps (
+                id, request_id, step_kind, step_sequence,
+                request_payload, state
+            ) VALUES ($1, $2, 'model_call', 0, '{}'::jsonb, 'pending')
+            "#,
+            step_id,
+            *request_id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        manager.delete_request(request_id).await.unwrap();
+
+        let step_count: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "count!" FROM response_steps WHERE id = $1"#,
+            step_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            step_count, 0,
+            "response_steps row should cascade-delete with its request",
         );
     }
 

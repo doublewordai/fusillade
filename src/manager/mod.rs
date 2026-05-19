@@ -220,6 +220,23 @@ pub trait Storage: Send + Sync {
     /// This is a destructive operation that removes the batch and all request data.
     async fn delete_batch(&self, batch_id: BatchId) -> Result<()>;
 
+    /// Hard-delete a single request row for right-to-erasure compliance.
+    ///
+    /// Cancels the request first (if not already in a terminal state) so any
+    /// in-flight daemon picks up the cancellation between writes, then deletes
+    /// the row. Dependent `response_steps` are removed via `ON DELETE CASCADE`;
+    /// `http_analytics` has no FK to requests and is preserved so billing /
+    /// usage metrics survive the delete.
+    ///
+    /// Unlike [`Self::delete_batch`], which soft-deletes the parent and lets
+    /// the orphan-purge daemon clean up the children later, this performs an
+    /// immediate hard delete because the caller has resolved a specific
+    /// request to erase.
+    ///
+    /// Returns `RequestNotFound` if the request does not exist (or was already
+    /// deleted).
+    async fn delete_request(&self, request_id: RequestId) -> Result<()>;
+
     /// Retry failed requests by resetting them to pending state.
     ///
     /// This resets the specified failed requests to pending state with retry_attempt = 0,
