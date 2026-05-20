@@ -216,9 +216,47 @@ pub trait Storage: Send + Sync {
         target_state: CascadeTargetState,
     ) -> Result<u64>;
 
-    /// Delete a batch and all its associated requests.
-    /// This is a destructive operation that removes the batch and all request data.
+    /// Soft-delete a batch by setting `deleted_at`.
+    ///
+    /// The batch row is marked deleted and (if not already terminal) cancelled
+    /// in the same UPDATE. Child requests and their templates are not touched
+    /// inline — they are hidden from active views via the `deleted_at` filter
+    /// and hard-deleted asynchronously by the orphan-purge daemon (see
+    /// `purge_orphaned_rows`) for right-to-erasure compliance.
     async fn delete_batch(&self, batch_id: BatchId) -> Result<()>;
+
+    /// Hard-delete a single request row for right-to-erasure compliance.
+    ///
+    /// Removes the `requests` row and, if its template is batchless
+    /// (`file_id IS NULL`, dedicated 1:1 to this request), the
+    /// `request_templates` row as well — batchless templates carry the
+    /// prompt body, so leaving them defeats the erasure. File-backed
+    /// templates (shared across siblings in a batch) are not touched here;
+    /// the orphan-purge daemon cleans those up after the parent file is
+    /// soft-deleted.
+    ///
+    /// FK behavior on the deleted `requests` row:
+    /// * `response_steps.request_id` → `ON DELETE CASCADE`: removes only the
+    ///   step row(s) whose `request_id` matches this request. After migration
+    ///   `20260430000000` (response_steps re-anchoring), each step points at
+    ///   its own per-step sub-request fusillade row, so deleting one request
+    ///   only cascade-removes that step. Callers wanting to erase a whole
+    ///   multi-step response chain must walk the chain and call this method
+    ///   for each backing request.
+    /// * Self-references `escalated_from_request_id` / `superseded_by_request_id`
+    ///   → `ON DELETE SET NULL`, so sibling rows lose their pointer cleanly.
+    ///
+    /// In-flight handling: this is an unconditional hard delete. A daemon mid-
+    /// update on the row sees 0 rows affected on its next write; a streaming
+    /// proxy mid-INSERT of `response_steps` FK-violates (logged, not corrupted).
+    /// Both are acceptable for explicit user-initiated erasure.
+    ///
+    /// Unlike [`Self::delete_batch`] (soft-delete + async purge), this is
+    /// immediate because the caller has resolved a specific request to erase.
+    ///
+    /// Returns `RequestNotFound` if the request does not exist (or was already
+    /// deleted).
+    async fn delete_request(&self, request_id: RequestId) -> Result<()>;
 
     /// Retry failed requests by resetting them to pending state.
     ///
