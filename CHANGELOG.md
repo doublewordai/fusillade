@@ -1,5 +1,12 @@
 # Changelog
 
+## [17.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v17.0.2...fusillade-v17.1.0) (2026-05-20)
+
+
+### Features
+
+* single request deletion ([#268](https://github.com/doublewordai/fusillade/issues/268)) ([04454c2](https://github.com/doublewordai/fusillade/commit/04454c237c0e96cbc5d8ae2493481abafa77b437))
+
 ## [17.0.2](https://github.com/doublewordai/fusillade/compare/fusillade-v17.0.1...fusillade-v17.0.2) (2026-05-15)
 
 
