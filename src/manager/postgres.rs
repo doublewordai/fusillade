@@ -3226,53 +3226,59 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     async fn delete_request(&self, request_id: RequestId) -> Result<()> {
-        // Right-to-erasure: cancel in-flight work first, then hard-delete the
-        // row. response_steps are removed via ON DELETE CASCADE. Escalation /
-        // supersession self-references on requests are ON DELETE SET NULL, so
-        // any sibling row that pointed at this one has its pointer cleared.
+        // Right-to-erasure: hard-delete the row, plus its dedicated
+        // request_template if the template is batchless (file_id IS NULL).
+        // Batchless templates carry the prompt body and are 1:1 with their
+        // request, so leaving them behind would defeat the erasure. Templates
+        // attached to a file (batched ingestion) are shared across sibling
+        // requests and are cleaned up by the orphan-purge daemon after the
+        // parent file is deleted.
         //
-        // The cancel step exists so a daemon mid-update on this row sees a
-        // terminal state on its next state check and exits cleanly. It is
-        // *not* required for correctness — the DELETE below would succeed
-        // either way, leaving the daemon's eventual UPDATE as a no-op
-        // (0 rows affected) when the row is gone.
-        let mut tx = self
-            .pools
-            .write()
-            .begin()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+        // Cascades from this DELETE:
+        //   * response_steps.request_id → ON DELETE CASCADE
+        //   * requests.escalated_from_request_id / superseded_by_request_id
+        //     (self-references) → ON DELETE SET NULL
+        //   * requests.template_id → ON DELETE SET NULL (so deleting the
+        //     template below cannot cascade-delete unrelated requests)
+        //
+        // In-flight handling: a daemon mid-update on this row will see 0 rows
+        // affected on its next UPDATE and log a no-op; a streaming proxy mid-
+        // write of response_steps will FK-violate (the row is gone) and
+        // surface that as an error log without corrupting state. Both are
+        // acceptable failure modes for an explicit user-initiated erasure.
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
 
-        // updated_at is maintained by the update_requests_updated_at trigger;
-        // canceled_at must be non-null when state='canceled' (CHECK constraint).
-        let cancelled = sqlx::query!(
-            r#"
-            UPDATE requests
-            SET state = CASE
-                    WHEN state IN ('completed', 'failed', 'canceled') THEN state
-                    ELSE 'canceled'
-                END,
-                canceled_at = COALESCE(canceled_at, NOW())
-            WHERE id = $1
-            "#,
+        let template_id: Option<Option<Uuid>> = sqlx::query_scalar!(
+            r#"DELETE FROM requests WHERE id = $1 RETURNING template_id"#,
             *request_id as Uuid,
         )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel request: {}", e)))?
-        .rows_affected();
-
-        if cancelled == 0 {
-            return Err(FusilladeError::RequestNotFound(request_id));
-        }
-
-        sqlx::query!(
-            r#"DELETE FROM requests WHERE id = $1"#,
-            *request_id as Uuid,
-        )
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete request: {}", e)))?;
+
+        let Some(template_id) = template_id else {
+            return Err(FusilladeError::RequestNotFound(request_id));
+        };
+
+        // template_id is nullable on requests (the orphan purger may have
+        // already cleared it). Only chase the template when one is set.
+        if let Some(template_id) = template_id {
+            // `file_id IS NULL` restricts deletion to dedicated batchless
+            // templates. File-backed (batched) templates are shared and must
+            // not be removed by a single-request erasure.
+            sqlx::query!(
+                r#"DELETE FROM request_templates WHERE id = $1 AND file_id IS NULL"#,
+                template_id,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to delete request_template: {}", e))
+            })?;
+        }
 
         tx.commit()
             .await
@@ -11619,6 +11625,230 @@ mod tests {
         assert_eq!(
             step_count, 0,
             "response_steps row should cascade-delete with its request",
+        );
+    }
+
+    /// Validates that the cascade is scoped to a single request row's
+    /// `response_steps`, not the whole chain. After migration `20260430000000`
+    /// re-anchored `response_steps.request_id` to per-step sub-request rows,
+    /// the fusillade primitive only removes the step row(s) whose
+    /// `request_id` matches the deleted request — sibling steps belonging to
+    /// other sub-requests in the same chain are untouched here. Walking the
+    /// chain and erasing every backing sub-request is the caller's job.
+    ///
+    /// Note: `response_steps.parent_step_id` and `prev_step_id` also have
+    /// `ON DELETE CASCADE`, so within a chain, deleting an early step
+    /// transitively removes descendants. To isolate the per-row primitive
+    /// semantic, this test uses two *unrelated* single-step responses (no
+    /// parent/prev links) — neither cascade edge can fire.
+    #[sqlx::test]
+    async fn test_delete_request_cascade_is_per_row(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let req_a = manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: r#"{"r":"a"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-1".to_string(),
+            })
+            .await
+            .unwrap();
+        let req_b = manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: r#"{"r":"b"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-1".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let step_a = uuid::Uuid::new_v4();
+        let step_b = uuid::Uuid::new_v4();
+        sqlx::query!(
+            r#"
+            INSERT INTO response_steps (
+                id, request_id, parent_step_id, prev_step_id, step_kind, step_sequence,
+                request_payload, state
+            ) VALUES
+                ($1, $2, NULL, NULL, 'model_call', 0, '{}'::jsonb, 'pending'),
+                ($3, $4, NULL, NULL, 'model_call', 0, '{}'::jsonb, 'pending')
+            "#,
+            step_a,
+            *req_a as Uuid,
+            step_b,
+            *req_b as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        manager.delete_request(req_a).await.unwrap();
+
+        // step_a is gone (cascade via its request_id); step_b is untouched;
+        // req_b's request row is untouched (no inter-request FK).
+        let step_a_count: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "count!" FROM response_steps WHERE id = $1"#,
+            step_a,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let step_b_count: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "count!" FROM response_steps WHERE id = $1"#,
+            step_b,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let req_b_count: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "count!" FROM requests WHERE id = $1"#,
+            *req_b as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(step_a_count, 0, "step_a should cascade-delete");
+        assert_eq!(step_b_count, 1, "unrelated step_b must survive");
+        assert_eq!(req_b_count, 1, "unrelated req_b must survive");
+    }
+
+    /// Right-to-erasure should also remove the dedicated batchless template
+    /// (which carries the prompt body). Templates attached to a file (batched
+    /// ingestion) must be left intact for sibling requests.
+    #[sqlx::test]
+    async fn test_delete_request_removes_batchless_template(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let request_id = manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: r#"{"prompt":"erase me"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-1".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Capture the dedicated template id before deletion.
+        let template_id: uuid::Uuid = sqlx::query_scalar!(
+            "SELECT template_id FROM requests WHERE id = $1",
+            *request_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .expect("realtime requests always have a template at creation");
+
+        manager.delete_request(request_id).await.unwrap();
+
+        // Both the request and its dedicated template must be gone — the
+        // prompt body lives in the template, so leaving it behind would
+        // defeat erasure.
+        let req_count: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "count!" FROM requests WHERE id = $1"#,
+            *request_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(req_count, 0);
+
+        let tpl_count: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "count!" FROM request_templates WHERE id = $1"#,
+            template_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tpl_count, 0, "batchless template should be hard-deleted");
+    }
+
+    /// Templates attached to a file (batched ingestion) are shared by all
+    /// sibling requests in the batch; a single-request erasure must not
+    /// remove them.
+    #[sqlx::test]
+    async fn test_delete_request_preserves_file_backed_template(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "preserve-template-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"n":1}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        let row = sqlx::query!(
+            "SELECT id, template_id FROM requests WHERE batch_id = $1 LIMIT 1",
+            *batch.id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let request_id = crate::request::RequestId(row.id);
+        let template_id = row.template_id.expect("batched request has a template");
+
+        manager.delete_request(request_id).await.unwrap();
+
+        let tpl_count: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "count!" FROM request_templates WHERE id = $1"#,
+            template_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            tpl_count, 1,
+            "file-backed template must survive single-request deletion",
         );
     }
 
