@@ -12462,11 +12462,18 @@ mod tests {
             })
             .await
             .unwrap();
-        sqlx::query("UPDATE requests SET state = 'processing' WHERE id = $1")
-            .bind(recent_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'processing',
+                 daemon_id = gen_random_uuid(),
+                 claimed_at = NOW(),
+                 started_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(recent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         manager
             .complete_request(RequestId(recent_id), r#"{"output":"recent"}"#, 200)
             .await
@@ -12486,11 +12493,18 @@ mod tests {
             })
             .await
             .unwrap();
-        sqlx::query("UPDATE requests SET state = 'processing' WHERE id = $1")
-            .bind(old_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'processing',
+                 daemon_id = gen_random_uuid(),
+                 claimed_at = NOW(),
+                 started_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(old_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         manager
             .complete_request(RequestId(old_id), r#"{"output":"old"}"#, 200)
             .await
@@ -12510,11 +12524,18 @@ mod tests {
             })
             .await
             .unwrap();
-        sqlx::query("UPDATE requests SET state = 'processing' WHERE id = $1")
-            .bind(failed_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'processing',
+                 daemon_id = gen_random_uuid(),
+                 claimed_at = NOW(),
+                 started_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(failed_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         manager
             .fail_request(RequestId(failed_id), r#"{"error":"failed"}"#, 500)
             .await
