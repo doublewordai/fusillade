@@ -236,6 +236,44 @@ pub struct CreateRealtimeInput {
     pub created_by: String,
 }
 
+/// Input for persisting a batch of already-completed realtime responses.
+///
+/// Used by the dwctl responses writer to flush a buffer of finished
+/// realtime calls in one transaction.
+///
+/// Two cases are handled in the same batch:
+///   * Background realtime: the row was pre-created in `processing` state by
+///     `create_realtime`; we UPDATE it to `completed`.
+///   * Non-background realtime: no row exists yet; we INSERT a template and
+///     a request row directly in `completed` state.
+///
+/// All synthesize fields (`request_body`, `model`, `endpoint`, etc.) are
+/// only consulted on the INSERT path. On the UPDATE path only `request_id`,
+/// `response_body`, and `status_code` are used.
+#[derive(Debug, Clone)]
+pub struct PersistCompletedRealtimeInput {
+    /// The request UUID (primary key).
+    pub request_id: Uuid,
+    /// Upstream response body to store.
+    pub response_body: String,
+    /// Upstream HTTP status code.
+    pub status_code: u16,
+    /// Original request body, stored on the synthesized template.
+    pub request_body: String,
+    /// Model identifier.
+    pub model: String,
+    /// Base URL of the target endpoint.
+    pub endpoint: String,
+    /// HTTP method (e.g., "POST").
+    pub method: String,
+    /// API path (e.g., "/v1/responses").
+    pub path: String,
+    /// API key for the request.
+    pub api_key: String,
+    /// User/org ID that owns this request.
+    pub created_by: String,
+}
+
 /// Input for creating a flex (async) response that the daemon will process.
 ///
 /// Inserts a request template (no parent file) and a request row in `pending`

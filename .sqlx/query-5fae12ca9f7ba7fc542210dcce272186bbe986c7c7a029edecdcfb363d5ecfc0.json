@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests r\n               SET state = 'completed',\n                   response_status = v.status,\n                   response_body = v.body,\n                   response_size = v.size,\n                   completed_at = NOW()\n              FROM UNNEST(\n                  $1::uuid[], $2::text[], $3::bigint[], $4::smallint[]\n              ) AS v(id, body, size, status)\n             WHERE r.id = v.id AND r.state = 'processing'\n            RETURNING r.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "TextArray",
+        "Int8Array",
+        "Int2Array"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5fae12ca9f7ba7fc542210dcce272186bbe986c7c7a029edecdcfb363d5ecfc0"
+}

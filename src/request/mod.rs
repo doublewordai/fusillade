@@ -13,8 +13,8 @@ pub mod types;
 #[allow(deprecated)]
 pub use query::RequestSummaryWithCount;
 pub use query::{
-    CreateFlexInput, CreateRealtimeInput, ListRequestsFilter, RequestDetail, RequestListResult,
-    RequestSummary, ServiceTierFilter,
+    CreateFlexInput, CreateRealtimeInput, ListRequestsFilter, PersistCompletedRealtimeInput,
+    RequestDetail, RequestListResult, RequestSummary, ServiceTierFilter,
 };
 pub use transitions::CancellationReason;
 pub use types::*;

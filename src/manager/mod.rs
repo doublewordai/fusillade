@@ -12,8 +12,8 @@ use crate::error::Result;
 use crate::http::HttpClient;
 use crate::request::{
     AnyRequest, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput, DaemonId,
-    ListRequestsFilter, Request, RequestDetail, RequestId, RequestListResult, RequestState,
-    ServiceTierFilter,
+    ListRequestsFilter, PersistCompletedRealtimeInput, Request, RequestDetail, RequestId,
+    RequestListResult, RequestState, ServiceTierFilter,
 };
 use async_trait::async_trait;
 use futures::stream::Stream;
@@ -463,6 +463,27 @@ pub trait Storage: Send + Sync {
         request_id: RequestId,
         error: &str,
         status_code: u16,
+    ) -> Result<()>;
+
+    /// Persist a batch of already-completed realtime responses in one transaction.
+    ///
+    /// Designed for the dwctl responses writer: dwctl proxies a realtime
+    /// request, captures the upstream response, and flushes a buffer of
+    /// completed records here. Two cases are handled together:
+    ///
+    ///   * Background realtime: a `processing` row exists (created inline by
+    ///     `create_realtime` before the 202 response). UPDATEd to `completed`.
+    ///   * Non-background realtime: no row exists. INSERTed (template + request)
+    ///     directly in `completed` state.
+    ///
+    /// Rows already in a terminal state (rare: duplicate enqueues, late
+    /// completions for flex slip-through) are left alone via `ON CONFLICT`.
+    ///
+    /// All work runs in a single transaction so commit overhead amortises
+    /// across the batch. An empty input is a no-op.
+    async fn persist_completed_realtime_batch(
+        &self,
+        records: &[PersistCompletedRealtimeInput],
     ) -> Result<()>;
 }
 
