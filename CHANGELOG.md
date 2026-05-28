@@ -1,5 +1,12 @@
 # Changelog
 
+## [17.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v17.1.0...fusillade-v17.1.1) (2026-05-28)
+
+
+### Bug Fixes
+
+* adds bulk writer for finished realtime responses ([#274](https://github.com/doublewordai/fusillade/issues/274)) ([1b64c0e](https://github.com/doublewordai/fusillade/commit/1b64c0e34fd0a3ae90aca959d233c906c76adc8c))
+
 ## [17.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v17.0.2...fusillade-v17.1.0) (2026-05-20)
 
 
