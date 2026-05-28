@@ -37,8 +37,8 @@ use crate::error::{FusilladeError, Result};
 use crate::http::HttpClient;
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateFlexInput, CreateRealtimeInput,
-    DaemonId, Failed, FailureReason, Pending, Processing, Request, RequestData, RequestId,
-    RequestState, ServiceTierFilter,
+    DaemonId, Failed, FailureReason, Pending, PersistCompletedRealtimeInput, Processing, Request,
+    RequestData, RequestId, RequestState, ServiceTierFilter,
 };
 
 use super::DaemonExecutor;
@@ -3858,10 +3858,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // processing immediately. daemon_id = nil sentinel keeps the daemon
         // from claiming or unclaiming it; service_tier = 'priority' matches
         // the legacy "0s" completion_window mapping.
-        // Empty-string created_by is a contract violation (the API guarantees
-        // a real user); coerce to NULL so the XOR CHECK rejects it loudly
-        // rather than letting a phantom-user row slip into the listing.
-        let created_by = Some(input.created_by.as_str()).filter(|s| !s.is_empty());
+        // Empty or whitespace-only created_by is a contract violation (the
+        // API guarantees a real user); trim then coerce to NULL so the XOR
+        // CHECK rejects it loudly rather than letting a phantom-user row
+        // slip into the listing. Matches the SQL `NULLIF(TRIM(...), '')`
+        // used by persist_completed_realtime_batch.
+        let created_by = Some(input.created_by.trim()).filter(|s| !s.is_empty());
         sqlx::query(
             "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by, daemon_id, claimed_at, started_at)
              VALUES ($1, NULL, $2, $3, NULL, 'processing', 0, 'priority', $4, $5, $6, $6)",
@@ -3916,10 +3918,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         // Pending row — the daemon will claim and process it like any other
         // pending request.
-        // Empty-string created_by is a contract violation (the API guarantees
-        // a real user); coerce to NULL so the XOR CHECK rejects it loudly
-        // rather than letting a phantom-user row slip into the listing.
-        let created_by = Some(input.created_by.as_str()).filter(|s| !s.is_empty());
+        // Empty-string (or whitespace-only) created_by is a contract violation
+        // (the API guarantees a real user); coerce to NULL so the XOR CHECK
+        // rejects it loudly rather than letting a phantom-user row slip into
+        // the listing. Trim matches the SQL-side `NULLIF(TRIM(...), '')` used
+        // by `persist_completed_realtime_batch` so all three call sites
+        // normalise identically.
+        let created_by = Some(input.created_by.trim()).filter(|s| !s.is_empty());
         sqlx::query(
             "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by)
              VALUES ($1, NULL, $2, $3, NULL, 'pending', 0, 'flex', $4)",
@@ -4036,6 +4041,178 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             }),
             Some((false, None)) | None => Err(FusilladeError::RequestNotFound(request_id)),
         }
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, records), fields(batch_size = records.len()))]
+    async fn persist_completed_realtime_batch(
+        &self,
+        records: &[PersistCompletedRealtimeInput],
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
+        // Bulk UPDATE for rows that already exist in 'processing' state.
+        // These are the background-realtime case: middleware called
+        // create_realtime inline before returning 202, and now the proxied
+        // call has come back through outlet.
+        let ids: Vec<Uuid> = records.iter().map(|r| r.request_id).collect();
+        let response_bodies: Vec<&str> = records.iter().map(|r| r.response_body.as_str()).collect();
+        let response_sizes: Vec<i64> = records
+            .iter()
+            .map(|r| r.response_body.len() as i64)
+            .collect();
+        let response_statuses: Vec<i16> = records.iter().map(|r| r.status_code as i16).collect();
+
+        // Scope the UPDATE to realtime rows only: `service_tier = 'priority'`
+        // and `batch_id IS NULL` together uniquely identify rows that
+        // create_realtime inserted. Without these predicates a stray
+        // request_id would silently overwrite a daemon-managed or batched
+        // row sharing the same id. Both columns are covered by existing
+        // indexes (idx_requests_active_first_tier, idx_requests_user_*).
+        let updated_rows = sqlx::query!(
+            r#"
+            UPDATE requests r
+               SET state = 'completed',
+                   response_status = v.status,
+                   response_body = v.body,
+                   response_size = v.size,
+                   completed_at = NOW()
+              FROM UNNEST(
+                  $1::uuid[], $2::text[], $3::bigint[], $4::smallint[]
+              ) AS v(id, body, size, status)
+             WHERE r.id = v.id
+               AND r.state = 'processing'
+               AND r.service_tier = 'priority'
+               AND r.batch_id IS NULL
+            RETURNING r.id
+            "#,
+            &ids as &[Uuid],
+            &response_bodies as &[&str],
+            &response_sizes as &[i64],
+            &response_statuses as &[i16],
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update existing requests: {}", e)))?;
+
+        let updated_set: std::collections::HashSet<Uuid> =
+            updated_rows.iter().map(|r| r.id).collect();
+
+        // Non-background realtime: no row existed yet. Synthesize a template
+        // + a request row directly in 'completed' state. The two INSERTs run
+        // in the same transaction; commit happens once at the end.
+        //
+        // ON CONFLICT (id) DO NOTHING on the request INSERT handles the rare
+        // case where a row appeared in a terminal state between our UPDATE
+        // and INSERT (duplicate enqueues, late completions for flex
+        // slip-through). Leaves an orphan template that's cheap to ignore.
+        let to_insert: Vec<&PersistCompletedRealtimeInput> = records
+            .iter()
+            .filter(|r| !updated_set.contains(&r.request_id))
+            .collect();
+
+        if !to_insert.is_empty() {
+            let template_ids: Vec<Uuid> = (0..to_insert.len()).map(|_| Uuid::new_v4()).collect();
+            let request_ids: Vec<Uuid> = to_insert.iter().map(|r| r.request_id).collect();
+            let endpoints: Vec<&str> = to_insert.iter().map(|r| r.endpoint.as_str()).collect();
+            let methods: Vec<&str> = to_insert.iter().map(|r| r.method.as_str()).collect();
+            let paths: Vec<&str> = to_insert.iter().map(|r| r.path.as_str()).collect();
+            // Borrow when the body is already clean; only rows that carry
+            // service_tier / background pay an allocation. Matches
+            // create_realtime's behaviour.
+            let stored_bodies: Vec<std::borrow::Cow<'_, str>> = to_insert
+                .iter()
+                .map(|r| sanitize_outbound_body(&r.request_body))
+                .collect();
+            let bodies: Vec<&str> = stored_bodies.iter().map(AsRef::as_ref).collect();
+            let body_sizes: Vec<i64> = stored_bodies.iter().map(|b| b.len() as i64).collect();
+            let models: Vec<&str> = to_insert.iter().map(|r| r.model.as_str()).collect();
+            let api_keys: Vec<&str> = to_insert.iter().map(|r| r.api_key.as_str()).collect();
+            let created_bys: Vec<&str> = to_insert.iter().map(|r| r.created_by.as_str()).collect();
+            let insert_response_bodies: Vec<&str> =
+                to_insert.iter().map(|r| r.response_body.as_str()).collect();
+            let insert_response_sizes: Vec<i64> = to_insert
+                .iter()
+                .map(|r| r.response_body.len() as i64)
+                .collect();
+            let insert_response_statuses: Vec<i16> =
+                to_insert.iter().map(|r| r.status_code as i16).collect();
+
+            sqlx::query!(
+                r#"
+                INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
+                SELECT id, NULL, NULL, endpoint, method, path, body, model, api_key, body_byte_size
+                FROM UNNEST(
+                    $1::uuid[], $2::text[], $3::text[], $4::text[],
+                    $5::text[], $6::text[], $7::text[], $8::bigint[]
+                ) AS t(id, endpoint, method, path, body, model, api_key, body_byte_size)
+                "#,
+                &template_ids as &[Uuid],
+                &endpoints as &[&str],
+                &methods as &[&str],
+                &paths as &[&str],
+                &bodies as &[&str],
+                &models as &[&str],
+                &api_keys as &[&str],
+                &body_sizes as &[i64],
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert realtime templates: {}", e)))?;
+
+            // Mirror create_realtime's row shape: daemon_id = nil sentinel,
+            // service_tier = 'priority', claimed_at = started_at = completed_at = NOW().
+            // NULLIF(TRIM(...), '') on created_by mirrors create_realtime's
+            // coercion of empty-string to NULL (XOR check rejects empty
+            // attribution loudly rather than silently producing a phantom row).
+            sqlx::query!(
+                r#"
+                INSERT INTO requests (
+                    id, batch_id, template_id, model, custom_id,
+                    state, retry_attempt, service_tier, created_by,
+                    daemon_id, claimed_at, started_at, completed_at,
+                    response_status, response_body, response_size
+                )
+                SELECT id, NULL, template_id, model, NULL,
+                       'completed', 0, 'priority', NULLIF(TRIM(created_by), ''),
+                       $1, NOW(), NOW(), NOW(),
+                       status, body, size
+                FROM UNNEST(
+                    $2::uuid[], $3::uuid[], $4::text[], $5::text[],
+                    $6::smallint[], $7::text[], $8::bigint[]
+                ) AS v(id, template_id, model, created_by, status, body, size)
+                ON CONFLICT (id) DO NOTHING
+                "#,
+                Uuid::nil(),
+                &request_ids as &[Uuid],
+                &template_ids as &[Uuid],
+                &models as &[&str],
+                &created_bys as &[&str],
+                &insert_response_statuses as &[i16],
+                &insert_response_bodies as &[&str],
+                &insert_response_sizes as &[i64],
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to insert completed realtime requests: {}",
+                    e
+                ))
+            })?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+
+        Ok(())
     }
 }
 
@@ -14059,6 +14236,285 @@ mod tests {
         let found = result.data.iter().find(|r| r.id == request_id).unwrap();
         assert_eq!(found.service_tier, Some("priority".to_string()));
         assert_eq!(found.created_by, "user-abc");
+    }
+
+    // =========================================================================
+    // Tests for persist_completed_realtime_batch
+    // =========================================================================
+
+    #[sqlx::test]
+    async fn test_persist_completed_realtime_batch_empty_is_noop(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        manager
+            .persist_completed_realtime_batch(&[])
+            .await
+            .expect("empty batch should succeed");
+    }
+
+    #[sqlx::test]
+    async fn test_persist_completed_realtime_batch_inserts_when_no_row(pool: sqlx::PgPool) {
+        // Non-background realtime path: no row exists yet. The batch INSERT
+        // synthesizes template + request rows directly in 'completed' state.
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let request_id = uuid::Uuid::new_v4();
+        manager
+            .persist_completed_realtime_batch(&[crate::request::PersistCompletedRealtimeInput {
+                request_id,
+                response_body: r#"{"output":"done"}"#.to_string(),
+                status_code: 200,
+                request_body: r#"{"input":"hi"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-1".to_string(),
+            }])
+            .await
+            .expect("batch should succeed");
+
+        let detail = manager
+            .get_request_detail(crate::request::RequestId(request_id))
+            .await
+            .expect("request should exist");
+        assert_eq!(detail.status, "completed");
+        assert_eq!(detail.service_tier, Some("priority".to_string()));
+        assert_eq!(detail.batch_id, None);
+        assert_eq!(detail.created_by, "user-1");
+        assert_eq!(
+            detail.response_body,
+            Some(r#"{"output":"done"}"#.to_string())
+        );
+        assert_eq!(detail.response_status, Some(200));
+        assert!(detail.completed_at.is_some());
+        assert!(detail.body.is_some());
+    }
+
+    #[sqlx::test]
+    async fn test_persist_completed_realtime_batch_updates_existing_processing_row(
+        pool: sqlx::PgPool,
+    ) {
+        // Background realtime path: middleware called create_realtime inline,
+        // leaving a 'processing' row. The batch UPDATE transitions it to
+        // 'completed' without inserting a new template.
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let request_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id,
+                body: r#"{"input":"hi"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-2".to_string(),
+            })
+            .await
+            .expect("create_realtime should succeed");
+
+        // Sanity: row is in 'processing' before we persist.
+        let pre = manager
+            .get_request_detail(crate::request::RequestId(request_id))
+            .await
+            .expect("pre-detail should fetch");
+        assert_eq!(pre.status, "processing");
+        assert!(pre.completed_at.is_none());
+
+        manager
+            .persist_completed_realtime_batch(&[crate::request::PersistCompletedRealtimeInput {
+                request_id,
+                response_body: r#"{"output":"done"}"#.to_string(),
+                status_code: 200,
+                // These synthesize fields should be ignored on the UPDATE
+                // path. We pass distinct values to confirm they don't
+                // overwrite the row's existing template/model attribution.
+                request_body: r#"{"input":"this should not be stored"}"#.to_string(),
+                model: "this-model-should-be-ignored".to_string(),
+                endpoint: String::new(),
+                method: String::new(),
+                path: String::new(),
+                api_key: String::new(),
+                created_by: "this-user-should-be-ignored".to_string(),
+            }])
+            .await
+            .expect("batch should succeed");
+
+        let detail = manager
+            .get_request_detail(crate::request::RequestId(request_id))
+            .await
+            .expect("post-detail should fetch");
+        assert_eq!(detail.status, "completed");
+        // model and created_by come from the existing template/row, not
+        // the input record's synthesize fields.
+        assert_eq!(detail.created_by, "user-2");
+        assert_eq!(
+            detail.response_body,
+            Some(r#"{"output":"done"}"#.to_string())
+        );
+        assert_eq!(detail.response_status, Some(200));
+        assert!(detail.completed_at.is_some());
+    }
+
+    #[sqlx::test]
+    async fn test_persist_completed_realtime_batch_mixed_insert_and_update(pool: sqlx::PgPool) {
+        // One batch carrying both cases: a record for which no row exists
+        // (synthesize path) and one for which a 'processing' row exists
+        // (update path). The UNION of (matched UPDATE) + (synthesized INSERT)
+        // must cover both.
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let existing_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: existing_id,
+                body: r#"{"input":"bg"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-bg".to_string(),
+            })
+            .await
+            .expect("create_realtime should succeed");
+
+        let new_id = uuid::Uuid::new_v4();
+        manager
+            .persist_completed_realtime_batch(&[
+                crate::request::PersistCompletedRealtimeInput {
+                    request_id: existing_id,
+                    response_body: r#"{"output":"bg done"}"#.to_string(),
+                    status_code: 200,
+                    request_body: String::new(),
+                    model: "ignored".to_string(),
+                    endpoint: String::new(),
+                    method: String::new(),
+                    path: String::new(),
+                    api_key: String::new(),
+                    created_by: String::new(),
+                },
+                crate::request::PersistCompletedRealtimeInput {
+                    request_id: new_id,
+                    response_body: r#"{"output":"non-bg done"}"#.to_string(),
+                    status_code: 200,
+                    request_body: r#"{"input":"non-bg"}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    endpoint: "http://localhost:3001/ai".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/responses".to_string(),
+                    api_key: String::new(),
+                    created_by: "user-nonbg".to_string(),
+                },
+            ])
+            .await
+            .expect("mixed batch should succeed");
+
+        let existing_detail = manager
+            .get_request_detail(crate::request::RequestId(existing_id))
+            .await
+            .expect("existing row should be readable");
+        assert_eq!(existing_detail.status, "completed");
+        assert_eq!(existing_detail.created_by, "user-bg");
+        assert_eq!(
+            existing_detail.response_body,
+            Some(r#"{"output":"bg done"}"#.to_string())
+        );
+
+        let new_detail = manager
+            .get_request_detail(crate::request::RequestId(new_id))
+            .await
+            .expect("new row should be readable");
+        assert_eq!(new_detail.status, "completed");
+        assert_eq!(new_detail.created_by, "user-nonbg");
+        assert_eq!(
+            new_detail.response_body,
+            Some(r#"{"output":"non-bg done"}"#.to_string())
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_persist_completed_realtime_batch_idempotent_on_terminal_row(pool: sqlx::PgPool) {
+        // If a row is already terminal (e.g. duplicate enqueue, flex
+        // slip-through where the daemon already completed it), the batch
+        // should leave the existing row alone rather than INSERT a duplicate
+        // or fail. The UPDATE matches no rows and the INSERT hits
+        // ON CONFLICT DO NOTHING.
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let request_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id,
+                body: r#"{"input":"first"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-3".to_string(),
+            })
+            .await
+            .expect("create should succeed");
+        manager
+            .complete_request(
+                crate::request::RequestId(request_id),
+                r#"{"output":"first"}"#,
+                200,
+            )
+            .await
+            .expect("first complete should succeed");
+
+        manager
+            .persist_completed_realtime_batch(&[crate::request::PersistCompletedRealtimeInput {
+                request_id,
+                response_body: r#"{"output":"second-should-not-overwrite"}"#.to_string(),
+                status_code: 500,
+                request_body: r#"{"input":"second"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-3".to_string(),
+            }])
+            .await
+            .expect("batch should succeed");
+
+        // Original row preserved (not overwritten by the second persist).
+        let detail = manager
+            .get_request_detail(crate::request::RequestId(request_id))
+            .await
+            .expect("request should exist");
+        assert_eq!(detail.status, "completed");
+        assert_eq!(
+            detail.response_body,
+            Some(r#"{"output":"first"}"#.to_string())
+        );
+        assert_eq!(detail.response_status, Some(200));
     }
 
     #[sqlx::test]
