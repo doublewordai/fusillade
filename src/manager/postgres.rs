@@ -3858,10 +3858,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // processing immediately. daemon_id = nil sentinel keeps the daemon
         // from claiming or unclaiming it; service_tier = 'priority' matches
         // the legacy "0s" completion_window mapping.
-        // Empty-string created_by is a contract violation (the API guarantees
-        // a real user); coerce to NULL so the XOR CHECK rejects it loudly
-        // rather than letting a phantom-user row slip into the listing.
-        let created_by = Some(input.created_by.as_str()).filter(|s| !s.is_empty());
+        // Empty or whitespace-only created_by is a contract violation (the
+        // API guarantees a real user); trim then coerce to NULL so the XOR
+        // CHECK rejects it loudly rather than letting a phantom-user row
+        // slip into the listing. Matches the SQL `NULLIF(TRIM(...), '')`
+        // used by persist_completed_realtime_batch.
+        let created_by = Some(input.created_by.trim()).filter(|s| !s.is_empty());
         sqlx::query(
             "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by, daemon_id, claimed_at, started_at)
              VALUES ($1, NULL, $2, $3, NULL, 'processing', 0, 'priority', $4, $5, $6, $6)",
@@ -3916,10 +3918,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         // Pending row — the daemon will claim and process it like any other
         // pending request.
-        // Empty-string created_by is a contract violation (the API guarantees
-        // a real user); coerce to NULL so the XOR CHECK rejects it loudly
-        // rather than letting a phantom-user row slip into the listing.
-        let created_by = Some(input.created_by.as_str()).filter(|s| !s.is_empty());
+        // Empty-string (or whitespace-only) created_by is a contract violation
+        // (the API guarantees a real user); coerce to NULL so the XOR CHECK
+        // rejects it loudly rather than letting a phantom-user row slip into
+        // the listing. Trim matches the SQL-side `NULLIF(TRIM(...), '')` used
+        // by `persist_completed_realtime_batch` so all three call sites
+        // normalise identically.
+        let created_by = Some(input.created_by.trim()).filter(|s| !s.is_empty());
         sqlx::query(
             "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by)
              VALUES ($1, NULL, $2, $3, NULL, 'pending', 0, 'flex', $4)",
@@ -4064,6 +4069,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .collect();
         let response_statuses: Vec<i16> = records.iter().map(|r| r.status_code as i16).collect();
 
+        // Scope the UPDATE to realtime rows only: `service_tier = 'priority'`
+        // and `batch_id IS NULL` together uniquely identify rows that
+        // create_realtime inserted. Without these predicates a stray
+        // request_id would silently overwrite a daemon-managed or batched
+        // row sharing the same id. Both columns are covered by existing
+        // indexes (idx_requests_active_first_tier, idx_requests_user_*).
         let updated_rows = sqlx::query!(
             r#"
             UPDATE requests r
@@ -4075,7 +4086,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
               FROM UNNEST(
                   $1::uuid[], $2::text[], $3::bigint[], $4::smallint[]
               ) AS v(id, body, size, status)
-             WHERE r.id = v.id AND r.state = 'processing'
+             WHERE r.id = v.id
+               AND r.state = 'processing'
+               AND r.service_tier = 'priority'
+               AND r.batch_id IS NULL
             RETURNING r.id
             "#,
             &ids as &[Uuid],
