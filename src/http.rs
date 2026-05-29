@@ -91,15 +91,61 @@ pub trait StreamEventCallback: Send + Sync {
 }
 
 /// Minimal representation of a provider error embedded in an SSE stream.
-/// Used to detect and extract error status codes from events before reassembly.
+/// Only the top-level `error` object is captured (as a raw value, so it can be
+/// re-emitted verbatim); any surrounding completion fields are ignored.
 #[derive(serde::Deserialize)]
 struct EmbeddedErrorEnvelope {
-    error: EmbeddedErrorBody,
+    error: serde_json::Value,
 }
 
-#[derive(serde::Deserialize)]
-struct EmbeddedErrorBody {
-    code: Option<serde_json::Value>,
+/// Scan collected SSE event payloads for an embedded provider error.
+///
+/// Some upstreams return HTTP 200 but signal failure inside the stream. The
+/// error can arrive as a bare `{"error":{…}}` event (onwards strips the chunk
+/// wrapper) or embedded alongside completion fields in a raw gateway chunk
+/// (`{"id":…,"choices":[],"error":{…}}`). Detection is position-independent: the
+/// first event whose top-level `error` object carries a non-null `code` or
+/// `message` wins. The cheap `"error"` substring check keeps success chunks off
+/// the JSON-parse path.
+///
+/// Returns the reclassified HTTP status and the raw `error` value (so the caller
+/// can emit a clean bare envelope regardless of the input shape).
+fn detect_embedded_error<'a>(
+    payloads: impl IntoIterator<Item = &'a str>,
+) -> Option<(u16, serde_json::Value)> {
+    payloads.into_iter().find_map(|data| {
+        if !data.contains("\"error\"") {
+            return None;
+        }
+        let error = serde_json::from_str::<EmbeddedErrorEnvelope>(data).ok()?.error;
+        // Reject empty/null placeholders (`error: null`, `error: {}`) so an
+        // otherwise-healthy stream isn't reclassified into a bogus 500.
+        let code_field = error.get("code").filter(|v| !v.is_null());
+        let has_message = error.get("message").is_some_and(|v| !v.is_null());
+        if code_field.is_none() && !has_message {
+            return None;
+        }
+        let status = code_field
+            .and_then(parse_embedded_status_code)
+            .filter(|c| (400..600).contains(c))
+            .unwrap_or(500);
+        Some((status, error))
+    })
+}
+
+/// Best-effort HTTP status extraction from a provider error `code` field.
+/// Tolerates the shapes raw upstreams use, mirroring onwards: a JSON number
+/// (`429`), a numeric string (`"429"`), or a rate-limit-family string
+/// (`"rate_limit"`/`"rate_limit_exceeded"` → 429).
+fn parse_embedded_status_code(code: &serde_json::Value) -> Option<u16> {
+    match code {
+        serde_json::Value::Number(n) => n.as_u64().map(|c| c as u16),
+        serde_json::Value::String(s) => s
+            .parse::<u16>()
+            .ok()
+            .or_else(|| s.starts_with("rate_limit").then_some(429)),
+        _ => None,
+    }
 }
 
 /// Trait for executing HTTP requests.
@@ -498,32 +544,24 @@ impl ReqwestHttpClient {
             ))
         })??;
 
-        // Check for provider error objects before reassembly. Some providers
-        // return HTTP 200 but embed an error in the SSE stream. If found, use
-        // the error JSON directly as the body and override the status with the
-        // embedded code so downstream retry logic classifies it correctly.
-        // The reassembler doesn't handle error objects and would mangle them.
-        if let Some(event) = collected.iter().find(|e| e.data.starts_with("{\"error\""))
-            && let Ok(envelope) = serde_json::from_str::<EmbeddedErrorEnvelope>(&event.data)
+        // Some upstreams return HTTP 200 but embed a provider error in the SSE
+        // stream; the reassembler can't handle error objects and would mangle
+        // them, so detect and reclassify before reassembly.
+        if let Some((code, error)) =
+            detect_embedded_error(collected.iter().map(|e| e.data.as_str()))
         {
-            let code = envelope
-                .error
-                .code
-                .as_ref()
-                .and_then(|c| c.as_u64())
-                .map(|c| c as u16)
-                .filter(|c| (400..600).contains(c))
-                .unwrap_or(500);
-
             tracing::warn!(
                 request_id = %request.id,
                 embedded_status = code,
                 "Provider returned error inside SSE stream, reclassifying as HTTP error"
             );
 
+            // Re-emit a clean bare `{"error": …}` envelope so the body never
+            // leaks completion fields (`id`/`choices`/…) from a raw gateway
+            // chunk, and still begins with `{"error"` for further consumers.
             return Ok(HttpResponse {
                 status: code,
-                body: event.data.clone(),
+                body: serde_json::json!({ "error": error }).to_string(),
             });
         }
 
@@ -765,6 +803,70 @@ impl Drop for InFlightGuard {
 mod tests {
     use super::*;
     use crate::types::RequestId;
+
+    #[test]
+    fn reclassifies_error_embedded_alongside_completion_fields() {
+        // Raw gateway chunk that bypasses onwards: error sits next to id/choices.
+        let chunk = r#"{"id":"gen-123","object":"chat.completion.chunk","choices":[],"error":{"code":429,"message":"rate limited"}}"#;
+        let (status, error) = detect_embedded_error([chunk]).expect("error should be detected");
+        assert_eq!(status, 429);
+
+        // The re-emitted body is a clean bare envelope, not the raw chunk.
+        let body = serde_json::json!({ "error": error }).to_string();
+        assert!(body.starts_with(r#"{"error""#), "body not a bare envelope: {body}");
+        assert!(!body.contains("choices"), "leaked completion fields: {body}");
+        assert!(!body.contains("gen-123"), "leaked id: {body}");
+    }
+
+    #[test]
+    fn ignores_null_and_empty_error_placeholders() {
+        let null_err = r#"{"id":"x","choices":[{"delta":{"content":"hi"}}],"error":null}"#;
+        let empty_err = r#"{"id":"x","choices":[{"delta":{"content":"hi"}}],"error":{}}"#;
+        assert!(detect_embedded_error([null_err]).is_none());
+        assert!(detect_embedded_error([empty_err]).is_none());
+    }
+
+    #[test]
+    fn still_reclassifies_bare_error_envelope() {
+        let bare = r#"{"error":{"code":503,"message":"upstream down"}}"#;
+        let (status, error) = detect_embedded_error([bare]).expect("bare error should be detected");
+        assert_eq!(status, 503);
+        assert_eq!(
+            error.get("message").and_then(|m| m.as_str()),
+            Some("upstream down")
+        );
+    }
+
+    #[test]
+    fn message_only_and_out_of_range_codes_default_to_500() {
+        let message_only = r#"{"error":{"message":"something broke"}}"#;
+        assert_eq!(detect_embedded_error([message_only]).unwrap().0, 500);
+
+        // A code outside 400..600 is ignored in favour of the 500 default.
+        let out_of_range = r#"{"error":{"code":200,"message":"weird"}}"#;
+        assert_eq!(detect_embedded_error([out_of_range]).unwrap().0, 500);
+    }
+
+    #[test]
+    fn parses_numeric_string_and_rate_limit_codes() {
+        let numeric_string = r#"{"error":{"code":"429","message":"slow down"}}"#;
+        assert_eq!(detect_embedded_error([numeric_string]).unwrap().0, 429);
+
+        let rate_limit = r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#;
+        assert_eq!(detect_embedded_error([rate_limit]).unwrap().0, 429);
+    }
+
+    #[test]
+    fn picks_first_error_event_and_skips_success_chunks() {
+        let events = [
+            r#"{"choices":[{"delta":{"content":"partial"}}]}"#,
+            r#"{"error":{"code":502,"message":"first"}}"#,
+            r#"{"error":{"code":503,"message":"second"}}"#,
+        ];
+        let (status, error) = detect_embedded_error(events).expect("error should be detected");
+        assert_eq!(status, 502);
+        assert_eq!(error.get("message").and_then(|m| m.as_str()), Some("first"));
+    }
 
     #[tokio::test]
     async fn test_mock_client_basic() {
