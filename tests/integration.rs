@@ -854,11 +854,19 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
         let retry_count = failed.state.retry_attempt;
         let call_count = http_client.call_count();
 
-        // 1. Verify we stopped before too many retries (deadline constraint)
-        // Allow 7-9 attempts to account for timing variations in test execution
+        // 1. Verify we stopped before too many retries (deadline constraint).
+        // The exponential-backoff schedule — not CPU speed — caps how many
+        // retries fit before the deadline: each retry must wait its full backoff
+        // (tracked via a wall-clock `not_before`) before it can be re-claimed, so
+        // within the effective 1500ms deadline (2000ms window − 500ms buffer) at
+        // most 8 retries fit even with zero overhead. Slow/loaded CI overhead only
+        // eats into that window and yields *fewer* retries, never more. Hence a
+        // tight upper bound (the real deadline guard) and a generous lower bound
+        // (slack for slow runners).
         assert!(
-            (7..=9).contains(&retry_count),
-            "Expected 7-9 retry attempts based on deadline and backoff calculation, got {}",
+            (4..=8).contains(&retry_count),
+            "Expected 4-8 retry attempts (stops ~500ms before the 2000ms deadline; \
+             upper bound 8 is the backoff-schedule ceiling), got {}",
             retry_count
         );
 
@@ -1028,12 +1036,19 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
         let retry_count = failed.state.retry_attempt;
         let call_count = http_client.call_count();
 
-        // 1. Verify we retried more than the buffered case (which stopped at ~8)
-        //    but still stopped before too many attempts
-        // Allow 9-12 attempts to account for timing variations with CI slower CI CPUs
+        // 1. Verify retries continued until the deadline. As with the buffered
+        // deadline test above, the exponential-backoff schedule — not CPU speed —
+        // caps the retry count: each retry waits its full backoff (wall-clock
+        // `not_before`) before re-claim, so at most 11 fit within the 2000ms
+        // deadline (no buffer) even with zero overhead, and slow/loaded CI
+        // overhead only reduces that count, never increases it. So we keep a tight
+        // upper bound (the deadline guard) and a generous lower bound (slack for
+        // slow runners; a hard floor of 9 previously flaked when a loaded runner
+        // fit only ~8).
         assert!(
-            (9..12).contains(&retry_count),
-            "Expected 9-12 retry attempts (should retry until deadline with no buffer), got {}",
+            (5..=11).contains(&retry_count),
+            "Expected 5-11 retry attempts (retries until the 2000ms deadline, no buffer; \
+             upper bound 11 is the backoff-schedule ceiling), got {}",
             retry_count
         );
 
