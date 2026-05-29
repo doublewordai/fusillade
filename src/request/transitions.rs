@@ -333,6 +333,22 @@ impl Request<Failed> {
     }
 }
 
+/// Extract the provider error `code` from an OpenAI-compatible error envelope
+/// body (`{"error": {"code": …}}`) for metric labelling. Captures both string
+/// codes (`"service_unavailable"`) and numeric codes (`429`) — the latter occur
+/// in re-emitted embedded SSE errors — returning an empty string when no usable
+/// code is present.
+fn extract_error_code(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| match v.get("error")?.get("code")? {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 impl Request<Processing> {
     /// Wait for the HTTP request to complete.
     ///
@@ -413,13 +429,9 @@ impl Request<Processing> {
 
                 // Check if this response should be retried
                 if should_retry(&http_response) {
-                    // Extract error code from OpenAI-compatible error envelope
-                    // (e.g. {"error": {"code": "service_unavailable"}}) for metric labelling,
-                    // allowing alerts to distinguish upstream error classes.
-                    let error_code = serde_json::from_str::<serde_json::Value>(&http_response.body)
-                        .ok()
-                        .and_then(|v| v.get("error")?.get("code")?.as_str().map(String::from))
-                        .unwrap_or_default();
+                    // Extract the provider error code for metric labelling so
+                    // alerts can distinguish upstream error classes.
+                    let error_code = extract_error_code(&http_response.body);
 
                     // Record retriable HTTP status for observability
                     counter!(
@@ -553,5 +565,32 @@ impl Request<Processing> {
         };
         storage.persist(&request).await?;
         Ok(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_error_code;
+
+    #[test]
+    fn extract_error_code_reads_string_codes() {
+        let body = r#"{"error":{"code":"service_unavailable","message":"down"}}"#;
+        assert_eq!(extract_error_code(body), "service_unavailable");
+    }
+
+    #[test]
+    fn extract_error_code_reads_numeric_codes() {
+        // Numeric codes (e.g. from a re-emitted embedded SSE error) must still
+        // be captured for the metric label, not silently dropped to "".
+        let body = r#"{"error":{"code":429,"message":"rate limited"}}"#;
+        assert_eq!(extract_error_code(body), "429");
+    }
+
+    #[test]
+    fn extract_error_code_is_empty_when_absent_or_unusable() {
+        assert_eq!(extract_error_code(r#"{"error":{"message":"no code"}}"#), "");
+        assert_eq!(extract_error_code(r#"{"error":{"code":null}}"#), "");
+        assert_eq!(extract_error_code(r#"{"choices":[]}"#), "");
+        assert_eq!(extract_error_code("not json"), "");
     }
 }
