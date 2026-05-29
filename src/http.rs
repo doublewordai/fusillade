@@ -117,7 +117,9 @@ fn detect_embedded_error<'a>(
         if !data.contains("\"error\"") {
             return None;
         }
-        let error = serde_json::from_str::<EmbeddedErrorEnvelope>(data).ok()?.error;
+        let error = serde_json::from_str::<EmbeddedErrorEnvelope>(data)
+            .ok()?
+            .error;
         // Reject empty/null placeholders (`error: null`, `error: {}`) so an
         // otherwise-healthy stream isn't reclassified into a bogus 500.
         let code_field = error.get("code").filter(|v| !v.is_null());
@@ -139,7 +141,10 @@ fn detect_embedded_error<'a>(
 /// (`"rate_limit"`/`"rate_limit_exceeded"` → 429).
 fn parse_embedded_status_code(code: &serde_json::Value) -> Option<u16> {
     match code {
-        serde_json::Value::Number(n) => n.as_u64().map(|c| c as u16),
+        // try_from (not `as`) so an out-of-range number yields None and falls
+        // back to the 500 default, rather than silently wrapping into a bogus
+        // in-range status (e.g. 66000 -> 464).
+        serde_json::Value::Number(n) => n.as_u64().and_then(|c| u16::try_from(c).ok()),
         serde_json::Value::String(s) => s
             .parse::<u16>()
             .ok()
@@ -813,8 +818,14 @@ mod tests {
 
         // The re-emitted body is a clean bare envelope, not the raw chunk.
         let body = serde_json::json!({ "error": error }).to_string();
-        assert!(body.starts_with(r#"{"error""#), "body not a bare envelope: {body}");
-        assert!(!body.contains("choices"), "leaked completion fields: {body}");
+        assert!(
+            body.starts_with(r#"{"error""#),
+            "body not a bare envelope: {body}"
+        );
+        assert!(
+            !body.contains("choices"),
+            "leaked completion fields: {body}"
+        );
         assert!(!body.contains("gen-123"), "leaked id: {body}");
     }
 
@@ -845,6 +856,11 @@ mod tests {
         // A code outside 400..600 is ignored in favour of the 500 default.
         let out_of_range = r#"{"error":{"code":200,"message":"weird"}}"#;
         assert_eq!(detect_embedded_error([out_of_range]).unwrap().0, 500);
+
+        // A code beyond u16::MAX must not wrap into a bogus in-range status
+        // (66000 would truncate to 464 under an `as u16` cast); it defaults to 500.
+        let oversized = r#"{"error":{"code":66000,"message":"hostile"}}"#;
+        assert_eq!(detect_embedded_error([oversized]).unwrap().0, 500);
     }
 
     #[test]
