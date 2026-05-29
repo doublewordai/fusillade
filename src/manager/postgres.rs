@@ -894,25 +894,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             WITH windows(label, start_seconds, has_start, end_seconds) AS (
                 SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::int2[], $4::bigint[])
             ),
-            batch_counts AS (
+            active_request_counts AS (
                 SELECT
-                    r.model as model,
-                    w.label as window_label,
-                    COUNT(*) FILTER (
-                        WHERE (w.has_start = 0 OR b.expires_at >= NOW() + make_interval(secs => w.start_seconds))
-                          AND b.expires_at < NOW() + make_interval(secs => w.end_seconds)
-                    )::BIGINT as count
+                    r.batch_id,
+                    r.model,
+                    COUNT(*)::BIGINT AS request_count
                 FROM requests r
-                JOIN batches b ON r.batch_id = b.id
-                CROSS JOIN windows w
                 WHERE r.state = ANY($5)
                 AND r.template_id IS NOT NULL
-                AND b.cancelling_at IS NULL
-                -- Row-level upper bound: a row that expires after every window's
-                -- end can't contribute to any window's COUNT FILTER, so prune it
-                -- here. Without this, the join reads every active+templated
-                -- request and only filters inside the aggregate.
-                AND b.expires_at < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
                 AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
                 AND (
                     $9 = 'any'
@@ -925,7 +914,26 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($7))
                     ))
                 )
-                GROUP BY r.model, w.label
+                GROUP BY r.batch_id, r.model
+            ),
+            batch_counts AS (
+                SELECT
+                    arc.model as model,
+                    w.label as window_label,
+                    COALESCE(SUM(arc.request_count) FILTER (
+                        WHERE (w.has_start = 0 OR b.expires_at >= NOW() + make_interval(secs => w.start_seconds))
+                          AND b.expires_at < NOW() + make_interval(secs => w.end_seconds)
+                    ), 0)::BIGINT as count
+                FROM active_request_counts arc
+                JOIN batches b ON arc.batch_id = b.id
+                CROSS JOIN windows w
+                WHERE b.cancelling_at IS NULL
+                -- Row-level upper bound: a row that expires after every window's
+                -- end can't contribute to any window's COUNT FILTER, so prune it
+                -- here. Without this, the join reads every active+templated
+                -- request and only filters inside the aggregate.
+                AND b.expires_at < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
+                GROUP BY arc.model, w.label
             ),
             priority_decay_counts AS (
                 SELECT
