@@ -491,6 +491,28 @@ pub trait Storage: Send + Sync {
         &self,
         records: &[PersistCompletedRealtimeInput],
     ) -> Result<()>;
+
+    /// Compute and persist the prompt-prefix cache hit count for an already-
+    /// inserted request, and emit cache instrumentation.
+    ///
+    /// Called at dispatch time by the daemon for flex/batch requests (the body
+    /// is already loaded and JSON-parsed there). `request_type` is one of
+    /// `"realtime"`, `"flex"`, or `"batch"` and is used only for metric labels.
+    /// Best-effort and tracking-only — implementations must not fail the request
+    /// on cache errors. The default implementation is a no-op for backends
+    /// without prefix-cache support.
+    async fn record_request_prefix_cache(
+        &self,
+        request_id: RequestId,
+        request_type: &str,
+        created_by: &str,
+        model: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<i64> {
+        let _ = (request_id, request_type, created_by, model, path, body);
+        Ok(0)
+    }
 }
 
 /// Daemon lifecycle persistence.
@@ -528,6 +550,20 @@ pub trait DaemonStorage: Send + Sync {
     /// Returns total rows deleted across both tables. Called periodically by
     /// the daemon purge task for right-to-erasure compliance.
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
+
+    /// Delete prompt-prefix cache blocks that have outlived their route TTL.
+    ///
+    /// Called periodically by the daemon's purge task. Returns the number of
+    /// rows deleted. The default implementation is a no-op.
+    async fn purge_prefix_cache(&self) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// Emit a periodic summary of per-user prompt-prefix cache activity
+    /// (structured log + per-user gauges) and reset the in-memory accumulators.
+    ///
+    /// Called on the daemon's per-user throughput interval. Default is a no-op.
+    async fn log_prefix_cache_summary(&self) {}
 }
 
 /// Daemon executor trait for runtime orchestration.

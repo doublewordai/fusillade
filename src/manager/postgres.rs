@@ -13,10 +13,12 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
+use metrics::{counter, gauge, histogram};
 use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::postgres::{PgListener, PgPool};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -145,6 +147,12 @@ pub struct PostgresRequestManager<P: PoolProvider, H: HttpClient> {
     /// The builder-style [`with_processor`](Self::with_processor) remains
     /// available for tests and consumers that don't have a cycle.
     processor: std::sync::OnceLock<Arc<dyn crate::processor::RequestProcessor<Self, H>>>,
+    /// Per-user prompt-prefix cache counters, accumulated in memory and flushed
+    /// periodically by the daemon's per-user throughput task. Shared between the
+    /// realtime ingestion path (on the manager) and the daemon process path
+    /// (which calls back through [`Storage::record_request_prefix_cache`]).
+    prefix_cache_user_stats:
+        Arc<dashmap::DashMap<String, crate::prefix_cache::PrefixCacheUserStats>>,
 }
 
 /// Macro for extracting a [`Batch`] from a dynamic query row (PgRow).
@@ -197,6 +205,8 @@ macro_rules! batch_status_from_dynamic_row {
             completed_requests: $row.get("completed_requests"),
             failed_requests: $row.get("failed_requests"),
             canceled_requests: $row.get("canceled_requests"),
+            cached_requests: $row.get("cached_requests"),
+            cached_tokens: $row.get("cached_tokens"),
             started_at: $row.get("started_at"),
             failed_at: $row.get("failed_at"),
             created_at: $row.get("created_at"),
@@ -230,6 +240,7 @@ impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> 
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             processor: std::sync::OnceLock::new(),
+            prefix_cache_user_stats: Arc::new(dashmap::DashMap::new()),
         }
     }
 }
@@ -255,6 +266,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             processor: std::sync::OnceLock::new(),
+            prefix_cache_user_stats: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -272,6 +284,52 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         // construction we're the only writer here.
         let _ = self.processor.set(processor);
         self
+    }
+
+    /// Emit prompt-prefix cache instrumentation for one request.
+    ///
+    /// Records overall (request_type/model-labelled) Prometheus counters and a
+    /// per-request histogram, per-user counters (matching the existing inline
+    /// per-user metric style), and updates the in-memory per-user accumulator
+    /// that the daemon flushes periodically. `cached_tokens > 0` counts as a hit.
+    fn observe_prefix_cache(
+        &self,
+        request_type: &str,
+        model: &str,
+        user: &str,
+        cached_tokens: i64,
+    ) {
+        let hit = cached_tokens > 0;
+        let rt = request_type.to_string();
+
+        counter!("fusillade_prefix_cache_lookups_total", "request_type" => rt.clone(), "model" => model.to_string()).increment(1);
+        if hit {
+            counter!("fusillade_prefix_cache_hits_total", "request_type" => rt.clone(), "model" => model.to_string()).increment(1);
+        }
+        counter!("fusillade_cached_tokens_total", "request_type" => rt.clone(), "model" => model.to_string()).increment(cached_tokens.max(0) as u64);
+        histogram!("fusillade_cached_tokens", "request_type" => rt)
+            .record(cached_tokens.max(0) as f64);
+
+        // Per-user counters (inline, matching fusillade_user_requests_in_flight).
+        counter!("fusillade_user_prefix_cache_lookups_total", "user" => user.to_string())
+            .increment(1);
+        if hit {
+            counter!("fusillade_user_prefix_cache_hits_total", "user" => user.to_string())
+                .increment(1);
+        }
+
+        // In-memory accumulator for the periodic per-user summary.
+        let entry = self
+            .prefix_cache_user_stats
+            .entry(user.to_string())
+            .or_default();
+        entry.lookups.fetch_add(1, Ordering::Relaxed);
+        if hit {
+            entry.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        entry
+            .cached_tokens
+            .fetch_add(cached_tokens.max(0) as u64, Ordering::Relaxed);
     }
 
     /// Inject the per-claim processor after the manager has already been
@@ -2663,7 +2721,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
                 COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
+                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests,
+                COALESCE(counts.cached_requests, 0)::BIGINT as cached_requests,
+                COALESCE(counts.cached_tokens, 0)::BIGINT as cached_tokens
             FROM batches b
             LEFT JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
@@ -2672,7 +2732,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled,
+                    COUNT(*) FILTER (WHERE cached_tokens > 0) as cached_requests,
+                    COALESCE(SUM(cached_tokens), 0) as cached_tokens
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -3096,7 +3158,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
                 COALESCE(counts.completed, 0)::BIGINT as completed_requests,
                 COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
+                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests,
+                COALESCE(counts.cached_requests, 0)::BIGINT as cached_requests,
+                COALESCE(counts.cached_tokens, 0)::BIGINT as cached_tokens
             FROM batches b
             LEFT JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
@@ -3105,7 +3169,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
+                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled,
+                    COUNT(*) FILTER (WHERE cached_tokens > 0) as cached_requests,
+                    COALESCE(SUM(cached_tokens), 0) as cached_tokens
                 FROM requests
                 WHERE batch_id = b.id
             ) counts ON TRUE
@@ -3854,7 +3920,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 CASE WHEN f.deleted_at IS NULL OR t.file_id IS NULL
                     THEN t.body ELSE NULL END as body,
                 r.response_body, r.error,
-                r.service_tier, r.created_by
+                r.service_tier, r.created_by, r.cached_tokens
             FROM requests r
             LEFT JOIN request_templates t ON r.template_id = t.id
             LEFT JOIN files f ON t.file_id = f.id
@@ -3912,14 +3978,46 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // slip into the listing. Matches the SQL `NULLIF(TRIM(...), '')`
         // used by persist_completed_realtime_batch.
         let created_by = Some(input.created_by.trim()).filter(|s| !s.is_empty());
+
+        // Prompt-prefix cache accounting (tracking-only). Realtime requests are
+        // dispatched immediately, so we compute the cached-token count inline at
+        // creation and store it on the row. Recorded against the pool (not the
+        // tx) so the value is available to bind; best-effort, never fails the
+        // request. Uses the sanitized body that is actually sent upstream.
+        let cached_tokens = match created_by {
+            Some(user) if self.config.prefix_cache.enabled => {
+                match crate::prefix_cache::record_and_count(
+                    self.pools.write(),
+                    &self.config.prefix_cache,
+                    user,
+                    &input.model,
+                    &input.path,
+                    stored_body.as_ref(),
+                )
+                .await
+                {
+                    Ok(n) => {
+                        self.observe_prefix_cache("realtime", &input.model, user, n);
+                        n
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "prefix cache accounting failed (realtime)");
+                        0
+                    }
+                }
+            }
+            _ => 0,
+        };
+
         sqlx::query(
-            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by, daemon_id, claimed_at, started_at)
-             VALUES ($1, NULL, $2, $3, NULL, 'processing', 0, 'priority', $4, $5, $6, $6)",
+            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by, cached_tokens, daemon_id, claimed_at, started_at)
+             VALUES ($1, NULL, $2, $3, NULL, 'processing', 0, 'priority', $4, $5, $6, $7, $7)",
         )
         .bind(input.request_id)
         .bind(template_id)
         .bind(&input.model)
         .bind(created_by)
+        .bind(cached_tokens)
         .bind(Uuid::nil())
         .bind(now)
         .execute(&mut *tx)
@@ -4261,6 +4359,39 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
         Ok(())
+    }
+
+    async fn record_request_prefix_cache(
+        &self,
+        request_id: RequestId,
+        request_type: &str,
+        created_by: &str,
+        model: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<i64> {
+        let cfg = &self.config.prefix_cache;
+        // Tracking-only with no real user means no meaningful scope; skip.
+        if !cfg.enabled || created_by.trim().is_empty() {
+            return Ok(0);
+        }
+
+        let pool = self.pools.write();
+        let cached_tokens =
+            crate::prefix_cache::record_and_count(pool, cfg, created_by, model, path, body).await?;
+
+        // Persist the count onto the (already-inserted) request row.
+        sqlx::query("UPDATE requests SET cached_tokens = $1 WHERE id = $2")
+            .bind(cached_tokens)
+            .bind(request_id.0)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to persist cached_tokens: {}", e))
+            })?;
+
+        self.observe_prefix_cache(request_type, model, created_by, cached_tokens);
+        Ok(cached_tokens)
     }
 }
 
@@ -5507,6 +5638,64 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         }
 
         Ok(total)
+    }
+
+    async fn purge_prefix_cache(&self) -> Result<u64> {
+        let deleted =
+            crate::prefix_cache::purge_expired(self.pools.write(), &self.config.prefix_cache)
+                .await?;
+        if deleted > 0 {
+            tracing::debug!(deleted, "Purged expired prompt-prefix cache blocks");
+        }
+        Ok(deleted)
+    }
+
+    async fn log_prefix_cache_summary(&self) {
+        // Atomically read-and-reset each user's counters, mirroring the per-user
+        // throughput emission. Evict users with no activity to bound map growth.
+        let mut overall_lookups = 0u64;
+        let mut overall_hits = 0u64;
+        let mut overall_cached_tokens = 0u64;
+        let mut to_remove = Vec::new();
+
+        for entry in self.prefix_cache_user_stats.iter() {
+            let user = entry.key();
+            let lookups = entry.value().lookups.swap(0, Ordering::Relaxed);
+            let hits = entry.value().hits.swap(0, Ordering::Relaxed);
+            let cached_tokens = entry.value().cached_tokens.swap(0, Ordering::Relaxed);
+
+            if lookups == 0 {
+                to_remove.push(user.clone());
+                continue;
+            }
+
+            overall_lookups += lookups;
+            overall_hits += hits;
+            overall_cached_tokens += cached_tokens;
+
+            gauge!("fusillade_user_prefix_cache_hit_ratio", "user" => user.clone())
+                .set(hits as f64 / lookups as f64);
+            tracing::info!(
+                user = %user,
+                lookups,
+                hits,
+                cached_tokens,
+                "fusillade.user_prefix_cache"
+            );
+        }
+
+        for user in to_remove {
+            self.prefix_cache_user_stats.remove(&user);
+        }
+
+        if overall_lookups > 0 {
+            tracing::info!(
+                lookups = overall_lookups,
+                hits = overall_hits,
+                cached_tokens = overall_cached_tokens,
+                "fusillade.prefix_cache_summary"
+            );
+        }
     }
 }
 
@@ -12393,7 +12582,7 @@ mod tests {
 
         // Only model-a pending should be counted
         assert_eq!(*counts.get("model-a").unwrap().get("15m").unwrap(), 1);
-        assert!(counts.get("model-b").is_none());
+        assert!(!counts.contains_key("model-b"));
 
         // Now include claimed state and remove model filter
         let states = vec!["pending".to_string(), "claimed".to_string()];

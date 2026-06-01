@@ -256,6 +256,11 @@ pub struct DaemonConfig {
     /// fall back to `created_at + flex_expiry_ms`. Default 1h (legacy flex SLA).
     #[serde(default = "default_flex_expiry_ms")]
     pub flex_expiry_ms: u64,
+
+    /// Prompt-prefix cache tracking settings (tracking-only; no discount yet).
+    /// Read by both ingestion (on the manager) and the daemon process loop.
+    #[serde(default)]
+    pub prefix_cache: crate::prefix_cache::PrefixCacheConfig,
 }
 
 fn default_batch_metadata_fields() -> Vec<String> {
@@ -303,6 +308,7 @@ impl Default for DaemonConfig {
             streamable_endpoints: Vec::new(),
             urgency_weight: 0.0,
             flex_expiry_ms: default_flex_expiry_ms(),
+            prefix_cache: crate::prefix_cache::PrefixCacheConfig::default(),
         }
     }
 }
@@ -515,6 +521,7 @@ where
             let user_requests_in_flight = self.user_requests_in_flight.clone();
             let daemon_id = self.daemon_id;
             let shutdown_token = self.shutdown_token.clone();
+            let storage = self.storage.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
                 // Skip the immediate first tick to avoid a near-zero window on the first emission
@@ -565,6 +572,10 @@ where
                             for user_id in users_to_remove {
                                 user_throughput.remove(&user_id);
                             }
+
+                            // Emit the per-user prompt-prefix cache summary on
+                            // the same cadence (no-op for backends without it).
+                            storage.log_prefix_cache_summary().await;
 
                             last_emission = std::time::Instant::now();
                         }
@@ -694,6 +705,19 @@ where
                                 tracing::error!(error = %e, "Failed to purge orphaned rows");
                                 break;
                             }
+                        }
+                    }
+
+                    // Evict expired prompt-prefix cache blocks on the same cadence.
+                    match storage.purge_prefix_cache().await {
+                        Ok(deleted) if deleted > 0 => {
+                            counter!("fusillade_prefix_cache_rows_purged_total").increment(deleted);
+                            tracing::debug!(deleted, "Purged expired prefix cache blocks");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            counter!("fusillade_purge_errors_total").increment(1);
+                            tracing::error!(error = %e, "Failed to purge prefix cache");
                         }
                     }
                 }
@@ -960,6 +984,8 @@ where
                         batch_id = ?batch_id,
                         model = %model,
                         outcome = tracing::field::Empty,
+                        cached_tokens = tracing::field::Empty,
+                        cache_hit = tracing::field::Empty,
                     );
 
                     join_set.spawn(async move {
@@ -1017,6 +1043,34 @@ where
                                     }
                                 }
                             });
+
+                        // Prompt-prefix cache accounting (tracking-only). Done
+                        // here, at dispatch time, where the body is already
+                        // loaded (and post escalation/priority injection), so it
+                        // adds no batch-creation latency and spreads across the
+                        // daemon's concurrency. Best-effort — never fails the
+                        // request. request_type drives metric labels.
+                        let request_type = if batch_id.is_some() { "batch" } else { "flex" };
+                        match storage
+                            .record_request_prefix_cache(
+                                request_id,
+                                request_type,
+                                &request.data.created_by,
+                                &request.data.model,
+                                &request.data.path,
+                                &request.data.body,
+                            )
+                            .await
+                        {
+                            Ok(cached_tokens) => {
+                                let span = tracing::Span::current();
+                                span.record("cached_tokens", cached_tokens);
+                                span.record("cache_hit", cached_tokens > 0);
+                            }
+                            Err(e) => {
+                                tracing::warn!(request_id = %request_id, error = %e, "prefix cache accounting failed");
+                            }
+                        }
 
                         // Hand the per-claim work to the processor. The default
                         // impl emits the same fusillade.state.claimed and
@@ -1268,6 +1322,7 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            prefix_cache: Default::default(),
         };
 
         let manager = Arc::new(
@@ -1450,6 +1505,7 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            prefix_cache: Default::default(),
         };
 
         let manager = Arc::new(
@@ -1694,6 +1750,7 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            prefix_cache: Default::default(),
         };
 
         let manager = Arc::new(
@@ -1843,6 +1900,7 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            prefix_cache: Default::default(),
         };
 
         let manager = Arc::new(
@@ -2031,6 +2089,7 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            prefix_cache: Default::default(),
         };
 
         let manager = Arc::new(
@@ -2203,6 +2262,7 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            prefix_cache: Default::default(),
         };
 
         let manager = Arc::new(
@@ -2380,6 +2440,7 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            prefix_cache: Default::default(),
         };
 
         let manager = Arc::new(
@@ -2552,6 +2613,7 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            prefix_cache: Default::default(),
         };
 
         let manager = Arc::new(
@@ -2707,6 +2769,7 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            prefix_cache: Default::default(),
         };
 
         let manager = Arc::new(
@@ -2843,6 +2906,7 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            prefix_cache: Default::default(),
         };
 
         let manager = Arc::new(

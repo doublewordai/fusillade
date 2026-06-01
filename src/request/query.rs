@@ -208,6 +208,9 @@ pub struct RequestDetail {
     /// Creator ID (user or org). Always set: `get_request_detail` only
     /// returns rows where `requests.created_by IS NOT NULL`.
     pub created_by: String,
+    /// Approximate prompt tokens served from the prefix cache for this request
+    /// (tracking-only; no billing discount applied).
+    pub cached_tokens: i64,
 }
 
 /// Input for creating a realtime response that the proxy is already handling.
