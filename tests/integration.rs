@@ -2358,6 +2358,7 @@ mod queue_counts {
                 &["pending".to_string()],
                 &[],
                 &ServiceTierFilter::Any,
+                None,
                 false,
             )
             .await

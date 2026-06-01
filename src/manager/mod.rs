@@ -310,6 +310,11 @@ pub trait Storage: Send + Sync {
     /// - `service_tier_filter`: filter on `service_tier`. `Any` (default) applies
     ///   no filter; `Include`/`Exclude` use `Option<String>` where `None`
     ///   represents the batch tier (`service_tier IS NULL`).
+    /// - `priority_decay_window`: optional lookback in seconds. When set,
+    ///   recently completed `service_tier = 'flex'` requests are added to
+    ///   the `"1h"` bucket so realtime traffic can decay out of scheduling
+    ///   pressure after successful completion. No effect if the requested
+    ///   windows do not include a `"1h"` label.
     /// - `strict`: bool. For critical/sensitive operations, set `true` to
     ///   use the write pool and avoid read lags.
     ///
@@ -322,6 +327,7 @@ pub trait Storage: Send + Sync {
         states: &[String],
         model_filter: &[String],
         service_tier_filter: &ServiceTierFilter,
+        priority_decay_window: Option<i64>,
         strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>>;
     ///

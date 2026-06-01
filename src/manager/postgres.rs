@@ -814,6 +814,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 // Implement Storage trait directly (no delegation)
 #[async_trait]
 /// Returns counts of **claimable** pending requests grouped by model and expiry window.
+/// When `priority_decay_window` is set, recently completed flex requests
+/// are added to the `1h` bucket as an explicit realtime-load decay signal.
 ///
 /// This intentionally excludes:
 /// - Requests without a template (`template_id IS NULL`), which are not claimable.
@@ -828,10 +830,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         states: &[String], // e.g. ["pending"] or ["pending","claimed","processing"]
         model_filter: &[String], // empty = all models
         service_tier_filter: &ServiceTierFilter,
+        priority_decay_window: Option<i64>,
         strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>> {
         if windows.is_empty() || states.is_empty() {
             return Ok(HashMap::new());
+        }
+
+        if let Some(priority_decay_window) = priority_decay_window
+            && priority_decay_window < 0
+        {
+            return Err(FusilladeError::ValidationError(
+                "priority_decay_window must be non-negative".to_string(),
+            ));
         }
 
         // Indicator: i16 instead of bool because `Vec<bool>` doesn't have a
@@ -882,38 +893,74 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             r#"
             WITH windows(label, start_seconds, has_start, end_seconds) AS (
                 SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::int2[], $4::bigint[])
+            ),
+            active_request_counts AS (
+                SELECT
+                    r.batch_id,
+                    r.model,
+                    COUNT(*)::BIGINT AS request_count
+                FROM requests r
+                WHERE r.state = ANY($5)
+                AND r.template_id IS NOT NULL
+                AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
+                AND (
+                    $9 = 'any'
+                    OR ($9 = 'include' AND (
+                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($7))
+                        OR ($8 AND r.service_tier IS NULL)
+                    ))
+                    OR ($9 = 'exclude' AND (
+                        (r.service_tier IS NULL AND NOT $8)
+                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($7))
+                    ))
+                )
+                GROUP BY r.batch_id, r.model
+            ),
+            batch_counts AS (
+                SELECT
+                    arc.model as model,
+                    w.label as window_label,
+                    COALESCE(SUM(arc.request_count) FILTER (
+                        WHERE (w.has_start = 0 OR b.expires_at >= NOW() + make_interval(secs => w.start_seconds))
+                          AND b.expires_at < NOW() + make_interval(secs => w.end_seconds)
+                    ), 0)::BIGINT as count
+                FROM active_request_counts arc
+                JOIN batches b ON arc.batch_id = b.id
+                CROSS JOIN windows w
+                WHERE b.cancelling_at IS NULL
+                -- Row-level upper bound: a row that expires after every window's
+                -- end can't contribute to any window's COUNT FILTER, so prune it
+                -- here. Without this, the join reads every active+templated
+                -- request and only filters inside the aggregate.
+                AND b.expires_at < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
+                GROUP BY arc.model, w.label
+            ),
+            priority_decay_counts AS (
+                SELECT
+                    r.model as model,
+                    '1h'::text as window_label,
+                    COUNT(*)::BIGINT as count
+                FROM requests r
+                WHERE $10::bigint IS NOT NULL
+                AND EXISTS (SELECT 1 FROM windows WHERE label = '1h')
+                AND r.service_tier = 'flex'
+                AND r.state = 'completed'
+                AND r.template_id IS NOT NULL
+                AND r.completed_at >= NOW() - make_interval(secs => $10::bigint)
+                AND r.completed_at <= NOW()
+                AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
+                GROUP BY r.model
             )
             SELECT
-                r.model as model,
-                w.label as window_label,
-                COUNT(*) FILTER (
-                    WHERE (w.has_start = 0 OR b.expires_at >= NOW() + make_interval(secs => w.start_seconds))
-                      AND b.expires_at < NOW() + make_interval(secs => w.end_seconds)
-                )::BIGINT as count
-            FROM requests r
-            JOIN batches b ON r.batch_id = b.id
-            CROSS JOIN windows w
-            WHERE r.state = ANY($5)
-            AND r.template_id IS NOT NULL
-            AND b.cancelling_at IS NULL
-            -- Row-level upper bound: a row that expires after every window's
-            -- end can't contribute to any window's COUNT FILTER, so prune it
-            -- here. Without this, the join reads every active+templated
-            -- request and only filters inside the aggregate.
-            AND b.expires_at < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
-            AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
-            AND (
-                $9 = 'any'
-                OR ($9 = 'include' AND (
-                    (r.service_tier IS NOT NULL AND r.service_tier = ANY($7))
-                    OR ($8 AND r.service_tier IS NULL)
-                ))
-                OR ($9 = 'exclude' AND (
-                    (r.service_tier IS NULL AND NOT $8)
-                    OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($7))
-                ))
-            )
-            GROUP BY r.model, w.label
+                model,
+                window_label,
+                SUM(count)::BIGINT as count
+            FROM (
+                SELECT * FROM batch_counts
+                UNION ALL
+                SELECT * FROM priority_decay_counts
+            ) counts
+            GROUP BY model, window_label
             "#,
         )
         .bind(&labels)
@@ -925,6 +972,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(&tier_names)
         .bind(tier_include_null)
         .bind(tier_mode)
+        .bind(priority_decay_window)
         .fetch_all(pool)
         .await
         .map_err(|e| {
@@ -12162,6 +12210,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
+                None,
                 false,
             )
             .await
@@ -12183,6 +12232,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
+                None,
                 false,
             )
             .await
@@ -12197,6 +12247,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
+                None,
                 false,
             )
             .await
@@ -12222,6 +12273,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
+                None,
                 false,
             )
             .await
@@ -12234,6 +12286,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
+                None,
                 false,
             )
             .await
@@ -12332,6 +12385,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
+                None,
                 false,
             )
             .await
@@ -12351,6 +12405,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
+                None,
                 false,
             )
             .await
@@ -12374,6 +12429,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
+                None,
                 false,
             )
             .await
@@ -12394,6 +12450,7 @@ mod tests {
                 &["pending".to_string()],
                 &[],
                 &ServiceTierFilter::Any,
+                None,
                 false,
             )
             .await
@@ -12406,6 +12463,7 @@ mod tests {
                 &[],
                 &[],
                 &ServiceTierFilter::Any,
+                None,
                 false,
             )
             .await
@@ -12488,6 +12546,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
+                None,
                 false,
             )
             .await
@@ -12501,6 +12560,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Exclude(vec![Some("priority".to_string())]),
+                None,
                 false,
             )
             .await
@@ -12514,6 +12574,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Include(vec![None]),
+                None,
                 false,
             )
             .await
@@ -12527,6 +12588,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Include(vec![None, Some("flex".to_string())]),
+                None,
                 false,
             )
             .await
@@ -12540,6 +12602,7 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Exclude(vec![None]),
+                None,
                 false,
             )
             .await
@@ -12553,11 +12616,223 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Include(vec![]),
+                None,
                 false,
             )
             .await
             .unwrap();
         assert!(counts.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn test_pending_request_counts_priority_decay_window(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let model = "flex-model";
+        let recent_id = Uuid::new_v4();
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: recent_id,
+                body: r#"{"input":"recent"}"#.to_string(),
+                model: model.to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "flex-user".to_string(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'processing',
+                 daemon_id = gen_random_uuid(),
+                 claimed_at = NOW(),
+                 started_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(recent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager
+            .complete_request(RequestId(recent_id), r#"{"output":"recent"}"#, 200)
+            .await
+            .unwrap();
+
+        let old_id = Uuid::new_v4();
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: old_id,
+                body: r#"{"input":"old"}"#.to_string(),
+                model: model.to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "flex-user".to_string(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'processing',
+                 daemon_id = gen_random_uuid(),
+                 claimed_at = NOW(),
+                 started_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(old_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager
+            .complete_request(RequestId(old_id), r#"{"output":"old"}"#, 200)
+            .await
+            .unwrap();
+
+        let failed_id = Uuid::new_v4();
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: failed_id,
+                body: r#"{"input":"failed"}"#.to_string(),
+                model: model.to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "flex-user".to_string(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'processing',
+                 daemon_id = gen_random_uuid(),
+                 claimed_at = NOW(),
+                 started_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(failed_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager
+            .fail_request(RequestId(failed_id), r#"{"error":"failed"}"#, 500)
+            .await
+            .unwrap();
+
+        let canceled_id = Uuid::new_v4();
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: canceled_id,
+                body: r#"{"input":"canceled"}"#.to_string(),
+                model: model.to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "flex-user".to_string(),
+            })
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE requests SET completed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1",
+        )
+        .bind(recent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE requests SET failed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
+            .bind(failed_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE requests SET state = 'canceled', canceled_at = NOW() - INTERVAL '5 minutes' WHERE id = $1",
+        )
+        .bind(canceled_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE requests SET completed_at = NOW() - INTERVAL '11 minutes' WHERE id = $1",
+        )
+        .bind(old_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let windows = vec![
+            ("1h".to_string(), None, 3600),
+            ("24h".to_string(), None, 86_400),
+        ];
+        let states = vec![
+            "pending".to_string(),
+            "claimed".to_string(),
+            "processing".to_string(),
+        ];
+        let model_filter: Vec<String> = vec![];
+        let exclude_priority = ServiceTierFilter::Exclude(vec![Some("priority".to_string())]);
+
+        let counts_without_decay = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &exclude_priority,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(counts_without_decay.is_empty());
+
+        let counts = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &exclude_priority,
+                Some(600),
+                false,
+            )
+            .await
+            .unwrap();
+        let model_counts = counts.get(model).unwrap();
+        assert_eq!(*model_counts.get("1h").unwrap(), 1);
+        assert_eq!(model_counts.get("24h").copied().unwrap_or(0), 0);
+
+        let no_1h_counts = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[("24h".to_string(), None, 86_400)],
+                &states,
+                &model_filter,
+                &exclude_priority,
+                Some(600),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(no_1h_counts.is_empty());
+
+        let err = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &exclude_priority,
+                Some(-1),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-negative"));
     }
 
     // =========================================================================
