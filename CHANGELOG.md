@@ -1,5 +1,12 @@
 # Changelog
 
+## [17.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v17.1.1...fusillade-v17.2.0) (2026-06-01)
+
+
+### Features
+
+* add priority_decay_window to Storage trait and PostgresRequestM… ([#273](https://github.com/doublewordai/fusillade/issues/273)) ([21ad826](https://github.com/doublewordai/fusillade/commit/21ad826c18155e5e80aa816429457d41860eadb7))
+
 ## [17.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v17.1.0...fusillade-v17.1.1) (2026-05-28)
 
 
