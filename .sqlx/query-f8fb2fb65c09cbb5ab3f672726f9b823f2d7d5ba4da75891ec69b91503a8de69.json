@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH ordered AS (\n                SELECT\n                    state,\n                    created_at,\n                    LEAD(created_at) OVER (ORDER BY created_at ASC, id ASC) AS next_at,\n                    LEAD(state)      OVER (ORDER BY created_at ASC, id ASC) AS next_state\n                FROM model_filters\n                WHERE model = $1\n            )\n            SELECT EXTRACT(EPOCH FROM (next_at - created_at))::DOUBLE PRECISION AS \"gap_secs!\"\n            FROM ordered\n            WHERE state = 'coming'\n              AND next_state = 'live'\n              AND next_at IS NOT NULL\n            ORDER BY created_at DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "gap_secs!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f8fb2fb65c09cbb5ab3f672726f9b823f2d7d5ba4da75891ec69b91503a8de69"
+}

@@ -5,6 +5,18 @@
 **Linear:** COR-431 (parent), COR-432 (this — fusillade), COR-433 (scouter), COR-434 (control-layer onwards)
 **Design doc:** Linear — "Architecture Options: Hard Guarantees on Async Workloads" (Solution 5)
 
+> **Update (append-only event log).** This plan originally framed `model_filters`
+> as a **current-state table** (one row per model, primary key on `model`, a
+> full-replace `set_model_filters`, claim joining the unique row). It has since
+> been reworked to an **append-only event log**: `model_filters` records every
+> liveness transition, the current state of a model is its **latest event**, and
+> retraction is an explicit `absent` **tombstone** event (never a DELETE). This
+> supersedes the current-state framing throughout. The benefit is that load
+> durations can be **learned from the log** (`coming -> live` gaps) to set future
+> ETAs (`model_load_estimate`), and the history is auditable. The sync heartbeat,
+> `D_eff` relaxation, hold/release predicates, and fail-closed behaviour are all
+> unchanged. Sections below are annotated where the design changed.
+
 ## Overview
 
 This is the fusillade half of **Solution 5** for the "Hard Guarantees on Async Workloads" project. The goal is to **maximise use of our own GPU infrastructure** for async/batch: don't dispatch work to OpenRouter while internal capacity is live or imminent, but never miss a request's TTFT target by waiting too long.
@@ -46,39 +58,66 @@ fusillade does **not** route internal-vs-OpenRouter — it dispatches to `reques
 
 ## Design
 
-### 1. `model_filters` table
+### 1. `model_filters` — append-only event log
 
 ```sql
 CREATE TABLE model_filters (
-    model             TEXT PRIMARY KEY,
-    state             TEXT NOT NULL CHECK (state IN ('live', 'coming')),
-    expected_ready_at TIMESTAMPTZ,            -- set when state = 'coming'
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                BIGSERIAL PRIMARY KEY,                                -- event id
+    model             TEXT NOT NULL,                                        -- NOT unique
+    state             TEXT NOT NULL CHECK (state IN ('live','coming','absent')),
+    expected_ready_at TIMESTAMPTZ,                                          -- set when state = 'coming'
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
--- Absent row = scouter is not deploying this model.
+CREATE INDEX idx_model_filters_model_created_at
+    ON model_filters (model, created_at DESC);
 ```
 
-Plus a singleton **sync heartbeat** so the daemon can tell "scouter is alive, absence is meaningful" from "scouter is dead, the table is frozen":
+Each row is one **liveness transition** appended by scouter. There is **no
+`model` primary key / uniqueness** — many events per model accumulate over time.
+
+- **Current state = latest event per model** (max `created_at`, tie-broken by
+  `id`). The claim query reads it via a `LEFT JOIN LATERAL (… ORDER BY
+  created_at DESC LIMIT 1)`, served by the `(model, created_at DESC)` index.
+- **Absent** = the model's **latest event is `state='absent'`** (an explicit
+  **tombstone**) **OR** the model has **no events at all**. Both are treated
+  identically by the gate: claim now (route to OpenRouter).
+- **Append-on-change is the caller's (scouter's) responsibility.** The write
+  functions always insert; scouter must append only when a model's state
+  actually changes, so the log stays a *transition* log rather than a *poll*
+  log. Retraction = append an `absent` event; there is never a DELETE in the
+  hot path (only the retention purge removes old rows — see §6).
+
+Plus a singleton **sync heartbeat** (unchanged) so the daemon can tell "scouter
+is alive, absence is meaningful" from "scouter is dead, the log is frozen":
 
 ```sql
 CREATE TABLE model_filters_sync ( id BOOLEAN PRIMARY KEY DEFAULT true CHECK (id), updated_at TIMESTAMPTZ NOT NULL );
 INSERT INTO model_filters_sync (id, updated_at) VALUES (true, now());
 ```
 
-scouter bumps `model_filters_sync.updated_at` on every sync.
+scouter bumps `model_filters_sync.updated_at` on every sync (every append fn
+bumps it too).
 
 ### 2. Per-request claim decision
 
 For a pending request for model X with effective deadline `D_eff` (below), let `serve` = `serve_margin_ms` (estimated time to actually serve once live):
 
-| `model_filters[X]` (with fresh heartbeat) | Decision |
+`model_filters[X]` below means **the latest event for model X** (NULL if no
+events). `absent` covers both "latest event is an `absent` tombstone" and "no
+events at all".
+
+| `model_filters[X]` (latest event, fresh heartbeat) | Decision |
 |---|---|
 | `live` | **claim** (→ onwards → internal) |
 | `coming(T)` and `T + serve ≤ D_eff` and `now + serve < D_eff` | **hold** (wait for internal) |
 | `coming(T)` and `T + serve > D_eff` | **claim** (can't wait → onwards → OR) |
-| absent | **claim** (not coming → onwards → OR) |
+| absent (tombstone latest **or** no events) | **claim** (not coming → onwards → OR) |
 | any, and `now + serve ≥ D_eff` | **claim** (deadline release — onwards/escalation → OR) |
 | heartbeat **stale** | **fail closed**: only the deadline-release clause claims; everything else holds |
+
+The hold predicate keys off `mf.state = 'coming'`, so a latest event of `live`,
+`absent`, or NULL never holds — exactly the append-only equivalent of the old
+current-state logic.
 
 So a row is **excluded from the claim** (held) iff: heartbeat fresh **and** `state='coming'` **and** `expected_ready_at + serve ≤ D_eff` **and** `now + serve < D_eff`. Everything else is claimable. Held requests stay `pending`, so they keep counting as demand for scouter.
 
@@ -102,16 +141,65 @@ Idle user → `D_eff ≈ now + min_async_ttft` → almost nothing qualifies to h
 
 The **deadline-release** clause (`now + serve ≥ D_eff`) is the new, `D_eff`-aware analogue of the existing escalation trigger. Under Solution 5, a released request dispatched to the composite is routed to OpenRouter by onwards (internal component excluded), so the `model`-swap in `model_escalations` (`:806-844`) becomes **redundant for the OR path** — but harmless. Decision for implementation: either (a) leave `model_escalations` as-is and rely on onwards routing, or (b) retire it once onwards' default-OR fallback (COR-434) is in place. Recommend (a) for the first cut (no behavioural removal), revisit in COR-434.
 
+### 5. Load-time learning from the log (`model_load_estimate`)
+
+Because the log retains every transition, we can **learn how long a model takes
+to load** internally and feed it back as future ETAs:
+
+- For each model, walk its events in time order and pair every `coming` event
+  with the **next `live`** event. The gap `live.created_at − coming.created_at`
+  is one observed load duration (we use the events' own timestamps — when
+  scouter saw the transition — not `expected_ready_at`, so the estimate
+  reflects *actual* loads).
+- `model_load_estimate(model) -> Option<Duration>` returns an **EWMA** over
+  those samples, newest-weighted (alpha 0.5), or `None` if no `coming → live`
+  transition has been observed. scouter calls this to set the next
+  `expected_ready_at` it publishes.
+- The SQL uses `LEAD()` window functions over the model's events; the Rust side
+  folds the EWMA so the curve stays one tunable place.
+
+### 6. Retention (purge integration)
+
+The append-only log must be bounded. The existing daemon purge task
+(`purge_interval_ms` / `purge_batch_size` / `purge_throttle_ms`) gains a second
+drain loop calling `purge_model_filter_events(batch_size, keep_per_model,
+retention_secs)`:
+
+- A row is eligible for deletion iff it is **both** beyond the most-recent
+  `keep_per_model` events for its model (ranked `created_at DESC, id DESC`)
+  **and** older than `retention_secs`.
+- `keep_per_model` is clamped to `>= 1`, so the **latest event per model is
+  never purged** — the claim gate can never lose a model's current state. The
+  extra history window feeds `model_load_estimate`.
+- New `DaemonConfig` knobs: `model_filters_keep_per_model` (default 50) and
+  `model_filters_retention_ms` (default 7 days), both `#[serde(default)]`.
+
 ## Implementation steps
 
-### Step 1 — Migration: `model_filters` + heartbeat
-- `migrations/<ts>_add_model_filters.{up,down}.sql` — tables above. `down` drops both.
+### Step 1 — Migration: `model_filters` event log + heartbeat
+- `migrations/<ts>_add_model_filters.{up,down}.sql` — append-only event-log
+  table (`id BIGSERIAL` PK, non-unique `model`, `state IN
+  ('live','coming','absent')`, `created_at`), the `(model, created_at DESC)`
+  index, and the `model_filters_sync` heartbeat singleton. `down` drops both.
 
 ### Step 2 — Storage trait + Postgres impl (`src/manager/mod.rs`, `src/manager/postgres.rs`)
-- Add typed functions (used by the daemon's claim query and by scouter):
-  - `set_model_filters(&self, entries: &[ModelFilter]) -> Result<()>` — transactional **replace** (upsert present, delete absent) + bump `model_filters_sync.updated_at`. `ModelFilter { model, state: ModelFilterState, expected_ready_at: Option<DateTime<Utc>> }`.
-  - `upsert_model_filter` / `delete_model_filter` for incremental updates (scouter may prefer deltas).
-  - `list_model_filters` / heartbeat read (observability/tests).
+- `ModelFilterState` gains an `Absent` variant (the tombstone). `ModelFilter {
+  model, state: ModelFilterState, expected_ready_at: Option<DateTime<Utc>> }`
+  is an **event**, not a unique row.
+- Append-only write API (replaces the old `set_model_filters` /
+  `upsert_model_filter` / `delete_model_filter`):
+  - `append_model_filter_event(&self, entry: &ModelFilter) -> Result<()>` —
+    insert one event + bump the heartbeat.
+  - `append_model_filter_events(&self, entries: &[ModelFilter]) -> Result<()>`
+    — insert a batch of events (one row each, caller order preserved via
+    `WITH ORDINALITY`) + bump the heartbeat once.
+  - **No upsert, no delete.** Retraction = append an `Absent` event. Appending
+    only on *change* is scouter's responsibility.
+- `list_model_filters` — returns the **latest event per model**
+  (`DISTINCT ON (model) … ORDER BY created_at DESC, id DESC`), excluding models
+  whose latest event is an `absent` tombstone (observability/tests).
+- `model_load_estimate(&self, model) -> Result<Option<Duration>>` — see §5.
+- heartbeat read (observability/tests) — unchanged.
 - Extend `claim_requests` signature with the per-user recent-claim snapshot, mirroring `user_active_counts`:
   ```rust
   async fn claim_requests(
@@ -127,7 +215,12 @@ The **deadline-release** clause (`now + serve ≥ D_eff`) is the new, `D_eff`-aw
 
 ### Step 3 — Claim SQL (`src/manager/postgres.rs`)
 - Pass new bind params: `$10` recent-claim user_ids `TEXT[]`, `$11` scores `DOUBLE PRECISION[]`, `$12` `min_async_ttft` seconds, `$13` `serve_margin` seconds, `$14` `model_filters_ttl` seconds.
-- In the per-model `LATERAL`, `LEFT JOIN model_filters mf ON mf.model = m.model`, and add a `CROSS JOIN model_filters_sync hb` (or scalar subquery) for the heartbeat.
+- In the per-model `LATERAL`, replace the unique-row join with a **latest-event
+  lookup**: `LEFT JOIN LATERAL (SELECT state, expected_ready_at FROM
+  model_filters WHERE model = m.model ORDER BY created_at DESC LIMIT 1) mf ON
+  true` (served by `idx_model_filters_model_created_at`). NULL (no events) and a
+  latest `absent` event both behave as absent because the hold predicate
+  requires `mf.state = 'coming'`. Add the heartbeat scalar subquery as before.
 - Add a recent-claim CTE (like `user_priority`) and compute `D_eff` inline from `effective_expires_at`, `$12`, and `g(score)`.
 - Add the **hold** exclusion to the `WHERE` (a row is skipped iff held):
   ```sql
@@ -169,13 +262,18 @@ All `#[serde(default)]`, backward-compatible.
 - **Native `service_tier` ingestion** on chat-completions/open-responses — COR-436 (standalone).
 
 ## Tests (`src/manager/postgres.rs`)
-- `test_claim_holds_for_coming_model_when_deadline_allows` — `coming(T)` with `T+serve ≤ D_eff` ⇒ not claimed; flip model to `live` ⇒ claimed.
-- `test_claim_releases_coming_model_near_deadline` — same `coming(T)` but request near `D_eff` ⇒ claimed (→ OR path).
-- `test_absent_model_claimed_immediately` — absent + fresh heartbeat ⇒ claimed (no hold).
+- `test_claim_holds_for_coming_model_when_deadline_allows` — append `coming(T)` with `T+serve ≤ D_eff` ⇒ not claimed; append `live` event ⇒ latest is live ⇒ claimed.
+- `test_claim_releases_coming_model_near_deadline` — `coming(T)` but request near `D_eff` ⇒ claimed (→ OR path).
+- `test_absent_model_claimed_immediately` — no events + fresh heartbeat ⇒ claimed (no hold).
+- `test_tombstone_absent_hides_model` — append `live` then `absent` tombstone ⇒ `list_model_filters` excludes it; both events remain in the log.
+- `test_tombstone_absent_model_is_claimed` — append `coming` then `absent` ⇒ latest is tombstone ⇒ claimed (not held).
 - `test_stale_heartbeat_fails_closed` — stale heartbeat ⇒ only near-`D_eff` rows claimed; others held.
 - `test_d_eff_idle_vs_busy_user` — idle user (no recent claims) gets tight `D_eff` (claimed/released fast); high recent-claim user holds for `coming` model.
-- `test_recent_claims_decay` — score decays over time so an idle-again user regains the tight target.
-- All existing claim tests pass with empty `model_filters` + empty `user_recent_claims` (i.e. behaviour is unchanged when scouter isn't writing).
+- `test_recent_claims_decay_relaxes_then_tightens` — score decays over time so an idle-again user regains the tight target.
+- `test_append_model_filter_events_and_heartbeat` — append-only: later events supersede earlier per model (latest wins), every event retained, heartbeat bumped; single-event helper.
+- `test_model_load_estimate` — EWMA of observed `coming → live` gaps; `None` when no transition seen.
+- `test_purge_model_filter_events_retention` — old events purged while the latest event per model (and the retention window) is always kept; `keep_per_model` clamped to ≥ 1.
+- All existing claim tests pass with an empty `model_filters` log + empty `user_recent_claims` (behaviour unchanged when scouter isn't writing).
 
 ## Version strategy
 `Storage::claim_requests` signature changes (new parameter) and `RequestData`/config evolve → `feat!:` **major bump**, consistent with the per-user fair-scheduling rollout. Bundle Steps 1–5 in one PR.
@@ -190,8 +288,9 @@ All `#[serde(default)]`, backward-compatible.
 ## Files to modify
 | File | Change |
 |------|--------|
-| `migrations/<ts>_add_model_filters.{up,down}.sql` | `model_filters` + `model_filters_sync` tables |
-| `src/manager/mod.rs` | `claim_requests` signature (+`user_recent_claims`); new `set_model_filters`/`upsert`/`delete`/heartbeat trait fns; `ModelFilter`/`ModelFilterState` types |
-| `src/manager/postgres.rs` | claim SQL: `model_filters` join, `D_eff`, hold/fail-closed predicate, new binds; model-filter write/read impls; tests |
-| `src/daemon/mod.rs` | `DaemonConfig` fields; `user_recent_claims` DashMap + increment/snapshot/decay; pass new arg/config |
+| `migrations/<ts>_add_model_filters.{up,down}.sql` | append-only `model_filters` event log + `(model, created_at DESC)` index + `model_filters_sync` heartbeat |
+| `src/manager/mod.rs` | `claim_requests` signature (+`user_recent_claims`); `ModelFilterState` (+`Absent`) / `ModelFilter` event types; `append_model_filter_event(s)`, `list_model_filters` (latest-per-model), `model_load_estimate`, heartbeat trait fns; `DaemonStorage::purge_model_filter_events` |
+| `src/manager/postgres.rs` | claim SQL: latest-event `LEFT JOIN LATERAL`, `D_eff`, hold/fail-closed predicate, new binds; append/list/load-estimate/purge impls; tests |
+| `src/daemon/mod.rs` | `DaemonConfig` fields (incl. `model_filters_keep_per_model`, `model_filters_retention_ms`); purge task drains `model_filters` events; `user_recent_claims` DashMap |
+| `src/daemon/transitions.rs` | `MockDaemonStorage::purge_model_filter_events` |
 | `.sqlx/query-*.json` | regenerated via `cargo sqlx prepare` |

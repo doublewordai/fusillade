@@ -288,6 +288,19 @@ pub struct DaemonConfig {
     /// recent resource before their deadline relaxes. Default: 4.0.
     #[serde(default = "default_recent_claims_curve_k")]
     pub recent_claims_curve_k: f64,
+
+    /// Number of most-recent `model_filters` events to ALWAYS retain per model
+    /// when the purge task trims the append-only log. Must be >= 1 so the
+    /// current-state lookup never loses a model. The extra history feeds
+    /// `model_load_estimate`. Default: 50.
+    #[serde(default = "default_model_filters_keep_per_model")]
+    pub model_filters_keep_per_model: i64,
+
+    /// Minimum age (milliseconds) before a `model_filters` event beyond the
+    /// per-model keep window is eligible for purging. Events newer than this
+    /// are retained regardless of count. Default: 604_800_000 (7 days).
+    #[serde(default = "default_model_filters_retention_ms")]
+    pub model_filters_retention_ms: u64,
 }
 
 fn default_batch_metadata_fields() -> Vec<String> {
@@ -317,6 +330,14 @@ fn default_recent_claims_halflife_ms() -> u64 {
 
 fn default_recent_claims_curve_k() -> f64 {
     4.0
+}
+
+fn default_model_filters_keep_per_model() -> i64 {
+    50
+}
+
+fn default_model_filters_retention_ms() -> u64 {
+    604_800_000 // 7 days
 }
 
 impl Default for DaemonConfig {
@@ -356,6 +377,8 @@ impl Default for DaemonConfig {
             model_filters_ttl_ms: default_model_filters_ttl_ms(),
             recent_claims_halflife_ms: default_recent_claims_halflife_ms(),
             recent_claims_curve_k: default_recent_claims_curve_k(),
+            model_filters_keep_per_model: default_model_filters_keep_per_model(),
+            model_filters_retention_ms: default_model_filters_retention_ms(),
         }
     }
 }
@@ -718,6 +741,8 @@ where
             let purge_interval_ms = self.config.purge_interval_ms;
             let purge_batch_size = self.config.purge_batch_size;
             let purge_throttle_ms = self.config.purge_throttle_ms;
+            let mf_keep_per_model = self.config.model_filters_keep_per_model;
+            let mf_retention_secs = self.config.model_filters_retention_ms as f64 / 1000.0;
 
             tokio::spawn(async move {
                 tracing::info!(
@@ -755,6 +780,39 @@ where
                             }
                             Err(e) => {
                                 crate::background_error!("purge_failed", Error, error = %e, "Failed to purge orphaned rows");
+                                break;
+                            }
+                        }
+                    }
+
+                    // Drain old model_filters events (append-only log), always
+                    // keeping the latest events per model + the retention
+                    // window so the claim gate never loses current state.
+                    loop {
+                        match storage
+                            .purge_model_filter_events(
+                                purge_batch_size,
+                                mf_keep_per_model,
+                                mf_retention_secs,
+                            )
+                            .await
+                        {
+                            Ok(0) => break,
+                            Ok(deleted) => {
+                                counter!("fusillade_model_filter_events_purged_total")
+                                    .increment(deleted);
+                                tracing::debug!(deleted, "Purged old model_filters events");
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_millis(purge_throttle_ms)) => {},
+                                    _ = shutdown_token.cancelled() => {
+                                        tracing::info!("Shutting down purge task during model_filters drain");
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                counter!("fusillade_purge_errors_total").increment(1);
+                                tracing::error!(error = %e, "Failed to purge model_filters events");
                                 break;
                             }
                         }
@@ -1388,6 +1446,8 @@ mod tests {
             model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -1575,6 +1635,8 @@ mod tests {
             model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -1824,6 +1886,8 @@ mod tests {
             model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -1978,6 +2042,8 @@ mod tests {
             model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -2171,6 +2237,8 @@ mod tests {
             model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -2348,6 +2416,8 @@ mod tests {
             model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -2530,6 +2600,8 @@ mod tests {
             model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -2707,6 +2779,8 @@ mod tests {
             model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -2867,6 +2941,8 @@ mod tests {
             model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -3008,6 +3084,8 @@ mod tests {
             model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(

@@ -29,10 +29,13 @@ pub mod response_step;
 mod utils;
 
 /// Liveness state of a model on internal (self-hosted) infrastructure, as
-/// published by scouter into the `model_filters` table.
+/// published by scouter into the `model_filters` append-only event log.
 ///
-/// An *absent* row (no entry for a model) means scouter is not deploying that
-/// model — the daemon treats absence as "claim now, route to OpenRouter".
+/// `model_filters` is an event log, not a current-state table: the CURRENT
+/// state of a model is the latest event for it. An `Absent` event is an
+/// explicit tombstone (scouter retracted the model); a model with no events at
+/// all is also treated as absent. The daemon treats absence as "claim now,
+/// route to OpenRouter".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelFilterState {
@@ -41,6 +44,10 @@ pub enum ModelFilterState {
     /// Internal infrastructure will serve this model soon; `expected_ready_at`
     /// carries the ETA.
     Coming,
+    /// Explicit tombstone: scouter is no longer deploying this model. Appended
+    /// (instead of deleting rows) to retract a model from the log. Treated
+    /// identically to "no events" by the claim gate.
+    Absent,
 }
 
 impl ModelFilterState {
@@ -49,19 +56,31 @@ impl ModelFilterState {
         match self {
             ModelFilterState::Live => "live",
             ModelFilterState::Coming => "coming",
+            ModelFilterState::Absent => "absent",
+        }
+    }
+
+    /// Parse the textual `model_filters.state` value.
+    pub fn parse_state(s: &str) -> Option<Self> {
+        match s {
+            "live" => Some(ModelFilterState::Live),
+            "coming" => Some(ModelFilterState::Coming),
+            "absent" => Some(ModelFilterState::Absent),
+            _ => None,
         }
     }
 }
 
-/// A single `model_filters` row describing a model's internal liveness.
+/// A single `model_filters` event describing a model's internal-liveness
+/// transition.
 ///
 /// `expected_ready_at` is only meaningful when `state == Coming`; for `Live`
-/// it should be `None`.
+/// and `Absent` it should be `None`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelFilter {
-    /// Model name (primary key).
+    /// Model name (NOT unique — many events per model in the log).
     pub model: String,
-    /// Liveness state.
+    /// Liveness state recorded by this event.
     pub state: ModelFilterState,
     /// ETA when `state == Coming`.
     pub expected_ready_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -469,21 +488,34 @@ pub trait Storage: Send + Sync {
         user_recent_claims: &std::collections::HashMap<String, f64>,
     ) -> Result<Vec<Request<Claimed>>>;
 
-    /// Replace the entire `model_filters` table with `entries` (transactional:
-    /// upsert present rows, delete absent ones) and bump the
-    /// `model_filters_sync` heartbeat. Used by scouter on each sync.
-    async fn set_model_filters(&self, entries: &[ModelFilter]) -> Result<()>;
+    /// Append a single event to the `model_filters` log and bump the
+    /// `model_filters_sync` heartbeat. Used by scouter when a model's internal
+    /// liveness CHANGES (live / coming(ETA) / absent-tombstone).
+    ///
+    /// This is append-only: there is no delete and no upsert. Retraction is
+    /// appending an `Absent` event. Appending **only on change** (so the log
+    /// stays a transition log rather than a poll log) is the caller's
+    /// responsibility — this function always inserts a row.
+    async fn append_model_filter_event(&self, entry: &ModelFilter) -> Result<()>;
 
-    /// Insert or update a single `model_filters` row and bump the heartbeat.
-    /// Convenience for incremental (delta) updates by scouter.
-    async fn upsert_model_filter(&self, entry: &ModelFilter) -> Result<()>;
+    /// Append a batch of events to the `model_filters` log (one row each, in
+    /// order) and bump the heartbeat once. Convenience for scouter publishing
+    /// several transitions in one sync. Same append-only / append-on-change
+    /// semantics as [`Storage::append_model_filter_event`].
+    async fn append_model_filter_events(&self, entries: &[ModelFilter]) -> Result<()>;
 
-    /// Delete a single `model_filters` row (model no longer deployed) and bump
-    /// the heartbeat.
-    async fn delete_model_filter(&self, model: &str) -> Result<()>;
-
-    /// List all `model_filters` rows (observability / tests).
+    /// List the CURRENT state of every model (the latest event per model),
+    /// excluding models whose latest event is an `Absent` tombstone
+    /// (observability / tests).
     async fn list_model_filters(&self) -> Result<Vec<ModelFilter>>;
+
+    /// Estimate how long a model takes to load on internal infrastructure, by
+    /// pairing each `coming` event with the next `live` event for that model in
+    /// the log and computing an exponentially-weighted moving average (EWMA)
+    /// over recent samples (newest-weighted). Returns `None` if no
+    /// `coming -> live` transition has ever been observed. scouter calls this
+    /// to set future `expected_ready_at` ETAs.
+    async fn model_load_estimate(&self, model: &str) -> Result<Option<chrono::Duration>>;
 
     /// Read the `model_filters_sync` heartbeat timestamp (observability /
     /// tests). Returns `None` if the singleton row is missing.
@@ -605,6 +637,22 @@ pub trait DaemonStorage: Send + Sync {
     /// Returns total rows deleted across both tables. Called periodically by
     /// the daemon purge task for right-to-erasure compliance.
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
+
+    /// Purge old `model_filters` events, ALWAYS retaining, per model, the most
+    /// recent `keep_per_model` events (so the current-state lookup and a short
+    /// history window survive) AND every event newer than `retention_secs`
+    /// regardless of count.
+    ///
+    /// Deletes at most `batch_size` rows per call. Returns rows deleted.
+    /// Called periodically by the daemon purge task to bound the append-only
+    /// log. `keep_per_model >= 1` guarantees the latest event per model is
+    /// never purged, so the claim gate never loses a model's current state.
+    async fn purge_model_filter_events(
+        &self,
+        batch_size: i64,
+        keep_per_model: i64,
+        retention_secs: f64,
+    ) -> Result<u64>;
 }
 
 /// Daemon executor trait for runtime orchestration.

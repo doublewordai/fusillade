@@ -1169,7 +1169,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         ON COALESCE(r.created_by, b.created_by) = up.user_id
                     LEFT JOIN user_recent ur
                         ON COALESCE(r.created_by, b.created_by) = ur.user_id
-                    LEFT JOIN model_filters mf ON mf.model = m.model
+                    -- Current internal-liveness of this model = the LATEST
+                    -- event in the append-only `model_filters` log. NULL (no
+                    -- events) and an `absent` tombstone both mean "absent" =>
+                    -- the `coming`-only hold predicate below never holds them.
+                    -- Relies on idx_model_filters_model_created_at.
+                    LEFT JOIN LATERAL (
+                        SELECT mfe.state, mfe.expected_ready_at
+                        FROM model_filters mfe
+                        WHERE mfe.model = m.model
+                        ORDER BY mfe.created_at DESC
+                        LIMIT 1
+                    ) mf ON true
                     WHERE r.state = 'pending'
                         AND r.model = m.model
                         AND r.template_id IS NOT NULL
@@ -1416,122 +1427,52 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(all_claimed)
     }
 
-    async fn set_model_filters(&self, entries: &[ModelFilter]) -> Result<()> {
-        let now = Utc::now();
-
-        let models: Vec<String> = entries.iter().map(|e| e.model.clone()).collect();
-        let states: Vec<String> = entries
-            .iter()
-            .map(|e| e.state.as_str().to_string())
-            .collect();
-        // chrono Option<DateTime<Utc>> arrays bind cleanly to TIMESTAMPTZ[].
-        let etas: Vec<Option<DateTime<Utc>>> =
-            entries.iter().map(|e| e.expected_ready_at).collect();
-
-        let mut tx = self.pools.write().begin().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to begin set_model_filters tx: {}", e))
-        })?;
-
-        // Upsert all present rows.
-        sqlx::query!(
-            r#"
-            INSERT INTO model_filters (model, state, expected_ready_at, updated_at)
-            SELECT model, state, expected_ready_at, $4
-            FROM unnest($1::TEXT[], $2::TEXT[], $3::TIMESTAMPTZ[])
-                AS t(model, state, expected_ready_at)
-            ON CONFLICT (model) DO UPDATE SET
-                state = EXCLUDED.state,
-                expected_ready_at = EXCLUDED.expected_ready_at,
-                updated_at = EXCLUDED.updated_at
-            "#,
-            &models,
-            &states,
-            &etas as &[Option<DateTime<Utc>>],
-            now,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to upsert model_filters: {}", e)))?;
-
-        // Delete any row not in the provided set (full replace semantics).
-        sqlx::query!(
-            r#"DELETE FROM model_filters WHERE model <> ALL($1::TEXT[])"#,
-            &models,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to prune model_filters: {}", e)))?;
-
-        sqlx::query!(
-            r#"
-            INSERT INTO model_filters_sync (id, updated_at) VALUES (true, $1)
-            ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at
-            "#,
-            now,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to bump model_filters_sync: {}", e)))?;
-
-        tx.commit().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to commit set_model_filters tx: {}", e))
-        })?;
-
-        Ok(())
+    async fn append_model_filter_event(&self, entry: &ModelFilter) -> Result<()> {
+        self.append_model_filter_events(std::slice::from_ref(entry))
+            .await
     }
 
-    async fn upsert_model_filter(&self, entry: &ModelFilter) -> Result<()> {
+    async fn append_model_filter_events(&self, entries: &[ModelFilter]) -> Result<()> {
         let now = Utc::now();
         let mut tx = self.pools.write().begin().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to begin upsert_model_filter tx: {}", e))
+            FusilladeError::Other(anyhow!(
+                "Failed to begin append_model_filter_events tx: {}",
+                e
+            ))
         })?;
 
-        sqlx::query!(
-            r#"
-            INSERT INTO model_filters (model, state, expected_ready_at, updated_at)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (model) DO UPDATE SET
-                state = EXCLUDED.state,
-                expected_ready_at = EXCLUDED.expected_ready_at,
-                updated_at = EXCLUDED.updated_at
-            "#,
-            entry.model,
-            entry.state.as_str(),
-            entry.expected_ready_at,
-            now,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to upsert model_filter: {}", e)))?;
+        if !entries.is_empty() {
+            let models: Vec<String> = entries.iter().map(|e| e.model.clone()).collect();
+            let states: Vec<String> = entries
+                .iter()
+                .map(|e| e.state.as_str().to_string())
+                .collect();
+            let etas: Vec<Option<DateTime<Utc>>> =
+                entries.iter().map(|e| e.expected_ready_at).collect();
 
-        sqlx::query!(
-            r#"
-            INSERT INTO model_filters_sync (id, updated_at) VALUES (true, $1)
-            ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at
-            "#,
-            now,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to bump model_filters_sync: {}", e)))?;
-
-        tx.commit().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to commit upsert_model_filter tx: {}", e))
-        })?;
-
-        Ok(())
-    }
-
-    async fn delete_model_filter(&self, model: &str) -> Result<()> {
-        let now = Utc::now();
-        let mut tx = self.pools.write().begin().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to begin delete_model_filter tx: {}", e))
-        })?;
-
-        sqlx::query!(r#"DELETE FROM model_filters WHERE model = $1"#, model)
+            // Append one row per event. `WITH ORDINALITY` preserves caller
+            // order so events that share `created_at = now` keep their relative
+            // order via the serial `id` (the latest-event lookup falls back to
+            // id when created_at ties are possible).
+            sqlx::query!(
+                r#"
+                INSERT INTO model_filters (model, state, expected_ready_at, created_at)
+                SELECT model, state, expected_ready_at, $4
+                FROM unnest($1::TEXT[], $2::TEXT[], $3::TIMESTAMPTZ[])
+                    WITH ORDINALITY AS t(model, state, expected_ready_at, ord)
+                ORDER BY ord
+                "#,
+                &models,
+                &states,
+                &etas as &[Option<DateTime<Utc>>],
+                now,
+            )
             .execute(&mut *tx)
             .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete model_filter: {}", e)))?;
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to append model_filters events: {}", e))
+            })?;
+        }
 
         sqlx::query!(
             r#"
@@ -1545,15 +1486,29 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to bump model_filters_sync: {}", e)))?;
 
         tx.commit().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to commit delete_model_filter tx: {}", e))
+            FusilladeError::Other(anyhow!(
+                "Failed to commit append_model_filter_events tx: {}",
+                e
+            ))
         })?;
 
         Ok(())
     }
 
     async fn list_model_filters(&self) -> Result<Vec<ModelFilter>> {
+        // Current state per model = latest event; exclude `absent` tombstones.
         let rows = sqlx::query!(
-            r#"SELECT model, state, expected_ready_at FROM model_filters ORDER BY model"#
+            r#"
+            SELECT model, state, expected_ready_at
+            FROM (
+                SELECT DISTINCT ON (model)
+                    model, state, expected_ready_at
+                FROM model_filters
+                ORDER BY model, created_at DESC, id DESC
+            ) latest
+            WHERE state <> 'absent'
+            ORDER BY model
+            "#
         )
         .fetch_all(self.pools.read())
         .await
@@ -1561,16 +1516,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         rows.into_iter()
             .map(|row| {
-                let state = match row.state.as_str() {
-                    "live" => ModelFilterState::Live,
-                    "coming" => ModelFilterState::Coming,
-                    other => {
-                        return Err(FusilladeError::Other(anyhow!(
-                            "Unknown model_filters.state: {}",
-                            other
-                        )));
-                    }
-                };
+                let state = ModelFilterState::parse_state(&row.state).ok_or_else(|| {
+                    FusilladeError::Other(anyhow!("Unknown model_filters.state: {}", row.state))
+                })?;
                 Ok(ModelFilter {
                     model: row.model,
                     state,
@@ -1578,6 +1526,58 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 })
             })
             .collect()
+    }
+
+    async fn model_load_estimate(&self, model: &str) -> Result<Option<chrono::Duration>> {
+        // Pair each `coming` event with the next `live` event for the model and
+        // measure the gap (observed load duration). We use the event's own
+        // `created_at` (when scouter saw the transition) rather than
+        // expected_ready_at, so the estimate reflects ACTUAL load times.
+        //
+        // Sorting newest-first and folding an EWMA in Rust (rather than SQL)
+        // keeps the formula a single tunable place; the index serves the scan.
+        let rows = sqlx::query!(
+            r#"
+            WITH ordered AS (
+                SELECT
+                    state,
+                    created_at,
+                    LEAD(created_at) OVER (ORDER BY created_at ASC, id ASC) AS next_at,
+                    LEAD(state)      OVER (ORDER BY created_at ASC, id ASC) AS next_state
+                FROM model_filters
+                WHERE model = $1
+            )
+            SELECT EXTRACT(EPOCH FROM (next_at - created_at))::DOUBLE PRECISION AS "gap_secs!"
+            FROM ordered
+            WHERE state = 'coming'
+              AND next_state = 'live'
+              AND next_at IS NOT NULL
+            ORDER BY created_at DESC
+            "#,
+            model,
+        )
+        .fetch_all(self.pools.read())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to compute model_load_estimate: {}", e))
+        })?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        // EWMA over samples, newest first (rows[0] is the most recent). With
+        // alpha weighting the newest sample most heavily:
+        //   ewma = sample_newest, then ewma = alpha*older + (1-alpha)*ewma ...
+        // Iterating newest -> oldest, fold so the newest dominates.
+        const ALPHA: f64 = 0.5;
+        let mut iter = rows.iter().map(|r| r.gap_secs.max(0.0));
+        let mut ewma = iter.next().unwrap_or(0.0);
+        for older in iter {
+            ewma = (1.0 - ALPHA) * ewma + ALPHA * older;
+        }
+
+        Ok(Some(chrono::Duration::milliseconds((ewma * 1000.0) as i64)))
     }
 
     async fn model_filters_heartbeat(&self) -> Result<Option<DateTime<Utc>>> {
@@ -5845,6 +5845,60 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         }
 
         Ok(total)
+    }
+
+    async fn purge_model_filter_events(
+        &self,
+        batch_size: i64,
+        keep_per_model: i64,
+        retention_secs: f64,
+    ) -> Result<u64> {
+        // Delete old `model_filters` events while guaranteeing that, per model,
+        // we keep the most recent `keep_per_model` events AND every event newer
+        // than `retention_secs`. A row is eligible for deletion iff BOTH:
+        //   - it is NOT within the most recent `keep_per_model` for its model
+        //     (rank by created_at DESC, id DESC), and
+        //   - it is older than `retention_secs`.
+        // Because keep_per_model >= 1, the latest event per model is never
+        // purged, so the claim gate never loses a model's current state.
+        let keep = keep_per_model.max(1);
+        let deleted = sqlx::query!(
+            r#"
+            WITH ranked AS (
+                SELECT
+                    id,
+                    created_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY model
+                        ORDER BY created_at DESC, id DESC
+                    ) AS rn
+                FROM model_filters
+            ),
+            eligible AS (
+                SELECT id
+                FROM ranked
+                WHERE rn > $2
+                  AND created_at < now() - make_interval(secs => $3)
+                ORDER BY id ASC
+                LIMIT $1
+            )
+            DELETE FROM model_filters
+            WHERE id IN (SELECT id FROM eligible)
+            "#,
+            batch_size,
+            keep,
+            retention_secs,
+        )
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge model_filters events: {}", e)))?
+        .rows_affected();
+
+        if deleted > 0 {
+            tracing::debug!(deleted, "Purged old model_filters events");
+        }
+
+        Ok(deleted)
     }
 }
 
@@ -11419,7 +11473,7 @@ mod tests {
 
         // Model is `coming` with ETA 30s out — within D_eff (60s), so HOLD.
         manager
-            .set_model_filters(&[ModelFilter {
+            .append_model_filter_events(&[ModelFilter {
                 model: "coming-model".to_string(),
                 state: ModelFilterState::Coming,
                 expected_ready_at: Some(Utc::now() + chrono::Duration::seconds(30)),
@@ -11442,7 +11496,7 @@ mod tests {
 
         // Flip to live ⇒ now claimable.
         manager
-            .set_model_filters(&[ModelFilter {
+            .append_model_filter_events(&[ModelFilter {
                 model: "coming-model".to_string(),
                 state: ModelFilterState::Live,
                 expected_ready_at: None,
@@ -11473,7 +11527,7 @@ mod tests {
         // Same coming model, but the request is at its deadline ⇒ must release
         // to the OR path rather than wait for internal capacity.
         manager
-            .set_model_filters(&[ModelFilter {
+            .append_model_filter_events(&[ModelFilter {
                 model: "coming-model".to_string(),
                 state: ModelFilterState::Coming,
                 expected_ready_at: Some(Utc::now() + chrono::Duration::seconds(30)),
@@ -11507,7 +11561,7 @@ mod tests {
         setup_filter_request(&manager, &pool, "idle-user", "absent-model", expires_at).await;
 
         // Fresh heartbeat, but no model_filters row for this model ⇒ claim.
-        manager.set_model_filters(&[]).await.unwrap();
+        manager.append_model_filter_events(&[]).await.unwrap();
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("absent-model".to_string(), 5)]);
@@ -11582,7 +11636,7 @@ mod tests {
         setup_filter_request(&manager, &pool, "busy-user", "coming-model", expires_at).await;
 
         manager
-            .set_model_filters(&[ModelFilter {
+            .append_model_filter_events(&[ModelFilter {
                 model: "coming-model".to_string(),
                 state: ModelFilterState::Coming,
                 expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(10)),
@@ -11630,7 +11684,7 @@ mod tests {
         setup_filter_request(&manager, &pool, "decaying-user", "coming-model", expires_at).await;
 
         manager
-            .set_model_filters(&[ModelFilter {
+            .append_model_filter_events(&[ModelFilter {
                 model: "coming-model".to_string(),
                 state: ModelFilterState::Coming,
                 expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(10)),
@@ -11663,7 +11717,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_set_model_filters_replace_and_heartbeat(pool: sqlx::PgPool) {
+    async fn test_append_model_filter_events_and_heartbeat(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -11675,8 +11729,9 @@ mod tests {
             "heartbeat singleton exists from migration"
         );
 
+        // Append a batch of events; latest-event-per-model is the current state.
         manager
-            .set_model_filters(&[
+            .append_model_filter_events(&[
                 ModelFilter {
                     model: "m-live".to_string(),
                     state: ModelFilterState::Live,
@@ -11703,14 +11758,15 @@ mod tests {
         let after = manager.model_filters_heartbeat().await.unwrap().unwrap();
         assert!(
             after >= before.unwrap(),
-            "set_model_filters should bump the heartbeat"
+            "append_model_filter_events should bump the heartbeat"
         );
 
-        // Replace semantics: m-live dropped, m-coming retained, m-new added.
+        // Append-only: a later event supersedes the earlier one for the same
+        // model (latest wins). m-live transitions to coming; m-new appears.
         manager
-            .set_model_filters(&[
+            .append_model_filter_events(&[
                 ModelFilter {
-                    model: "m-coming".to_string(),
+                    model: "m-live".to_string(),
                     state: ModelFilterState::Coming,
                     expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(2)),
                 },
@@ -11724,19 +11780,21 @@ mod tests {
             .unwrap();
         let mut listed = manager.list_model_filters().await.unwrap();
         listed.sort_by(|a, b| a.model.cmp(&b.model));
-        assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].model, "m-coming");
-        assert_eq!(listed[1].model, "m-new");
+        assert_eq!(
+            listed.len(),
+            3,
+            "all three models have a live/coming latest"
+        );
+        assert_eq!(listed[1].model, "m-live");
+        assert_eq!(
+            listed[1].state,
+            ModelFilterState::Coming,
+            "m-live's latest event is now coming"
+        );
 
-        // Incremental delete.
-        manager.delete_model_filter("m-coming").await.unwrap();
-        let listed = manager.list_model_filters().await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].model, "m-new");
-
-        // Incremental upsert.
+        // Single-event append helper.
         manager
-            .upsert_model_filter(&ModelFilter {
+            .append_model_filter_event(&ModelFilter {
                 model: "m-new".to_string(),
                 state: ModelFilterState::Coming,
                 expected_ready_at: Some(Utc::now()),
@@ -11744,8 +11802,215 @@ mod tests {
             .await
             .unwrap();
         let listed = manager.list_model_filters().await.unwrap();
+        let m_new = listed.iter().find(|m| m.model == "m-new").unwrap();
+        assert_eq!(m_new.state, ModelFilterState::Coming);
+
+        // Underlying log retains every event (2 + 2 + 1 = 5 rows).
+        let total: i64 = sqlx::query_scalar!("SELECT COUNT(*) AS \"c!\" FROM model_filters")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 5, "append-only: every event is retained in the log");
+    }
+
+    #[sqlx::test]
+    async fn test_tombstone_absent_hides_model(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        // Model goes live, then is retracted with an explicit absent tombstone.
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "m-tomb".to_string(),
+                state: ModelFilterState::Live,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(manager.list_model_filters().await.unwrap().len(), 1);
+
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "m-tomb".to_string(),
+                state: ModelFilterState::Absent,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+
+        // Latest event is absent => current-state listing excludes the model.
+        let listed = manager.list_model_filters().await.unwrap();
+        assert!(
+            listed.iter().all(|m| m.model != "m-tomb"),
+            "a model whose latest event is an absent tombstone is treated as absent"
+        );
+
+        // But the event log still holds both rows (append-only, no delete).
+        let total: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) AS \"c!\" FROM model_filters WHERE model = 'm-tomb'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(total, 2);
+    }
+
+    #[sqlx::test]
+    async fn test_tombstone_absent_model_is_claimed(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "idle-user", "tomb-model", expires_at).await;
+
+        // coming (would hold) then absent tombstone (latest) => claim.
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "tomb-model".to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: Some(Utc::now() + chrono::Duration::seconds(30)),
+            })
+            .await
+            .unwrap();
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "tomb-model".to_string(),
+                state: ModelFilterState::Absent,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("tomb-model".to_string(), 5)]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "latest event is absent tombstone => claim (route to OR), not hold"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_model_load_estimate(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        // No events => no estimate.
+        assert!(
+            manager
+                .model_load_estimate("m-load")
+                .await
+                .unwrap()
+                .is_none(),
+            "no coming->live transitions yet"
+        );
+
+        // Insert paired coming/live events with controlled timestamps so the
+        // observed load durations are deterministic: 100s then 200s.
+        let base = Utc::now() - chrono::Duration::hours(1);
+        let pairs = [
+            (base, base + chrono::Duration::seconds(100)),
+            (
+                base + chrono::Duration::minutes(10),
+                base + chrono::Duration::minutes(10) + chrono::Duration::seconds(200),
+            ),
+        ];
+        for (coming_at, live_at) in pairs {
+            sqlx::query!(
+                "INSERT INTO model_filters (model, state, expected_ready_at, created_at) \
+                 VALUES ('m-load', 'coming', $2, $1)",
+                coming_at,
+                live_at,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query!(
+                "INSERT INTO model_filters (model, state, expected_ready_at, created_at) \
+                 VALUES ('m-load', 'live', NULL, $1)",
+                live_at,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let est = manager
+            .model_load_estimate("m-load")
+            .await
+            .unwrap()
+            .expect("a coming->live transition exists");
+        let secs = est.num_seconds();
+        // EWMA over [200 (newest), 100 (oldest)] with alpha 0.5 => 150s.
+        assert!(
+            (140..=160).contains(&secs),
+            "EWMA of 100s and 200s load times should be ~150s, got {secs}s"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_purge_model_filter_events_retention(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        // Insert 5 old events (2 hours ago) for one model.
+        let old = Utc::now() - chrono::Duration::hours(2);
+        for i in 0..5 {
+            sqlx::query!(
+                "INSERT INTO model_filters (model, state, created_at) \
+                 VALUES ('m-purge', 'coming', $1)",
+                old + chrono::Duration::seconds(i),
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // And a recent event (now) for the same model.
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "m-purge".to_string(),
+                state: ModelFilterState::Live,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+
+        // Retention: keep latest 1 per model, purge anything older than 1 hour.
+        // The newest event (the appended live) is kept by rank; of the 5 old
+        // events, all are older than 1h and beyond the keep window => purged.
+        let deleted = manager
+            .purge_model_filter_events(1000, 1, 3600.0)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 5, "the 5 old events should be purged");
+
+        // Latest event per model is always retained: current state survives.
+        let listed = manager.list_model_filters().await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].state, ModelFilterState::Coming);
+        assert_eq!(listed[0].model, "m-purge");
+        assert_eq!(listed[0].state, ModelFilterState::Live);
+
+        // keep_per_model is clamped to >= 1 even if 0 is passed, so the latest
+        // event is never lost.
+        let deleted = manager
+            .purge_model_filter_events(1000, 0, 0.0)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0, "nothing left beyond the protected latest event");
+        assert_eq!(manager.list_model_filters().await.unwrap().len(), 1);
     }
 
     #[sqlx::test]
