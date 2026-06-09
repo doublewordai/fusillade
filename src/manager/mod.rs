@@ -28,6 +28,45 @@ pub mod postgres;
 pub mod response_step;
 mod utils;
 
+/// Liveness state of a model on internal (self-hosted) infrastructure, as
+/// published by scouter into the `model_filters` table.
+///
+/// An *absent* row (no entry for a model) means scouter is not deploying that
+/// model — the daemon treats absence as "claim now, route to OpenRouter".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelFilterState {
+    /// Internal infrastructure is serving this model now.
+    Live,
+    /// Internal infrastructure will serve this model soon; `expected_ready_at`
+    /// carries the ETA.
+    Coming,
+}
+
+impl ModelFilterState {
+    /// The textual value stored in `model_filters.state`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelFilterState::Live => "live",
+            ModelFilterState::Coming => "coming",
+        }
+    }
+}
+
+/// A single `model_filters` row describing a model's internal liveness.
+///
+/// `expected_ready_at` is only meaningful when `state == Coming`; for `Live`
+/// it should be `None`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelFilter {
+    /// Model name (primary key).
+    pub model: String,
+    /// Liveness state.
+    pub state: ModelFilterState,
+    /// ETA when `state == Coming`.
+    pub expected_ready_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Storage trait for persisting and querying requests.
 ///
 /// This trait provides atomic operations for request lifecycle management.
@@ -411,13 +450,44 @@ pub trait Storage: Send + Sync {
     /// Implementations may blend user-fairness with SLA urgency (batch deadline
     /// proximity) via `DaemonConfig::urgency_weight`. See the PostgreSQL
     /// implementation for the composite scoring formula.
+    ///
+    /// `user_recent_claims` maps user identifiers to a decaying per-user
+    /// recent-CLAIM score (resource consumed, not backlog). It feeds the
+    /// effective deadline `D_eff` used by the async model-filters hold/release
+    /// gate: idle users get a tight `D_eff` (served fast / released to
+    /// OpenRouter), sustained consumers get a relaxed `D_eff` (work held for
+    /// imminent internal capacity). Pass an empty map to disable the relaxation
+    /// (every user is treated as idle). The gate also consults the
+    /// `model_filters` table and the `model_filters_sync` heartbeat; with an
+    /// empty `model_filters` table the gate is a no-op (everything claimable).
     async fn claim_requests(
         &self,
         limit: usize,
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
+        user_recent_claims: &std::collections::HashMap<String, f64>,
     ) -> Result<Vec<Request<Claimed>>>;
+
+    /// Replace the entire `model_filters` table with `entries` (transactional:
+    /// upsert present rows, delete absent ones) and bump the
+    /// `model_filters_sync` heartbeat. Used by scouter on each sync.
+    async fn set_model_filters(&self, entries: &[ModelFilter]) -> Result<()>;
+
+    /// Insert or update a single `model_filters` row and bump the heartbeat.
+    /// Convenience for incremental (delta) updates by scouter.
+    async fn upsert_model_filter(&self, entry: &ModelFilter) -> Result<()>;
+
+    /// Delete a single `model_filters` row (model no longer deployed) and bump
+    /// the heartbeat.
+    async fn delete_model_filter(&self, model: &str) -> Result<()>;
+
+    /// List all `model_filters` rows (observability / tests).
+    async fn list_model_filters(&self) -> Result<Vec<ModelFilter>>;
+
+    /// Read the `model_filters_sync` heartbeat timestamp (observability /
+    /// tests). Returns `None` if the singleton row is missing.
+    async fn model_filters_heartbeat(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>>;
 
     /// Update an existing request's state in storage.
     ///

@@ -256,6 +256,38 @@ pub struct DaemonConfig {
     /// fall back to `created_at + flex_expiry_ms`. Default 1h (legacy flex SLA).
     #[serde(default = "default_flex_expiry_ms")]
     pub flex_expiry_ms: u64,
+
+    /// Floor TTFT target (milliseconds) for the async model-filters effective
+    /// deadline `D_eff`. An idle user gets `D_eff ≈ now + min_async_ttft`, so
+    /// almost nothing qualifies to hold — responsive. INTERNAL config only;
+    /// never a published flex/batch SLA. Default: 60_000 (1 minute).
+    #[serde(default = "default_min_async_ttft_ms")]
+    pub min_async_ttft_ms: u64,
+
+    /// Estimated time (milliseconds) to actually serve a request once internal
+    /// capacity is live. Used in the hold/release decision (`now + serve` vs
+    /// `D_eff`, `expected_ready_at + serve` vs `D_eff`). Start small.
+    /// Default: 0.
+    #[serde(default)]
+    pub serve_margin_ms: u64,
+
+    /// Staleness threshold (milliseconds) for the `model_filters_sync`
+    /// heartbeat. When the heartbeat is older than this, the claim gate fails
+    /// closed (only deadline-release claims). Align to scouter's poll cadence.
+    /// Default: 30_000.
+    #[serde(default = "default_model_filters_ttl_ms")]
+    pub model_filters_ttl_ms: u64,
+
+    /// Half-life (milliseconds) of the per-user decaying recent-claim score
+    /// that relaxes `D_eff` for sustained consumers. Default: 120_000.
+    #[serde(default = "default_recent_claims_halflife_ms")]
+    pub recent_claims_halflife_ms: u64,
+
+    /// Curve constant `k` for the saturating relaxation `g(score) = score /
+    /// (score + k)` used in `D_eff`. Larger `k` => a user must consume more
+    /// recent resource before their deadline relaxes. Default: 4.0.
+    #[serde(default = "default_recent_claims_curve_k")]
+    pub recent_claims_curve_k: f64,
 }
 
 fn default_batch_metadata_fields() -> Vec<String> {
@@ -269,6 +301,22 @@ fn default_batch_metadata_fields() -> Vec<String> {
 
 fn default_flex_expiry_ms() -> u64 {
     3_600_000 // 1 hour
+}
+
+fn default_min_async_ttft_ms() -> u64 {
+    60_000 // 1 minute
+}
+
+fn default_model_filters_ttl_ms() -> u64 {
+    30_000 // 30 seconds
+}
+
+fn default_recent_claims_halflife_ms() -> u64 {
+    120_000 // 2 minutes
+}
+
+fn default_recent_claims_curve_k() -> f64 {
+    4.0
 }
 
 impl Default for DaemonConfig {
@@ -303,6 +351,11 @@ impl Default for DaemonConfig {
             streamable_endpoints: Vec::new(),
             urgency_weight: 0.0,
             flex_expiry_ms: default_flex_expiry_ms(),
+            min_async_ttft_ms: default_min_async_ttft_ms(),
+            serve_margin_ms: 0,
+            model_filters_ttl_ms: default_model_filters_ttl_ms(),
+            recent_claims_halflife_ms: default_recent_claims_halflife_ms(),
+            recent_claims_curve_k: default_recent_claims_curve_k(),
         }
     }
 }
@@ -336,6 +389,13 @@ where
     /// Per-user in-flight request counts across all models, used to prioritise
     /// users with fewer active requests during claim (per-user fair scheduling).
     user_requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
+    /// Per-user decaying recent-CLAIM score, feeding the async model-filters
+    /// effective deadline `D_eff`. Each entry is `(score, last_update)`;
+    /// incremented at claim time (decay-then-add) and decayed-on-read when
+    /// snapshotted. Keys off resource consumed, not backlog, so a large batch
+    /// and a few sequential requests relax identically. See
+    /// `recent_claims_halflife_ms` / `recent_claims_curve_k`.
+    user_recent_claims: Arc<dashmap::DashMap<String, (f64, std::time::Instant)>>,
     /// Per-user throughput counters for periodic OTel emission.
     user_throughput: Arc<dashmap::DashMap<String, UserThroughputStats>>,
     requests_processed: Arc<AtomicU64>,
@@ -370,6 +430,7 @@ where
             processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
             user_requests_in_flight: Arc::new(dashmap::DashMap::new()),
+            user_recent_claims: Arc::new(dashmap::DashMap::new()),
             user_throughput: Arc::new(dashmap::DashMap::new()),
             requests_processed: Arc::new(AtomicU64::new(0)),
             requests_failed: Arc::new(AtomicU64::new(0)),
@@ -782,6 +843,40 @@ where
                 })
                 .collect();
 
+            // Snapshot per-user decaying recent-claim scores for the async
+            // model-filters D_eff relaxation. Decay-on-read to `now`, drop
+            // entries that have decayed below ε (keeps the map bounded — no
+            // periodic task needed). Score units are "recent claims" with the
+            // configured half-life.
+            let recent_now = std::time::Instant::now();
+            let recent_halflife_secs =
+                (self.config.recent_claims_halflife_ms as f64 / 1000.0).max(f64::MIN_POSITIVE);
+            const RECENT_CLAIMS_EPSILON: f64 = 0.01;
+            let mut decayed_user_ids: Vec<String> = Vec::new();
+            let user_recent_claims: HashMap<String, f64> = self
+                .user_recent_claims
+                .iter()
+                .filter_map(|entry| {
+                    let (score, last) = *entry.value();
+                    let dt = recent_now.saturating_duration_since(last).as_secs_f64();
+                    let decayed = score * 0.5f64.powf(dt / recent_halflife_secs);
+                    if decayed >= RECENT_CLAIMS_EPSILON {
+                        Some((entry.key().clone(), decayed))
+                    } else {
+                        decayed_user_ids.push(entry.key().clone());
+                        None
+                    }
+                })
+                .collect();
+            // Prune fully-decayed entries to keep the map bounded.
+            for user_id in decayed_user_ids {
+                self.user_recent_claims
+                    .remove_if(&user_id, |_, (score, last)| {
+                        let dt = recent_now.saturating_duration_since(*last).as_secs_f64();
+                        *score * 0.5f64.powf(dt / recent_halflife_secs) < RECENT_CLAIMS_EPSILON
+                    });
+            }
+
             // Claim a batch of pending requests (guaranteed ≤ available capacity per model)
             let claim_start = std::time::Instant::now();
             let mut claimed = self
@@ -791,6 +886,7 @@ where
                     self.daemon_id,
                     &available_capacity,
                     &user_active_counts,
+                    &user_recent_claims,
                 )
                 .await?;
             histogram!("fusillade_claim_duration_seconds")
@@ -951,6 +1047,24 @@ where
                         .fetch_add(1, Ordering::Relaxed);
                     gauge!("fusillade_user_requests_in_flight", "user" => user_id.clone(), "completion_window" => completion_window.clone())
                         .increment(1.0);
+
+                    // Bump the per-user decaying recent-claim score (resource
+                    // consumed) at the same site as the in-flight counter:
+                    // decay-then-add so the score reflects recent claim volume
+                    // for the async model-filters D_eff relaxation.
+                    {
+                        let now = std::time::Instant::now();
+                        let halflife_secs = (self.config.recent_claims_halflife_ms as f64 / 1000.0)
+                            .max(f64::MIN_POSITIVE);
+                        let mut entry = self
+                            .user_recent_claims
+                            .entry(user_id.clone())
+                            .or_insert((0.0, now));
+                        let (score, last) = *entry;
+                        let dt = now.saturating_duration_since(last).as_secs_f64();
+                        let decayed = score * 0.5f64.powf(dt / halflife_secs);
+                        *entry = (decayed + 1.0, now);
+                    }
 
                     let process_span = tracing::info_span!(
                         parent: tracing::Span::none(),
@@ -1269,6 +1383,11 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            min_async_ttft_ms: 60_000,
+            serve_margin_ms: 0,
+            model_filters_ttl_ms: 30_000,
+            recent_claims_halflife_ms: 120_000,
+            recent_claims_curve_k: 4.0,
         };
 
         let manager = Arc::new(
@@ -1451,6 +1570,11 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            min_async_ttft_ms: 60_000,
+            serve_margin_ms: 0,
+            model_filters_ttl_ms: 30_000,
+            recent_claims_halflife_ms: 120_000,
+            recent_claims_curve_k: 4.0,
         };
 
         let manager = Arc::new(
@@ -1695,6 +1819,11 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            min_async_ttft_ms: 60_000,
+            serve_margin_ms: 0,
+            model_filters_ttl_ms: 30_000,
+            recent_claims_halflife_ms: 120_000,
+            recent_claims_curve_k: 4.0,
         };
 
         let manager = Arc::new(
@@ -1844,6 +1973,11 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            min_async_ttft_ms: 60_000,
+            serve_margin_ms: 0,
+            model_filters_ttl_ms: 30_000,
+            recent_claims_halflife_ms: 120_000,
+            recent_claims_curve_k: 4.0,
         };
 
         let manager = Arc::new(
@@ -2032,6 +2166,11 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            min_async_ttft_ms: 60_000,
+            serve_margin_ms: 0,
+            model_filters_ttl_ms: 30_000,
+            recent_claims_halflife_ms: 120_000,
+            recent_claims_curve_k: 4.0,
         };
 
         let manager = Arc::new(
@@ -2204,6 +2343,11 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            min_async_ttft_ms: 60_000,
+            serve_margin_ms: 0,
+            model_filters_ttl_ms: 30_000,
+            recent_claims_halflife_ms: 120_000,
+            recent_claims_curve_k: 4.0,
         };
 
         let manager = Arc::new(
@@ -2381,6 +2525,11 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            min_async_ttft_ms: 60_000,
+            serve_margin_ms: 0,
+            model_filters_ttl_ms: 30_000,
+            recent_claims_halflife_ms: 120_000,
+            recent_claims_curve_k: 4.0,
         };
 
         let manager = Arc::new(
@@ -2553,6 +2702,11 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            min_async_ttft_ms: 60_000,
+            serve_margin_ms: 0,
+            model_filters_ttl_ms: 30_000,
+            recent_claims_halflife_ms: 120_000,
+            recent_claims_curve_k: 4.0,
         };
 
         let manager = Arc::new(
@@ -2708,6 +2862,11 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            min_async_ttft_ms: 60_000,
+            serve_margin_ms: 0,
+            model_filters_ttl_ms: 30_000,
+            recent_claims_halflife_ms: 120_000,
+            recent_claims_curve_k: 4.0,
         };
 
         let manager = Arc::new(
@@ -2844,6 +3003,11 @@ mod tests {
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
             flex_expiry_ms: 3_600_000,
+            min_async_ttft_ms: 60_000,
+            serve_margin_ms: 0,
+            model_filters_ttl_ms: 30_000,
+            recent_claims_halflife_ms: 120_000,
+            recent_claims_curve_k: 4.0,
         };
 
         let manager = Arc::new(

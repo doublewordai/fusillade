@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO model_filters (model, state, expected_ready_at, updated_at)\n            SELECT model, state, expected_ready_at, $4\n            FROM unnest($1::TEXT[], $2::TEXT[], $3::TIMESTAMPTZ[])\n                AS t(model, state, expected_ready_at)\n            ON CONFLICT (model) DO UPDATE SET\n                state = EXCLUDED.state,\n                expected_ready_at = EXCLUDED.expected_ready_at,\n                updated_at = EXCLUDED.updated_at\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "TimestamptzArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "352f542341d51b85c71ce0e9dd64d3a385eea8298779bf743e7c9d277b62f5e7"
+}

@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use super::{DaemonStorage, Storage};
+use super::{DaemonStorage, ModelFilter, ModelFilterState, Storage};
 use crate::batch::{
     Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchNotification,
     BatchOutputItem, BatchResponseDetails, BatchStatus, File, FileContentItem, FileId,
@@ -1057,6 +1057,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
+        user_recent_claims: &std::collections::HashMap<String, f64>,
     ) -> Result<Vec<Request<Claimed>>> {
         // First, unclaim any stale requests (self-healing for daemon crashes)
         let unclaimed_count = self.unclaim_stale_requests().await?;
@@ -1104,6 +1105,24 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .map(|u| *user_active_counts.get(u).unwrap_or(&0) as i64)
             .collect();
 
+        // Per-user recent-claim scores feeding the effective-deadline (D_eff)
+        // relaxation in the async model-filters gate. Empty map => every user
+        // treated as idle (tight D_eff), which makes the gate behave as if no
+        // user has consumed recent resource.
+        let recent_user_ids_arr: Vec<String> = user_recent_claims.keys().cloned().collect();
+        let recent_scores_arr: Vec<f64> = recent_user_ids_arr
+            .iter()
+            .map(|u| *user_recent_claims.get(u).unwrap_or(&0.0))
+            .collect();
+
+        // Async model-filters / D_eff tuning, all sourced from DaemonConfig
+        // like `urgency_weight` / `flex_expiry_ms` already are.
+        let min_async_ttft_secs = self.config.min_async_ttft_ms as f64 / 1000.0;
+        let serve_margin_secs = self.config.serve_margin_ms as f64 / 1000.0;
+        let model_filters_ttl_secs = self.config.model_filters_ttl_ms as f64 / 1000.0;
+        // `g(score) = score / (score + k)` (saturating in [0,1), g(0)=0).
+        let recent_claims_curve_k = self.config.recent_claims_curve_k;
+
         // Single query claims across all models using LATERAL.
         //
         // Eligibility: pending rows whose `not_before` has passed AND either
@@ -1121,9 +1140,24 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             WITH user_priority AS (
                 SELECT * FROM unnest($6::TEXT[], $7::BIGINT[]) AS u(user_id, active_count)
             ),
+            user_recent AS (
+                SELECT * FROM unnest($10::TEXT[], $11::DOUBLE PRECISION[]) AS u(user_id, score)
+            ),
+            heartbeat AS (
+                -- Async model-filters sync heartbeat. Fresh iff updated within
+                -- $14 seconds of `now` ($3). When stale we fail closed: only the
+                -- deadline-release clause may claim (see the WHERE below).
+                SELECT
+                    COALESCE(
+                        (SELECT updated_at FROM model_filters_sync WHERE id = true)
+                            > $3::TIMESTAMPTZ - make_interval(secs => $14),
+                        FALSE
+                    ) AS fresh
+            ),
             to_claim AS (
                 SELECT claimed.id, claimed.template_id, claimed.batch_id, claimed.effective_expires_at
                 FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
+                CROSS JOIN heartbeat hb
                 CROSS JOIN LATERAL (
                     SELECT r.id, r.template_id, r.batch_id,
                            COALESCE(b.expires_at,
@@ -1133,6 +1167,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     LEFT JOIN batches b ON r.batch_id = b.id
                     LEFT JOIN user_priority up
                         ON COALESCE(r.created_by, b.created_by) = up.user_id
+                    LEFT JOIN user_recent ur
+                        ON COALESCE(r.created_by, b.created_by) = ur.user_id
+                    LEFT JOIN model_filters mf ON mf.model = m.model
                     WHERE r.state = 'pending'
                         AND r.model = m.model
                         AND r.template_id IS NOT NULL
@@ -1146,6 +1183,71 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 AND b.failed_at IS NULL
                                 AND b.cancelled_at IS NULL
                             )
+                        )
+                        -- Async model-filters hold/release gate.
+                        --
+                        -- D_eff (effective deadline) = now + min_async_ttft
+                        --   + (effective_expires_at - now - min_async_ttft) * g(score)
+                        -- clamped to [now + min_async_ttft, effective_expires_at],
+                        -- where g(score) = score / (score + k) saturates in [0,1).
+                        -- Idle user (score 0) => D_eff = now + min_async_ttft (tight);
+                        -- sustained consumer => D_eff approaches the hard expiry.
+                        --
+                        -- HOLD (exclude the row) iff: heartbeat fresh AND the model
+                        -- is `coming` AND it will be ready+served before D_eff AND we
+                        -- are not yet at the deadline. Everything else is claimable.
+                        AND NOT (
+                            hb.fresh
+                            AND mf.state = 'coming'
+                            AND mf.expected_ready_at IS NOT NULL
+                            AND mf.expected_ready_at + make_interval(secs => $13)
+                                <= LEAST(
+                                    -- ceiling: the hard expiry wins even if below the floor.
+                                    COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond')),
+                                    GREATEST(
+                                        -- floor: now + min_async_ttft.
+                                        $3::TIMESTAMPTZ + make_interval(secs => $12),
+                                        -- raw D_eff = floor + (expiry - floor) * g(score).
+                                        $3::TIMESTAMPTZ + make_interval(secs => $12)
+                                            + (COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond'))
+                                               - $3::TIMESTAMPTZ - make_interval(secs => $12))
+                                              * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $15))
+                                    )
+                                )
+                            AND $3::TIMESTAMPTZ + make_interval(secs => $13)
+                                < LEAST(
+                                    -- ceiling: the hard expiry wins even if below the floor.
+                                    COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond')),
+                                    GREATEST(
+                                        -- floor: now + min_async_ttft.
+                                        $3::TIMESTAMPTZ + make_interval(secs => $12),
+                                        -- raw D_eff = floor + (expiry - floor) * g(score).
+                                        $3::TIMESTAMPTZ + make_interval(secs => $12)
+                                            + (COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond'))
+                                               - $3::TIMESTAMPTZ - make_interval(secs => $12))
+                                              * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $15))
+                                    )
+                                )
+                        )
+                        -- Fail-closed: when the heartbeat is stale, only the
+                        -- deadline-release clause (now + serve >= D_eff) may claim;
+                        -- everything else holds until scouter recovers.
+                        AND (
+                            hb.fresh
+                            OR $3::TIMESTAMPTZ + make_interval(secs => $13)
+                                >= LEAST(
+                                    -- ceiling: the hard expiry wins even if below the floor.
+                                    COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond')),
+                                    GREATEST(
+                                        -- floor: now + min_async_ttft.
+                                        $3::TIMESTAMPTZ + make_interval(secs => $12),
+                                        -- raw D_eff = floor + (expiry - floor) * g(score).
+                                        $3::TIMESTAMPTZ + make_interval(secs => $12)
+                                            + (COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond'))
+                                               - $3::TIMESTAMPTZ - make_interval(secs => $12))
+                                              * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $15))
+                                    )
+                                )
                         )
                     ORDER BY
                         -- Postgres doesn't allow SELECT-list aliases in ORDER BY
@@ -1206,6 +1308,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             &user_counts_arr,
             self.config.urgency_weight,
             flex_expiry_ms,
+            &recent_user_ids_arr,
+            &recent_scores_arr,
+            min_async_ttft_secs,
+            serve_margin_secs,
+            model_filters_ttl_secs,
+            recent_claims_curve_k,
         )
         .fetch_all(self.pools.write())
         .await
@@ -1306,6 +1414,181 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         );
 
         Ok(all_claimed)
+    }
+
+    async fn set_model_filters(&self, entries: &[ModelFilter]) -> Result<()> {
+        let now = Utc::now();
+
+        let models: Vec<String> = entries.iter().map(|e| e.model.clone()).collect();
+        let states: Vec<String> = entries
+            .iter()
+            .map(|e| e.state.as_str().to_string())
+            .collect();
+        // chrono Option<DateTime<Utc>> arrays bind cleanly to TIMESTAMPTZ[].
+        let etas: Vec<Option<DateTime<Utc>>> =
+            entries.iter().map(|e| e.expected_ready_at).collect();
+
+        let mut tx = self.pools.write().begin().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to begin set_model_filters tx: {}", e))
+        })?;
+
+        // Upsert all present rows.
+        sqlx::query!(
+            r#"
+            INSERT INTO model_filters (model, state, expected_ready_at, updated_at)
+            SELECT model, state, expected_ready_at, $4
+            FROM unnest($1::TEXT[], $2::TEXT[], $3::TIMESTAMPTZ[])
+                AS t(model, state, expected_ready_at)
+            ON CONFLICT (model) DO UPDATE SET
+                state = EXCLUDED.state,
+                expected_ready_at = EXCLUDED.expected_ready_at,
+                updated_at = EXCLUDED.updated_at
+            "#,
+            &models,
+            &states,
+            &etas as &[Option<DateTime<Utc>>],
+            now,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to upsert model_filters: {}", e)))?;
+
+        // Delete any row not in the provided set (full replace semantics).
+        sqlx::query!(
+            r#"DELETE FROM model_filters WHERE model <> ALL($1::TEXT[])"#,
+            &models,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to prune model_filters: {}", e)))?;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO model_filters_sync (id, updated_at) VALUES (true, $1)
+            ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at
+            "#,
+            now,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to bump model_filters_sync: {}", e)))?;
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to commit set_model_filters tx: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    async fn upsert_model_filter(&self, entry: &ModelFilter) -> Result<()> {
+        let now = Utc::now();
+        let mut tx = self.pools.write().begin().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to begin upsert_model_filter tx: {}", e))
+        })?;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO model_filters (model, state, expected_ready_at, updated_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (model) DO UPDATE SET
+                state = EXCLUDED.state,
+                expected_ready_at = EXCLUDED.expected_ready_at,
+                updated_at = EXCLUDED.updated_at
+            "#,
+            entry.model,
+            entry.state.as_str(),
+            entry.expected_ready_at,
+            now,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to upsert model_filter: {}", e)))?;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO model_filters_sync (id, updated_at) VALUES (true, $1)
+            ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at
+            "#,
+            now,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to bump model_filters_sync: {}", e)))?;
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to commit upsert_model_filter tx: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    async fn delete_model_filter(&self, model: &str) -> Result<()> {
+        let now = Utc::now();
+        let mut tx = self.pools.write().begin().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to begin delete_model_filter tx: {}", e))
+        })?;
+
+        sqlx::query!(r#"DELETE FROM model_filters WHERE model = $1"#, model)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete model_filter: {}", e)))?;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO model_filters_sync (id, updated_at) VALUES (true, $1)
+            ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at
+            "#,
+            now,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to bump model_filters_sync: {}", e)))?;
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to commit delete_model_filter tx: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    async fn list_model_filters(&self) -> Result<Vec<ModelFilter>> {
+        let rows = sqlx::query!(
+            r#"SELECT model, state, expected_ready_at FROM model_filters ORDER BY model"#
+        )
+        .fetch_all(self.pools.read())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list model_filters: {}", e)))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let state = match row.state.as_str() {
+                    "live" => ModelFilterState::Live,
+                    "coming" => ModelFilterState::Coming,
+                    other => {
+                        return Err(FusilladeError::Other(anyhow!(
+                            "Unknown model_filters.state: {}",
+                            other
+                        )));
+                    }
+                };
+                Ok(ModelFilter {
+                    model: row.model,
+                    state,
+                    expected_ready_at: row.expected_ready_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn model_filters_heartbeat(&self) -> Result<Option<DateTime<Utc>>> {
+        let row = sqlx::query!(r#"SELECT updated_at FROM model_filters_sync WHERE id = true"#)
+            .fetch_optional(self.pools.read())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to read model_filters_sync: {}", e))
+            })?;
+
+        Ok(row.map(|r| r.updated_at))
     }
 
     async fn persist<T: RequestState + Clone>(
@@ -6596,7 +6879,7 @@ mod tests {
         // Claim 3 requests
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(3, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(3, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -6608,7 +6891,7 @@ mod tests {
 
         // Try to claim again - should get the remaining 2
         let claimed2 = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -7424,7 +7707,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -7442,7 +7725,7 @@ mod tests {
         // Now daemon2 tries to claim - should unclaim the stale request and re-claim it
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
 
@@ -7509,7 +7792,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -7537,7 +7820,7 @@ mod tests {
         // Now daemon2 tries to claim - should unclaim the stale processing request
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
 
@@ -7618,7 +7901,7 @@ mod tests {
         // Claim request as daemon1, then set to processing
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -7639,7 +7922,7 @@ mod tests {
         // Daemon2 claims — should reclaim daemon1's request because daemon1 is dead
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
 
@@ -7720,7 +8003,7 @@ mod tests {
         // Claim request as daemon1, then set to processing
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -7741,7 +8024,7 @@ mod tests {
         // Daemon2 claims — should reclaim because daemon1's heartbeat is stale
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
 
@@ -7833,7 +8116,7 @@ mod tests {
         // Daemon1 claims first request and sets to processing
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -7850,7 +8133,7 @@ mod tests {
         // Daemon2 claims — should get the second request, NOT steal from healthy daemon1
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let claimed2 = manager
-            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
 
@@ -7930,7 +8213,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let claimed1 = manager
-            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed1.len(), 1);
@@ -7938,7 +8221,7 @@ mod tests {
         // Daemon2 immediately tries to claim - should get the second request, not steal the first
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let claimed2 = manager
-            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
         assert_eq!(claimed2.len(), 1);
@@ -8030,7 +8313,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
 
@@ -8880,7 +9163,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(2, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(2, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
 
@@ -9061,7 +9344,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(2, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(2, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .unwrap();
         let claimed_ids: Vec<_> = claimed.iter().map(|r| r.data.id).collect();
@@ -9332,15 +9615,33 @@ mod tests {
             [("model-a".to_string(), 3), ("model-b".to_string(), 3)].into();
 
         let claimed1 = manager
-            .claim_requests(10, daemon1_id, &full_capacity, &HashMap::new())
+            .claim_requests(
+                10,
+                daemon1_id,
+                &full_capacity,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         let claimed2 = manager
-            .claim_requests(10, daemon2_id, &full_capacity, &HashMap::new())
+            .claim_requests(
+                10,
+                daemon2_id,
+                &full_capacity,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         let claimed3 = manager
-            .claim_requests(10, daemon3_id, &full_capacity, &HashMap::new())
+            .claim_requests(
+                10,
+                daemon3_id,
+                &full_capacity,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
 
@@ -10530,7 +10831,7 @@ mod tests {
 
         // Claim 1 request - should get the most urgent one (batch1, 30 min)
         let claimed = manager
-            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -10544,7 +10845,7 @@ mod tests {
 
         // Claim another - should get medium priority (batch2, 2 hours)
         let claimed2 = manager
-            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -10558,7 +10859,7 @@ mod tests {
 
         // Claim last one - should get no-SLA batch (batch3)
         let claimed3 = manager
-            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -10688,7 +10989,7 @@ mod tests {
         let capacity = HashMap::from([("test-fifo".to_string(), 3)]);
 
         let claimed = manager
-            .claim_requests(3, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(3, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -10761,7 +11062,7 @@ mod tests {
 
         // Cold start: empty HashMap means no user priority info — all users equal
         let claimed = manager
-            .claim_requests(6, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(6, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
             .await
             .expect("Failed to claim requests (cold start)");
 
@@ -10780,7 +11081,7 @@ mod tests {
         // Re-claim with user-a having 5 in-flight requests; user-b and user-c have 0
         let user_counts = HashMap::from([("user-a".to_string(), 5usize)]);
         let claimed = manager
-            .claim_requests(6, daemon_id, &capacity, &user_counts)
+            .claim_requests(6, daemon_id, &capacity, &user_counts, &HashMap::new())
             .await
             .expect("Failed to claim requests (with user counts)");
 
@@ -10895,7 +11196,7 @@ mod tests {
         // Both batches belong to same user with same active count — deadline should break tie
         let user_counts = HashMap::from([("same-user".to_string(), 0usize)]);
         let claimed = manager
-            .claim_requests(1, daemon_id, &capacity, &user_counts)
+            .claim_requests(1, daemon_id, &capacity, &user_counts, &HashMap::new())
             .await
             .expect("Failed to claim requests");
 
@@ -10976,7 +11277,7 @@ mod tests {
         ]);
 
         let claimed = manager
-            .claim_requests(1, daemon_id, &capacity, &user_counts)
+            .claim_requests(1, daemon_id, &capacity, &user_counts, &HashMap::new())
             .await
             .expect("Failed to claim with urgency weight");
 
@@ -11016,7 +11317,13 @@ mod tests {
         ]);
 
         let claimed = manager_no_urgency
-            .claim_requests(1, daemon_id, &capacity, &user_counts_skewed)
+            .claim_requests(
+                1,
+                daemon_id,
+                &capacity,
+                &user_counts_skewed,
+                &HashMap::new(),
+            )
             .await
             .expect("Failed to claim without urgency weight");
 
@@ -11026,6 +11333,419 @@ mod tests {
             "With urgency_weight=0.0, user-b (0 active) should beat user-a (5 active) \
              despite user-a having a more urgent 1hr SLA"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ASYNC MODEL-FILTERS CLAIM GATE TESTS (COR-432)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Create a single pending batched request for `model` owned by `user`,
+    /// and force the batch's `expires_at` to exactly `expires_at` so the test
+    /// controls `effective_expires_at` (and therefore `D_eff`) precisely.
+    async fn setup_filter_request(
+        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        pool: &sqlx::PgPool,
+        user: &str,
+        model: &str,
+        expires_at: DateTime<Utc>,
+    ) -> BatchId {
+        let file_id = manager
+            .create_file(
+                format!("{user}-{model}-file"),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some(format!("{user}-req")),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: model.to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some(user.to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = $1 WHERE id = $2",
+            expires_at,
+            *batch.id as Uuid,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        batch.id
+    }
+
+    /// Config with a tight floor TTFT so idle users get `D_eff ≈ now + 1s`.
+    fn filter_test_config() -> DaemonConfig {
+        DaemonConfig {
+            min_async_ttft_ms: 60_000, // 1 minute floor TTFT
+            serve_margin_ms: 0,
+            model_filters_ttl_ms: 30_000,
+            recent_claims_halflife_ms: 120_000,
+            recent_claims_curve_k: 4.0,
+            ..Default::default()
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_claim_holds_for_coming_model_when_deadline_allows(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Hard deadline far in the future, so D_eff for an idle user is
+        // now + min_async_ttft (1 min). expected_ready_at within that window.
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "idle-user", "coming-model", expires_at).await;
+
+        // Model is `coming` with ETA 30s out — within D_eff (60s), so HOLD.
+        manager
+            .set_model_filters(&[ModelFilter {
+                model: "coming-model".to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: Some(Utc::now() + chrono::Duration::seconds(30)),
+            }])
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("coming-model".to_string(), 5)]);
+
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            0,
+            "coming model with ETA inside D_eff should be HELD, not claimed"
+        );
+
+        // Flip to live ⇒ now claimable.
+        manager
+            .set_model_filters(&[ModelFilter {
+                model: "coming-model".to_string(),
+                state: ModelFilterState::Live,
+                expected_ready_at: None,
+            }])
+            .await
+            .unwrap();
+
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "live model should be claimed immediately");
+    }
+
+    #[sqlx::test]
+    async fn test_claim_releases_coming_model_near_deadline(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Hard deadline is already past the floor TTFT, so D_eff clamps to the
+        // deadline (which is essentially `now`). now + serve >= D_eff ⇒ release.
+        let expires_at = Utc::now() - chrono::Duration::seconds(5);
+        setup_filter_request(&manager, &pool, "idle-user", "coming-model", expires_at).await;
+
+        // Same coming model, but the request is at its deadline ⇒ must release
+        // to the OR path rather than wait for internal capacity.
+        manager
+            .set_model_filters(&[ModelFilter {
+                model: "coming-model".to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: Some(Utc::now() + chrono::Duration::seconds(30)),
+            }])
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("coming-model".to_string(), 5)]);
+
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "request at its deadline should be released (claimed) even for a coming model"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_absent_model_claimed_immediately(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "idle-user", "absent-model", expires_at).await;
+
+        // Fresh heartbeat, but no model_filters row for this model ⇒ claim.
+        manager.set_model_filters(&[]).await.unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("absent-model".to_string(), 5)]);
+
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "absent model with fresh heartbeat should be claimed (route to OR)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_stale_heartbeat_fails_closed(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // One request far from deadline (should HOLD when stale) and one at
+        // its deadline (should still be released).
+        let far = Utc::now() + chrono::Duration::hours(12);
+        let near = Utc::now() - chrono::Duration::seconds(5);
+        setup_filter_request(&manager, &pool, "user-far", "absent-model", far).await;
+        setup_filter_request(&manager, &pool, "user-near", "absent-model", near).await;
+
+        // Force the heartbeat stale (older than model_filters_ttl_ms = 30s).
+        sqlx::query!(
+            "UPDATE model_filters_sync SET updated_at = $1 WHERE id = true",
+            Utc::now() - chrono::Duration::minutes(5),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("absent-model".to_string(), 5)]);
+
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "stale heartbeat fails closed: only the at-deadline request is claimed"
+        );
+        assert_eq!(
+            claimed[0].data.created_by, "user-near",
+            "the released request should be the one at its deadline"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_d_eff_idle_vs_busy_user(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Both users have a far-future hard deadline. The model is `coming`
+        // with an ETA (10 min) that is BEYOND the idle user's D_eff
+        // (now + 1 min) but well WITHIN a busy user's relaxed D_eff (which
+        // approaches the 12h deadline). So: idle user releases, busy user holds.
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "idle-user", "coming-model", expires_at).await;
+        setup_filter_request(&manager, &pool, "busy-user", "coming-model", expires_at).await;
+
+        manager
+            .set_model_filters(&[ModelFilter {
+                model: "coming-model".to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(10)),
+            }])
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("coming-model".to_string(), 5)]);
+
+        // busy-user has a large recent-claim score ⇒ relaxed D_eff ⇒ holds for
+        // the coming model. idle-user has no recent claims ⇒ tight D_eff ⇒ the
+        // 10-min ETA is past D_eff ⇒ released (claimed).
+        let recent = HashMap::from([("busy-user".to_string(), 1000.0_f64)]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &recent)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            claimed.len(),
+            1,
+            "only the idle user's request should be released; the busy user holds"
+        );
+        assert_eq!(
+            claimed[0].data.created_by, "idle-user",
+            "idle user has the tight D_eff and is released to OR"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_recent_claims_decay_relaxes_then_tightens(pool: sqlx::PgPool) {
+        // Pure SQL-level analogue of decay: a user with a high recent-claim
+        // score holds for a coming model, but once their score decays toward 0
+        // (passed as a small value) the same request is released. The daemon
+        // applies the time-based decay; here we feed the post-decay scores
+        // directly to prove the claim query honours them.
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "decaying-user", "coming-model", expires_at).await;
+
+        manager
+            .set_model_filters(&[ModelFilter {
+                model: "coming-model".to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(10)),
+            }])
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("coming-model".to_string(), 5)]);
+
+        // High score ⇒ relaxed D_eff ⇒ HOLD.
+        let busy = HashMap::from([("decaying-user".to_string(), 1000.0_f64)]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &busy)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 0, "high recent-claim score should HOLD");
+
+        // After decay (score ~0) ⇒ tight D_eff ⇒ RELEASE.
+        let decayed = HashMap::from([("decaying-user".to_string(), 0.001_f64)]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &decayed)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "decayed score should regain the tight D_eff and release the request"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_set_model_filters_replace_and_heartbeat(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        let before = manager.model_filters_heartbeat().await.unwrap();
+        assert!(
+            before.is_some(),
+            "heartbeat singleton exists from migration"
+        );
+
+        manager
+            .set_model_filters(&[
+                ModelFilter {
+                    model: "m-live".to_string(),
+                    state: ModelFilterState::Live,
+                    expected_ready_at: None,
+                },
+                ModelFilter {
+                    model: "m-coming".to_string(),
+                    state: ModelFilterState::Coming,
+                    expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(5)),
+                },
+            ])
+            .await
+            .unwrap();
+
+        let mut listed = manager.list_model_filters().await.unwrap();
+        listed.sort_by(|a, b| a.model.cmp(&b.model));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].model, "m-coming");
+        assert_eq!(listed[0].state, ModelFilterState::Coming);
+        assert!(listed[0].expected_ready_at.is_some());
+        assert_eq!(listed[1].model, "m-live");
+        assert_eq!(listed[1].state, ModelFilterState::Live);
+
+        let after = manager.model_filters_heartbeat().await.unwrap().unwrap();
+        assert!(
+            after >= before.unwrap(),
+            "set_model_filters should bump the heartbeat"
+        );
+
+        // Replace semantics: m-live dropped, m-coming retained, m-new added.
+        manager
+            .set_model_filters(&[
+                ModelFilter {
+                    model: "m-coming".to_string(),
+                    state: ModelFilterState::Coming,
+                    expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(2)),
+                },
+                ModelFilter {
+                    model: "m-new".to_string(),
+                    state: ModelFilterState::Live,
+                    expected_ready_at: None,
+                },
+            ])
+            .await
+            .unwrap();
+        let mut listed = manager.list_model_filters().await.unwrap();
+        listed.sort_by(|a, b| a.model.cmp(&b.model));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].model, "m-coming");
+        assert_eq!(listed[1].model, "m-new");
+
+        // Incremental delete.
+        manager.delete_model_filter("m-coming").await.unwrap();
+        let listed = manager.list_model_filters().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].model, "m-new");
+
+        // Incremental upsert.
+        manager
+            .upsert_model_filter(&ModelFilter {
+                model: "m-new".to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: Some(Utc::now()),
+            })
+            .await
+            .unwrap();
+        let listed = manager.list_model_filters().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, ModelFilterState::Coming);
     }
 
     #[sqlx::test]
