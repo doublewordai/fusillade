@@ -274,7 +274,7 @@ pub struct DaemonConfig {
     /// Staleness threshold (milliseconds) for the `model_filters_sync`
     /// heartbeat. When the heartbeat is older than this, the claim gate fails
     /// OPEN — it reverts to baseline claiming (the `coming`-hold predicate is
-    /// gated on a fresh heartbeat). Align to scouter's poll cadence.
+    /// gated on a fresh heartbeat). Align to the controller's poll cadence.
     /// Default: 30_000.
     #[serde(default = "default_model_filters_ttl_ms")]
     pub model_filters_ttl_ms: u64,

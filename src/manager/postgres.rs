@@ -1255,13 +1255,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         )
                         -- Fail-OPEN when the heartbeat is stale: the hold
                         -- predicate above is gated on `hb.fresh`, so a quiet/
-                        -- absent scouter leaves no gating here and the claim
+                        -- absent controller leaves no gating here and the claim
                         -- query reverts to its pre-feature behaviour (claim
                         -- normally). This is the safe degradation for an
-                        -- optimisation layer — when scouter (the availability
+                        -- optimisation layer — when the controller (the availability
                         -- oracle) is unavailable we fall back to the proven
                         -- baseline rather than holding work. The gate is active
-                        -- only while scouter keeps the heartbeat fresh.
+                        -- only while the controller keeps the heartbeat fresh.
                     ORDER BY
                         -- Postgres doesn't allow SELECT-list aliases in ORDER BY
                         -- when FOR UPDATE is in play, so the deadline expression
@@ -1533,7 +1533,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     async fn model_load_estimate(&self, model: &str) -> Result<Option<chrono::Duration>> {
         // Pair each `coming` event with the next `live` event for the model and
         // measure the gap (observed load duration). We use the event's own
-        // `created_at` (when scouter saw the transition) rather than
+        // `created_at` (when the controller saw the transition) rather than
         // expected_ready_at, so the estimate reflects ACTUAL load times.
         //
         // Sorting newest-first and folding an EWMA in Rust (rather than SQL)
@@ -11591,7 +11591,7 @@ mod tests {
 
         // A request far from its deadline AND a `coming` model that would
         // normally be held when the heartbeat is fresh. With a STALE heartbeat
-        // the gate fails OPEN: scouter is treated as unavailable and the claim
+        // the gate fails OPEN: the controller is treated as unavailable and the claim
         // query reverts to baseline behaviour, so BOTH are claimed normally.
         let far = Utc::now() + chrono::Duration::hours(12);
         setup_filter_request(&manager, &pool, "user-absent", "absent-model", far).await;

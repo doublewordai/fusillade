@@ -3,7 +3,7 @@
 -- `model_filters` is an APPEND-ONLY EVENT LOG of per-model internal liveness
 -- transitions. Each row records that, at `created_at`, a model became `live`
 -- (serving now), `coming` (will serve, with an ETA in `expected_ready_at`), or
--- `absent` (an explicit tombstone: scouter is no longer deploying the model).
+-- `absent` (an explicit tombstone: the controller is no longer deploying the model).
 --
 -- The CURRENT state of a model is the LATEST event (max `created_at`) for that
 -- model. A model is treated as absent if its latest event has `state='absent'`
@@ -15,14 +15,14 @@
 -- Append-only (rather than current-state upsert) lets us learn model load
 -- durations from the log: pairing each `coming` event with the next `live`
 -- event for that model yields observed load times (see `model_load_estimate`),
--- which scouter uses to set future ETAs. Retraction is appending an `absent`
+-- which the controller uses to set future ETAs. Retraction is appending an `absent`
 -- event, never a DELETE.
 --
--- scouter is responsible for appending only on a state CHANGE (so the log
+-- The controller is responsible for appending only on a state CHANGE (so the log
 -- stays a transition log, not a poll log). Old events are purged by the daemon
 -- while always retaining the latest event per model (see the purge task).
 --
--- The producer (scouter) owns the `state`/`expected_ready_at` invariant
+-- The controller owns the `state`/`expected_ready_at` invariant
 -- (`expected_ready_at` set iff `state='coming'`). We deliberately do NOT add a
 -- hard CHECK for it: this is an append-only event log of historical
 -- transitions, and the claim gate only reads `expected_ready_at` when
@@ -43,10 +43,10 @@ CREATE TABLE model_filters (
 CREATE INDEX idx_model_filters_model_created_at
     ON model_filters (model, created_at DESC, id DESC);
 
--- Singleton sync heartbeat so the daemon can tell whether scouter is actively
--- syncing. scouter bumps `updated_at` on every sync; when the heartbeat is
+-- Singleton sync heartbeat so the daemon can tell whether the controller is actively
+-- syncing. The controller bumps `updated_at` on every sync; when the heartbeat is
 -- stale (or absent) the claim gate fails OPEN — the `coming`-hold predicate is
--- gated on a fresh heartbeat, so a quiet/absent scouter reverts the claim query
+-- gated on a fresh heartbeat, so a quiet/absent controller reverts the claim query
 -- to its pre-feature baseline (claim normally) rather than holding work.
 CREATE TABLE model_filters_sync (
     id         BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),

@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-09
 **Status:** Planned
-**Linear:** COR-431 (parent), COR-432 (this — fusillade), COR-433 (scouter), COR-434 (control-layer onwards)
+**Linear:** COR-431 (parent), COR-432 (this — fusillade), COR-433 (the controller), COR-434 (control-layer onwards)
 **Design doc:** Linear — "Architecture Options: Hard Guarantees on Async Workloads" (Solution 5)
 
 > **Update (append-only event log).** This plan originally framed `model_filters`
@@ -16,7 +16,7 @@
 > ETAs (`model_load_estimate`), and the history is auditable. The sync heartbeat,
 > `D_eff` relaxation, and hold/release predicates are unchanged. **Stale/absent
 > heartbeat now fails OPEN** (reverts to baseline claiming) rather than closed —
-> the safe degradation, and it makes this PR inert to deploy ahead of scouter.
+> the safe degradation, and it makes this PR inert to deploy ahead of the controller.
 > Sections below are annotated where the design changed.
 
 ## Overview
@@ -39,7 +39,7 @@ fusillade does **not** route internal-vs-OpenRouter — it dispatches to `reques
 ## Cross-component contract (for context — not all in this repo)
 
 ```
-   scouter (COR-433, embeds this crate, NO daemon)
+   the controller (COR-433, embeds this crate, NO daemon)
      • polls dynamo-frontend /v1/models for liveness
      • computes/retracts expected_ready_at for models it plans to deploy
      • writes model_filters (this crate's fns) + a sync heartbeat
@@ -56,7 +56,7 @@ fusillade does **not** route internal-vs-OpenRouter — it dispatches to `reques
             internal backend   |   OpenRouter
 ```
 
-`model_filters` is owned by this crate (migrations included). control-layer-fusillade runs migrations; **scouter embeds the crate with migrations disabled** and a schema-compatible version pin.
+`model_filters` is owned by this crate (migrations included). control-layer-fusillade runs migrations; **the controller embeds the crate with migrations disabled** and a schema-compatible version pin.
 
 ## Design
 
@@ -74,7 +74,7 @@ CREATE INDEX idx_model_filters_model_created_at
     ON model_filters (model, created_at DESC);
 ```
 
-Each row is one **liveness transition** appended by scouter. There is **no
+Each row is one **liveness transition** appended by the controller. There is **no
 `model` primary key / uniqueness** — many events per model accumulate over time.
 
 - **Current state = latest event per model** (max `created_at`, tie-broken by
@@ -83,21 +83,21 @@ Each row is one **liveness transition** appended by scouter. There is **no
 - **Absent** = the model's **latest event is `state='absent'`** (an explicit
   **tombstone**) **OR** the model has **no events at all**. Both are treated
   identically by the gate: claim now (route to OpenRouter).
-- **Append-on-change is the caller's (scouter's) responsibility.** The write
-  functions always insert; scouter must append only when a model's state
+- **Append-on-change is the caller's (the controller's) responsibility.** The write
+  functions always insert; the controller must append only when a model's state
   actually changes, so the log stays a *transition* log rather than a *poll*
   log. Retraction = append an `absent` event; there is never a DELETE in the
   hot path (only the retention purge removes old rows — see §6).
 
-Plus a singleton **sync heartbeat** (unchanged) so the daemon can tell "scouter
-is alive, absence is meaningful" from "scouter is dead, the log is frozen":
+Plus a singleton **sync heartbeat** (unchanged) so the daemon can tell "the controller
+is alive, absence is meaningful" from "the controller is dead, the log is frozen":
 
 ```sql
 CREATE TABLE model_filters_sync ( id BOOLEAN PRIMARY KEY DEFAULT true CHECK (id), updated_at TIMESTAMPTZ NOT NULL );
 INSERT INTO model_filters_sync (id, updated_at) VALUES (true, now());
 ```
 
-scouter bumps `model_filters_sync.updated_at` on every sync (every append fn
+The controller bumps `model_filters_sync.updated_at` on every sync (every append fn
 bumps it too).
 
 ### 2. Per-request claim decision
@@ -115,13 +115,13 @@ events at all".
 | `coming(T)` and `T + serve > D_eff` | **claim** (can't wait → onwards → OR) |
 | absent (tombstone latest **or** no events) | **claim** (not coming → onwards → OR) |
 | any, and `now + serve ≥ D_eff` | **claim** (deadline release — onwards/escalation → OR) |
-| heartbeat **stale** (or absent) | **fail OPEN**: the hold predicate is gated on `hb.fresh`, so a quiet/absent scouter leaves the claim query at its pre-feature baseline (claim normally). Safe degradation + makes the PR inert to deploy ahead of scouter. |
+| heartbeat **stale** (or absent) | **fail OPEN**: the hold predicate is gated on `hb.fresh`, so a quiet/absent controller leaves the claim query at its pre-feature baseline (claim normally). Safe degradation + makes the PR inert to deploy ahead of the controller. |
 
 The hold predicate keys off `mf.state = 'coming'`, so a latest event of `live`,
 `absent`, or NULL never holds — exactly the append-only equivalent of the old
 current-state logic.
 
-So a row is **excluded from the claim** (held) iff: heartbeat fresh **and** `state='coming'` **and** `expected_ready_at + serve ≤ D_eff` **and** `now + serve < D_eff`. Everything else is claimable. Held requests stay `pending`, so they keep counting as demand for scouter.
+So a row is **excluded from the claim** (held) iff: heartbeat fresh **and** `state='coming'` **and** `expected_ready_at + serve ≤ D_eff` **and** `now + serve < D_eff`. Everything else is claimable. Held requests stay `pending`, so they keep counting as demand for the controller.
 
 ### 3. Effective deadline `D_eff` — TTFT target × fair-share (closes brief ①)
 
@@ -151,11 +151,11 @@ to load** internally and feed it back as future ETAs:
 - For each model, walk its events in time order and pair every `coming` event
   with the **next `live`** event. The gap `live.created_at − coming.created_at`
   is one observed load duration (we use the events' own timestamps — when
-  scouter saw the transition — not `expected_ready_at`, so the estimate
+  the controller saw the transition — not `expected_ready_at`, so the estimate
   reflects *actual* loads).
 - `model_load_estimate(model) -> Option<Duration>` returns an **EWMA** over
   those samples, newest-weighted (alpha 0.5), or `None` if no `coming → live`
-  transition has been observed. scouter calls this to set the next
+  transition has been observed. The controller calls this to set the next
   `expected_ready_at` it publishes.
 - The SQL uses `LEAD()` window functions over the model's events; the Rust side
   folds the EWMA so the curve stays one tunable place.
@@ -196,7 +196,7 @@ retention_secs)`:
     — insert a batch of events (one row each, caller order preserved via
     `WITH ORDINALITY`) + bump the heartbeat once.
   - **No upsert, no delete.** Retraction = append an `Absent` event. Appending
-    only on *change* is scouter's responsibility.
+    only on *change* is the controller's responsibility.
 - `list_model_filters` — returns the **latest event per model**
   (`DISTINCT ON (model) … ORDER BY created_at DESC, id DESC`), excluding models
   whose latest event is an `absent` tombstone (observability/tests).
@@ -242,7 +242,7 @@ retention_secs)`:
 ### Step 4 — `DaemonConfig` (`src/daemon/mod.rs`, defaults `:274-308`)
 - `min_async_ttft_ms: u64` (default `60_000`)
 - `serve_margin_ms: u64` (default e.g. `0`–`5_000`; start small)
-- `model_filters_ttl_ms: u64` (staleness threshold; default e.g. `30_000`, aligned to scouter poll cadence)
+- `model_filters_ttl_ms: u64` (staleness threshold; default e.g. `30_000`, aligned to the controller poll cadence)
 - `recent_claims_halflife_ms: u64` (decay time constant; default e.g. `120_000`)
 - `recent_claims_curve_k: f64` (the `k`/`S_max` for `g()`; tuning dial, default conservative)
 All `#[serde(default)]`, backward-compatible.
@@ -253,13 +253,13 @@ All `#[serde(default)]`, backward-compatible.
 - **Snapshot before claim** (next to `:771-782`): read each entry, apply decay-on-read to `now`, drop entries that have decayed below ε (keeps the map bounded), produce `HashMap<String, f64>` → pass as `user_recent_claims`.
 - No periodic task needed (decay-on-read).
 
-### Step 6 — Embedding support for scouter (no code change expected, verify)
-- Confirm `PostgresRequestManager` / `Storage` is usable without constructing a `Daemon` (it already is — manager and daemon are separate). scouter calls `set_model_filters` / heartbeat only.
-- Ensure migrations are **opt-in** (caller invokes `migrator().run()`); scouter must not run them. Document the version-pin requirement against control-layer-fusillade's deployed schema.
+### Step 6 — Embedding support for the controller (no code change expected, verify)
+- Confirm `PostgresRequestManager` / `Storage` is usable without constructing a `Daemon` (it already is — manager and daemon are separate). The controller calls `set_model_filters` / heartbeat only.
+- Ensure migrations are **opt-in** (caller invokes `migrator().run()`); the controller must not run them. Document the version-pin requirement against control-layer-fusillade's deployed schema.
 
 ## Out of scope (tracked elsewhere)
-- **Counters table** — *not built*. Adds nothing to the claim decision (which needs `model_filters` + each request's deadline + current backlog); scouter's demand input stays the existing `get_pending_request_counts_by_model_and_window` query.
-- **scouter** liveness poll, ETA computation, `model_filters` writes, control-layer active/inactive — COR-433.
+- **Counters table** — *not built*. Adds nothing to the claim decision (which needs `model_filters` + each request's deadline + current backlog); the controller's demand input stays the existing `get_pending_request_counts_by_model_and_window` query.
+- **the controller** liveness poll, ETA computation, `model_filters` writes, control-layer active/inactive — COR-433.
 - **control-layer** onwards skip-not-live + default OpenRouter fallback — COR-434.
 - **Native `service_tier` ingestion** on chat-completions/open-responses — COR-436 (standalone).
 
@@ -275,7 +275,7 @@ All `#[serde(default)]`, backward-compatible.
 - `test_append_model_filter_events_and_heartbeat` — append-only: later events supersede earlier per model (latest wins), every event retained, heartbeat bumped; single-event helper.
 - `test_model_load_estimate` — EWMA of observed `coming → live` gaps; `None` when no transition seen.
 - `test_purge_model_filter_events_retention` — old events purged while the latest event per model (and the retention window) is always kept; `keep_per_model` clamped to ≥ 1.
-- All existing claim tests pass with an empty `model_filters` log + empty `user_recent_claims` (behaviour unchanged when scouter isn't writing).
+- All existing claim tests pass with an empty `model_filters` log + empty `user_recent_claims` (behaviour unchanged when the controller isn't writing).
 
 ## Version strategy
 `Storage::claim_requests` signature changes (new parameter) and `RequestData`/config evolve → `feat!:` **major bump**, consistent with the per-user fair-scheduling rollout. Bundle Steps 1–5 in one PR.

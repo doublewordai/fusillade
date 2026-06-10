@@ -29,11 +29,11 @@ pub mod response_step;
 mod utils;
 
 /// Liveness state of a model on internal (self-hosted) infrastructure, as
-/// published by scouter into the `model_filters` append-only event log.
+/// published by the controller into the `model_filters` append-only event log.
 ///
 /// `model_filters` is an event log, not a current-state table: the CURRENT
 /// state of a model is the latest event for it. An `Absent` event is an
-/// explicit tombstone (scouter retracted the model); a model with no events at
+/// explicit tombstone (the controller retracted the model); a model with no events at
 /// all is also treated as absent. The daemon treats absence as "claim now,
 /// route to OpenRouter".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -44,7 +44,7 @@ pub enum ModelFilterState {
     /// Internal infrastructure will serve this model soon; `expected_ready_at`
     /// carries the ETA.
     Coming,
-    /// Explicit tombstone: scouter is no longer deploying this model. Appended
+    /// Explicit tombstone: the controller is no longer deploying this model. Appended
     /// (instead of deleting rows) to retract a model from the log. Treated
     /// identically to "no events" by the claim gate.
     Absent,
@@ -489,7 +489,7 @@ pub trait Storage: Send + Sync {
     ) -> Result<Vec<Request<Claimed>>>;
 
     /// Append a single event to the `model_filters` log and bump the
-    /// `model_filters_sync` heartbeat. Used by scouter when a model's internal
+    /// `model_filters_sync` heartbeat. Used by the controller when a model's internal
     /// liveness CHANGES (live / coming(ETA) / absent-tombstone).
     ///
     /// This is append-only: there is no delete and no upsert. Retraction is
@@ -499,7 +499,7 @@ pub trait Storage: Send + Sync {
     async fn append_model_filter_event(&self, entry: &ModelFilter) -> Result<()>;
 
     /// Append a batch of events to the `model_filters` log (one row each, in
-    /// order) and bump the heartbeat once. Convenience for scouter publishing
+    /// order) and bump the heartbeat once. Convenience for the controller publishing
     /// several transitions in one sync. Same append-only / append-on-change
     /// semantics as [`Storage::append_model_filter_event`].
     async fn append_model_filter_events(&self, entries: &[ModelFilter]) -> Result<()>;
@@ -513,7 +513,7 @@ pub trait Storage: Send + Sync {
     /// pairing each `coming` event with the next `live` event for that model in
     /// the log and computing an exponentially-weighted moving average (EWMA)
     /// over recent samples (newest-weighted). Returns `None` if no
-    /// `coming -> live` transition has ever been observed. scouter calls this
+    /// `coming -> live` transition has ever been observed. The controller calls this
     /// to set future `expected_ready_at` ETAs.
     async fn model_load_estimate(&self, model: &str) -> Result<Option<chrono::Duration>>;
 
