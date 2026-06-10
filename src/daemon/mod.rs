@@ -1114,14 +1114,17 @@ where
                         let now = std::time::Instant::now();
                         let halflife_secs = (self.config.recent_claims_halflife_ms as f64 / 1000.0)
                             .max(f64::MIN_POSITIVE);
-                        let mut entry = self
-                            .user_recent_claims
+                        // `entry` holds the shard write lock across both the decay
+                        // (and_modify) and the insert, so the read-modify-write is
+                        // atomic — no other thread can observe an interleaved state.
+                        self.user_recent_claims
                             .entry(user_id.clone())
-                            .or_insert((0.0, now));
-                        let (score, last) = *entry;
-                        let dt = now.saturating_duration_since(last).as_secs_f64();
-                        let decayed = score * 0.5f64.powf(dt / halflife_secs);
-                        *entry = (decayed + 1.0, now);
+                            .and_modify(|(score, last)| {
+                                let dt = now.saturating_duration_since(*last).as_secs_f64();
+                                *score = *score * 0.5f64.powf(dt / halflife_secs) + 1.0;
+                                *last = now;
+                            })
+                            .or_insert((1.0, now));
                     }
 
                     let process_span = tracing::info_span!(

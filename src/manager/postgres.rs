@@ -1207,10 +1207,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         -- HOLD (exclude the row) iff: heartbeat fresh AND the model
                         -- is `coming` AND it will be ready+served before D_eff AND we
                         -- are not yet at the deadline. Everything else is claimable.
+                        --
+                        -- `expected_ready_at > now` guards against a stuck deploy: a
+                        -- `coming` row whose ETA is already in the past must NOT keep
+                        -- holding (it would do so until the heartbeat went stale), so a
+                        -- past ETA falls through to claimable (→ OpenRouter).
                         AND NOT (
                             hb.fresh
                             AND mf.state = 'coming'
                             AND mf.expected_ready_at IS NOT NULL
+                            AND mf.expected_ready_at > $3::TIMESTAMPTZ
                             AND mf.expected_ready_at + make_interval(secs => $13)
                                 <= LEAST(
                                     -- ceiling: the hard expiry wins even if below the floor.
@@ -1566,15 +1572,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             return Ok(None);
         }
 
-        // EWMA over samples, newest first (rows[0] is the most recent). With
-        // alpha weighting the newest sample most heavily:
-        //   ewma = sample_newest, then ewma = alpha*older + (1-alpha)*ewma ...
-        // Iterating newest -> oldest, fold so the newest dominates.
+        // EWMA weighting the NEWEST sample most heavily. `rows` is newest-first
+        // (ORDER BY created_at DESC), so fold OLDEST -> NEWEST (`.rev()`): seed
+        // with the oldest sample, then `ewma = alpha*newer + (1-alpha)*ewma`.
+        // For samples [N(newest), M, O(oldest)] with alpha 0.5 this yields
+        // weights N=0.5, M=0.25, O=0.25 — recent load times dominate.
         const ALPHA: f64 = 0.5;
-        let mut iter = rows.iter().map(|r| r.gap_secs.max(0.0));
+        let mut iter = rows.iter().rev().map(|r| r.gap_secs.max(0.0));
         let mut ewma = iter.next().unwrap_or(0.0);
-        for older in iter {
-            ewma = (1.0 - ALPHA) * ewma + ALPHA * older;
+        for newer in iter {
+            ewma = ALPHA * newer + (1.0 - ALPHA) * ewma;
         }
 
         Ok(Some(chrono::Duration::milliseconds((ewma * 1000.0) as i64)))
@@ -11956,6 +11963,62 @@ mod tests {
         assert!(
             (140..=160).contains(&secs),
             "EWMA of 100s and 200s load times should be ~150s, got {secs}s"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_model_load_estimate_recency_weighted(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        // Three coming->live pairs, oldest -> newest, with load gaps 100s, 200s,
+        // 900s. A correct NEWEST-weighted EWMA (alpha 0.5) yields
+        //   0.5*900 + 0.25*200 + 0.25*100 = 525s.
+        // An oldest-weighted (buggy) fold yields ~325s, so this test locks in
+        // recency ordering — which the 2-sample test above cannot distinguish.
+        let base = Utc::now() - chrono::Duration::hours(1);
+        let pairs = [
+            (base, base + chrono::Duration::seconds(100)),
+            (
+                base + chrono::Duration::minutes(10),
+                base + chrono::Duration::minutes(10) + chrono::Duration::seconds(200),
+            ),
+            (
+                base + chrono::Duration::minutes(20),
+                base + chrono::Duration::minutes(20) + chrono::Duration::seconds(900),
+            ),
+        ];
+        for (coming_at, live_at) in pairs {
+            sqlx::query!(
+                "INSERT INTO model_filters (model, state, expected_ready_at, created_at) \
+                 VALUES ('m-load-recency', 'coming', $2, $1)",
+                coming_at,
+                live_at,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query!(
+                "INSERT INTO model_filters (model, state, expected_ready_at, created_at) \
+                 VALUES ('m-load-recency', 'live', NULL, $1)",
+                live_at,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let secs = manager
+            .model_load_estimate("m-load-recency")
+            .await
+            .unwrap()
+            .expect("a coming->live transition exists")
+            .num_seconds();
+        assert!(
+            (500..=550).contains(&secs),
+            "newest-weighted EWMA of [100,200,900] should be ~525s, got {secs}s"
         );
     }
 

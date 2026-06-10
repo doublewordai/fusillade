@@ -21,11 +21,17 @@
 -- scouter is responsible for appending only on a state CHANGE (so the log
 -- stays a transition log, not a poll log). Old events are purged by the daemon
 -- while always retaining the latest event per model (see the purge task).
+--
+-- The producer (scouter) owns the `state`/`expected_ready_at` invariant
+-- (`expected_ready_at` set iff `state='coming'`). We deliberately do NOT add a
+-- hard CHECK for it: this is an append-only event log of historical
+-- transitions, and the claim gate only reads `expected_ready_at` when
+-- `state='coming'`, so a stray value on a non-`coming` event is inert.
 CREATE TABLE model_filters (
     id                BIGSERIAL PRIMARY KEY,
     model             TEXT NOT NULL,
     state             TEXT NOT NULL CHECK (state IN ('live', 'coming', 'absent')),
-    expected_ready_at TIMESTAMPTZ, -- set when state = 'coming'
+    expected_ready_at TIMESTAMPTZ, -- set when state = 'coming' (producer-owned invariant)
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
