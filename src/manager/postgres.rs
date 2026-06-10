@@ -1139,127 +1139,211 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let flex_expiry_ms = self.config.flex_expiry_ms as i64;
         let rows = sqlx::query!(
             r#"
-            WITH user_priority AS (
+            -- Two-path claim, bounded for large per-model backlogs.
+            --
+            -- The naive `ORDER BY <blend> ... FOR UPDATE SKIP LOCKED LIMIT cap`
+            -- reads and full-sorts the ENTIRE per-model pending set every cycle
+            -- (SKIP LOCKED + a runtime sort key can't be index-served), so a model
+            -- with millions pending costs seconds per claim. We exploit that a
+            -- BATCH's sort key is constant across its rows (same user => same
+            -- active_count; same b.expires_at; same b.id tiebreak): rank the
+            -- batches (from `batches` + the user arrays, no request-heap scan),
+            -- take the top `capacity` by that key, and pull rows only from those
+            -- winning batches — the locked scan touches ~`capacity` rows
+            -- regardless of backlog size. Batchless (flex) rows have per-row
+            -- deadlines, so they keep the per-row scan as a second UNION arm.
+            WITH RECURSIVE all_models AS (
+                SELECT model, capacity FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
+            ),
+            user_priority AS (
                 SELECT * FROM unnest($6::TEXT[], $7::BIGINT[]) AS u(user_id, active_count)
             ),
             user_recent AS (
                 SELECT * FROM unnest($10::TEXT[], $11::DOUBLE PRECISION[]) AS u(user_id, score)
             ),
+            -- Distinct batch_ids that still have pending rows for each model, via
+            -- an index-only "loose index scan" (hop to the next batch_id > the
+            -- current one) so enumeration costs O(batches · log N), not a full
+            -- pending scan. Relies on idx_requests_pending (model, batch_id).
+            batch_groups AS (
+                SELECT m.model, m.capacity,
+                       (SELECT r.batch_id FROM requests r
+                        WHERE r.state = 'pending' AND r.model = m.model
+                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
+                        ORDER BY r.batch_id LIMIT 1) AS batch_id
+                FROM all_models m
+              UNION ALL
+                SELECT g.model, g.capacity,
+                       (SELECT r.batch_id FROM requests r
+                        WHERE r.state = 'pending' AND r.model = g.model
+                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
+                          AND r.batch_id > g.batch_id
+                        ORDER BY r.batch_id LIMIT 1) AS batch_id
+                FROM batch_groups g WHERE g.batch_id IS NOT NULL
+            ),
+            -- One row per (model, batch): its constant priority `pr` (the same
+            -- fairness+urgency blend used as the row sort key) plus the
+            -- hold/eligibility gate. A batch is wholly held or wholly claimable
+            -- because every hold input (model state, user score, b.expires_at) is
+            -- constant across its rows, so the gate composes at the batch level.
+            ranked_batches AS (
+                SELECT g.model, g.capacity, g.batch_id, b.expires_at, b.created_by,
+                       (1.0 - $8::DOUBLE PRECISION)
+                           * COALESCE(up.active_count, 0)::DOUBLE PRECISION
+                           / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
+                       + $8::DOUBLE PRECISION
+                           * LEAST(GREATEST(EXTRACT(EPOCH FROM b.expires_at - $3), 0.0) / 86400.0, 1.0) AS pr
+                FROM batch_groups g
+                JOIN batches b ON b.id = g.batch_id
+                LEFT JOIN user_priority up ON b.created_by = up.user_id
+                LEFT JOIN user_recent ur ON b.created_by = ur.user_id
+                LEFT JOIN LATERAL (
+                    SELECT mfe.state, mfe.expected_ready_at FROM model_filters mfe
+                    WHERE mfe.model = g.model
+                    ORDER BY mfe.created_at DESC, mfe.id DESC LIMIT 1
+                ) mf ON true
+                WHERE g.batch_id IS NOT NULL
+                  AND b.cancelling_at IS NULL AND b.deleted_at IS NULL
+                  AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL
+                  -- Hold gate (see note on the batchless arm). Held batches are
+                  -- excluded here, so they are never pulled until released.
+                  AND NOT (
+                      mf.state = 'coming'
+                      AND mf.expected_ready_at IS NOT NULL
+                      AND mf.expected_ready_at > $3::TIMESTAMPTZ
+                      AND mf.expected_ready_at + make_interval(secs => $13)
+                          <= LEAST(b.expires_at,
+                               GREATEST($3::TIMESTAMPTZ + make_interval(secs => $12),
+                                 $3::TIMESTAMPTZ + make_interval(secs => $12)
+                                   + (b.expires_at - $3::TIMESTAMPTZ - make_interval(secs => $12))
+                                     * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14))))
+                      AND $3::TIMESTAMPTZ + make_interval(secs => $13)
+                          < LEAST(b.expires_at,
+                               GREATEST($3::TIMESTAMPTZ + make_interval(secs => $12),
+                                 $3::TIMESTAMPTZ + make_interval(secs => $12)
+                                   + (b.expires_at - $3::TIMESTAMPTZ - make_interval(secs => $12))
+                                     * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14))))
+                  )
+            ),
             to_claim AS (
                 SELECT claimed.id, claimed.template_id, claimed.batch_id, claimed.effective_expires_at
-                FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
+                FROM all_models m
                 CROSS JOIN LATERAL (
-                    SELECT r.id, r.template_id, r.batch_id,
-                           COALESCE(b.expires_at,
-                                    r.created_at + ($9::BIGINT * interval '1 millisecond'))
-                               AS effective_expires_at
-                    FROM requests r
-                    LEFT JOIN batches b ON r.batch_id = b.id
-                    LEFT JOIN user_priority up
-                        ON COALESCE(r.created_by, b.created_by) = up.user_id
-                    LEFT JOIN user_recent ur
-                        ON COALESCE(r.created_by, b.created_by) = ur.user_id
-                    -- Current internal-liveness of this model = the LATEST
-                    -- event in the append-only `model_filters` log. NULL (no
-                    -- events) and an `absent` tombstone both mean "absent" =>
-                    -- the `coming`-only hold predicate below never holds them.
-                    -- Relies on idx_model_filters_model_created_at.
-                    LEFT JOIN LATERAL (
-                        SELECT mfe.state, mfe.expected_ready_at
-                        FROM model_filters mfe
-                        WHERE mfe.model = m.model
-                        -- `id DESC` breaks ties when a batch append writes
-                        -- several events with the same `created_at`, so the
-                        -- "latest event" (current state) is deterministic.
-                        ORDER BY mfe.created_at DESC, mfe.id DESC
-                        LIMIT 1
-                    ) mf ON true
-                    WHERE r.state = 'pending'
-                        AND r.model = m.model
-                        AND r.template_id IS NOT NULL
-                        AND (r.not_before IS NULL OR r.not_before <= $3)
-                        AND (
-                            r.batch_id IS NULL
-                            OR (
-                                b.cancelling_at IS NULL
-                                AND b.deleted_at IS NULL
-                                AND b.completed_at IS NULL
-                                AND b.failed_at IS NULL
-                                AND b.cancelled_at IS NULL
-                            )
-                        )
-                        -- Async model-filters hold/release gate.
+                    SELECT c.id, c.template_id, c.batch_id, c.effective_expires_at
+                    FROM (
+                        -- BATCH arm: stream the top-`capacity` batches in priority
+                        -- order and pull their oldest rows; the outer LIMIT lets the
+                        -- pull short-circuit after the first batches fill `capacity`,
+                        -- so only ~`capacity` rows are ever locked.
+                        SELECT bp.id, bp.template_id, bp.batch_id, bp.effective_expires_at,
+                               bp.ord_blend, bp.ord_exp, bp.ord_id
+                        FROM (
+                            SELECT r.id, r.template_id, r.batch_id,
+                                   COALESCE(tb.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond'))
+                                       AS effective_expires_at,
+                                   tb.pr AS ord_blend, tb.expires_at AS ord_exp, tb.batch_id AS ord_id
+                            FROM (
+                                SELECT * FROM ranked_batches rb WHERE rb.model = m.model
+                                ORDER BY rb.pr ASC, rb.expires_at ASC, rb.batch_id ASC
+                                LIMIT m.capacity
+                            ) tb
+                            CROSS JOIN LATERAL (
+                                SELECT r.id, r.template_id, r.batch_id, r.created_at
+                                FROM requests r
+                                WHERE r.state = 'pending' AND r.model = tb.model
+                                  AND r.batch_id = tb.batch_id AND r.template_id IS NOT NULL
+                                  AND (r.not_before IS NULL OR r.not_before <= $3)
+                                ORDER BY r.created_at
+                                LIMIT m.capacity
+                                FOR UPDATE OF r SKIP LOCKED
+                            ) r
+                            ORDER BY tb.pr ASC, tb.expires_at ASC, tb.batch_id ASC, r.created_at ASC
+                            LIMIT m.capacity
+                        ) bp
+
+                      UNION ALL
+                        -- BATCHLESS (flex) arm: per-row deadlines (no constant
+                        -- per-group priority), so this keeps the direct per-row
+                        -- scan. Wrapped in a subquery so FOR UPDATE is not directly
+                        -- under UNION; the ORDER BY repeats the blend expression
+                        -- (aliases aren't allowed in ORDER BY with FOR UPDATE).
                         --
-                        -- D_eff (effective deadline) = now + min_async_ttft
+                        -- NOTE: unlike the batch arm, this still scans the whole
+                        -- batchless-pending set for the model and sorts it each
+                        -- cycle, so it carries the same scaling cliff the batch
+                        -- arm fixes if a single model ever accumulates a very
+                        -- large batchless (flex) backlog. That is not the case
+                        -- today (flex volume is low vs. bulk batch uploads). The
+                        -- fix when needed: group by user (created_at is the
+                        -- per-user urgency order, so the oldest-K rows per user
+                        -- are the candidates) and rank-then-pull as the batch
+                        -- arm does.
+                        --
+                        -- Hold gate: D_eff (effective deadline) = now + min_async_ttft
                         --   + (effective_expires_at - now - min_async_ttft) * g(score)
                         -- clamped to [now + min_async_ttft, effective_expires_at],
-                        -- where g(score) = score / (score + k) saturates in [0,1).
-                        -- Idle user (score 0) => D_eff = now + min_async_ttft (tight);
-                        -- sustained consumer => D_eff approaches the hard expiry.
-                        --
-                        -- HOLD (exclude the row) iff: the model is `coming` with a
-                        -- future ETA that will be ready+served before D_eff AND we
-                        -- are not yet at the deadline. Everything else is claimable.
-                        --
-                        -- There is NO liveness/heartbeat gate: the gate simply
-                        -- trusts the latest `model_filters` state and degrades
-                        -- PER REQUEST. A `coming` model frozen by a dead/quiet
-                        -- controller stops holding once its ETA passes
-                        -- (`expected_ready_at > now` below) or once the request
-                        -- reaches its own deadline (`now + serve >= D_eff`), so a
-                        -- held request is always eventually released (→ OpenRouter)
-                        -- — no heartbeat needed, and nothing is ever held forever.
-                        AND NOT (
-                            mf.state = 'coming'
-                            AND mf.expected_ready_at IS NOT NULL
-                            AND mf.expected_ready_at > $3::TIMESTAMPTZ
-                            AND mf.expected_ready_at + make_interval(secs => $13)
-                                <= LEAST(
-                                    -- ceiling: the hard expiry wins even if below the floor.
-                                    COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond')),
-                                    GREATEST(
-                                        -- floor: now + min_async_ttft.
-                                        $3::TIMESTAMPTZ + make_interval(secs => $12),
-                                        -- raw D_eff = floor + (expiry - floor) * g(score).
-                                        $3::TIMESTAMPTZ + make_interval(secs => $12)
-                                            + (COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond'))
-                                               - $3::TIMESTAMPTZ - make_interval(secs => $12))
-                                              * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14))
-                                    )
-                                )
-                            AND $3::TIMESTAMPTZ + make_interval(secs => $13)
-                                < LEAST(
-                                    -- ceiling: the hard expiry wins even if below the floor.
-                                    COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond')),
-                                    GREATEST(
-                                        -- floor: now + min_async_ttft.
-                                        $3::TIMESTAMPTZ + make_interval(secs => $12),
-                                        -- raw D_eff = floor + (expiry - floor) * g(score).
-                                        $3::TIMESTAMPTZ + make_interval(secs => $12)
-                                            + (COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond'))
-                                               - $3::TIMESTAMPTZ - make_interval(secs => $12))
-                                              * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14))
-                                    )
-                                )
-                        )
-                    ORDER BY
-                        -- Postgres doesn't allow SELECT-list aliases in ORDER BY
-                        -- when FOR UPDATE is in play, so the deadline expression
-                        -- is repeated here. The synthesized window for batchless
-                        -- rows still lives in exactly one constant ($9 from
-                        -- DaemonConfig.flex_expiry_ms).
-                        (1.0 - $8::DOUBLE PRECISION)
-                            * COALESCE(up.active_count, 0)::DOUBLE PRECISION
-                            / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
-                        + $8::DOUBLE PRECISION
-                            * LEAST(GREATEST(EXTRACT(EPOCH FROM
-                                COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond'))
-                                - $3), 0.0) / 86400.0, 1.0)
-                        ASC,
-                        COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond')) ASC,
-                        COALESCE(b.id, r.id) ASC
+                        -- g(score) = score / (score + k) in [0,1). HOLD (exclude) iff
+                        -- the model is `coming` with a future ETA ready+served before
+                        -- D_eff AND we're not yet at the deadline. No heartbeat gate:
+                        -- a `coming` model frozen by a dead controller releases once
+                        -- its ETA passes or the row reaches its own deadline, so
+                        -- nothing is ever held forever.
+                        SELECT bl.id, bl.template_id, bl.batch_id, bl.effective_expires_at,
+                               bl.ord_blend, bl.ord_exp, bl.ord_id
+                        FROM (
+                            SELECT r.id, r.template_id, r.batch_id,
+                                   r.created_at + ($9::BIGINT * interval '1 millisecond') AS effective_expires_at,
+                                   (1.0 - $8::DOUBLE PRECISION)
+                                       * COALESCE(up.active_count, 0)::DOUBLE PRECISION
+                                       / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
+                                   + $8::DOUBLE PRECISION
+                                       * LEAST(GREATEST(EXTRACT(EPOCH FROM
+                                           (r.created_at + ($9::BIGINT * interval '1 millisecond')) - $3), 0.0) / 86400.0, 1.0)
+                                       AS ord_blend,
+                                   r.created_at + ($9::BIGINT * interval '1 millisecond') AS ord_exp,
+                                   r.id AS ord_id
+                            FROM requests r
+                            LEFT JOIN user_priority up ON r.created_by = up.user_id
+                            LEFT JOIN user_recent ur ON r.created_by = ur.user_id
+                            LEFT JOIN LATERAL (
+                                SELECT mfe.state, mfe.expected_ready_at FROM model_filters mfe
+                                WHERE mfe.model = m.model
+                                ORDER BY mfe.created_at DESC, mfe.id DESC LIMIT 1
+                            ) mf ON true
+                            WHERE r.state = 'pending' AND r.model = m.model AND r.batch_id IS NULL
+                              AND r.template_id IS NOT NULL AND (r.not_before IS NULL OR r.not_before <= $3)
+                              AND NOT (
+                                  mf.state = 'coming'
+                                  AND mf.expected_ready_at IS NOT NULL
+                                  AND mf.expected_ready_at > $3::TIMESTAMPTZ
+                                  AND mf.expected_ready_at + make_interval(secs => $13)
+                                      <= LEAST(r.created_at + ($9::BIGINT * interval '1 millisecond'),
+                                           GREATEST($3::TIMESTAMPTZ + make_interval(secs => $12),
+                                             $3::TIMESTAMPTZ + make_interval(secs => $12)
+                                               + ((r.created_at + ($9::BIGINT * interval '1 millisecond')) - $3::TIMESTAMPTZ - make_interval(secs => $12))
+                                                 * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14))))
+                                  AND $3::TIMESTAMPTZ + make_interval(secs => $13)
+                                      < LEAST(r.created_at + ($9::BIGINT * interval '1 millisecond'),
+                                           GREATEST($3::TIMESTAMPTZ + make_interval(secs => $12),
+                                             $3::TIMESTAMPTZ + make_interval(secs => $12)
+                                               + ((r.created_at + ($9::BIGINT * interval '1 millisecond')) - $3::TIMESTAMPTZ - make_interval(secs => $12))
+                                                 * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14))))
+                              )
+                            ORDER BY
+                                (1.0 - $8::DOUBLE PRECISION)
+                                    * COALESCE(up.active_count, 0)::DOUBLE PRECISION
+                                    / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
+                                + $8::DOUBLE PRECISION
+                                    * LEAST(GREATEST(EXTRACT(EPOCH FROM
+                                        (r.created_at + ($9::BIGINT * interval '1 millisecond')) - $3), 0.0) / 86400.0, 1.0) ASC,
+                                r.created_at + ($9::BIGINT * interval '1 millisecond') ASC,
+                                r.id ASC
+                            LIMIT m.capacity
+                            FOR UPDATE OF r SKIP LOCKED
+                        ) bl
+                    ) c
+                    ORDER BY c.ord_blend ASC, c.ord_exp ASC, c.ord_id ASC
                     LIMIT m.capacity
-                    FOR UPDATE OF r SKIP LOCKED
                 ) claimed
                 LIMIT $2::BIGINT
             )
@@ -11332,6 +11416,157 @@ mod tests {
             claimed[0].data.created_by, "user-b",
             "With urgency_weight=0.0, user-b (0 active) should beat user-a (5 active) \
              despite user-a having a more urgent 1hr SLA"
+        );
+    }
+
+    /// Regression test for the rank-then-pull claim path. A model with a backlog
+    /// spread across several batches must still claim the most-urgent
+    /// (soonest-expiring) rows, and must pull across batch boundaries in
+    /// priority order when `capacity` exceeds a single batch's pending count.
+    /// This exercises the batch-ranking + winners-only pull that replaced the
+    /// full per-model scan/sort.
+    #[sqlx::test]
+    async fn test_claim_ranks_batches_and_pulls_from_winners(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(DaemonConfig {
+            // Urgency dominates so the soonest-expiring batch ranks first.
+            urgency_weight: 1.0,
+            ..DaemonConfig::default()
+        });
+
+        // A batch with `n` pending requests for `model`, expiring at `expires_at`.
+        async fn setup_batch_n(
+            manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+            pool: &sqlx::PgPool,
+            label: &str,
+            model: &str,
+            n: usize,
+            expires_at: DateTime<Utc>,
+        ) -> BatchId {
+            let templates: Vec<RequestTemplateInput> = (0..n)
+                .map(|i| RequestTemplateInput {
+                    custom_id: Some(format!("{label}-req-{i}")),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: model.to_string(),
+                    api_key: "key".to_string(),
+                })
+                .collect();
+            let file_id = manager
+                .create_file(format!("{label}-file"), None, templates)
+                .await
+                .unwrap();
+            let batch = manager
+                .create_batch(BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    created_by: Some(format!("{label}-user")),
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+            sqlx::query!(
+                "UPDATE batches SET expires_at = $1 WHERE id = $2",
+                expires_at,
+                *batch.id as Uuid,
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+            batch.id
+        }
+
+        let now = Utc::now();
+        let _far = setup_batch_n(
+            &manager,
+            &pool,
+            "far",
+            "rank-test",
+            3,
+            now + chrono::Duration::hours(24),
+        )
+        .await;
+        let mid = setup_batch_n(
+            &manager,
+            &pool,
+            "mid",
+            "rank-test",
+            3,
+            now + chrono::Duration::hours(2),
+        )
+        .await;
+        let soon = setup_batch_n(
+            &manager,
+            &pool,
+            "soon",
+            "rank-test",
+            3,
+            now + chrono::Duration::minutes(30),
+        )
+        .await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+
+        // capacity == soonest batch's size: all claimed rows come from `soon`.
+        let cap3 = HashMap::from([("rank-test".to_string(), 3)]);
+        let claimed = manager
+            .claim_requests(3, daemon_id, &cap3, &HashMap::new(), &HashMap::new())
+            .await
+            .expect("claim (cap 3) failed");
+        assert_eq!(claimed.len(), 3);
+        assert!(
+            claimed.iter().all(|r| r.data.batch_id == Some(soon)),
+            "with capacity 3, all rows should be pulled from the soonest-expiring batch"
+        );
+
+        // Reset to pending for the next claim.
+        sqlx::query!(
+            "UPDATE requests SET state='pending', daemon_id=NULL, claimed_at=NULL WHERE state='claimed'"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // capacity spans batches: 3 from `soon`, then 2 from `mid`, none from `far`.
+        let cap5 = HashMap::from([("rank-test".to_string(), 5)]);
+        let claimed = manager
+            .claim_requests(5, daemon_id, &cap5, &HashMap::new(), &HashMap::new())
+            .await
+            .expect("claim (cap 5) failed");
+        assert_eq!(claimed.len(), 5);
+        let from_soon = claimed
+            .iter()
+            .filter(|r| r.data.batch_id == Some(soon))
+            .count();
+        let from_mid = claimed
+            .iter()
+            .filter(|r| r.data.batch_id == Some(mid))
+            .count();
+        let from_far = claimed
+            .iter()
+            .filter(|r| r.data.batch_id == Some(_far))
+            .count();
+        assert_eq!(
+            from_soon, 3,
+            "the whole soonest batch should be claimed first"
+        );
+        assert_eq!(
+            from_mid, 2,
+            "the remainder should come from the next-soonest batch"
+        );
+        assert_eq!(
+            from_far, 0,
+            "the farthest-deadline batch should not be touched"
         );
     }
 
