@@ -289,11 +289,18 @@ pub trait Storage: Send + Sync {
     /// Get request counts grouped by model and deadline window.
     ///
     /// Each window is the half-open interval `[now + start_secs, now + end_secs)`
-    /// applied to each request's batch `expires_at`. A request is counted in a
+    /// applied to each request's deadline. A request is counted in a
     /// window if its deadline falls inside that range. Because the end is
     /// exclusive, adjacent windows (e.g. `(_, Some(0), 3600)` and
     /// `(_, Some(3600), 86400)`) never double-count a request sitting on the
     /// boundary.
+    ///
+    /// A request's deadline is its batch's `expires_at`. Batchless rows
+    /// (flex/async responses, `batch_id IS NULL`) have no batch expiry, so
+    /// their deadline is synthesized as `created_at + flex_expiry_ms`
+    /// (`DaemonConfig.flex_expiry_ms`, 1h by default) — the same effective
+    /// deadline the claim path uses, so reported queue depth matches what
+    /// the daemon will claim.
     ///
     /// `start_secs` is optional. When `None`, the lower bound is unbounded
     /// (the query matches every request with a deadline strictly before
