@@ -36,10 +36,12 @@ CREATE TABLE model_filters (
 );
 
 -- Latest-event lookup per model (the claim query's LATERAL ORDER BY
--- created_at DESC LIMIT 1) and the load-estimate scan both walk events for a
--- single model newest-first.
+-- created_at DESC, id DESC LIMIT 1) and the load-estimate scan both walk events
+-- for a single model newest-first. `id DESC` is in the index so the latest
+-- event is deterministic (and the ORDER BY is index-satisfiable) when a batch
+-- append shares one `created_at` across rows.
 CREATE INDEX idx_model_filters_model_created_at
-    ON model_filters (model, created_at DESC);
+    ON model_filters (model, created_at DESC, id DESC);
 
 -- Singleton sync heartbeat so the daemon can distinguish "scouter is alive,
 -- absence is meaningful" from "scouter is dead, the table is frozen". scouter

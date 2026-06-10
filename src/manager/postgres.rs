@@ -1120,8 +1120,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let min_async_ttft_secs = self.config.min_async_ttft_ms as f64 / 1000.0;
         let serve_margin_secs = self.config.serve_margin_ms as f64 / 1000.0;
         let model_filters_ttl_secs = self.config.model_filters_ttl_ms as f64 / 1000.0;
-        // `g(score) = score / (score + k)` (saturating in [0,1), g(0)=0).
-        let recent_claims_curve_k = self.config.recent_claims_curve_k;
+        // `g(score) = score / (score + k)` (saturating in [0,1), g(0)=0). Clamp
+        // `k` strictly positive so a misconfigured `0`/negative/NaN can't make
+        // the denominator `score + k` zero (0/0 = NaN) and corrupt the D_eff
+        // timestamp arithmetic in the claim SQL. (`NaN.max(x)` returns `x`.)
+        let recent_claims_curve_k = self.config.recent_claims_curve_k.max(f64::MIN_POSITIVE);
 
         // Single query claims across all models using LATERAL.
         //
@@ -1178,7 +1181,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         SELECT mfe.state, mfe.expected_ready_at
                         FROM model_filters mfe
                         WHERE mfe.model = m.model
-                        ORDER BY mfe.created_at DESC
+                        -- `id DESC` breaks ties when a batch append writes
+                        -- several events with the same `created_at`, so the
+                        -- "latest event" (current state) is deterministic.
+                        ORDER BY mfe.created_at DESC, mfe.id DESC
                         LIMIT 1
                     ) mf ON true
                     WHERE r.state = 'pending'
@@ -11453,7 +11459,8 @@ mod tests {
         batch.id
     }
 
-    /// Config with a tight floor TTFT so idle users get `D_eff ≈ now + 1s`.
+    /// Config with a tight floor TTFT so idle users get `D_eff ≈ now + 1 min`
+    /// (the `min_async_ttft_ms: 60_000` floor below).
     fn filter_test_config() -> DaemonConfig {
         DaemonConfig {
             min_async_ttft_ms: 60_000, // 1 minute floor TTFT
