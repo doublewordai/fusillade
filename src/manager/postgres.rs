@@ -1119,7 +1119,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // like `urgency_weight` / `flex_expiry_ms` already are.
         let min_async_ttft_secs = self.config.min_async_ttft_ms as f64 / 1000.0;
         let serve_margin_secs = self.config.serve_margin_ms as f64 / 1000.0;
-        let model_filters_ttl_secs = self.config.model_filters_ttl_ms as f64 / 1000.0;
         // `g(score) = score / (score + k)` (saturating in [0,1), g(0)=0). Clamp
         // `k` strictly positive so a misconfigured `0`/negative/NaN can't make
         // the denominator `score + k` zero (0/0 = NaN) and corrupt the D_eff
@@ -1146,22 +1145,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             user_recent AS (
                 SELECT * FROM unnest($10::TEXT[], $11::DOUBLE PRECISION[]) AS u(user_id, score)
             ),
-            heartbeat AS (
-                -- Async model-filters sync heartbeat. Fresh iff updated within
-                -- $14 seconds of `now` ($3). When stale we fail OPEN: the hold
-                -- predicate (gated on `hb.fresh`) stops gating, so the claim
-                -- query reverts to pre-feature behaviour (see the WHERE below).
-                SELECT
-                    COALESCE(
-                        (SELECT updated_at FROM model_filters_sync WHERE id = true)
-                            > $3::TIMESTAMPTZ - make_interval(secs => $14),
-                        FALSE
-                    ) AS fresh
-            ),
             to_claim AS (
                 SELECT claimed.id, claimed.template_id, claimed.batch_id, claimed.effective_expires_at
                 FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
-                CROSS JOIN heartbeat hb
                 CROSS JOIN LATERAL (
                     SELECT r.id, r.template_id, r.batch_id,
                            COALESCE(b.expires_at,
@@ -1211,17 +1197,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         -- Idle user (score 0) => D_eff = now + min_async_ttft (tight);
                         -- sustained consumer => D_eff approaches the hard expiry.
                         --
-                        -- HOLD (exclude the row) iff: heartbeat fresh AND the model
-                        -- is `coming` AND it will be ready+served before D_eff AND we
+                        -- HOLD (exclude the row) iff: the model is `coming` with a
+                        -- future ETA that will be ready+served before D_eff AND we
                         -- are not yet at the deadline. Everything else is claimable.
                         --
-                        -- `expected_ready_at > now` guards against a stuck deploy: a
-                        -- `coming` row whose ETA is already in the past must NOT keep
-                        -- holding (it would do so until the heartbeat went stale), so a
-                        -- past ETA falls through to claimable (→ OpenRouter).
+                        -- There is NO liveness/heartbeat gate: the gate simply
+                        -- trusts the latest `model_filters` state and degrades
+                        -- PER REQUEST. A `coming` model frozen by a dead/quiet
+                        -- controller stops holding once its ETA passes
+                        -- (`expected_ready_at > now` below) or once the request
+                        -- reaches its own deadline (`now + serve >= D_eff`), so a
+                        -- held request is always eventually released (→ OpenRouter)
+                        -- — no heartbeat needed, and nothing is ever held forever.
                         AND NOT (
-                            hb.fresh
-                            AND mf.state = 'coming'
+                            mf.state = 'coming'
                             AND mf.expected_ready_at IS NOT NULL
                             AND mf.expected_ready_at > $3::TIMESTAMPTZ
                             AND mf.expected_ready_at + make_interval(secs => $13)
@@ -1235,7 +1224,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                         $3::TIMESTAMPTZ + make_interval(secs => $12)
                                             + (COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond'))
                                                - $3::TIMESTAMPTZ - make_interval(secs => $12))
-                                              * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $15))
+                                              * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14))
                                     )
                                 )
                             AND $3::TIMESTAMPTZ + make_interval(secs => $13)
@@ -1249,19 +1238,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                         $3::TIMESTAMPTZ + make_interval(secs => $12)
                                             + (COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond'))
                                                - $3::TIMESTAMPTZ - make_interval(secs => $12))
-                                              * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $15))
+                                              * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14))
                                     )
                                 )
                         )
-                        -- Fail-OPEN when the heartbeat is stale: the hold
-                        -- predicate above is gated on `hb.fresh`, so a quiet/
-                        -- absent controller leaves no gating here and the claim
-                        -- query reverts to its pre-feature behaviour (claim
-                        -- normally). This is the safe degradation for an
-                        -- optimisation layer — when the controller (the availability
-                        -- oracle) is unavailable we fall back to the proven
-                        -- baseline rather than holding work. The gate is active
-                        -- only while the controller keeps the heartbeat fresh.
                     ORDER BY
                         -- Postgres doesn't allow SELECT-list aliases in ORDER BY
                         -- when FOR UPDATE is in play, so the deadline expression
@@ -1325,7 +1305,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             &recent_scores_arr,
             min_async_ttft_secs,
             serve_margin_secs,
-            model_filters_ttl_secs,
             recent_claims_curve_k,
         )
         .fetch_all(self.pools.write())
@@ -1435,63 +1414,38 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     async fn append_model_filter_events(&self, entries: &[ModelFilter]) -> Result<()> {
-        let now = Utc::now();
-        let mut tx = self.pools.write().begin().await.map_err(|e| {
-            FusilladeError::Other(anyhow!(
-                "Failed to begin append_model_filter_events tx: {}",
-                e
-            ))
-        })?;
-
-        if !entries.is_empty() {
-            let models: Vec<String> = entries.iter().map(|e| e.model.clone()).collect();
-            let states: Vec<String> = entries
-                .iter()
-                .map(|e| e.state.as_str().to_string())
-                .collect();
-            let etas: Vec<Option<DateTime<Utc>>> =
-                entries.iter().map(|e| e.expected_ready_at).collect();
-
-            // Append one row per event. `WITH ORDINALITY` preserves caller
-            // order so events that share `created_at = now` keep their relative
-            // order via the serial `id` (the latest-event lookup falls back to
-            // id when created_at ties are possible).
-            sqlx::query!(
-                r#"
-                INSERT INTO model_filters (model, state, expected_ready_at, created_at)
-                SELECT model, state, expected_ready_at, $4
-                FROM unnest($1::TEXT[], $2::TEXT[], $3::TIMESTAMPTZ[])
-                    WITH ORDINALITY AS t(model, state, expected_ready_at, ord)
-                ORDER BY ord
-                "#,
-                &models,
-                &states,
-                &etas as &[Option<DateTime<Utc>>],
-                now,
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to append model_filters events: {}", e))
-            })?;
+        if entries.is_empty() {
+            return Ok(());
         }
+        let now = Utc::now();
+        let models: Vec<String> = entries.iter().map(|e| e.model.clone()).collect();
+        let states: Vec<String> = entries
+            .iter()
+            .map(|e| e.state.as_str().to_string())
+            .collect();
+        let etas: Vec<Option<DateTime<Utc>>> =
+            entries.iter().map(|e| e.expected_ready_at).collect();
 
+        // Append one row per event. `WITH ORDINALITY` preserves caller order so
+        // events that share `created_at = now` keep their relative order via the
+        // serial `id` (the latest-event lookup falls back to id on created_at ties).
         sqlx::query!(
             r#"
-            INSERT INTO model_filters_sync (id, updated_at) VALUES (true, $1)
-            ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at
+            INSERT INTO model_filters (model, state, expected_ready_at, created_at)
+            SELECT model, state, expected_ready_at, $4
+            FROM unnest($1::TEXT[], $2::TEXT[], $3::TIMESTAMPTZ[])
+                WITH ORDINALITY AS t(model, state, expected_ready_at, ord)
+            ORDER BY ord
             "#,
+            &models,
+            &states,
+            &etas as &[Option<DateTime<Utc>>],
             now,
         )
-        .execute(&mut *tx)
+        .execute(self.pools.write())
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to bump model_filters_sync: {}", e)))?;
-
-        tx.commit().await.map_err(|e| {
-            FusilladeError::Other(anyhow!(
-                "Failed to commit append_model_filter_events tx: {}",
-                e
-            ))
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to append model_filters events: {}", e))
         })?;
 
         Ok(())
@@ -1581,17 +1535,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         }
 
         Ok(Some(chrono::Duration::milliseconds((ewma * 1000.0) as i64)))
-    }
-
-    async fn model_filters_heartbeat(&self) -> Result<Option<DateTime<Utc>>> {
-        let row = sqlx::query!(r#"SELECT updated_at FROM model_filters_sync WHERE id = true"#)
-            .fetch_optional(self.pools.read())
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to read model_filters_sync: {}", e))
-            })?;
-
-        Ok(row.map(|r| r.updated_at))
     }
 
     async fn persist<T: RequestState + Clone>(
@@ -11455,7 +11398,6 @@ mod tests {
         DaemonConfig {
             min_async_ttft_ms: 60_000, // 1 minute floor TTFT
             serve_margin_ms: 0,
-            model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
             ..Default::default()
@@ -11582,42 +11524,42 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_stale_heartbeat_fails_open(pool: sqlx::PgPool) {
+    async fn test_coming_past_eta_is_released_no_heartbeat(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         )
         .with_config(filter_test_config());
 
-        // A request far from its deadline AND a `coming` model that would
-        // normally be held when the heartbeat is fresh. With a STALE heartbeat
-        // the gate fails OPEN: the controller is treated as unavailable and the claim
-        // query reverts to baseline behaviour, so BOTH are claimed normally.
+        // There is no heartbeat table — the gate trusts the latest model_filters
+        // state and degrades PER REQUEST. A `coming` model whose ETA is already
+        // in the PAST (e.g. a dead/quiet controller's stuck deploy) must be
+        // released (claimed → OpenRouter); a `coming` model with a future ETA
+        // within the idle D_eff (60s floor) is still held.
         let far = Utc::now() + chrono::Duration::hours(12);
-        setup_filter_request(&manager, &pool, "user-absent", "absent-model", far).await;
+        setup_filter_request(&manager, &pool, "user-stuck", "stuck-model", far).await;
         setup_filter_request(&manager, &pool, "user-coming", "coming-model", far).await;
-        // Mark `coming-model` as coming with a far-future ETA (would be held if fresh).
         manager
-            .append_model_filter_events(&[ModelFilter {
-                model: "coming-model".to_string(),
-                state: ModelFilterState::Coming,
-                expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(10)),
-            }])
+            .append_model_filter_events(&[
+                ModelFilter {
+                    model: "stuck-model".to_string(),
+                    state: ModelFilterState::Coming,
+                    // ETA in the past → not held, released to OR.
+                    expected_ready_at: Some(Utc::now() - chrono::Duration::minutes(1)),
+                },
+                ModelFilter {
+                    model: "coming-model".to_string(),
+                    state: ModelFilterState::Coming,
+                    // ETA 30s out, within the idle D_eff (now + 60s) → held.
+                    expected_ready_at: Some(Utc::now() + chrono::Duration::seconds(30)),
+                },
+            ])
             .await
             .unwrap();
 
-        // Force the heartbeat stale (older than model_filters_ttl_ms = 30s).
-        sqlx::query!(
-            "UPDATE model_filters_sync SET updated_at = $1 WHERE id = true",
-            Utc::now() - chrono::Duration::minutes(5),
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([
-            ("absent-model".to_string(), 5),
+            ("stuck-model".to_string(), 5),
             ("coming-model".to_string(), 5),
         ]);
 
@@ -11627,10 +11569,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             claimed.len(),
-            2,
-            "stale heartbeat fails OPEN: both requests are claimed (baseline behaviour), \
-             including the `coming` model that would be held when the heartbeat is fresh"
+            1,
+            "only the past-ETA `coming` model is released; the in-window `coming` model is held"
         );
+        assert_eq!(claimed[0].data.created_by, "user-stuck");
     }
 
     #[sqlx::test]
@@ -11731,16 +11673,10 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_append_model_filter_events_and_heartbeat(pool: sqlx::PgPool) {
+    async fn test_append_model_filter_events(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
-        );
-
-        let before = manager.model_filters_heartbeat().await.unwrap();
-        assert!(
-            before.is_some(),
-            "heartbeat singleton exists from migration"
         );
 
         // Append a batch of events; latest-event-per-model is the current state.
@@ -11768,12 +11704,6 @@ mod tests {
         assert!(listed[0].expected_ready_at.is_some());
         assert_eq!(listed[1].model, "m-live");
         assert_eq!(listed[1].state, ModelFilterState::Live);
-
-        let after = manager.model_filters_heartbeat().await.unwrap().unwrap();
-        assert!(
-            after >= before.unwrap(),
-            "append_model_filter_events should bump the heartbeat"
-        );
 
         // Append-only: a later event supersedes the earlier one for the same
         // model (latest wins). m-live transitions to coming; m-new appears.

@@ -43,14 +43,8 @@ CREATE TABLE model_filters (
 CREATE INDEX idx_model_filters_model_created_at
     ON model_filters (model, created_at DESC, id DESC);
 
--- Singleton sync heartbeat so the daemon can tell whether the controller is actively
--- syncing. The controller bumps `updated_at` on every sync; when the heartbeat is
--- stale (or absent) the claim gate fails OPEN — the `coming`-hold predicate is
--- gated on a fresh heartbeat, so a quiet/absent controller reverts the claim query
--- to its pre-feature baseline (claim normally) rather than holding work.
-CREATE TABLE model_filters_sync (
-    id         BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
-    updated_at TIMESTAMPTZ NOT NULL
-);
-
-INSERT INTO model_filters_sync (id, updated_at) VALUES (true, now());
+-- No separate liveness/heartbeat table: the claim gate trusts the latest
+-- `model_filters` event per model and degrades per-request. A `coming` model
+-- frozen by a dead/quiet controller stops being held once its ETA passes
+-- (`expected_ready_at > now`) or once the request reaches its own deadline, so
+-- held work is always eventually released to OpenRouter without a heartbeat.

@@ -271,14 +271,6 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub serve_margin_ms: u64,
 
-    /// Staleness threshold (milliseconds) for the `model_filters_sync`
-    /// heartbeat. When the heartbeat is older than this, the claim gate fails
-    /// OPEN — it reverts to baseline claiming (the `coming`-hold predicate is
-    /// gated on a fresh heartbeat). Align to the controller's poll cadence.
-    /// Default: 30_000.
-    #[serde(default = "default_model_filters_ttl_ms")]
-    pub model_filters_ttl_ms: u64,
-
     /// Half-life (milliseconds) of the per-user decaying recent-claim score
     /// that relaxes `D_eff` for sustained consumers. Default: 120_000.
     #[serde(default = "default_recent_claims_halflife_ms")]
@@ -319,10 +311,6 @@ fn default_flex_expiry_ms() -> u64 {
 
 fn default_min_async_ttft_ms() -> u64 {
     60_000 // 1 minute
-}
-
-fn default_model_filters_ttl_ms() -> u64 {
-    30_000 // 30 seconds
 }
 
 fn default_recent_claims_halflife_ms() -> u64 {
@@ -375,7 +363,6 @@ impl Default for DaemonConfig {
             flex_expiry_ms: default_flex_expiry_ms(),
             min_async_ttft_ms: default_min_async_ttft_ms(),
             serve_margin_ms: 0,
-            model_filters_ttl_ms: default_model_filters_ttl_ms(),
             recent_claims_halflife_ms: default_recent_claims_halflife_ms(),
             recent_claims_curve_k: default_recent_claims_curve_k(),
             model_filters_keep_per_model: default_model_filters_keep_per_model(),
@@ -1447,7 +1434,6 @@ mod tests {
             flex_expiry_ms: 3_600_000,
             min_async_ttft_ms: 60_000,
             serve_margin_ms: 0,
-            model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
             model_filters_keep_per_model: 50,
@@ -1636,7 +1622,6 @@ mod tests {
             flex_expiry_ms: 3_600_000,
             min_async_ttft_ms: 60_000,
             serve_margin_ms: 0,
-            model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
             model_filters_keep_per_model: 50,
@@ -1887,7 +1872,6 @@ mod tests {
             flex_expiry_ms: 3_600_000,
             min_async_ttft_ms: 60_000,
             serve_margin_ms: 0,
-            model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
             model_filters_keep_per_model: 50,
@@ -2043,7 +2027,6 @@ mod tests {
             flex_expiry_ms: 3_600_000,
             min_async_ttft_ms: 60_000,
             serve_margin_ms: 0,
-            model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
             model_filters_keep_per_model: 50,
@@ -2238,7 +2221,6 @@ mod tests {
             flex_expiry_ms: 3_600_000,
             min_async_ttft_ms: 60_000,
             serve_margin_ms: 0,
-            model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
             model_filters_keep_per_model: 50,
@@ -2417,7 +2399,6 @@ mod tests {
             flex_expiry_ms: 3_600_000,
             min_async_ttft_ms: 60_000,
             serve_margin_ms: 0,
-            model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
             model_filters_keep_per_model: 50,
@@ -2601,7 +2582,6 @@ mod tests {
             flex_expiry_ms: 3_600_000,
             min_async_ttft_ms: 60_000,
             serve_margin_ms: 0,
-            model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
             model_filters_keep_per_model: 50,
@@ -2780,7 +2760,6 @@ mod tests {
             flex_expiry_ms: 3_600_000,
             min_async_ttft_ms: 60_000,
             serve_margin_ms: 0,
-            model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
             model_filters_keep_per_model: 50,
@@ -2942,7 +2921,6 @@ mod tests {
             flex_expiry_ms: 3_600_000,
             min_async_ttft_ms: 60_000,
             serve_margin_ms: 0,
-            model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
             model_filters_keep_per_model: 50,
@@ -3085,7 +3063,6 @@ mod tests {
             flex_expiry_ms: 3_600_000,
             min_async_ttft_ms: 60_000,
             serve_margin_ms: 0,
-            model_filters_ttl_ms: 30_000,
             recent_claims_halflife_ms: 120_000,
             recent_claims_curve_k: 4.0,
             model_filters_keep_per_model: 50,

@@ -476,9 +476,9 @@ pub trait Storage: Send + Sync {
     /// gate: idle users get a tight `D_eff` (served fast / released to
     /// OpenRouter), sustained consumers get a relaxed `D_eff` (work held for
     /// imminent internal capacity). Pass an empty map to disable the relaxation
-    /// (every user is treated as idle). The gate also consults the
-    /// `model_filters` table and the `model_filters_sync` heartbeat; with an
-    /// empty `model_filters` table the gate is a no-op (everything claimable).
+    /// (every user is treated as idle). The gate consults the latest
+    /// `model_filters` event per model; with an empty `model_filters` table the
+    /// gate is a no-op (everything claimable).
     async fn claim_requests(
         &self,
         limit: usize,
@@ -488,9 +488,9 @@ pub trait Storage: Send + Sync {
         user_recent_claims: &std::collections::HashMap<String, f64>,
     ) -> Result<Vec<Request<Claimed>>>;
 
-    /// Append a single event to the `model_filters` log and bump the
-    /// `model_filters_sync` heartbeat. Used by the controller when a model's internal
-    /// liveness CHANGES (live / coming(ETA) / absent-tombstone).
+    /// Append a single event to the `model_filters` log. Used by the controller
+    /// when a model's internal liveness CHANGES (live / coming(ETA) /
+    /// absent-tombstone).
     ///
     /// This is append-only: there is no delete and no upsert. Retraction is
     /// appending an `Absent` event. Appending **only on change** (so the log
@@ -499,9 +499,9 @@ pub trait Storage: Send + Sync {
     async fn append_model_filter_event(&self, entry: &ModelFilter) -> Result<()>;
 
     /// Append a batch of events to the `model_filters` log (one row each, in
-    /// order) and bump the heartbeat once. Convenience for the controller publishing
-    /// several transitions in one sync. Same append-only / append-on-change
-    /// semantics as [`Storage::append_model_filter_event`].
+    /// order). Convenience for the controller publishing several transitions in
+    /// one sync. Same append-only / append-on-change semantics as
+    /// [`Storage::append_model_filter_event`].
     async fn append_model_filter_events(&self, entries: &[ModelFilter]) -> Result<()>;
 
     /// List the CURRENT state of every model (the latest event per model),
@@ -516,10 +516,6 @@ pub trait Storage: Send + Sync {
     /// `coming -> live` transition has ever been observed. The controller calls this
     /// to set future `expected_ready_at` ETAs.
     async fn model_load_estimate(&self, model: &str) -> Result<Option<chrono::Duration>>;
-
-    /// Read the `model_filters_sync` heartbeat timestamp (observability /
-    /// tests). Returns `None` if the singleton row is missing.
-    async fn model_filters_heartbeat(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>>;
 
     /// Update an existing request's state in storage.
     ///

@@ -13,11 +13,19 @@
 > retraction is an explicit `absent` **tombstone** event (never a DELETE). This
 > supersedes the current-state framing throughout. The benefit is that load
 > durations can be **learned from the log** (`coming -> live` gaps) to set future
-> ETAs (`model_load_estimate`), and the history is auditable. The sync heartbeat,
-> `D_eff` relaxation, and hold/release predicates are unchanged. **Stale/absent
-> heartbeat now fails OPEN** (reverts to baseline claiming) rather than closed —
-> the safe degradation, and it makes this PR inert to deploy ahead of the controller.
-> Sections below are annotated where the design changed.
+> ETAs (`model_load_estimate`), and the history is auditable.
+>
+> **Update (no heartbeat table).** An earlier revision had a separate
+> `model_filters_sync` heartbeat table and made the gate fail-open on its
+> staleness. That table has been **removed**: the gate now simply trusts the
+> latest `model_filters` event per model and **degrades per request** — a
+> `coming` model frozen by a dead/quiet controller stops being held once its ETA
+> passes (`expected_ready_at > now`) or once the request reaches its own
+> deadline, so held work is always eventually released to OpenRouter without any
+> heartbeat or freshness TTL. **All `model_filters_sync` / heartbeat /
+> `model_filters_ttl_ms` / `hb.fresh` mentions below are superseded** — one
+> append-only table, no liveness gate. This also keeps the PR inert to deploy
+> ahead of the controller: with no events, the gate is a no-op.
 
 ## Overview
 
@@ -42,7 +50,7 @@ fusillade does **not** route internal-vs-OpenRouter — it dispatches to `reques
    the controller (COR-433, embeds this crate, NO daemon)
      • polls dynamo-frontend /v1/models for liveness
      • computes/retracts expected_ready_at for models it plans to deploy
-     • writes model_filters (this crate's fns) + a sync heartbeat
+     • writes model_filters events (this crate's fns) on state change
      • writes active/inactive to control-layer (for onwards)
                          │ writes
                          ▼
@@ -89,16 +97,9 @@ Each row is one **liveness transition** appended by the controller. There is **n
   log. Retraction = append an `absent` event; there is never a DELETE in the
   hot path (only the retention purge removes old rows — see §6).
 
-Plus a singleton **sync heartbeat** (unchanged) so the daemon can tell "the controller
-is alive, absence is meaningful" from "the controller is dead, the log is frozen":
-
-```sql
-CREATE TABLE model_filters_sync ( id BOOLEAN PRIMARY KEY DEFAULT true CHECK (id), updated_at TIMESTAMPTZ NOT NULL );
-INSERT INTO model_filters_sync (id, updated_at) VALUES (true, now());
-```
-
-The controller bumps `model_filters_sync.updated_at` on every sync (every append fn
-bumps it too).
+No separate liveness/heartbeat table: the gate trusts the latest event per model
+and degrades per request (see the per-request decision and the top "no heartbeat
+table" note).
 
 ### 2. Per-request claim decision
 
@@ -108,20 +109,22 @@ For a pending request for model X with effective deadline `D_eff` (below), let `
 events). `absent` covers both "latest event is an `absent` tombstone" and "no
 events at all".
 
-| `model_filters[X]` (latest event, fresh heartbeat) | Decision |
+| `model_filters[X]` (latest event) | Decision |
 |---|---|
 | `live` | **claim** (→ onwards → internal) |
-| `coming(T)` and `T + serve ≤ D_eff` and `now + serve < D_eff` | **hold** (wait for internal) |
+| `coming(T)` and `T > now` and `T + serve ≤ D_eff` and `now + serve < D_eff` | **hold** (wait for internal) |
 | `coming(T)` and `T + serve > D_eff` | **claim** (can't wait → onwards → OR) |
+| `coming(T)` and `T ≤ now` (past/stuck ETA) | **claim** (self-heal — controller likely gone → OR) |
 | absent (tombstone latest **or** no events) | **claim** (not coming → onwards → OR) |
 | any, and `now + serve ≥ D_eff` | **claim** (deadline release — onwards/escalation → OR) |
-| heartbeat **stale** (or absent) | **fail OPEN**: the hold predicate is gated on `hb.fresh`, so a quiet/absent controller leaves the claim query at its pre-feature baseline (claim normally). Safe degradation + makes the PR inert to deploy ahead of the controller. |
+
+There is **no heartbeat/freshness gate** — degradation when the controller is gone is per-request (the past-ETA and deadline-release rows), so held work is always eventually released and nothing is held forever.
 
 The hold predicate keys off `mf.state = 'coming'`, so a latest event of `live`,
 `absent`, or NULL never holds — exactly the append-only equivalent of the old
 current-state logic.
 
-So a row is **excluded from the claim** (held) iff: heartbeat fresh **and** `state='coming'` **and** `expected_ready_at + serve ≤ D_eff` **and** `now + serve < D_eff`. Everything else is claimable. Held requests stay `pending`, so they keep counting as demand for the controller.
+So a row is **excluded from the claim** (held) iff: `state='coming'` **and** `expected_ready_at > now` **and** `expected_ready_at + serve ≤ D_eff` **and** `now + serve < D_eff`. Everything else is claimable. Held requests stay `pending`, so they keep counting as demand for the controller.
 
 ### 3. Effective deadline `D_eff` — TTFT target × fair-share (closes brief ①)
 
@@ -266,13 +269,13 @@ All `#[serde(default)]`, backward-compatible.
 ## Tests (`src/manager/postgres.rs`)
 - `test_claim_holds_for_coming_model_when_deadline_allows` — append `coming(T)` with `T+serve ≤ D_eff` ⇒ not claimed; append `live` event ⇒ latest is live ⇒ claimed.
 - `test_claim_releases_coming_model_near_deadline` — `coming(T)` but request near `D_eff` ⇒ claimed (→ OR path).
-- `test_absent_model_claimed_immediately` — no events + fresh heartbeat ⇒ claimed (no hold).
+- `test_absent_model_claimed_immediately` — no events ⇒ claimed (no hold).
 - `test_tombstone_absent_hides_model` — append `live` then `absent` tombstone ⇒ `list_model_filters` excludes it; both events remain in the log.
 - `test_tombstone_absent_model_is_claimed` — append `coming` then `absent` ⇒ latest is tombstone ⇒ claimed (not held).
-- `test_stale_heartbeat_fails_open` — stale heartbeat ⇒ fail OPEN: all rows claimed normally (incl. a `coming` model that would be held when fresh).
+- `test_coming_past_eta_is_released_no_heartbeat` — a `coming` model with a past ETA is released (self-heal), while an in-window `coming` model is still held — no heartbeat involved.
 - `test_d_eff_idle_vs_busy_user` — idle user (no recent claims) gets tight `D_eff` (claimed/released fast); high recent-claim user holds for `coming` model.
 - `test_recent_claims_decay_relaxes_then_tightens` — score decays over time so an idle-again user regains the tight target.
-- `test_append_model_filter_events_and_heartbeat` — append-only: later events supersede earlier per model (latest wins), every event retained, heartbeat bumped; single-event helper.
+- `test_append_model_filter_events` — append-only: later events supersede earlier per model (latest wins), every event retained; single-event helper.
 - `test_model_load_estimate` — EWMA of observed `coming → live` gaps; `None` when no transition seen.
 - `test_purge_model_filter_events_retention` — old events purged while the latest event per model (and the retention window) is always kept; `keep_per_model` clamped to ≥ 1.
 - All existing claim tests pass with an empty `model_filters` log + empty `user_recent_claims` (behaviour unchanged when the controller isn't writing).
@@ -291,8 +294,8 @@ All `#[serde(default)]`, backward-compatible.
 | File | Change |
 |------|--------|
 | `migrations/<ts>_add_model_filters.{up,down}.sql` | append-only `model_filters` event log + `(model, created_at DESC)` index + `model_filters_sync` heartbeat |
-| `src/manager/mod.rs` | `claim_requests` signature (+`user_recent_claims`); `ModelFilterState` (+`Absent`) / `ModelFilter` event types; `append_model_filter_event(s)`, `list_model_filters` (latest-per-model), `model_load_estimate`, heartbeat trait fns; `DaemonStorage::purge_model_filter_events` |
-| `src/manager/postgres.rs` | claim SQL: latest-event `LEFT JOIN LATERAL`, `D_eff`, hold predicate (fail-OPEN on stale heartbeat), new binds; append/list/load-estimate/purge impls; tests |
+| `src/manager/mod.rs` | `claim_requests` signature (+`user_recent_claims`); `ModelFilterState` (+`Absent`) / `ModelFilter` event types; `append_model_filter_event(s)`, `list_model_filters` (latest-per-model), `model_load_estimate` trait fns; `DaemonStorage::purge_model_filter_events` |
+| `src/manager/postgres.rs` | claim SQL: latest-event `LEFT JOIN LATERAL`, `D_eff`, hold predicate (per-request self-heal, no heartbeat), new binds; append/list/load-estimate/purge impls; tests |
 | `src/daemon/mod.rs` | `DaemonConfig` fields (incl. `model_filters_keep_per_model`, `model_filters_retention_ms`); purge task drains `model_filters` events; `user_recent_claims` DashMap |
 | `src/daemon/transitions.rs` | `MockDaemonStorage::purge_model_filter_events` |
 | `.sqlx/query-*.json` | regenerated via `cargo sqlx prepare` |
