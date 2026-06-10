@@ -1148,8 +1148,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ),
             heartbeat AS (
                 -- Async model-filters sync heartbeat. Fresh iff updated within
-                -- $14 seconds of `now` ($3). When stale we fail closed: only the
-                -- deadline-release clause may claim (see the WHERE below).
+                -- $14 seconds of `now` ($3). When stale we fail OPEN: the hold
+                -- predicate (gated on `hb.fresh`) stops gating, so the claim
+                -- query reverts to pre-feature behaviour (see the WHERE below).
                 SELECT
                     COALESCE(
                         (SELECT updated_at FROM model_filters_sync WHERE id = true)
@@ -1252,26 +1253,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                     )
                                 )
                         )
-                        -- Fail-closed: when the heartbeat is stale, only the
-                        -- deadline-release clause (now + serve >= D_eff) may claim;
-                        -- everything else holds until scouter recovers.
-                        AND (
-                            hb.fresh
-                            OR $3::TIMESTAMPTZ + make_interval(secs => $13)
-                                >= LEAST(
-                                    -- ceiling: the hard expiry wins even if below the floor.
-                                    COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond')),
-                                    GREATEST(
-                                        -- floor: now + min_async_ttft.
-                                        $3::TIMESTAMPTZ + make_interval(secs => $12),
-                                        -- raw D_eff = floor + (expiry - floor) * g(score).
-                                        $3::TIMESTAMPTZ + make_interval(secs => $12)
-                                            + (COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond'))
-                                               - $3::TIMESTAMPTZ - make_interval(secs => $12))
-                                              * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $15))
-                                    )
-                                )
-                        )
+                        -- Fail-OPEN when the heartbeat is stale: the hold
+                        -- predicate above is gated on `hb.fresh`, so a quiet/
+                        -- absent scouter leaves no gating here and the claim
+                        -- query reverts to its pre-feature behaviour (claim
+                        -- normally). This is the safe degradation for an
+                        -- optimisation layer — when scouter (the availability
+                        -- oracle) is unavailable we fall back to the proven
+                        -- baseline rather than holding work. The gate is active
+                        -- only while scouter keeps the heartbeat fresh.
                     ORDER BY
                         -- Postgres doesn't allow SELECT-list aliases in ORDER BY
                         -- when FOR UPDATE is in play, so the deadline expression
@@ -11592,19 +11582,29 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_stale_heartbeat_fails_closed(pool: sqlx::PgPool) {
+    async fn test_stale_heartbeat_fails_open(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         )
         .with_config(filter_test_config());
 
-        // One request far from deadline (should HOLD when stale) and one at
-        // its deadline (should still be released).
+        // A request far from its deadline AND a `coming` model that would
+        // normally be held when the heartbeat is fresh. With a STALE heartbeat
+        // the gate fails OPEN: scouter is treated as unavailable and the claim
+        // query reverts to baseline behaviour, so BOTH are claimed normally.
         let far = Utc::now() + chrono::Duration::hours(12);
-        let near = Utc::now() - chrono::Duration::seconds(5);
-        setup_filter_request(&manager, &pool, "user-far", "absent-model", far).await;
-        setup_filter_request(&manager, &pool, "user-near", "absent-model", near).await;
+        setup_filter_request(&manager, &pool, "user-absent", "absent-model", far).await;
+        setup_filter_request(&manager, &pool, "user-coming", "coming-model", far).await;
+        // Mark `coming-model` as coming with a far-future ETA (would be held if fresh).
+        manager
+            .append_model_filter_events(&[ModelFilter {
+                model: "coming-model".to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(10)),
+            }])
+            .await
+            .unwrap();
 
         // Force the heartbeat stale (older than model_filters_ttl_ms = 30s).
         sqlx::query!(
@@ -11616,7 +11616,10 @@ mod tests {
         .unwrap();
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let capacity = HashMap::from([("absent-model".to_string(), 5)]);
+        let capacity = HashMap::from([
+            ("absent-model".to_string(), 5),
+            ("coming-model".to_string(), 5),
+        ]);
 
         let claimed = manager
             .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashMap::new())
@@ -11624,12 +11627,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             claimed.len(),
-            1,
-            "stale heartbeat fails closed: only the at-deadline request is claimed"
-        );
-        assert_eq!(
-            claimed[0].data.created_by, "user-near",
-            "the released request should be the one at its deadline"
+            2,
+            "stale heartbeat fails OPEN: both requests are claimed (baseline behaviour), \
+             including the `coming` model that would be held when the heartbeat is fresh"
         );
     }
 

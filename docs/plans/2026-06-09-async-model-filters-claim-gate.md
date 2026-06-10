@@ -14,8 +14,10 @@
 > supersedes the current-state framing throughout. The benefit is that load
 > durations can be **learned from the log** (`coming -> live` gaps) to set future
 > ETAs (`model_load_estimate`), and the history is auditable. The sync heartbeat,
-> `D_eff` relaxation, hold/release predicates, and fail-closed behaviour are all
-> unchanged. Sections below are annotated where the design changed.
+> `D_eff` relaxation, and hold/release predicates are unchanged. **Stale/absent
+> heartbeat now fails OPEN** (reverts to baseline claiming) rather than closed —
+> the safe degradation, and it makes this PR inert to deploy ahead of scouter.
+> Sections below are annotated where the design changed.
 
 ## Overview
 
@@ -113,7 +115,7 @@ events at all".
 | `coming(T)` and `T + serve > D_eff` | **claim** (can't wait → onwards → OR) |
 | absent (tombstone latest **or** no events) | **claim** (not coming → onwards → OR) |
 | any, and `now + serve ≥ D_eff` | **claim** (deadline release — onwards/escalation → OR) |
-| heartbeat **stale** | **fail closed**: only the deadline-release clause claims; everything else holds |
+| heartbeat **stale** (or absent) | **fail OPEN**: the hold predicate is gated on `hb.fresh`, so a quiet/absent scouter leaves the claim query at its pre-feature baseline (claim normally). Safe degradation + makes the PR inert to deploy ahead of scouter. |
 
 The hold predicate keys off `mf.state = 'coming'`, so a latest event of `live`,
 `absent`, or NULL never holds — exactly the append-only equivalent of the old
@@ -230,9 +232,9 @@ retention_secs)`:
       AND mf.expected_ready_at + make_interval(secs => $13) <= <D_eff>
       AND $3 + make_interval(secs => $13) < <D_eff>           -- not yet at deadline
   )
-  -- fail-closed: when heartbeat stale, also require deadline-release to claim:
-  AND ( hb.updated_at > $3 - make_interval(secs => $14)
-        OR $3 + make_interval(secs => $13) >= <D_eff> )
+  -- fail-OPEN: there is NO extra heartbeat clause. The hold predicate above is
+  -- gated on `hb.fresh`, so when the heartbeat is stale nothing is held and the
+  -- claim query reverts to baseline (claim normally).
   ```
   where `<D_eff>` is the clamped expression from §3. Keep the existing ORDER BY (fairness + urgency) for *ordering among claimable rows*.
 - Regenerate the sqlx cache: `cargo sqlx prepare`.
@@ -267,7 +269,7 @@ All `#[serde(default)]`, backward-compatible.
 - `test_absent_model_claimed_immediately` — no events + fresh heartbeat ⇒ claimed (no hold).
 - `test_tombstone_absent_hides_model` — append `live` then `absent` tombstone ⇒ `list_model_filters` excludes it; both events remain in the log.
 - `test_tombstone_absent_model_is_claimed` — append `coming` then `absent` ⇒ latest is tombstone ⇒ claimed (not held).
-- `test_stale_heartbeat_fails_closed` — stale heartbeat ⇒ only near-`D_eff` rows claimed; others held.
+- `test_stale_heartbeat_fails_open` — stale heartbeat ⇒ fail OPEN: all rows claimed normally (incl. a `coming` model that would be held when fresh).
 - `test_d_eff_idle_vs_busy_user` — idle user (no recent claims) gets tight `D_eff` (claimed/released fast); high recent-claim user holds for `coming` model.
 - `test_recent_claims_decay_relaxes_then_tightens` — score decays over time so an idle-again user regains the tight target.
 - `test_append_model_filter_events_and_heartbeat` — append-only: later events supersede earlier per model (latest wins), every event retained, heartbeat bumped; single-event helper.
@@ -290,7 +292,7 @@ All `#[serde(default)]`, backward-compatible.
 |------|--------|
 | `migrations/<ts>_add_model_filters.{up,down}.sql` | append-only `model_filters` event log + `(model, created_at DESC)` index + `model_filters_sync` heartbeat |
 | `src/manager/mod.rs` | `claim_requests` signature (+`user_recent_claims`); `ModelFilterState` (+`Absent`) / `ModelFilter` event types; `append_model_filter_event(s)`, `list_model_filters` (latest-per-model), `model_load_estimate`, heartbeat trait fns; `DaemonStorage::purge_model_filter_events` |
-| `src/manager/postgres.rs` | claim SQL: latest-event `LEFT JOIN LATERAL`, `D_eff`, hold/fail-closed predicate, new binds; append/list/load-estimate/purge impls; tests |
+| `src/manager/postgres.rs` | claim SQL: latest-event `LEFT JOIN LATERAL`, `D_eff`, hold predicate (fail-OPEN on stale heartbeat), new binds; append/list/load-estimate/purge impls; tests |
 | `src/daemon/mod.rs` | `DaemonConfig` fields (incl. `model_filters_keep_per_model`, `model_filters_retention_ms`); purge task drains `model_filters` events; `user_recent_claims` DashMap |
 | `src/daemon/transitions.rs` | `MockDaemonStorage::purge_model_filter_events` |
 | `.sqlx/query-*.json` | regenerated via `cargo sqlx prepare` |
