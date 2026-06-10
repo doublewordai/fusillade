@@ -43,10 +43,11 @@ CREATE TABLE model_filters (
 CREATE INDEX idx_model_filters_model_created_at
     ON model_filters (model, created_at DESC, id DESC);
 
--- Singleton sync heartbeat so the daemon can distinguish "scouter is alive,
--- absence is meaningful" from "scouter is dead, the table is frozen". scouter
--- bumps `updated_at` on every sync; the daemon fails closed (only the
--- deadline-release clause claims) when the heartbeat is stale.
+-- Singleton sync heartbeat so the daemon can tell whether scouter is actively
+-- syncing. scouter bumps `updated_at` on every sync; when the heartbeat is
+-- stale (or absent) the claim gate fails OPEN — the `coming`-hold predicate is
+-- gated on a fresh heartbeat, so a quiet/absent scouter reverts the claim query
+-- to its pre-feature baseline (claim normally) rather than holding work.
 CREATE TABLE model_filters_sync (
     id         BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
     updated_at TIMESTAMPTZ NOT NULL
