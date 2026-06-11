@@ -1187,12 +1187,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             -- because every hold input (model state, user score, b.expires_at) is
             -- constant across its rows, so the gate composes at the batch level.
             ranked_batches AS (
-                SELECT g.model, g.capacity, g.batch_id, b.expires_at, b.created_by,
-                       (1.0 - $8::DOUBLE PRECISION)
-                           * COALESCE(up.active_count, 0)::DOUBLE PRECISION
-                           / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
-                       + $8::DOUBLE PRECISION
-                           * LEAST(GREATEST(EXTRACT(EPOCH FROM b.expires_at - $3), 0.0) / 86400.0, 1.0) AS pr
+                SELECT g.model, g.capacity, g.batch_id, b.expires_at, b.created_by, calc.pr
                 FROM batch_groups g
                 JOIN batches b ON b.id = g.batch_id
                 LEFT JOIN user_priority up ON b.created_by = up.user_id
@@ -1202,6 +1197,23 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     WHERE mfe.model = g.model
                     ORDER BY mfe.created_at DESC, mfe.id DESC LIMIT 1
                 ) mf ON true
+                -- Priority blend `pr` and the effective deadline `d_eff` computed
+                -- ONCE here and referenced by name (no FOR UPDATE in this CTE, so
+                -- plain derived columns are fine). See the batchless arm for the
+                -- D_eff / hold-gate semantics.
+                CROSS JOIN LATERAL (
+                    SELECT
+                        (1.0 - $8::DOUBLE PRECISION)
+                            * COALESCE(up.active_count, 0)::DOUBLE PRECISION
+                            / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
+                        + $8::DOUBLE PRECISION
+                            * LEAST(GREATEST(EXTRACT(EPOCH FROM b.expires_at - $3), 0.0) / 86400.0, 1.0) AS pr,
+                        LEAST(b.expires_at,
+                            GREATEST($3::TIMESTAMPTZ + make_interval(secs => $12),
+                                $3::TIMESTAMPTZ + make_interval(secs => $12)
+                                    + (b.expires_at - $3::TIMESTAMPTZ - make_interval(secs => $12))
+                                      * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14)))) AS d_eff
+                ) calc
                 WHERE g.batch_id IS NOT NULL
                   AND b.cancelling_at IS NULL AND b.deleted_at IS NULL
                   AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL
@@ -1211,18 +1223,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                       mf.state = 'coming'
                       AND mf.expected_ready_at IS NOT NULL
                       AND mf.expected_ready_at > $3::TIMESTAMPTZ
-                      AND mf.expected_ready_at + make_interval(secs => $13)
-                          <= LEAST(b.expires_at,
-                               GREATEST($3::TIMESTAMPTZ + make_interval(secs => $12),
-                                 $3::TIMESTAMPTZ + make_interval(secs => $12)
-                                   + (b.expires_at - $3::TIMESTAMPTZ - make_interval(secs => $12))
-                                     * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14))))
-                      AND $3::TIMESTAMPTZ + make_interval(secs => $13)
-                          < LEAST(b.expires_at,
-                               GREATEST($3::TIMESTAMPTZ + make_interval(secs => $12),
-                                 $3::TIMESTAMPTZ + make_interval(secs => $12)
-                                   + (b.expires_at - $3::TIMESTAMPTZ - make_interval(secs => $12))
-                                     * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14))))
+                      AND mf.expected_ready_at + make_interval(secs => $13) <= calc.d_eff
+                      AND $3::TIMESTAMPTZ + make_interval(secs => $13) < calc.d_eff
                   )
             ),
             to_claim AS (
@@ -1265,8 +1267,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         -- BATCHLESS (flex) arm: per-row deadlines (no constant
                         -- per-group priority), so this keeps the direct per-row
                         -- scan. Wrapped in a subquery so FOR UPDATE is not directly
-                        -- under UNION; the ORDER BY repeats the blend expression
-                        -- (aliases aren't allowed in ORDER BY with FOR UPDATE).
+                        -- under UNION; the effective expiry / blend / D_eff are
+                        -- computed once in `calc` laterals and referenced by name.
+                        -- (Lateral-relation columns ARE allowed in ORDER BY under
+                        -- FOR UPDATE, unlike SELECT-list aliases — which is why the
+                        -- expressions are written once rather than repeated inline.)
                         --
                         -- NOTE: unlike the batch arm, this still scans the whole
                         -- batchless-pending set for the model and sorts it each
@@ -1300,16 +1305,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                bl.ord_blend, bl.ord_exp, bl.ord_id
                         FROM (
                             SELECT r.id, r.template_id, r.batch_id,
-                                   r.created_at + ($9::BIGINT * interval '1 millisecond') AS effective_expires_at,
-                                   (1.0 - $8::DOUBLE PRECISION)
-                                       * COALESCE(up.active_count, 0)::DOUBLE PRECISION
-                                       / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
-                                   + $8::DOUBLE PRECISION
-                                       * LEAST(GREATEST(EXTRACT(EPOCH FROM
-                                           (r.created_at + ($9::BIGINT * interval '1 millisecond')) - $3), 0.0) / 86400.0, 1.0)
-                                       AS ord_blend,
-                                   r.created_at + ($9::BIGINT * interval '1 millisecond') AS ord_exp,
-                                   r.id AS ord_id
+                                   e.eff AS effective_expires_at,
+                                   calc.blend AS ord_blend, e.eff AS ord_exp, r.id AS ord_id
                             FROM requests r
                             LEFT JOIN user_priority up ON r.created_by = up.user_id
                             LEFT JOIN user_recent ur ON r.created_by = ur.user_id
@@ -1318,34 +1315,34 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 WHERE mfe.model = m.model
                                 ORDER BY mfe.created_at DESC, mfe.id DESC LIMIT 1
                             ) mf ON true
+                            -- effective expiry (synthesized from flex_expiry_ms),
+                            -- then the blend + D_eff computed ONCE from it.
+                            CROSS JOIN LATERAL (
+                                SELECT r.created_at + ($9::BIGINT * interval '1 millisecond') AS eff
+                            ) e
+                            CROSS JOIN LATERAL (
+                                SELECT
+                                    (1.0 - $8::DOUBLE PRECISION)
+                                        * COALESCE(up.active_count, 0)::DOUBLE PRECISION
+                                        / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
+                                    + $8::DOUBLE PRECISION
+                                        * LEAST(GREATEST(EXTRACT(EPOCH FROM e.eff - $3), 0.0) / 86400.0, 1.0) AS blend,
+                                    LEAST(e.eff,
+                                        GREATEST($3::TIMESTAMPTZ + make_interval(secs => $12),
+                                            $3::TIMESTAMPTZ + make_interval(secs => $12)
+                                                + (e.eff - $3::TIMESTAMPTZ - make_interval(secs => $12))
+                                                  * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14)))) AS d_eff
+                            ) calc
                             WHERE r.state = 'pending' AND r.model = m.model AND r.batch_id IS NULL
                               AND r.template_id IS NOT NULL AND (r.not_before IS NULL OR r.not_before <= $3)
                               AND NOT (
                                   mf.state = 'coming'
                                   AND mf.expected_ready_at IS NOT NULL
                                   AND mf.expected_ready_at > $3::TIMESTAMPTZ
-                                  AND mf.expected_ready_at + make_interval(secs => $13)
-                                      <= LEAST(r.created_at + ($9::BIGINT * interval '1 millisecond'),
-                                           GREATEST($3::TIMESTAMPTZ + make_interval(secs => $12),
-                                             $3::TIMESTAMPTZ + make_interval(secs => $12)
-                                               + ((r.created_at + ($9::BIGINT * interval '1 millisecond')) - $3::TIMESTAMPTZ - make_interval(secs => $12))
-                                                 * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14))))
-                                  AND $3::TIMESTAMPTZ + make_interval(secs => $13)
-                                      < LEAST(r.created_at + ($9::BIGINT * interval '1 millisecond'),
-                                           GREATEST($3::TIMESTAMPTZ + make_interval(secs => $12),
-                                             $3::TIMESTAMPTZ + make_interval(secs => $12)
-                                               + ((r.created_at + ($9::BIGINT * interval '1 millisecond')) - $3::TIMESTAMPTZ - make_interval(secs => $12))
-                                                 * (COALESCE(ur.score, 0.0) / (COALESCE(ur.score, 0.0) + $14))))
+                                  AND mf.expected_ready_at + make_interval(secs => $13) <= calc.d_eff
+                                  AND $3::TIMESTAMPTZ + make_interval(secs => $13) < calc.d_eff
                               )
-                            ORDER BY
-                                (1.0 - $8::DOUBLE PRECISION)
-                                    * COALESCE(up.active_count, 0)::DOUBLE PRECISION
-                                    / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
-                                + $8::DOUBLE PRECISION
-                                    * LEAST(GREATEST(EXTRACT(EPOCH FROM
-                                        (r.created_at + ($9::BIGINT * interval '1 millisecond')) - $3), 0.0) / 86400.0, 1.0) ASC,
-                                r.created_at + ($9::BIGINT * interval '1 millisecond') ASC,
-                                r.id ASC
+                            ORDER BY calc.blend ASC, e.eff ASC, r.id ASC
                             LIMIT m.capacity
                             FOR UPDATE OF r SKIP LOCKED
                         ) bl
