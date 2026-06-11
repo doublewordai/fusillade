@@ -1,5 +1,12 @@
 # Changelog
 
+## [17.3.0](https://github.com/doublewordai/fusillade/compare/fusillade-v17.2.0...fusillade-v17.3.0) (2026-06-11)
+
+
+### Features
+
+* standardise error logs into having metric emissions ([#283](https://github.com/doublewordai/fusillade/issues/283)) ([a45b847](https://github.com/doublewordai/fusillade/commit/a45b847b0315daa4715809084f83188f0da97fd9))
+
 ## [17.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v17.1.1...fusillade-v17.2.0) (2026-06-01)
 
 
