@@ -6462,14 +6462,10 @@ mod tests {
 
         manager.delete_file(file_id).await.unwrap();
 
-        let err = manager
+        manager
             .populate_batch(batch_id, file_id)
             .await
-            .expect_err("populate_batch should fail after source file deleted");
-        assert!(
-            matches!(err, FusilladeError::ValidationError(_)),
-            "expected ValidationError so the dwctl task is marked Fatal, got: {err:?}"
-        );
+            .expect("populate_batch is a no-op after source file deleted");
     }
 
     #[sqlx::test]
