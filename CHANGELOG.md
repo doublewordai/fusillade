@@ -1,5 +1,12 @@
 # Changelog
 
+## [17.3.1](https://github.com/doublewordai/fusillade/compare/fusillade-v17.3.0...fusillade-v17.3.1) (2026-06-11)
+
+
+### Bug Fixes
+
+* count batchless flex requests in pending request counts ([#282](https://github.com/doublewordai/fusillade/issues/282)) ([a06e3cd](https://github.com/doublewordai/fusillade/commit/a06e3cda7105c628f269b9717e583248b5144a0b))
+
 ## [17.3.0](https://github.com/doublewordai/fusillade/compare/fusillade-v17.2.0...fusillade-v17.3.0) (2026-06-11)
 
 
