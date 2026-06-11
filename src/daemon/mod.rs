@@ -279,6 +279,11 @@ pub struct DaemonConfig {
     /// Curve constant `k` for the saturating relaxation `g(score) = score /
     /// (score + k)` used in `D_eff`. Larger `k` => a user must consume more
     /// recent resource before their deadline relaxes. Default: 4.0.
+    ///
+    /// Must be strictly positive: `claim_requests` clamps it to
+    /// `f64::MIN_POSITIVE` before use so a misconfigured `0` (or negative/NaN)
+    /// can't make the denominator `score + k` zero and turn `g(score)` into
+    /// `0/0 = NaN`, which would corrupt the `D_eff` timestamp arithmetic.
     #[serde(default = "default_recent_claims_curve_k")]
     pub recent_claims_curve_k: f64,
 

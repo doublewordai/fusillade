@@ -1282,12 +1282,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         -- Hold gate: D_eff (effective deadline) = now + min_async_ttft
                         --   + (effective_expires_at - now - min_async_ttft) * g(score)
                         -- clamped to [now + min_async_ttft, effective_expires_at],
-                        -- g(score) = score / (score + k) in [0,1). HOLD (exclude) iff
-                        -- the model is `coming` with a future ETA ready+served before
-                        -- D_eff AND we're not yet at the deadline. No heartbeat gate:
-                        -- a `coming` model frozen by a dead controller releases once
-                        -- its ETA passes or the row reaches its own deadline, so
-                        -- nothing is ever held forever.
+                        -- g(score) = score / (score + k) in [0,1). For an idle user
+                        -- (score 0) g(0)=0 => tight D_eff = now + min_async_ttft; `k`
+                        -- is clamped strictly positive upstream so score/(score+k) is
+                        -- never 0/0 = NaN. HOLD (exclude) iff the model is `coming`
+                        -- with a future ETA ready+served before D_eff AND we're not
+                        -- yet at the deadline. No heartbeat gate: a `coming` model
+                        -- frozen by a dead controller releases once its ETA passes or
+                        -- the row reaches its own deadline, so nothing is ever held
+                        -- forever. The `expected_ready_at > now` clause also means a
+                        -- model whose REAL load time exceeds its ETA is released early
+                        -- (→ OpenRouter) rather than waiting — deliberate: better to
+                        -- serve via OR than miss the TTFT target. A `coming` row with
+                        -- a NULL ETA likewise falls through to claimable (fail-open):
+                        -- a malformed event must not cause an indefinite hold.
                         SELECT bl.id, bl.template_id, bl.batch_id, bl.effective_expires_at,
                                bl.ord_blend, bl.ord_exp, bl.ord_id
                         FROM (
