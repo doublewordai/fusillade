@@ -528,8 +528,12 @@ impl ReqwestHttpClient {
         }
 
         let body = match &self.stream_reassembler {
-            Some(reassemble) => reassemble(&collected)?,
-            None => collected
+            // Only reassemble successful streams. An error response (empty or a
+            // contentless chunk) must not be synthesized into a degenerate
+            // `{"choices":[],"usage":null}` completion — return its raw payload
+            // so the real HTTP status drives retry classification.
+            Some(reassemble) if status < 400 => reassemble(&collected)?,
+            _ => collected
                 .iter()
                 .filter(|e| !e.data.is_empty() && e.data != "[DONE]")
                 .map(|e| e.data.as_str())

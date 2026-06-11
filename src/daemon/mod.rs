@@ -462,8 +462,8 @@ where
                             Err(e) => {
                                 histogram!("fusillade_heartbeat_duration_seconds")
                                     .record(heartbeat_start.elapsed().as_secs_f64());
-                                counter!("fusillade_heartbeat_failures_total").increment(1);
-                                tracing::error!(
+                                crate::background_error!(
+                                    "heartbeat_failed", Error,
                                     daemon_id = %daemon_id,
                                     error = %e,
                                     "Failed to send heartbeat"
@@ -476,7 +476,8 @@ where
                         // Mark daemon as dead on shutdown
                         tracing::info!("Shutting down heartbeat task");
                         if let Err(e) = daemon_record.shutdown(storage.as_ref()).await {
-                            tracing::error!(
+                            crate::background_error!(
+                                "shutdown_mark_failed", Error,
                                 daemon_id = %daemon_id,
                                 error = %e,
                                 "Failed to mark daemon as dead during shutdown"
@@ -628,8 +629,10 @@ where
                                 }
                             }
                             Err(e) => {
-                                counter!("fusillade_cancellation_poll_errors_total").increment(1);
-                                tracing::warn!(
+                                // Sustained failure means cancelled batches keep spending and
+                                // completed batches never get finalized - error, not warn.
+                                crate::background_error!(
+                                    "cancellation_poll_failed", Error,
                                     error = %e,
                                     "Failed to check batch cancellation status"
                                 );
@@ -690,8 +693,7 @@ where
                                 }
                             }
                             Err(e) => {
-                                counter!("fusillade_purge_errors_total").increment(1);
-                                tracing::error!(error = %e, "Failed to purge orphaned rows");
+                                crate::background_error!("purge_failed", Error, error = %e, "Failed to purge orphaned rows");
                                 break;
                             }
                         }
@@ -716,11 +718,10 @@ where
                         tracing::trace!("Task completed successfully");
                     }
                     Ok(Err(e)) => {
-                        tracing::error!(error = %e, "Task failed");
+                        crate::background_error!("task_failed", Error, error = %e, "Task failed");
                     }
                     Err(join_error) => {
-                        counter!("fusillade_task_panics_total").increment(1);
-                        tracing::error!(error = %join_error, "Task panicked");
+                        crate::background_error!("task_panicked", Critical, error = %join_error, "Task panicked");
                     }
                 }
             }
@@ -1204,7 +1205,7 @@ where
         // Wait for heartbeat task to complete (it will mark daemon as dead)
         tracing::info!("Waiting for heartbeat task to complete");
         if let Err(e) = heartbeat_handle.await {
-            tracing::error!(error = %e, "Heartbeat task panicked");
+            crate::background_error!("heartbeat_task_panicked", Critical, error = %e, "Heartbeat task panicked");
         }
 
         run_result

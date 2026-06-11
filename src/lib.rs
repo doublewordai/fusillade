@@ -7,6 +7,7 @@
 //! Batching system with PostgreSQL storage and background daemon for processing requests.
 
 pub mod batch;
+pub mod bg_errors;
 pub mod daemon;
 pub mod error;
 pub mod http;

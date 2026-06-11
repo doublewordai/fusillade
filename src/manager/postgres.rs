@@ -2577,14 +2577,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch state: {}", e)))?;
 
         if row.batch_deleted_at.is_some() {
-            return Err(FusilladeError::ValidationError(
-                "batch was deleted before population".to_string(),
-            ));
+            // Deleted before population could run - nothing to populate. The delete
+            // path owns the batch's final state, so this is a clean no-op, not a failure.
+            tracing::debug!(batch_id = %*batch_id, "Batch deleted before population, skipping");
+            return Ok(());
         }
         if row.cancelling_at.is_some() {
-            return Err(FusilladeError::ValidationError(
-                "batch was cancelled before population".to_string(),
-            ));
+            // Cancelled before population could run - nothing to populate. The cancel
+            // path owns the batch's final state, so this is a clean no-op, not a failure.
+            tracing::debug!(batch_id = %*batch_id, "Batch cancelled before population, skipping");
+            return Ok(());
         }
         if row.file_deleted_at.is_some() {
             return Err(FusilladeError::ValidationError(
@@ -2975,7 +2977,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     );
                 }
                 unknown => {
-                    return Err(FusilladeError::Other(anyhow!(
+                    // Invalid client-supplied filter value - a bad request, not a server
+                    // fault. ValidationError so dwctl maps it to 400, not 500 (which pages).
+                    return Err(FusilladeError::ValidationError(format!(
                         "Unknown batch status filter: '{}'. Valid values: in_progress, completed, failed, cancelled, expired",
                         unknown
                     )));
