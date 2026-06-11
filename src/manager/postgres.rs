@@ -11915,6 +11915,71 @@ mod tests {
         );
     }
 
+    /// A `live` model must be claimed immediately regardless of how relaxed the
+    /// user's `D_eff` is. The hold gate keys entirely off `state = 'coming'`, so
+    /// even a heavy user with a maximally relaxed `D_eff` (large recent-claims
+    /// score) is never held when internal capacity already exists. Guards the
+    /// "hold only for genuinely-coming infra, never artificially" invariant.
+    #[sqlx::test]
+    async fn test_live_model_claims_even_for_heavy_user(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Far-future deadline so the heavy user's D_eff relaxes toward the hard
+        // expiry — the regime that WOULD hold a `coming` model.
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "heavy-user", "live-model", expires_at).await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("live-model".to_string(), 5)]);
+        // Maximally relaxed D_eff (huge recent-claims score).
+        let heavy = HashMap::from([("heavy-user".to_string(), 1_000_000.0_f64)]);
+
+        // Sanity: while the model is `coming` (ETA inside the relaxed D_eff) the
+        // heavy user IS held — confirms the relaxation is in force here.
+        manager
+            .append_model_filter_events(&[ModelFilter {
+                model: "live-model".to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(10)),
+            }])
+            .await
+            .unwrap();
+        let held = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &heavy)
+            .await
+            .unwrap();
+        assert_eq!(
+            held.len(),
+            0,
+            "sanity: a heavy user with relaxed D_eff is held while the model is coming"
+        );
+
+        // Flip to LIVE: internal capacity exists, so the same heavy user must be
+        // claimed immediately — a relaxed D_eff must never hold a live model.
+        manager
+            .append_model_filter_events(&[ModelFilter {
+                model: "live-model".to_string(),
+                state: ModelFilterState::Live,
+                expected_ready_at: None,
+            }])
+            .await
+            .unwrap();
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &heavy)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "a live model must be claimed immediately even for a heavy user with a \
+             maximally relaxed D_eff — holds are only for `coming` infra, never live"
+        );
+    }
+
     #[sqlx::test]
     async fn test_append_model_filter_events(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
