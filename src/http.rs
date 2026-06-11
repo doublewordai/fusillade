@@ -528,8 +528,12 @@ impl ReqwestHttpClient {
         }
 
         let body = match &self.stream_reassembler {
-            Some(reassemble) => reassemble(&collected)?,
-            None => collected
+            // Only reassemble successful streams. An error response (empty or a
+            // contentless chunk) must not be synthesized into a degenerate
+            // `{"choices":[],"usage":null}` completion — return its raw payload
+            // so the real HTTP status drives retry classification.
+            Some(reassemble) if status < 400 => reassemble(&collected)?,
+            _ => collected
                 .iter()
                 .filter(|e| !e.data.is_empty() && e.data != "[DONE]")
                 .map(|e| e.data.as_str())
@@ -1349,6 +1353,78 @@ mod tests {
         assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
         assert_eq!(body["usage"]["total_tokens"], 7);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_error_status_skips_reassembly() {
+        use axum::{Router, http::StatusCode, routing::post};
+
+        // An error-status SSE response whose chunks, if reassembled, would
+        // synthesize a successful-looking `chat.completion`. The `status < 400`
+        // guard must bypass reassembly and return the raw payload so the real
+        // 5xx drives retry classification (rather than a misleading or
+        // degenerate `{"choices":[],"usage":null}` completion).
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let sse = concat!(
+                    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("content-type", "text/event-stream")],
+                    sse,
+                )
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: format!("http://{}", addr),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#.to_string(),
+            model: "gpt-4".to_string(),
+            api_key: "".to_string(),
+            created_by: String::new(),
+            batch_metadata: std::collections::HashMap::new(),
+        };
+
+        // Default client has openai reassembly enabled.
+        let client = ReqwestHttpClient::new(
+            ONE_DAY_DURATION,
+            ONE_DAY_DURATION,
+            ONE_DAY_DURATION,
+            vec!["/v1/chat/completions".to_string()],
+        );
+        let response = client.execute(&request, "").await.unwrap();
+
+        // Real HTTP status preserved, so retry classification sees a 5xx.
+        assert_eq!(response.status, 500);
+
+        // Body is the raw SSE payload, not reassembled: the chunk-level
+        // `chat.completion.chunk` objects survive verbatim, and the raw
+        // multi-chunk body does not parse as one reassembled JSON object.
+        assert!(
+            response.body.contains("chat.completion.chunk"),
+            "error-status body should be raw chunks, got: {}",
+            response.body
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&response.body).is_err(),
+            "raw multi-chunk body should not parse as a single reassembled object, got: {}",
+            response.body
+        );
     }
 
     /// Captures every event's `data` field into a shared Vec. Used by
