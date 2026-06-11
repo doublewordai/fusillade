@@ -520,6 +520,11 @@ pub struct BatchStatus {
     pub completed_requests: i64,
     pub failed_requests: i64,
     pub canceled_requests: i64,
+    /// Number of requests in this batch that recorded a prompt-prefix cache hit
+    /// (`cached_tokens > 0`). Tracking-only.
+    pub cached_requests: i64,
+    /// Sum of `cached_tokens` across this batch's requests. Tracking-only.
+    pub cached_tokens: i64,
     pub started_at: Option<DateTime<Utc>>,
     pub failed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
