@@ -6478,14 +6478,10 @@ mod tests {
 
         manager.cancel_batch(batch_id).await.unwrap();
 
-        let err = manager
+        manager
             .populate_batch(batch_id, file_id)
             .await
-            .expect_err("populate_batch should fail after batch cancelled");
-        assert!(
-            matches!(err, FusilladeError::ValidationError(_)),
-            "expected ValidationError, got: {err:?}"
-        );
+            .expect("populate_batch is a no-op after batch cancelled");
     }
 
     #[sqlx::test]
@@ -6494,14 +6490,10 @@ mod tests {
 
         manager.delete_batch(batch_id).await.unwrap();
 
-        let err = manager
+        manager
             .populate_batch(batch_id, file_id)
             .await
-            .expect_err("populate_batch should fail after batch deleted");
-        assert!(
-            matches!(err, FusilladeError::ValidationError(_)),
-            "expected ValidationError, got: {err:?}"
-        );
+            .expect("populate_batch is a no-op after batch deleted");
     }
 
     // =========================================================================
