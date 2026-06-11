@@ -911,6 +911,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*)::BIGINT AS request_count
                 FROM requests r
                 WHERE r.state = ANY($5)
+                -- Batchless rows are counted by batchless_counts below; the
+                -- inner join in batch_counts would drop them anyway, so skip
+                -- scanning them here and keep the two CTEs disjoint.
+                AND r.batch_id IS NOT NULL
                 AND r.template_id IS NOT NULL
                 AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
                 AND (
