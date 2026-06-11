@@ -817,6 +817,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 /// When `priority_decay_window` is set, recently completed flex requests
 /// are added to the `1h` bucket as an explicit realtime-load decay signal.
 ///
+/// Batch requests are windowed by their batch's `expires_at`. Batchless rows
+/// (flex/async responses, `batch_id IS NULL`) have no batch expiry, so they
+/// are windowed by the same synthesized deadline the claim path uses:
+/// `created_at + DaemonConfig.flex_expiry_ms`.
+///
 /// This intentionally excludes:
 /// - Requests without a template (`template_id IS NULL`), which are not claimable.
 /// - Requests from batches that are being cancelled (`b.cancelling_at IS NOT NULL`).
@@ -889,6 +894,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             self.pools.read()
         };
 
+        // Batchless rows have no batch expiry; synthesize the same effective
+        // deadline `claim_requests` uses so the reported queue depth matches
+        // what the daemon will actually claim.
+        let flex_expiry_ms = self.config.flex_expiry_ms as i64;
+
         let rows = sqlx::query(
             r#"
             WITH windows(label, start_seconds, has_start, end_seconds) AS (
@@ -901,6 +911,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     COUNT(*)::BIGINT AS request_count
                 FROM requests r
                 WHERE r.state = ANY($5)
+                -- Batchless rows are counted by batchless_counts below; the
+                -- inner join in batch_counts would drop them anyway, so skip
+                -- scanning them here and keep the two CTEs disjoint.
+                AND r.batch_id IS NOT NULL
                 AND r.template_id IS NOT NULL
                 AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
                 AND (
@@ -935,6 +949,40 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 AND b.expires_at < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
                 GROUP BY arc.model, w.label
             ),
+            batchless_counts AS (
+                -- Daemon-claimable rows with no parent batch (flex/async
+                -- responses). They carry no batch expiry, so window them by
+                -- the deadline the claim path synthesizes for them:
+                -- created_at + flex_expiry ($11, milliseconds).
+                SELECT
+                    r.model as model,
+                    w.label as window_label,
+                    COUNT(*) FILTER (
+                        WHERE (w.has_start = 0 OR r.created_at + ($11::BIGINT * interval '1 millisecond') >= NOW() + make_interval(secs => w.start_seconds))
+                          AND r.created_at + ($11::BIGINT * interval '1 millisecond') < NOW() + make_interval(secs => w.end_seconds)
+                    )::BIGINT as count
+                FROM requests r
+                CROSS JOIN windows w
+                WHERE r.batch_id IS NULL
+                AND r.state = ANY($5)
+                AND r.template_id IS NOT NULL
+                AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
+                AND (
+                    $9 = 'any'
+                    OR ($9 = 'include' AND (
+                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($7))
+                        OR ($8 AND r.service_tier IS NULL)
+                    ))
+                    OR ($9 = 'exclude' AND (
+                        (r.service_tier IS NULL AND NOT $8)
+                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($7))
+                    ))
+                )
+                -- Same row-level upper bound as batch_counts: rows whose
+                -- deadline is past every window's end can't contribute.
+                AND r.created_at + ($11::BIGINT * interval '1 millisecond') < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
+                GROUP BY r.model, w.label
+            ),
             priority_decay_counts AS (
                 SELECT
                     r.model as model,
@@ -958,6 +1006,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             FROM (
                 SELECT * FROM batch_counts
                 UNION ALL
+                SELECT * FROM batchless_counts
+                UNION ALL
                 SELECT * FROM priority_decay_counts
             ) counts
             GROUP BY model, window_label
@@ -973,6 +1023,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(tier_include_null)
         .bind(tier_mode)
         .bind(priority_decay_window)
+        .bind(flex_expiry_ms)
         .fetch_all(pool)
         .await
         .map_err(|e| {
@@ -12825,6 +12876,244 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("non-negative"));
+    }
+
+    #[sqlx::test]
+    async fn test_pending_request_counts_includes_batchless_flex(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // Queued async response: pending row with batch_id = NULL. The daemon
+        // claims it like any batch request, so queue-depth counts must see it.
+        let flex_id = Uuid::new_v4();
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: flex_id,
+                body: r#"{"input":"flex"}"#.to_string(),
+                model: "flex-model".to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "queue-user".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Pin created_at so the synthesized deadline (created_at +
+        // flex_expiry_ms, 1h by default) is deterministically ~55min out.
+        sqlx::query("UPDATE requests SET created_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
+            .bind(flex_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let windows = vec![
+            ("1h".to_string(), None, 3600),
+            ("24h".to_string(), None, 86_400),
+        ];
+        let pending = vec!["pending".to_string()];
+        let model_filter: Vec<String> = vec![];
+
+        // Due within the hour → counted in both cumulative windows, exactly
+        // like a batch request whose batch expires in 55 minutes.
+        let counts = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &pending,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let flex_counts = counts
+            .get("flex-model")
+            .expect("batchless flex request must appear in pending counts");
+        assert_eq!(*flex_counts.get("1h").unwrap(), 1);
+        assert_eq!(*flex_counts.get("24h").unwrap(), 1);
+
+        // Bounded window: deadline ~55min out falls inside (0s, 1h).
+        let bounded = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[("1h".to_string(), Some(0), 3600)],
+                &pending,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*bounded.get("flex-model").unwrap().get("1h").unwrap(), 1);
+
+        // Overdue flex (deadline 1h in the past): unbounded-below windows
+        // still count it, bounded windows exclude it — same semantics as
+        // overdue batches.
+        sqlx::query("UPDATE requests SET created_at = NOW() - INTERVAL '2 hours' WHERE id = $1")
+            .bind(flex_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let overdue = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &pending,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*overdue.get("flex-model").unwrap().get("1h").unwrap(), 1);
+        let overdue_bounded = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[("1h".to_string(), Some(0), 3600)],
+                &pending,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *overdue_bounded
+                .get("flex-model")
+                .unwrap()
+                .get("1h")
+                .unwrap(),
+            0
+        );
+        sqlx::query("UPDATE requests SET created_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
+            .bind(flex_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Once claimed, the row leaves "pending" but still counts when the
+        // caller includes active states (the control-layer monitoring shape).
+        sqlx::query("UPDATE requests SET state = 'claimed', daemon_id = gen_random_uuid(), claimed_at = NOW() WHERE id = $1")
+            .bind(flex_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending_only = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &pending,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(pending_only.get("flex-model").is_none());
+
+        let active_states = vec![
+            "pending".to_string(),
+            "claimed".to_string(),
+            "processing".to_string(),
+        ];
+        let active = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &active_states,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*active.get("flex-model").unwrap().get("1h").unwrap(), 1);
+
+        // Batchless rows respect the service-tier filter: a realtime row
+        // (priority tier, born processing) must stay invisible under the
+        // control layer's Exclude(priority), while flex remains counted.
+        let realtime_id = Uuid::new_v4();
+        manager
+            .create_realtime(CreateRealtimeInput {
+                request_id: realtime_id,
+                body: r#"{"input":"rt"}"#.to_string(),
+                model: "rt-model".to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "queue-user".to_string(),
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE requests SET created_at = NOW() - INTERVAL '1 minute' WHERE id = $1")
+            .bind(realtime_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let excl_priority = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &active_states,
+                &model_filter,
+                &ServiceTierFilter::Exclude(vec![Some("priority".to_string())]),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *excl_priority.get("flex-model").unwrap().get("1h").unwrap(),
+            1
+        );
+        assert!(excl_priority.get("rt-model").is_none());
+
+        let any_tier = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &active_states,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*any_tier.get("rt-model").unwrap().get("1h").unwrap(), 1);
+
+        // Excluding flex drops the batchless flex row.
+        let excl_flex = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &active_states,
+                &model_filter,
+                &ServiceTierFilter::Exclude(vec![Some("flex".to_string())]),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(excl_flex.get("flex-model").is_none());
+
+        // Model filter applies to batchless rows too.
+        let filtered = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &active_states,
+                &["other-model".to_string()],
+                &ServiceTierFilter::Any,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(filtered.get("flex-model").is_none());
     }
 
     // =========================================================================
