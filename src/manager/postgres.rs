@@ -11746,7 +11746,8 @@ mod tests {
         let expires_at = Utc::now() + chrono::Duration::hours(12);
         setup_filter_request(&manager, &pool, "idle-user", "absent-model", expires_at).await;
 
-        // Fresh heartbeat, but no model_filters row for this model ⇒ claim.
+        // No model_filters events for this model ⇒ treated as absent ⇒ claim
+        // (the empty append is a no-op; there is no heartbeat table).
         manager.append_model_filter_events(&[]).await.unwrap();
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
@@ -11759,7 +11760,7 @@ mod tests {
         assert_eq!(
             claimed.len(),
             1,
-            "absent model with fresh heartbeat should be claimed (route to OR)"
+            "absent model (no events) should be claimed (route to OR)"
         );
     }
 
