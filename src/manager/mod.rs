@@ -498,8 +498,11 @@ pub trait Storage: Send + Sync {
     ) -> Result<Vec<Request<Claimed>>>;
 
     /// Append a single event to the `model_filters` log. Used by the controller
-    /// when a model's internal liveness CHANGES (live / coming(ETA) /
-    /// absent-tombstone).
+    /// when a model's internal liveness CHANGES (live / coming / absent).
+    ///
+    /// The gate reads only `state` (live ⇒ claim full; coming/absent ⇒ not-live).
+    /// `expected_ready_at` is retained on the type/column for the controller's own
+    /// use but is **not read by the claim gate** — callers may leave it `None`.
     ///
     /// This is append-only: there is no delete and no upsert. Retraction is
     /// appending an `Absent` event. Appending **only on change** (so the log

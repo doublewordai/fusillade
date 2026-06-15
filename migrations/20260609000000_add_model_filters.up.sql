@@ -36,7 +36,7 @@ CREATE TABLE model_filters (
 );
 
 -- Latest-event lookup per model (the claim query's LATERAL ORDER BY
--- created_at DESC, id DESC LIMIT 1) and the load-estimate scan both walk events
+-- created_at DESC, id DESC LIMIT 1) and the retention purge both walk events
 -- for a single model newest-first. `id DESC` is in the index so the latest
 -- event is deterministic (and the ORDER BY is index-satisfiable) when a batch
 -- append shares one `created_at` across rows.
@@ -44,7 +44,8 @@ CREATE INDEX idx_model_filters_model_created_at
     ON model_filters (model, created_at DESC, id DESC);
 
 -- No separate liveness/heartbeat table: the claim gate trusts the latest
--- `model_filters` event per model and degrades per-request. A `coming` model
--- frozen by a dead/quiet controller stops being held once its ETA passes
--- (`expected_ready_at > now`) or once the request reaches its own deadline, so
--- held work is always eventually released to OpenRouter without a heartbeat.
+-- `model_filters` event per model (live / no-events => claim at full capacity;
+-- coming / absent => leaky-bucket trickle + per-request deadline ramp) and
+-- degrades per-request. A not-live model frozen by a dead/quiet controller
+-- still drains: each held request claims at full capacity once within its
+-- deadline ramp, so work is always eventually released without a heartbeat.
