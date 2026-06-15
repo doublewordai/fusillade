@@ -1216,6 +1216,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ranked_batches AS (
                 SELECT g.model, g.capacity, g.batch_id,
                        b.expires_at, b.created_at, b.created_by,
+                       -- window_class is the leaky-bucket KEY label, not a duration
+                       -- (W comes from expires_at - created_at). completion_window
+                       -- is NOT NULL on real batches, so the COALESCE fallback is
+                       -- unreachable defensive code, never a config-derived default.
                        COALESCE(b.completion_window, '24h') AS window_class,
                        (mf.state IS NULL OR mf.state = 'live') AS claim_full,
                        GREATEST(EXTRACT(EPOCH FROM (b.expires_at - b.created_at)), 0.0)::DOUBLE PRECISION AS w_secs,
@@ -11982,6 +11986,44 @@ mod tests {
         assert!(
             claimed[0].state.leak.is_none(),
             "a ramped claim consumes no leaky-bucket token"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_expired_deadline_claims_at_full_capacity(pool: sqlx::PgPool) {
+        // Edge of the ramp: a request whose deadline is already in the PAST is
+        // trivially within ramp(W) (now - expires is negative, always ≤ the
+        // non-negative ramp), so it claims at full capacity (→ OpenRouter)
+        // regardless of liveness — never trickled, never held. Also guards the
+        // NaN edge: W is GREATEST(..., 0) so power() never sees a negative base.
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        let created_at = Utc::now() - chrono::Duration::hours(1);
+        let expires_at = Utc::now() - chrono::Duration::minutes(5); // already overdue
+        let bid = setup_filter_request(&manager, &pool, "u", "nl-expired", Utc::now()).await;
+        set_batch_window(&pool, bid, created_at, expires_at).await;
+        mark_not_live(&manager, "nl-expired").await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("nl-expired".to_string(), 5)]);
+        // In cooldown too — the ramp still releases it, leaky bucket irrelevant.
+        let cooldown = HashSet::from([("u".to_string(), "24h".to_string())]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "an overdue request is claimed immediately"
+        );
+        assert!(
+            claimed[0].state.leak.is_none(),
+            "an overdue (within-ramp) claim is full-capacity, not leaked"
         );
     }
 
