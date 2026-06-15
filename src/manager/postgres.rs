@@ -11827,6 +11827,63 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn test_becoming_live_releases_throttled_backlog(pool: sqlx::PgPool) {
+        // The transition that matters operationally: a not-live model whose
+        // backlog is being trickled flips to `live` and the remaining work is
+        // claimed at full capacity on the very next cycle.
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Three batches, same user + window-class, far deadline.
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        for _ in 0..3 {
+            setup_filter_request(&manager, &pool, "u", "m", expires_at).await;
+        }
+        mark_not_live(&manager, "m").await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("m".to_string(), 5)]);
+
+        // Not-live: the leaky bucket trickles exactly one (≤1 per bucket), tagged
+        // leaked; the other two are held.
+        let throttled = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(throttled.len(), 1, "not-live model trickles one per cycle");
+        assert!(throttled[0].state.leak.is_some());
+
+        // The controller (scouter) marks it live. The next cycle claims ALL the
+        // remaining pending work at full capacity, none of it leaked — even
+        // though the bucket is now in cooldown from the leak above.
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "m".to_string(),
+                state: ModelFilterState::Live,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+        let cooldown = HashSet::from([("u".to_string(), "24h".to_string())]);
+        let released = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .await
+            .unwrap();
+        assert_eq!(
+            released.len(),
+            2,
+            "becoming live releases the full remaining backlog at capacity"
+        );
+        assert!(
+            released.iter().all(|r| r.state.leak.is_none()),
+            "live claims are full-capacity, never leaked"
+        );
+    }
+
+    #[sqlx::test]
     async fn test_not_live_leaky_bucket_one_per_user_window(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
