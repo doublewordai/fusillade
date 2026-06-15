@@ -1,5 +1,16 @@
 # Changelog
 
+## [18.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v17.3.1...fusillade-v18.0.0) (2026-06-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* async model_filters claim gate ([#281](https://github.com/doublewordai/fusillade/issues/281))
+
+### Features
+
+* async model_filters claim gate ([#281](https://github.com/doublewordai/fusillade/issues/281)) ([d29f5c1](https://github.com/doublewordai/fusillade/commit/d29f5c198d84603bd0a72eac4a1a7dc0d22ada59))
+
 ## [17.3.1](https://github.com/doublewordai/fusillade/compare/fusillade-v17.3.0...fusillade-v17.3.1) (2026-06-11)
 
 
