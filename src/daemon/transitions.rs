@@ -127,6 +127,15 @@ mod tests {
         async fn purge_orphaned_rows(&self, _batch_size: i64) -> Result<u64> {
             Ok(0)
         }
+
+        async fn purge_model_filter_events(
+            &self,
+            _batch_size: i64,
+            _keep_per_model: i64,
+            _retention_secs: f64,
+        ) -> Result<u64> {
+            Ok(0)
+        }
     }
 
     fn test_daemon_data() -> DaemonData {

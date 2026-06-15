@@ -16,13 +16,13 @@ use futures::stream::Stream;
 use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::postgres::{PgListener, PgPool};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use super::{DaemonStorage, Storage};
+use super::{DaemonStorage, ModelFilter, ModelFilterState, Storage};
 use crate::batch::{
     Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchNotification,
     BatchOutputItem, BatchResponseDetails, BatchStatus, File, FileContentItem, FileId,
@@ -37,8 +37,8 @@ use crate::error::{FusilladeError, Result};
 use crate::http::HttpClient;
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateFlexInput, CreateRealtimeInput,
-    DaemonId, Failed, FailureReason, Pending, PersistCompletedRealtimeInput, Processing, Request,
-    RequestData, RequestId, RequestState, ServiceTierFilter,
+    DaemonId, Failed, FailureReason, LeakStamp, Pending, PersistCompletedRealtimeInput, Processing,
+    Request, RequestData, RequestId, RequestState, ServiceTierFilter,
 };
 
 use super::DaemonExecutor;
@@ -819,8 +819,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 ///
 /// Batch requests are windowed by their batch's `expires_at`. Batchless rows
 /// (flex/async responses, `batch_id IS NULL`) have no batch expiry, so they
-/// are windowed by the same synthesized deadline the claim path uses:
-/// `created_at + DaemonConfig.flex_expiry_ms`.
+/// are windowed by the same `service_tier`-mapped deadline the claim path uses:
+/// `created_at + W`, where `W` comes from
+/// `DaemonConfig.service_tier_completion_windows_ms` (`'flex'` → 1h) or
+/// `default_completion_window_ms` (24h) for a NULL/unmapped tier.
 ///
 /// This intentionally excludes:
 /// - Requests without a template (`template_id IS NULL`), which are not claimable.
@@ -896,8 +898,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         // Batchless rows have no batch expiry; synthesize the same effective
         // deadline `claim_requests` uses so the reported queue depth matches
-        // what the daemon will actually claim.
-        let flex_expiry_ms = self.config.flex_expiry_ms as i64;
+        // what the daemon will actually claim. The window is mapped from
+        // `service_tier` exactly as the claim path does: 'flex' => 1h,
+        // NULL/other => 24h.
+        let flex_window_ms =
+            self.config
+                .service_tier_completion_windows_ms
+                .get("flex")
+                .copied()
+                .unwrap_or(self.config.default_completion_window_ms) as i64;
+        let default_window_ms = self.config.default_completion_window_ms as i64;
 
         let rows = sqlx::query(
             r#"
@@ -953,13 +963,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 -- Daemon-claimable rows with no parent batch (flex/async
                 -- responses). They carry no batch expiry, so window them by
                 -- the deadline the claim path synthesizes for them:
-                -- created_at + flex_expiry ($11, milliseconds).
+                -- created_at + the service_tier completion window
+                -- (flex => $11, NULL/other => $12; milliseconds).
                 SELECT
                     r.model as model,
                     w.label as window_label,
                     COUNT(*) FILTER (
-                        WHERE (w.has_start = 0 OR r.created_at + ($11::BIGINT * interval '1 millisecond') >= NOW() + make_interval(secs => w.start_seconds))
-                          AND r.created_at + ($11::BIGINT * interval '1 millisecond') < NOW() + make_interval(secs => w.end_seconds)
+                        WHERE (w.has_start = 0 OR r.created_at + ((CASE WHEN r.service_tier = 'flex' THEN $11::BIGINT ELSE $12::BIGINT END) * interval '1 millisecond') >= NOW() + make_interval(secs => w.start_seconds))
+                          AND r.created_at + ((CASE WHEN r.service_tier = 'flex' THEN $11::BIGINT ELSE $12::BIGINT END) * interval '1 millisecond') < NOW() + make_interval(secs => w.end_seconds)
                     )::BIGINT as count
                 FROM requests r
                 CROSS JOIN windows w
@@ -980,7 +991,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 )
                 -- Same row-level upper bound as batch_counts: rows whose
                 -- deadline is past every window's end can't contribute.
-                AND r.created_at + ($11::BIGINT * interval '1 millisecond') < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
+                AND r.created_at + ((CASE WHEN r.service_tier = 'flex' THEN $11::BIGINT ELSE $12::BIGINT END) * interval '1 millisecond') < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
                 GROUP BY r.model, w.label
             ),
             priority_decay_counts AS (
@@ -1023,7 +1034,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(tier_include_null)
         .bind(tier_mode)
         .bind(priority_decay_window)
-        .bind(flex_expiry_ms)
+        .bind(flex_window_ms)
+        .bind(default_window_ms)
         .fetch_all(pool)
         .await
         .map_err(|e| {
@@ -1057,6 +1069,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
+        leak_cooldown: &HashSet<(String, String)>,
     ) -> Result<Vec<Request<Claimed>>> {
         // First, unclaim any stale requests (self-healing for daemon crashes)
         let unclaimed_count = self.unclaim_stale_requests().await?;
@@ -1104,67 +1117,350 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .map(|u| *user_active_counts.get(u).unwrap_or(&0) as i64)
             .collect();
 
-        // Single query claims across all models using LATERAL.
+        // Leaky-bucket cooldown: `(user, window-class)` pairs that may not leak
+        // this cycle. Source B in the claim SQL anti-joins against these, so a
+        // pair in cooldown is skipped (≤ 1 leak per pair per `leak_interval`).
+        // Empty => every bucket has its first token available.
+        let cooldown_user_arr: Vec<String> = leak_cooldown.iter().map(|p| p.0.clone()).collect();
+        let cooldown_window_arr: Vec<String> = leak_cooldown.iter().map(|p| p.1.clone()).collect();
+
+        // Deadline ramp exponent: `ramp_minutes = W_minutes ^ exponent`. A
+        // not-live request within `ramp(W)` of its deadline is claimed at full
+        // capacity (→ OpenRouter) rather than trickled.
+        let ramp_exponent = self.config.claim_ramp_exponent;
+
+        // service_tier -> completion-window (ms) map for batchless rows, as
+        // parallel arrays. Batchless rows carry no stored window, so the gate
+        // looks the tier up here (NULL/unmapped -> `default_completion_window_ms`)
+        // to derive `W`. Batch rows ignore this (real `completion_window`).
+        let tier_names_arr: Vec<String> = self
+            .config
+            .service_tier_completion_windows_ms
+            .keys()
+            .cloned()
+            .collect();
+        let tier_windows_arr: Vec<i64> = tier_names_arr
+            .iter()
+            .map(|t| self.config.service_tier_completion_windows_ms[t] as i64)
+            .collect();
+        let default_window_ms = self.config.default_completion_window_ms as i64;
+
+        // Single query, one round-trip: liveness + deadline-ramp gate over a
+        // bounded candidate set, claiming across all models via LATERAL.
         //
         // Eligibility: pending rows whose `not_before` has passed AND either
         //   - have no parent batch (batchless flex responses), or
         //   - have a parent batch in a non-terminal, non-cancelling state.
         //
-        // The claim path needs each row's deadline. Batched rows have
-        // `b.expires_at`; batchless rows don't, so we synthesize one as
-        // `r.created_at + ($9 ms)` from `flex_expiry_ms`. Computed once in
-        // the LATERAL as `effective_expires_at` and threaded through
-        // `to_claim` so the value is referenced (not re-derived) below.
-        let flex_expiry_ms = self.config.flex_expiry_ms as i64;
+        // Each row's window `W` is the batch's real `expires_at - created_at`,
+        // or for batchless the service_tier→window map ($10/$11, default $12).
+        // The gate claims a row at full capacity when its model is live OR it
+        // is within `ramp(W)` of its deadline (Source A); otherwise the
+        // per-(user, window-class) leaky bucket trickles ≤ 1 per cycle (Source
+        // B). See the `to_claim` CTE for the four-arm structure.
         let rows = sqlx::query!(
             r#"
-            WITH user_priority AS (
+            -- Two-path claim, bounded for large per-model backlogs.
+            --
+            -- The naive `ORDER BY <blend> ... FOR UPDATE SKIP LOCKED LIMIT cap`
+            -- reads and full-sorts the ENTIRE per-model pending set every cycle
+            -- (SKIP LOCKED + a runtime sort key can't be index-served), so a model
+            -- with millions pending costs seconds per claim. We exploit that a
+            -- BATCH's sort key is constant across its rows (same user => same
+            -- active_count; same b.expires_at; same b.id tiebreak): rank the
+            -- batches (from `batches` + the user arrays, no request-heap scan),
+            -- take the top `capacity` by that key, and pull rows only from those
+            -- winning batches — the locked scan touches ~`capacity` rows
+            -- regardless of backlog size. Batchless (flex) rows have per-row
+            -- deadlines, so they keep the per-row scan as a second UNION arm.
+            WITH RECURSIVE all_models AS (
+                SELECT model, capacity FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
+            ),
+            user_priority AS (
                 SELECT * FROM unnest($6::TEXT[], $7::BIGINT[]) AS u(user_id, active_count)
             ),
-            to_claim AS (
-                SELECT claimed.id, claimed.template_id, claimed.batch_id, claimed.effective_expires_at
-                FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
+            -- Distinct batch_ids that still have pending rows for each model, via
+            -- an index-only "loose index scan" (hop to the next batch_id > the
+            -- current one) so enumeration costs O(batches · log N), not a full
+            -- pending scan. Relies on idx_requests_pending (model, batch_id).
+            batch_groups AS (
+                SELECT m.model, m.capacity,
+                       (SELECT r.batch_id FROM requests r
+                        WHERE r.state = 'pending' AND r.model = m.model
+                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
+                        ORDER BY r.batch_id LIMIT 1) AS batch_id
+                FROM all_models m
+              UNION ALL
+                SELECT g.model, g.capacity,
+                       (SELECT r.batch_id FROM requests r
+                        WHERE r.state = 'pending' AND r.model = g.model
+                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
+                          AND r.batch_id > g.batch_id
+                        ORDER BY r.batch_id LIMIT 1) AS batch_id
+                FROM batch_groups g WHERE g.batch_id IS NOT NULL
+            ),
+            -- One row per (model, batch): its constant priority `pr`, plus the
+            -- per-batch `claim_full` flag (claim at full capacity), window length
+            -- (`w_secs`) and the `within_ramp` flag. Every gate input (model
+            -- state, b.expires_at, b.created_at) is constant across a batch's
+            -- rows, so the Source A/B split (which reads claim_full / within_ramp)
+            -- composes at the batch level. No FOR UPDATE here, so plain derived
+            -- columns are fine.
+            --
+            -- `claim_full` is TRUE when the model is live OR has NO model_filters
+            -- events at all (unmanaged by the controller => no internal capacity
+            -- to wait for => claim straight through to OpenRouter). Only an
+            -- EXPLICIT not-live event (`coming`/`absent`) puts a model on the
+            -- leaky-bucket path. This makes the gate a no-op until the controller
+            -- (COR-433) starts writing events, so it is safe to ship standalone.
+            ranked_batches AS (
+                SELECT g.model, g.capacity, g.batch_id,
+                       b.expires_at, b.created_at, b.created_by,
+                       -- window_class is the leaky-bucket KEY label, not a duration
+                       -- (W comes from expires_at - created_at). completion_window
+                       -- is NOT NULL on real batches, so the COALESCE fallback is
+                       -- unreachable defensive code, never a config-derived default.
+                       COALESCE(b.completion_window, '24h') AS window_class,
+                       (mf.state IS NULL OR mf.state = 'live') AS claim_full,
+                       GREATEST(EXTRACT(EPOCH FROM (b.expires_at - b.created_at)), 0.0)::DOUBLE PRECISION AS w_secs,
+                       (EXTRACT(EPOCH FROM (b.expires_at - $3))
+                            <= power(GREATEST(EXTRACT(EPOCH FROM (b.expires_at - b.created_at)), 0.0)::DOUBLE PRECISION / 60.0,
+                                     $9::DOUBLE PRECISION) * 60.0) AS within_ramp,
+                       calc.pr
+                FROM batch_groups g
+                JOIN batches b ON b.id = g.batch_id
+                LEFT JOIN user_priority up ON b.created_by = up.user_id
+                LEFT JOIN LATERAL (
+                    SELECT mfe.state FROM model_filters mfe
+                    WHERE mfe.model = g.model
+                    ORDER BY mfe.created_at DESC, mfe.id DESC LIMIT 1
+                ) mf ON true
                 CROSS JOIN LATERAL (
-                    SELECT r.id, r.template_id, r.batch_id,
-                           COALESCE(b.expires_at,
-                                    r.created_at + ($9::BIGINT * interval '1 millisecond'))
-                               AS effective_expires_at
-                    FROM requests r
-                    LEFT JOIN batches b ON r.batch_id = b.id
-                    LEFT JOIN user_priority up
-                        ON COALESCE(r.created_by, b.created_by) = up.user_id
-                    WHERE r.state = 'pending'
-                        AND r.model = m.model
-                        AND r.template_id IS NOT NULL
-                        AND (r.not_before IS NULL OR r.not_before <= $3)
-                        AND (
-                            r.batch_id IS NULL
-                            OR (
-                                b.cancelling_at IS NULL
-                                AND b.deleted_at IS NULL
-                                AND b.completed_at IS NULL
-                                AND b.failed_at IS NULL
-                                AND b.cancelled_at IS NULL
-                            )
-                        )
-                    ORDER BY
-                        -- Postgres doesn't allow SELECT-list aliases in ORDER BY
-                        -- when FOR UPDATE is in play, so the deadline expression
-                        -- is repeated here. The synthesized window for batchless
-                        -- rows still lives in exactly one constant ($9 from
-                        -- DaemonConfig.flex_expiry_ms).
+                    SELECT
                         (1.0 - $8::DOUBLE PRECISION)
                             * COALESCE(up.active_count, 0)::DOUBLE PRECISION
                             / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
                         + $8::DOUBLE PRECISION
-                            * LEAST(GREATEST(EXTRACT(EPOCH FROM
-                                COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond'))
-                                - $3), 0.0) / 86400.0, 1.0)
-                        ASC,
-                        COALESCE(b.expires_at, r.created_at + ($9::BIGINT * interval '1 millisecond')) ASC,
-                        COALESCE(b.id, r.id) ASC
+                            * LEAST(GREATEST(EXTRACT(EPOCH FROM b.expires_at - $3), 0.0) / 86400.0, 1.0) AS pr
+                ) calc
+                WHERE g.batch_id IS NOT NULL
+                  AND b.cancelling_at IS NULL AND b.deleted_at IS NULL
+                  AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL
+            ),
+            -- Per model, four arms feed `to_claim`, each with its own
+            -- FOR UPDATE … SKIP LOCKED, UNION-ed then capped at `capacity`:
+            --   A1/A2 — Source A (full capacity): live OR within ramp(W).
+            --   B3/B4 — Source B (leaky bucket): not-live, before-ramp, ≤ 1 per
+            --           (user, window-class) not in the daemon's cooldown set.
+            -- `leaked` tags Source B rows; `window_class`/`window_secs` ride
+            -- along so the daemon stamps the right bucket. `claim_full` is a
+            -- plain boolean (never NULL), so a not-live before-ramp row always
+            -- lands in exactly one source — it can never fall out of both.
+            to_claim AS (
+                SELECT claimed.id, claimed.template_id, claimed.batch_id, claimed.effective_expires_at,
+                       claimed.leaked, claimed.window_class, claimed.window_secs
+                FROM all_models m
+                CROSS JOIN LATERAL (
+                    SELECT c.id, c.template_id, c.batch_id, c.effective_expires_at,
+                           c.leaked, c.window_class, c.window_secs
+                    FROM (
+                        -- ARM A1 — Source A, BATCH: live OR within-ramp batches,
+                        -- streamed top-`capacity` by priority; the locked scan
+                        -- touches ~`capacity` rows regardless of backlog size.
+                        SELECT bp.id, bp.template_id, bp.batch_id, bp.effective_expires_at,
+                               bp.leaked, bp.window_class, bp.window_secs,
+                               bp.ord_blend, bp.ord_exp, bp.ord_id
+                        FROM (
+                            SELECT r.id, r.template_id, r.batch_id,
+                                   tb.expires_at AS effective_expires_at,
+                                   FALSE AS leaked, tb.window_class AS window_class,
+                                   tb.w_secs AS window_secs,
+                                   tb.pr AS ord_blend, tb.expires_at AS ord_exp, tb.batch_id AS ord_id
+                            FROM (
+                                SELECT * FROM ranked_batches rb
+                                WHERE rb.model = m.model AND (rb.claim_full OR rb.within_ramp)
+                                ORDER BY rb.pr ASC, rb.expires_at ASC, rb.batch_id ASC
+                                LIMIT m.capacity
+                            ) tb
+                            CROSS JOIN LATERAL (
+                                SELECT r.id, r.template_id, r.batch_id, r.created_at
+                                FROM requests r
+                                WHERE r.state = 'pending' AND r.model = tb.model
+                                  AND r.batch_id = tb.batch_id AND r.template_id IS NOT NULL
+                                  AND (r.not_before IS NULL OR r.not_before <= $3)
+                                ORDER BY r.created_at
+                                LIMIT m.capacity
+                                FOR UPDATE OF r SKIP LOCKED
+                            ) r
+                            ORDER BY tb.pr ASC, tb.expires_at ASC, tb.batch_id ASC, r.created_at ASC
+                            LIMIT m.capacity
+                        ) bp
+
+                      UNION ALL
+                        -- ARM B3 — Source B, BATCH: not-live, before-ramp batches,
+                        -- ≤ 1 per (user, window-class) not in cooldown. DISTINCT ON
+                        -- keeps the best batch per (created_by, window_class) over
+                        -- the bounded `ranked_batches` set, then pulls its 1 oldest
+                        -- pending row. Per-model (cross-model ≤1 is converged by the
+                        -- daemon cooldown set across cycles).
+                        SELECT sb.id, sb.template_id, sb.batch_id, sb.effective_expires_at,
+                               sb.leaked, sb.window_class, sb.window_secs,
+                               sb.ord_blend, sb.ord_exp, sb.ord_id
+                        FROM (
+                            SELECT r.id, r.template_id, r.batch_id,
+                                   tb.expires_at AS effective_expires_at,
+                                   TRUE AS leaked, tb.window_class AS window_class,
+                                   tb.w_secs AS window_secs,
+                                   tb.pr AS ord_blend, tb.expires_at AS ord_exp, tb.batch_id AS ord_id
+                            FROM (
+                                SELECT DISTINCT ON (rb.created_by, rb.window_class) rb.*
+                                FROM ranked_batches rb
+                                WHERE rb.model = m.model AND NOT (rb.claim_full OR rb.within_ramp)
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM unnest($13::TEXT[], $14::TEXT[]) AS cd(u, w)
+                                      WHERE cd.u = rb.created_by AND cd.w = rb.window_class
+                                  )
+                                ORDER BY rb.created_by, rb.window_class,
+                                         rb.pr ASC, rb.expires_at ASC, rb.batch_id ASC
+                            ) tb
+                            CROSS JOIN LATERAL (
+                                SELECT r.id, r.template_id, r.batch_id, r.created_at
+                                FROM requests r
+                                WHERE r.state = 'pending' AND r.model = tb.model
+                                  AND r.batch_id = tb.batch_id AND r.template_id IS NOT NULL
+                                  AND (r.not_before IS NULL OR r.not_before <= $3)
+                                ORDER BY r.created_at
+                                LIMIT 1
+                                FOR UPDATE OF r SKIP LOCKED
+                            ) r
+                        ) sb
+
+                      UNION ALL
+                        -- ARM A2 — Source A, BATCHLESS (flex): per-row deadlines, so
+                        -- this keeps the direct per-row scan. `W` is mapped from
+                        -- service_tier ($10/$11, default $12); claim iff live OR
+                        -- within ramp(W). (Lateral columns ARE allowed in ORDER BY
+                        -- under FOR UPDATE, unlike SELECT aliases, so eff/blend are
+                        -- written once in laterals.)
+                        SELECT bl.id, bl.template_id, bl.batch_id, bl.effective_expires_at,
+                               bl.leaked, bl.window_class, bl.window_secs,
+                               bl.ord_blend, bl.ord_exp, bl.ord_id
+                        FROM (
+                            SELECT r.id, r.template_id, r.batch_id,
+                                   e.eff AS effective_expires_at,
+                                   FALSE AS leaked, e.window_class AS window_class,
+                                   e.w_secs AS window_secs,
+                                   calc.blend AS ord_blend, e.eff AS ord_exp, r.id AS ord_id
+                            FROM requests r
+                            LEFT JOIN user_priority up ON r.created_by = up.user_id
+                            LEFT JOIN LATERAL (
+                                SELECT mfe.state FROM model_filters mfe
+                                WHERE mfe.model = m.model
+                                ORDER BY mfe.created_at DESC, mfe.id DESC LIMIT 1
+                            ) mf ON true
+                            CROSS JOIN LATERAL (
+                                SELECT COALESCE(
+                                    (SELECT stw.window_ms FROM unnest($10::TEXT[], $11::BIGINT[]) AS stw(tier, window_ms)
+                                     WHERE stw.tier = r.service_tier),
+                                    $12::BIGINT) AS window_ms
+                            ) wm
+                            CROSS JOIN LATERAL (
+                                SELECT COALESCE(r.service_tier, 'default') AS window_class,
+                                       wm.window_ms::DOUBLE PRECISION / 1000.0 AS w_secs,
+                                       r.created_at + (wm.window_ms * interval '1 millisecond') AS eff
+                            ) e
+                            CROSS JOIN LATERAL (
+                                SELECT
+                                    (1.0 - $8::DOUBLE PRECISION)
+                                        * COALESCE(up.active_count, 0)::DOUBLE PRECISION
+                                        / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
+                                    + $8::DOUBLE PRECISION
+                                        * LEAST(GREATEST(EXTRACT(EPOCH FROM e.eff - $3), 0.0) / 86400.0, 1.0) AS blend
+                            ) calc
+                            WHERE r.state = 'pending' AND r.model = m.model AND r.batch_id IS NULL
+                              AND r.template_id IS NOT NULL AND (r.not_before IS NULL OR r.not_before <= $3)
+                              AND ((mf.state IS NULL OR mf.state = 'live')
+                                   OR (EXTRACT(EPOCH FROM (e.eff - $3))
+                                       <= power(GREATEST(e.w_secs, 0.0) / 60.0, $9::DOUBLE PRECISION) * 60.0))
+                            ORDER BY calc.blend ASC, e.eff ASC, r.id ASC
+                            LIMIT m.capacity
+                            FOR UPDATE OF r SKIP LOCKED
+                        ) bl
+
+                      UNION ALL
+                        -- ARM B4 — Source B, BATCHLESS (flex): not-live, before-ramp
+                        -- rows, ≤ 1 per (user, window-class) not in cooldown.
+                        -- DISTINCT ON can't coexist with FOR UPDATE, so pick the best
+                        -- candidate per bucket UNLOCKED, then lock exactly that row
+                        -- (SKIP LOCKED; if it's gone/locked the bucket simply leaks
+                        -- next cycle). Unbounded scan, acceptable at low flex volume.
+                        SELECT blb.id, blb.template_id, blb.batch_id, blb.effective_expires_at,
+                               blb.leaked, blb.window_class, blb.window_secs,
+                               blb.ord_blend, blb.ord_exp, blb.ord_id
+                        FROM (
+                            SELECT picks.id, picks.template_id, picks.batch_id, picks.effective_expires_at,
+                                   picks.leaked, picks.window_class, picks.window_secs,
+                                   picks.ord_blend, picks.ord_exp, picks.ord_id
+                            FROM (
+                                SELECT DISTINCT ON (cand.created_by, cand.window_class)
+                                       cand.id, cand.template_id, cand.batch_id,
+                                       cand.eff AS effective_expires_at,
+                                       TRUE AS leaked, cand.window_class AS window_class,
+                                       cand.w_secs AS window_secs,
+                                       cand.blend AS ord_blend, cand.eff AS ord_exp, cand.id AS ord_id
+                                FROM (
+                                    SELECT r.id, r.template_id, r.batch_id, r.created_by,
+                                           e.window_class, e.w_secs, e.eff, calc.blend
+                                    FROM requests r
+                                    LEFT JOIN user_priority up ON r.created_by = up.user_id
+                                    LEFT JOIN LATERAL (
+                                        SELECT mfe.state FROM model_filters mfe
+                                        WHERE mfe.model = m.model
+                                        ORDER BY mfe.created_at DESC, mfe.id DESC LIMIT 1
+                                    ) mf ON true
+                                    CROSS JOIN LATERAL (
+                                        SELECT COALESCE(
+                                            (SELECT stw.window_ms FROM unnest($10::TEXT[], $11::BIGINT[]) AS stw(tier, window_ms)
+                                             WHERE stw.tier = r.service_tier),
+                                            $12::BIGINT) AS window_ms
+                                    ) wm
+                                    CROSS JOIN LATERAL (
+                                        SELECT COALESCE(r.service_tier, 'default') AS window_class,
+                                               wm.window_ms::DOUBLE PRECISION / 1000.0 AS w_secs,
+                                               r.created_at + (wm.window_ms * interval '1 millisecond') AS eff
+                                    ) e
+                                    CROSS JOIN LATERAL (
+                                        SELECT
+                                            (1.0 - $8::DOUBLE PRECISION)
+                                                * COALESCE(up.active_count, 0)::DOUBLE PRECISION
+                                                / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
+                                            + $8::DOUBLE PRECISION
+                                                * LEAST(GREATEST(EXTRACT(EPOCH FROM e.eff - $3), 0.0) / 86400.0, 1.0) AS blend
+                                    ) calc
+                                    WHERE r.state = 'pending' AND r.model = m.model AND r.batch_id IS NULL
+                                      AND r.template_id IS NOT NULL AND (r.not_before IS NULL OR r.not_before <= $3)
+                                      AND NOT ((mf.state IS NULL OR mf.state = 'live')
+                                               OR (EXTRACT(EPOCH FROM (e.eff - $3))
+                                                   <= power(GREATEST(e.w_secs, 0.0) / 60.0, $9::DOUBLE PRECISION) * 60.0))
+                                      AND NOT EXISTS (
+                                          SELECT 1 FROM unnest($13::TEXT[], $14::TEXT[]) AS cd(u, w)
+                                          WHERE cd.u = r.created_by AND cd.w = COALESCE(r.service_tier, 'default')
+                                      )
+                                ) cand
+                                ORDER BY cand.created_by, cand.window_class,
+                                         cand.blend ASC, cand.eff ASC, cand.id ASC
+                            ) picks
+                            CROSS JOIN LATERAL (
+                                SELECT 1 FROM requests r
+                                WHERE r.id = picks.id AND r.state = 'pending'
+                                FOR UPDATE OF r SKIP LOCKED
+                            ) lk
+                        ) blb
+                    ) c
+                    -- Source A (leaked = false) fills capacity first; Source B
+                    -- trickle takes any leftover, ordered by the same blend.
+                    ORDER BY c.leaked ASC, c.ord_blend ASC, c.ord_exp ASC, c.ord_id ASC
                     LIMIT m.capacity
-                    FOR UPDATE OF r SKIP LOCKED
                 ) claimed
                 LIMIT $2::BIGINT
             )
@@ -1195,7 +1491,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                       to_char(tc.effective_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_expires_at_str",
                       to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_cancelling_at",
                       b.errors::TEXT as "batch_errors",
-                      COALESCE(b.total_requests::TEXT, '1') as "batch_total_requests!"
+                      COALESCE(b.total_requests::TEXT, '1') as "batch_total_requests!",
+                      tc.leaked as "leaked!",
+                      tc.window_class as "window_class!",
+                      tc.window_secs as "window_secs!"
             "#,
             *daemon_id as Uuid,
             limit as i64,
@@ -1205,7 +1504,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             &user_ids_arr,
             &user_counts_arr,
             self.config.urgency_weight,
-            flex_expiry_ms,
+            ramp_exponent,
+            &tier_names_arr,
+            &tier_windows_arr,
+            default_window_ms,
+            &cooldown_user_arr,
+            &cooldown_window_arr,
         )
         .fetch_all(self.pools.write())
         .await
@@ -1281,6 +1585,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         claimed_at: now,
                         retry_attempt: row.retry_attempt as u32,
                         batch_expires_at: row.batch_expires_at,
+                        // Source B (leaky bucket) rows carry their bucket so the
+                        // daemon can stamp `next_token_at`; Source A rows do not.
+                        leak: if row.leaked {
+                            Some(LeakStamp {
+                                window_class: row.window_class.clone(),
+                                window_secs: row.window_secs,
+                            })
+                        } else {
+                            None
+                        },
                     },
                     data: RequestData {
                         id: RequestId(row.id),
@@ -1306,6 +1620,82 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         );
 
         Ok(all_claimed)
+    }
+
+    async fn append_model_filter_event(&self, entry: &ModelFilter) -> Result<()> {
+        self.append_model_filter_events(std::slice::from_ref(entry))
+            .await
+    }
+
+    async fn append_model_filter_events(&self, entries: &[ModelFilter]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let models: Vec<String> = entries.iter().map(|e| e.model.clone()).collect();
+        let states: Vec<String> = entries
+            .iter()
+            .map(|e| e.state.as_str().to_string())
+            .collect();
+        let etas: Vec<Option<DateTime<Utc>>> =
+            entries.iter().map(|e| e.expected_ready_at).collect();
+
+        // Append one row per event. `WITH ORDINALITY` preserves caller order so
+        // events that share `created_at = now` keep their relative order via the
+        // serial `id` (the latest-event lookup falls back to id on created_at ties).
+        sqlx::query!(
+            r#"
+            INSERT INTO model_filters (model, state, expected_ready_at, created_at)
+            SELECT model, state, expected_ready_at, $4
+            FROM unnest($1::TEXT[], $2::TEXT[], $3::TIMESTAMPTZ[])
+                WITH ORDINALITY AS t(model, state, expected_ready_at, ord)
+            ORDER BY ord
+            "#,
+            &models,
+            &states,
+            &etas as &[Option<DateTime<Utc>>],
+            now,
+        )
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to append model_filters events: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    async fn list_model_filters(&self) -> Result<Vec<ModelFilter>> {
+        // Current state per model = latest event; exclude `absent` tombstones.
+        let rows = sqlx::query!(
+            r#"
+            SELECT model, state, expected_ready_at
+            FROM (
+                SELECT DISTINCT ON (model)
+                    model, state, expected_ready_at
+                FROM model_filters
+                ORDER BY model, created_at DESC, id DESC
+            ) latest
+            WHERE state <> 'absent'
+            ORDER BY model
+            "#
+        )
+        .fetch_all(self.pools.read())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list model_filters: {}", e)))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let state = ModelFilterState::parse_state(&row.state).ok_or_else(|| {
+                    FusilladeError::Other(anyhow!("Unknown model_filters.state: {}", row.state))
+                })?;
+                Ok(ModelFilter {
+                    model: row.model,
+                    state,
+                    expected_ready_at: row.expected_ready_at,
+                })
+            })
+            .collect()
     }
 
     async fn persist<T: RequestState + Clone>(
@@ -1639,6 +2029,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         })?,
                         retry_attempt: row.retry_attempt as u32,
                         batch_expires_at: row.batch_expires_at,
+                        // Leak state is claim-cycle-only and not persisted; a row
+                        // rehydrated from storage is never re-stamped.
+                        leak: None,
                     },
                     data,
                 })),
@@ -3605,6 +3998,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         })?,
                         retry_attempt: row.retry_attempt as u32,
                         batch_expires_at: row.batch_expires_at,
+                        // Leak state is claim-cycle-only and not persisted.
+                        leak: None,
                     },
                     data,
                 }),
@@ -5563,6 +5958,60 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
 
         Ok(total)
     }
+
+    async fn purge_model_filter_events(
+        &self,
+        batch_size: i64,
+        keep_per_model: i64,
+        retention_secs: f64,
+    ) -> Result<u64> {
+        // Delete old `model_filters` events while guaranteeing that, per model,
+        // we keep the most recent `keep_per_model` events AND every event newer
+        // than `retention_secs`. A row is eligible for deletion iff BOTH:
+        //   - it is NOT within the most recent `keep_per_model` for its model
+        //     (rank by created_at DESC, id DESC), and
+        //   - it is older than `retention_secs`.
+        // Because keep_per_model >= 1, the latest event per model is never
+        // purged, so the claim gate never loses a model's current state.
+        let keep = keep_per_model.max(1);
+        let deleted = sqlx::query!(
+            r#"
+            WITH ranked AS (
+                SELECT
+                    id,
+                    created_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY model
+                        ORDER BY created_at DESC, id DESC
+                    ) AS rn
+                FROM model_filters
+            ),
+            eligible AS (
+                SELECT id
+                FROM ranked
+                WHERE rn > $2
+                  AND created_at < now() - make_interval(secs => $3)
+                ORDER BY id ASC
+                LIMIT $1
+            )
+            DELETE FROM model_filters
+            WHERE id IN (SELECT id FROM eligible)
+            "#,
+            batch_size,
+            keep,
+            retention_secs,
+        )
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge model_filters events: {}", e)))?
+        .rows_affected();
+
+        if deleted > 0 {
+            tracing::debug!(deleted, "Purged old model_filters events");
+        }
+
+        Ok(deleted)
+    }
 }
 
 // Implement DaemonExecutor trait
@@ -6596,7 +7045,7 @@ mod tests {
         // Claim 3 requests
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(3, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(3, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .expect("Failed to claim requests");
 
@@ -6608,7 +7057,7 @@ mod tests {
 
         // Try to claim again - should get the remaining 2
         let claimed2 = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .expect("Failed to claim requests");
 
@@ -7424,7 +7873,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -7442,7 +7891,7 @@ mod tests {
         // Now daemon2 tries to claim - should unclaim the stale request and re-claim it
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
 
@@ -7509,7 +7958,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -7537,7 +7986,7 @@ mod tests {
         // Now daemon2 tries to claim - should unclaim the stale processing request
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
 
@@ -7618,7 +8067,7 @@ mod tests {
         // Claim request as daemon1, then set to processing
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -7639,7 +8088,7 @@ mod tests {
         // Daemon2 claims — should reclaim daemon1's request because daemon1 is dead
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
 
@@ -7720,7 +8169,7 @@ mod tests {
         // Claim request as daemon1, then set to processing
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -7741,7 +8190,7 @@ mod tests {
         // Daemon2 claims — should reclaim because daemon1's heartbeat is stale
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed = manager
-            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
 
@@ -7833,7 +8282,7 @@ mod tests {
         // Daemon1 claims first request and sets to processing
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -7850,7 +8299,7 @@ mod tests {
         // Daemon2 claims — should get the second request, NOT steal from healthy daemon1
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let claimed2 = manager
-            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
 
@@ -7930,7 +8379,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let claimed1 = manager
-            .claim_requests(1, daemon1_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon1_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
         assert_eq!(claimed1.len(), 1);
@@ -7938,7 +8387,7 @@ mod tests {
         // Daemon2 immediately tries to claim - should get the second request, not steal the first
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let claimed2 = manager
-            .claim_requests(1, daemon2_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon2_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
         assert_eq!(claimed2.len(), 1);
@@ -8030,7 +8479,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
 
@@ -8880,7 +9329,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(2, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(2, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
 
@@ -9061,7 +9510,7 @@ mod tests {
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed = manager
-            .claim_requests(2, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(2, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .unwrap();
         let claimed_ids: Vec<_> = claimed.iter().map(|r| r.data.id).collect();
@@ -9332,15 +9781,33 @@ mod tests {
             [("model-a".to_string(), 3), ("model-b".to_string(), 3)].into();
 
         let claimed1 = manager
-            .claim_requests(10, daemon1_id, &full_capacity, &HashMap::new())
+            .claim_requests(
+                10,
+                daemon1_id,
+                &full_capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+            )
             .await
             .unwrap();
         let claimed2 = manager
-            .claim_requests(10, daemon2_id, &full_capacity, &HashMap::new())
+            .claim_requests(
+                10,
+                daemon2_id,
+                &full_capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+            )
             .await
             .unwrap();
         let claimed3 = manager
-            .claim_requests(10, daemon3_id, &full_capacity, &HashMap::new())
+            .claim_requests(
+                10,
+                daemon3_id,
+                &full_capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+            )
             .await
             .unwrap();
 
@@ -10530,7 +10997,7 @@ mod tests {
 
         // Claim 1 request - should get the most urgent one (batch1, 30 min)
         let claimed = manager
-            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .expect("Failed to claim requests");
 
@@ -10544,7 +11011,7 @@ mod tests {
 
         // Claim another - should get medium priority (batch2, 2 hours)
         let claimed2 = manager
-            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .expect("Failed to claim requests");
 
@@ -10558,7 +11025,7 @@ mod tests {
 
         // Claim last one - should get no-SLA batch (batch3)
         let claimed3 = manager
-            .claim_requests(1, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .expect("Failed to claim requests");
 
@@ -10688,7 +11155,7 @@ mod tests {
         let capacity = HashMap::from([("test-fifo".to_string(), 3)]);
 
         let claimed = manager
-            .claim_requests(3, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(3, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .expect("Failed to claim requests");
 
@@ -10761,7 +11228,7 @@ mod tests {
 
         // Cold start: empty HashMap means no user priority info — all users equal
         let claimed = manager
-            .claim_requests(6, daemon_id, &capacity, &HashMap::new())
+            .claim_requests(6, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
             .await
             .expect("Failed to claim requests (cold start)");
 
@@ -10780,7 +11247,7 @@ mod tests {
         // Re-claim with user-a having 5 in-flight requests; user-b and user-c have 0
         let user_counts = HashMap::from([("user-a".to_string(), 5usize)]);
         let claimed = manager
-            .claim_requests(6, daemon_id, &capacity, &user_counts)
+            .claim_requests(6, daemon_id, &capacity, &user_counts, &HashSet::new())
             .await
             .expect("Failed to claim requests (with user counts)");
 
@@ -10895,7 +11362,7 @@ mod tests {
         // Both batches belong to same user with same active count — deadline should break tie
         let user_counts = HashMap::from([("same-user".to_string(), 0usize)]);
         let claimed = manager
-            .claim_requests(1, daemon_id, &capacity, &user_counts)
+            .claim_requests(1, daemon_id, &capacity, &user_counts, &HashSet::new())
             .await
             .expect("Failed to claim requests");
 
@@ -10976,7 +11443,7 @@ mod tests {
         ]);
 
         let claimed = manager
-            .claim_requests(1, daemon_id, &capacity, &user_counts)
+            .claim_requests(1, daemon_id, &capacity, &user_counts, &HashSet::new())
             .await
             .expect("Failed to claim with urgency weight");
 
@@ -11016,7 +11483,13 @@ mod tests {
         ]);
 
         let claimed = manager_no_urgency
-            .claim_requests(1, daemon_id, &capacity, &user_counts_skewed)
+            .claim_requests(
+                1,
+                daemon_id,
+                &capacity,
+                &user_counts_skewed,
+                &HashSet::new(),
+            )
             .await
             .expect("Failed to claim without urgency weight");
 
@@ -11026,6 +11499,812 @@ mod tests {
             "With urgency_weight=0.0, user-b (0 active) should beat user-a (5 active) \
              despite user-a having a more urgent 1hr SLA"
         );
+    }
+
+    /// Regression test for the rank-then-pull claim path. A model with a backlog
+    /// spread across several batches must still claim the most-urgent
+    /// (soonest-expiring) rows, and must pull across batch boundaries in
+    /// priority order when `capacity` exceeds a single batch's pending count.
+    /// This exercises the batch-ranking + winners-only pull that replaced the
+    /// full per-model scan/sort.
+    #[sqlx::test]
+    async fn test_claim_ranks_batches_and_pulls_from_winners(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client.clone(),
+        )
+        .with_config(DaemonConfig {
+            // Urgency dominates so the soonest-expiring batch ranks first.
+            urgency_weight: 1.0,
+            ..DaemonConfig::default()
+        });
+
+        // A batch with `n` pending requests for `model`, expiring at `expires_at`.
+        async fn setup_batch_n(
+            manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+            pool: &sqlx::PgPool,
+            label: &str,
+            model: &str,
+            n: usize,
+            expires_at: DateTime<Utc>,
+        ) -> BatchId {
+            let templates: Vec<RequestTemplateInput> = (0..n)
+                .map(|i| RequestTemplateInput {
+                    custom_id: Some(format!("{label}-req-{i}")),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: model.to_string(),
+                    api_key: "key".to_string(),
+                })
+                .collect();
+            let file_id = manager
+                .create_file(format!("{label}-file"), None, templates)
+                .await
+                .unwrap();
+            let batch = manager
+                .create_batch(BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    created_by: Some(format!("{label}-user")),
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+            sqlx::query!(
+                "UPDATE batches SET expires_at = $1 WHERE id = $2",
+                expires_at,
+                *batch.id as Uuid,
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+            batch.id
+        }
+
+        let now = Utc::now();
+        let _far = setup_batch_n(
+            &manager,
+            &pool,
+            "far",
+            "rank-test",
+            3,
+            now + chrono::Duration::hours(24),
+        )
+        .await;
+        let mid = setup_batch_n(
+            &manager,
+            &pool,
+            "mid",
+            "rank-test",
+            3,
+            now + chrono::Duration::hours(2),
+        )
+        .await;
+        let soon = setup_batch_n(
+            &manager,
+            &pool,
+            "soon",
+            "rank-test",
+            3,
+            now + chrono::Duration::minutes(30),
+        )
+        .await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+
+        // capacity == soonest batch's size: all claimed rows come from `soon`.
+        let cap3 = HashMap::from([("rank-test".to_string(), 3)]);
+        let claimed = manager
+            .claim_requests(3, daemon_id, &cap3, &HashMap::new(), &HashSet::new())
+            .await
+            .expect("claim (cap 3) failed");
+        assert_eq!(claimed.len(), 3);
+        assert!(
+            claimed.iter().all(|r| r.data.batch_id == Some(soon)),
+            "with capacity 3, all rows should be pulled from the soonest-expiring batch"
+        );
+
+        // Reset to pending for the next claim.
+        sqlx::query!(
+            "UPDATE requests SET state='pending', daemon_id=NULL, claimed_at=NULL WHERE state='claimed'"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // capacity spans batches: 3 from `soon`, then 2 from `mid`, none from `far`.
+        let cap5 = HashMap::from([("rank-test".to_string(), 5)]);
+        let claimed = manager
+            .claim_requests(5, daemon_id, &cap5, &HashMap::new(), &HashSet::new())
+            .await
+            .expect("claim (cap 5) failed");
+        assert_eq!(claimed.len(), 5);
+        let from_soon = claimed
+            .iter()
+            .filter(|r| r.data.batch_id == Some(soon))
+            .count();
+        let from_mid = claimed
+            .iter()
+            .filter(|r| r.data.batch_id == Some(mid))
+            .count();
+        let from_far = claimed
+            .iter()
+            .filter(|r| r.data.batch_id == Some(_far))
+            .count();
+        assert_eq!(
+            from_soon, 3,
+            "the whole soonest batch should be claimed first"
+        );
+        assert_eq!(
+            from_mid, 2,
+            "the remainder should come from the next-soonest batch"
+        );
+        assert_eq!(
+            from_far, 0,
+            "the farthest-deadline batch should not be touched"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ASYNC MODEL-FILTERS CLAIM GATE TESTS (COR-432)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Create a single pending batched request for `model` owned by `user`,
+    /// and force the batch's `expires_at` to exactly `expires_at` so the test
+    /// controls `effective_expires_at` (and therefore `D_eff`) precisely.
+    async fn setup_filter_request(
+        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        pool: &sqlx::PgPool,
+        user: &str,
+        model: &str,
+        expires_at: DateTime<Utc>,
+    ) -> BatchId {
+        let file_id = manager
+            .create_file(
+                format!("{user}-{model}-file"),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some(format!("{user}-req")),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: model.to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some(user.to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = $1 WHERE id = $2",
+            expires_at,
+            *batch.id as Uuid,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        batch.id
+    }
+
+    /// Test config for the claim gate with explicit ramp/leak knobs, so these
+    /// tests don't drift if the defaults change. flex window 1h, default 24h.
+    fn filter_test_config() -> DaemonConfig {
+        DaemonConfig {
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
+            ..Default::default()
+        }
+    }
+
+    /// Override a batch's window timestamps so the gate sees a specific
+    /// `(created_at, expires_at)` — `W = expires - created`. Lets a test place a
+    /// request inside or outside `ramp(W)` deterministically.
+    async fn set_batch_window(
+        pool: &sqlx::PgPool,
+        batch_id: BatchId,
+        created_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) {
+        sqlx::query!(
+            "UPDATE batches SET created_at = $1, expires_at = $2 WHERE id = $3",
+            created_at,
+            expires_at,
+            *batch_id as Uuid,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Append an explicit not-live (`coming`) event so the model takes the
+    /// leaky-bucket / ramp path. A model with NO events is "unmanaged" and
+    /// claims at full capacity, so the leaky-bucket tests must mark it.
+    async fn mark_not_live(
+        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        model: &str,
+    ) {
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: model.to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn test_live_model_claims_full_capacity(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Far deadline => not within ramp; only liveness yields full-capacity claims.
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "u1", "live-model", expires_at).await;
+        setup_filter_request(&manager, &pool, "u2", "live-model", expires_at).await;
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "live-model".to_string(),
+                state: ModelFilterState::Live,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("live-model".to_string(), 5)]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            2,
+            "a live model drains its backlog at full capacity"
+        );
+        assert!(
+            claimed.iter().all(|r| r.state.leak.is_none()),
+            "full-capacity (Source A) claims are never leaked"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_live_overrides_cooldown(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // A live model is claimed even when this user's (window-class) bucket is
+        // in cooldown — Source A ignores the leaky bucket entirely.
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "heavy", "live-model", expires_at).await;
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "live-model".to_string(),
+                state: ModelFilterState::Live,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("live-model".to_string(), 5)]);
+        let cooldown = HashSet::from([("heavy".to_string(), "24h".to_string())]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "a live model claims regardless of cooldown"
+        );
+        assert!(claimed[0].state.leak.is_none());
+    }
+
+    #[sqlx::test]
+    async fn test_becoming_live_releases_throttled_backlog(pool: sqlx::PgPool) {
+        // The transition that matters operationally: a not-live model whose
+        // backlog is being trickled flips to `live` and the remaining work is
+        // claimed at full capacity on the very next cycle.
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Three batches, same user + window-class, far deadline.
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        for _ in 0..3 {
+            setup_filter_request(&manager, &pool, "u", "m", expires_at).await;
+        }
+        mark_not_live(&manager, "m").await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("m".to_string(), 5)]);
+
+        // Not-live: the leaky bucket trickles exactly one (≤1 per bucket), tagged
+        // leaked; the other two are held.
+        let throttled = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(throttled.len(), 1, "not-live model trickles one per cycle");
+        assert!(throttled[0].state.leak.is_some());
+
+        // The controller (scouter) marks it live. The next cycle claims ALL the
+        // remaining pending work at full capacity, none of it leaked — even
+        // though the bucket is now in cooldown from the leak above.
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "m".to_string(),
+                state: ModelFilterState::Live,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+        let cooldown = HashSet::from([("u".to_string(), "24h".to_string())]);
+        let released = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .await
+            .unwrap();
+        assert_eq!(
+            released.len(),
+            2,
+            "becoming live releases the full remaining backlog at capacity"
+        );
+        assert!(
+            released.iter().all(|r| r.state.leak.is_none()),
+            "live claims are full-capacity, never leaked"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_not_live_leaky_bucket_one_per_user_window(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Two batches, same user, same window-class (24h), not-live, far deadline.
+        // Source B claims AT MOST ONE (one (user, window-class) bucket), tagged
+        // leaked; with that bucket in cooldown the next cycle claims none.
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "u", "nl-model", expires_at).await;
+        setup_filter_request(&manager, &pool, "u", "nl-model", expires_at).await;
+        mark_not_live(&manager, "nl-model").await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("nl-model".to_string(), 5)]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "≤ 1 leak per (user, window-class) per cycle"
+        );
+        let leak = claimed[0]
+            .state
+            .leak
+            .as_ref()
+            .expect("a not-live before-ramp claim is leaked");
+        assert_eq!(leak.window_class.as_str(), "24h");
+
+        // The bucket is now in cooldown => nothing leaks.
+        let cooldown = HashSet::from([("u".to_string(), "24h".to_string())]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 0, "a bucket in cooldown does not leak");
+    }
+
+    #[sqlx::test]
+    async fn test_two_users_each_leak_one(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Distinct users => distinct buckets => each leaks one this cycle.
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "a", "nl-model", expires_at).await;
+        setup_filter_request(&manager, &pool, "b", "nl-model", expires_at).await;
+        mark_not_live(&manager, "nl-model").await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("nl-model".to_string(), 5)]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 2, "two distinct buckets each leak one");
+        assert!(claimed.iter().all(|r| r.state.leak.is_some()));
+    }
+
+    #[sqlx::test]
+    async fn test_not_live_within_ramp_claims_full_capacity(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Not-live, but within ramp(W): W ≈ 2h05m (ramp ≈ 15 min) and the deadline
+        // is only 5 min away => Source A claims at full capacity, not leaked —
+        // even with the bucket in cooldown.
+        let created_at = Utc::now() - chrono::Duration::hours(2);
+        let expires_at = Utc::now() + chrono::Duration::minutes(5);
+        let bid = setup_filter_request(&manager, &pool, "u", "nl-ramp", Utc::now()).await;
+        set_batch_window(&pool, bid, created_at, expires_at).await;
+        mark_not_live(&manager, "nl-ramp").await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("nl-ramp".to_string(), 5)]);
+        let cooldown = HashSet::from([("u".to_string(), "24h".to_string())]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "a within-ramp request is claimed at full capacity"
+        );
+        assert!(
+            claimed[0].state.leak.is_none(),
+            "a ramped claim consumes no leaky-bucket token"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_expired_deadline_claims_at_full_capacity(pool: sqlx::PgPool) {
+        // Edge of the ramp: a request whose deadline is already in the PAST is
+        // trivially within ramp(W) (now - expires is negative, always ≤ the
+        // non-negative ramp), so it claims at full capacity (→ OpenRouter)
+        // regardless of liveness — never trickled, never held. Also guards the
+        // NaN edge: W is GREATEST(..., 0) so power() never sees a negative base.
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        let created_at = Utc::now() - chrono::Duration::hours(1);
+        let expires_at = Utc::now() - chrono::Duration::minutes(5); // already overdue
+        let bid = setup_filter_request(&manager, &pool, "u", "nl-expired", Utc::now()).await;
+        set_batch_window(&pool, bid, created_at, expires_at).await;
+        mark_not_live(&manager, "nl-expired").await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("nl-expired".to_string(), 5)]);
+        // In cooldown too — the ramp still releases it, leaky bucket irrelevant.
+        let cooldown = HashSet::from([("u".to_string(), "24h".to_string())]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "an overdue request is claimed immediately"
+        );
+        assert!(
+            claimed[0].state.leak.is_none(),
+            "an overdue (within-ramp) claim is full-capacity, not leaked"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_ramp_scales_with_window(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Both requests are ~50 min from their deadline and not-live, but have
+        // very different windows. ramp(24h) ≈ 59 min > 50 => the long-window
+        // request is WITHIN ramp (full-capacity, not leaked). ramp(1h) ≈ 10 min
+        // < 50 => the short-window request is BEFORE ramp (Source B, leaked).
+        // This is the sub-linear ramp scaling.
+        let now = Utc::now();
+        let long_bid = setup_filter_request(&manager, &pool, "long", "ramp-model", now).await;
+        set_batch_window(
+            &pool,
+            long_bid,
+            now - chrono::Duration::hours(23) - chrono::Duration::minutes(10),
+            now + chrono::Duration::minutes(50),
+        )
+        .await;
+        let short_bid = setup_filter_request(&manager, &pool, "short", "ramp-model", now).await;
+        set_batch_window(
+            &pool,
+            short_bid,
+            now - chrono::Duration::minutes(10),
+            now + chrono::Duration::minutes(50),
+        )
+        .await;
+        mark_not_live(&manager, "ramp-model").await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("ramp-model".to_string(), 5)]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 2, "both requests are claimed this cycle");
+        let leaked_by_user: HashMap<String, bool> = claimed
+            .iter()
+            .map(|r| (r.data.created_by.clone(), r.state.leak.is_some()))
+            .collect();
+        assert_eq!(
+            leaked_by_user.get("long"),
+            Some(&false),
+            "the 24h-window request is within ramp => full-capacity (not leaked)"
+        );
+        assert_eq!(
+            leaked_by_user.get("short"),
+            Some(&true),
+            "the 1h-window request is before ramp => leaked (Source B)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_append_model_filter_events(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        // Append a batch of events; latest-event-per-model is the current state.
+        manager
+            .append_model_filter_events(&[
+                ModelFilter {
+                    model: "m-live".to_string(),
+                    state: ModelFilterState::Live,
+                    expected_ready_at: None,
+                },
+                ModelFilter {
+                    model: "m-coming".to_string(),
+                    state: ModelFilterState::Coming,
+                    expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(5)),
+                },
+            ])
+            .await
+            .unwrap();
+
+        let mut listed = manager.list_model_filters().await.unwrap();
+        listed.sort_by(|a, b| a.model.cmp(&b.model));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].model, "m-coming");
+        assert_eq!(listed[0].state, ModelFilterState::Coming);
+        assert!(listed[0].expected_ready_at.is_some());
+        assert_eq!(listed[1].model, "m-live");
+        assert_eq!(listed[1].state, ModelFilterState::Live);
+
+        // Append-only: a later event supersedes the earlier one for the same
+        // model (latest wins). m-live transitions to coming; m-new appears.
+        manager
+            .append_model_filter_events(&[
+                ModelFilter {
+                    model: "m-live".to_string(),
+                    state: ModelFilterState::Coming,
+                    expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(2)),
+                },
+                ModelFilter {
+                    model: "m-new".to_string(),
+                    state: ModelFilterState::Live,
+                    expected_ready_at: None,
+                },
+            ])
+            .await
+            .unwrap();
+        let mut listed = manager.list_model_filters().await.unwrap();
+        listed.sort_by(|a, b| a.model.cmp(&b.model));
+        assert_eq!(
+            listed.len(),
+            3,
+            "all three models have a live/coming latest"
+        );
+        assert_eq!(listed[1].model, "m-live");
+        assert_eq!(
+            listed[1].state,
+            ModelFilterState::Coming,
+            "m-live's latest event is now coming"
+        );
+
+        // Single-event append helper.
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "m-new".to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: Some(Utc::now()),
+            })
+            .await
+            .unwrap();
+        let listed = manager.list_model_filters().await.unwrap();
+        let m_new = listed.iter().find(|m| m.model == "m-new").unwrap();
+        assert_eq!(m_new.state, ModelFilterState::Coming);
+
+        // Underlying log retains every event (2 + 2 + 1 = 5 rows).
+        let total: i64 = sqlx::query_scalar!("SELECT COUNT(*) AS \"c!\" FROM model_filters")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 5, "append-only: every event is retained in the log");
+    }
+
+    #[sqlx::test]
+    async fn test_tombstone_absent_hides_model(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        // Model goes live, then is retracted with an explicit absent tombstone.
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "m-tomb".to_string(),
+                state: ModelFilterState::Live,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(manager.list_model_filters().await.unwrap().len(), 1);
+
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "m-tomb".to_string(),
+                state: ModelFilterState::Absent,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+
+        // Latest event is absent => current-state listing excludes the model.
+        let listed = manager.list_model_filters().await.unwrap();
+        assert!(
+            listed.iter().all(|m| m.model != "m-tomb"),
+            "a model whose latest event is an absent tombstone is treated as absent"
+        );
+
+        // But the event log still holds both rows (append-only, no delete).
+        let total: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) AS \"c!\" FROM model_filters WHERE model = 'm-tomb'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(total, 2);
+    }
+
+    #[sqlx::test]
+    async fn test_tombstone_absent_model_is_claimed(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "idle-user", "tomb-model", expires_at).await;
+
+        // coming (would hold) then absent tombstone (latest) => claim.
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "tomb-model".to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: Some(Utc::now() + chrono::Duration::seconds(30)),
+            })
+            .await
+            .unwrap();
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "tomb-model".to_string(),
+                state: ModelFilterState::Absent,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("tomb-model".to_string(), 5)]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "latest event is absent tombstone => claim (route to OR), not hold"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_purge_model_filter_events_retention(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        // Insert 5 old events (2 hours ago) for one model.
+        let old = Utc::now() - chrono::Duration::hours(2);
+        for i in 0..5 {
+            sqlx::query!(
+                "INSERT INTO model_filters (model, state, created_at) \
+                 VALUES ('m-purge', 'coming', $1)",
+                old + chrono::Duration::seconds(i),
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // And a recent event (now) for the same model.
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "m-purge".to_string(),
+                state: ModelFilterState::Live,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+
+        // Retention: keep latest 1 per model, purge anything older than 1 hour.
+        // The newest event (the appended live) is kept by rank; of the 5 old
+        // events, all are older than 1h and beyond the keep window => purged.
+        let deleted = manager
+            .purge_model_filter_events(1000, 1, 3600.0)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 5, "the 5 old events should be purged");
+
+        // Latest event per model is always retained: current state survives.
+        let listed = manager.list_model_filters().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].model, "m-purge");
+        assert_eq!(listed[0].state, ModelFilterState::Live);
+
+        // keep_per_model is clamped to >= 1 even if 0 is passed, so the latest
+        // event is never lost.
+        let deleted = manager
+            .purge_model_filter_events(1000, 0, 0.0)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0, "nothing left beyond the protected latest event");
+        assert_eq!(manager.list_model_filters().await.unwrap().len(), 1);
     }
 
     #[sqlx::test]
@@ -12903,8 +14182,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Pin created_at so the synthesized deadline (created_at +
-        // flex_expiry_ms, 1h by default) is deterministically ~55min out.
+        // Pin created_at so the synthesized deadline (created_at + the flex
+        // service-tier window, 1h by default) is deterministically ~55min out.
         sqlx::query("UPDATE requests SET created_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
             .bind(flex_id)
             .execute(&pool)
@@ -13085,7 +14364,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(*any_tier.get("rt-model").unwrap().get("1h").unwrap(), 1);
+        // The realtime row's `priority` tier is unmapped, so it windows at the
+        // default (24h) — it lands in the 24h bucket, not 1h.
+        assert_eq!(*any_tier.get("rt-model").unwrap().get("24h").unwrap(), 1);
+        assert_eq!(*any_tier.get("rt-model").unwrap().get("1h").unwrap(), 0);
 
         // Excluding flex drops the batchless flex row.
         let excl_flex = manager

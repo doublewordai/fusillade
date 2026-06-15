@@ -251,11 +251,48 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub urgency_weight: f64,
 
-    /// Synthetic deadline applied to batchless flex responses when the daemon
-    /// orders claims. Batched rows have `batches.expires_at`; batchless rows
-    /// fall back to `created_at + flex_expiry_ms`. Default 1h (legacy flex SLA).
-    #[serde(default = "default_flex_expiry_ms")]
-    pub flex_expiry_ms: u64,
+    /// Maps a batchless request's `service_tier` → completion window
+    /// (milliseconds). Batchless rows carry no stored completion window, so the
+    /// claim gate derives `W` by looking the tier up here, falling back to
+    /// `default_completion_window_ms` for a NULL or unmapped tier. Batch rows
+    /// ignore this entirely and use their real `batches.completion_window`.
+    /// Default: `{"flex": 3_600_000}` (1 hour).
+    #[serde(default = "default_service_tier_completion_windows_ms")]
+    pub service_tier_completion_windows_ms: HashMap<String, u64>,
+
+    /// Completion window (milliseconds) for batchless requests whose
+    /// `service_tier` is NULL or absent from `service_tier_completion_windows_ms`.
+    /// Default: 86_400_000 (24 hours).
+    #[serde(default = "default_completion_window_ms")]
+    pub default_completion_window_ms: u64,
+
+    /// Exponent of the deadline ramp `ramp_minutes = W_minutes ^ exponent`:
+    /// how long before a request's completion-window deadline the claim gate
+    /// abandons the leaky-bucket trickle and claims at full capacity (→ OR).
+    /// Sub-linear, so longer windows get a proportionally smaller ramp.
+    /// Default: 0.56 (anchors: 1h→~10min, 24h→~59min).
+    #[serde(default = "default_claim_ramp_exponent")]
+    pub claim_ramp_exponent: f64,
+
+    /// Leaky-bucket refills per completion window for a not-live model:
+    /// `leak_interval = W / leaks_per_window`. Larger => faster trickle to
+    /// OpenRouter while a model is not live. Default: 60.0 (1h window → 1
+    /// token/min, 24h window → 1 token/24min).
+    #[serde(default = "default_leaks_per_window")]
+    pub leaks_per_window: f64,
+
+    /// Number of most-recent `model_filters` events to ALWAYS retain per model
+    /// when the purge task trims the append-only log. Must be >= 1 so the
+    /// current-state lookup (latest event per model) never loses a model. Extra
+    /// history is kept for the controller / observability. Default: 50.
+    #[serde(default = "default_model_filters_keep_per_model")]
+    pub model_filters_keep_per_model: i64,
+
+    /// Minimum age (milliseconds) before a `model_filters` event beyond the
+    /// per-model keep window is eligible for purging. Events newer than this
+    /// are retained regardless of count. Default: 604_800_000 (7 days).
+    #[serde(default = "default_model_filters_retention_ms")]
+    pub model_filters_retention_ms: u64,
 }
 
 fn default_batch_metadata_fields() -> Vec<String> {
@@ -267,8 +304,28 @@ fn default_batch_metadata_fields() -> Vec<String> {
     ]
 }
 
-fn default_flex_expiry_ms() -> u64 {
-    3_600_000 // 1 hour
+fn default_service_tier_completion_windows_ms() -> HashMap<String, u64> {
+    HashMap::from([("flex".to_string(), 3_600_000)]) // flex → 1 hour
+}
+
+fn default_completion_window_ms() -> u64 {
+    86_400_000 // 24 hours
+}
+
+fn default_claim_ramp_exponent() -> f64 {
+    0.56
+}
+
+fn default_leaks_per_window() -> f64 {
+    60.0
+}
+
+fn default_model_filters_keep_per_model() -> i64 {
+    50
+}
+
+fn default_model_filters_retention_ms() -> u64 {
+    604_800_000 // 7 days
 }
 
 impl Default for DaemonConfig {
@@ -302,7 +359,12 @@ impl Default for DaemonConfig {
             throughput_log_interval_ms: Some(60_000), // Log per-user throughput every minute
             streamable_endpoints: Vec::new(),
             urgency_weight: 0.0,
-            flex_expiry_ms: default_flex_expiry_ms(),
+            service_tier_completion_windows_ms: default_service_tier_completion_windows_ms(),
+            default_completion_window_ms: default_completion_window_ms(),
+            claim_ramp_exponent: default_claim_ramp_exponent(),
+            leaks_per_window: default_leaks_per_window(),
+            model_filters_keep_per_model: default_model_filters_keep_per_model(),
+            model_filters_retention_ms: default_model_filters_retention_ms(),
         }
     }
 }
@@ -336,6 +398,14 @@ where
     /// Per-user in-flight request counts across all models, used to prioritise
     /// users with fewer active requests during claim (per-user fair scheduling).
     user_requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
+    /// Per-`(user, window-class)` leaky-bucket state for not-live models. Each
+    /// entry's value is `next_token_at`: the earliest `Instant` the bucket may
+    /// leak its next request. Before a claim cycle the daemon derives the
+    /// cooldown set (pairs with `next_token_at > now`) and passes it to
+    /// `claim_requests`; after a claim it stamps `next_token_at = now + W /
+    /// leaks_per_window` for each leaked row's pair. Stale entries are pruned on
+    /// read to bound the map. See `leaks_per_window`.
+    leak_buckets: Arc<dashmap::DashMap<(String, String), std::time::Instant>>,
     /// Per-user throughput counters for periodic OTel emission.
     user_throughput: Arc<dashmap::DashMap<String, UserThroughputStats>>,
     requests_processed: Arc<AtomicU64>,
@@ -370,6 +440,7 @@ where
             processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
             user_requests_in_flight: Arc::new(dashmap::DashMap::new()),
+            leak_buckets: Arc::new(dashmap::DashMap::new()),
             user_throughput: Arc::new(dashmap::DashMap::new()),
             requests_processed: Arc::new(AtomicU64::new(0)),
             requests_failed: Arc::new(AtomicU64::new(0)),
@@ -657,6 +728,8 @@ where
             let purge_interval_ms = self.config.purge_interval_ms;
             let purge_batch_size = self.config.purge_batch_size;
             let purge_throttle_ms = self.config.purge_throttle_ms;
+            let mf_keep_per_model = self.config.model_filters_keep_per_model;
+            let mf_retention_secs = self.config.model_filters_retention_ms as f64 / 1000.0;
 
             tokio::spawn(async move {
                 tracing::info!(
@@ -694,6 +767,39 @@ where
                             }
                             Err(e) => {
                                 crate::background_error!("purge_failed", Error, error = %e, "Failed to purge orphaned rows");
+                                break;
+                            }
+                        }
+                    }
+
+                    // Drain old model_filters events (append-only log), always
+                    // keeping the latest events per model + the retention
+                    // window so the claim gate never loses current state.
+                    loop {
+                        match storage
+                            .purge_model_filter_events(
+                                purge_batch_size,
+                                mf_keep_per_model,
+                                mf_retention_secs,
+                            )
+                            .await
+                        {
+                            Ok(0) => break,
+                            Ok(deleted) => {
+                                counter!("fusillade_model_filter_events_purged_total")
+                                    .increment(deleted);
+                                tracing::debug!(deleted, "Purged old model_filters events");
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_millis(purge_throttle_ms)) => {},
+                                    _ = shutdown_token.cancelled() => {
+                                        tracing::info!("Shutting down purge task during model_filters drain");
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                counter!("fusillade_purge_errors_total").increment(1);
+                                tracing::error!(error = %e, "Failed to purge model_filters events");
                                 break;
                             }
                         }
@@ -782,6 +888,32 @@ where
                 })
                 .collect();
 
+            // Derive the leaky-bucket cooldown set: `(user, window-class)` pairs
+            // whose bucket has not yet refilled (`next_token_at` in the future).
+            // Source B in the claim query skips these, so each pair leaks ≤ 1
+            // request per `leak_interval`. Prune refilled buckets (next_token_at
+            // already passed) on read to keep the map bounded — a refilled
+            // bucket carries no state until it leaks again.
+            let cooldown_now = std::time::Instant::now();
+            let mut refilled_buckets: Vec<(String, String)> = Vec::new();
+            let leak_cooldown: std::collections::HashSet<(String, String)> = self
+                .leak_buckets
+                .iter()
+                .filter_map(|entry| {
+                    if *entry.value() > cooldown_now {
+                        Some(entry.key().clone())
+                    } else {
+                        refilled_buckets.push(entry.key().clone());
+                        None
+                    }
+                })
+                .collect();
+            // Prune refilled buckets to keep the map bounded.
+            for key in refilled_buckets {
+                self.leak_buckets
+                    .remove_if(&key, |_, next_token_at| *next_token_at <= cooldown_now);
+            }
+
             // Claim a batch of pending requests (guaranteed ≤ available capacity per model)
             let claim_start = std::time::Instant::now();
             let mut claimed = self
@@ -791,6 +923,7 @@ where
                     self.daemon_id,
                     &available_capacity,
                     &user_active_counts,
+                    &leak_cooldown,
                 )
                 .await?;
             histogram!("fusillade_claim_duration_seconds")
@@ -803,6 +936,34 @@ where
                 claimed_count = claimed.len(),
                 "Claimed requests from storage"
             );
+
+            // Stamp the leaky bucket for each row claimed via Source B. A leaked
+            // row consumes its `(user, window-class)` token: the bucket may not
+            // leak again until `now + W / leaks_per_window`, which the next
+            // cycle reads back as cooldown. Source A (full-capacity) claims have
+            // `leak == None` and consume no token.
+            {
+                let stamp_now = std::time::Instant::now();
+                let leaks_per_window = self.config.leaks_per_window.max(f64::MIN_POSITIVE);
+                let mut leaked_count = 0u64;
+                for request in &claimed {
+                    if let Some(stamp) = &request.state.leak {
+                        let interval = std::time::Duration::from_secs_f64(
+                            (stamp.window_secs / leaks_per_window).max(0.0),
+                        );
+                        let key = (request.data.created_by.clone(), stamp.window_class.clone());
+                        self.leak_buckets.insert(key, stamp_now + interval);
+                        leaked_count += 1;
+                    }
+                }
+                if leaked_count > 0 {
+                    counter!("fusillade_leaky_bucket_leaks_total").increment(leaked_count);
+                    tracing::debug!(
+                        leaked_count,
+                        "Stamped leaky-bucket tokens for leaked claims"
+                    );
+                }
+            }
 
             // Route requests to escalated models if time is running low
             // This replaces the old SLA racing system with a simpler approach:
@@ -1268,7 +1429,12 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -1450,7 +1616,12 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -1694,7 +1865,12 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -1843,7 +2019,12 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -2031,7 +2212,12 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -2203,7 +2389,12 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -2380,7 +2571,12 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -2552,7 +2748,12 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -2707,7 +2908,12 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(
@@ -2843,7 +3049,12 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
         };
 
         let manager = Arc::new(

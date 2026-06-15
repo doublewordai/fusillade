@@ -28,6 +28,64 @@ pub mod postgres;
 pub mod response_step;
 mod utils;
 
+/// Liveness state of a model on internal (self-hosted) infrastructure, as
+/// published by the controller into the `model_filters` append-only event log.
+///
+/// `model_filters` is an event log, not a current-state table: the CURRENT
+/// state of a model is the latest event for it. An `Absent` event is an
+/// explicit tombstone (the controller retracted the model); a model with no events at
+/// all is also treated as absent. The daemon treats absence as "claim now,
+/// route to OpenRouter".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelFilterState {
+    /// Internal infrastructure is serving this model now.
+    Live,
+    /// Internal infrastructure will serve this model soon; `expected_ready_at`
+    /// carries the ETA.
+    Coming,
+    /// Explicit tombstone: the controller is no longer deploying this model. Appended
+    /// (instead of deleting rows) to retract a model from the log. Treated
+    /// identically to "no events" by the claim gate.
+    Absent,
+}
+
+impl ModelFilterState {
+    /// The textual value stored in `model_filters.state`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelFilterState::Live => "live",
+            ModelFilterState::Coming => "coming",
+            ModelFilterState::Absent => "absent",
+        }
+    }
+
+    /// Parse the textual `model_filters.state` value.
+    pub fn parse_state(s: &str) -> Option<Self> {
+        match s {
+            "live" => Some(ModelFilterState::Live),
+            "coming" => Some(ModelFilterState::Coming),
+            "absent" => Some(ModelFilterState::Absent),
+            _ => None,
+        }
+    }
+}
+
+/// A single `model_filters` event describing a model's internal-liveness
+/// transition.
+///
+/// `expected_ready_at` is only meaningful when `state == Coming`; for `Live`
+/// and `Absent` it should be `None`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelFilter {
+    /// Model name (NOT unique — many events per model in the log).
+    pub model: String,
+    /// Liveness state recorded by this event.
+    pub state: ModelFilterState,
+    /// ETA when `state == Coming`.
+    pub expected_ready_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Storage trait for persisting and querying requests.
 ///
 /// This trait provides atomic operations for request lifecycle management.
@@ -296,11 +354,12 @@ pub trait Storage: Send + Sync {
     /// boundary.
     ///
     /// A request's deadline is its batch's `expires_at`. Batchless rows
-    /// (flex/async responses, `batch_id IS NULL`) have no batch expiry, so
-    /// their deadline is synthesized as `created_at + flex_expiry_ms`
-    /// (`DaemonConfig.flex_expiry_ms`, 1h by default) — the same effective
-    /// deadline the claim path uses, so reported queue depth matches what
-    /// the daemon will claim.
+    /// (flex/async responses, `batch_id IS NULL`) have no batch expiry, so their
+    /// deadline is synthesized as `created_at + W`, where `W` is mapped from the
+    /// row's `service_tier` via `DaemonConfig.service_tier_completion_windows_ms`
+    /// (`'flex'` → 1h by default, NULL/unmapped → `default_completion_window_ms`,
+    /// 24h) — the same window the claim path uses, so reported queue depth
+    /// matches what the daemon will claim.
     ///
     /// `start_secs` is optional. When `None`, the lower bound is unbounded
     /// (the query matches every request with a deadline strictly before
@@ -411,13 +470,56 @@ pub trait Storage: Send + Sync {
     /// Implementations may blend user-fairness with SLA urgency (batch deadline
     /// proximity) via `DaemonConfig::urgency_weight`. See the PostgreSQL
     /// implementation for the composite scoring formula.
+    ///
+    /// The claim gate consults the latest `model_filters` event per model:
+    /// `state = 'live'` **or no events at all** ⇒ claim at full capacity (a
+    /// model with no events is unmanaged by the controller, so there is no
+    /// internal capacity to wait for — it flows straight through to OpenRouter).
+    /// An EXPLICIT not-live event (`coming`/`absent`) ⇒ the request is either
+    /// claimed at full capacity (→ OpenRouter) when within `ramp(W)` of its
+    /// completion-window deadline, or otherwise released only via the
+    /// per-`(user, window-class)` leaky bucket. So with an empty `model_filters`
+    /// table the gate is a no-op (everything claims at full capacity) — it only
+    /// engages once the controller starts writing not-live events.
+    ///
+    /// `leak_cooldown` is the set of `(user, window-class)` pairs whose leaky
+    /// bucket has no token this cycle (the daemon stamped `next_token_at` in
+    /// the future after a recent leak). Source B skips these pairs, claiming
+    /// ≤ 1 per `(user, window-class)` not in cooldown. Pass an empty set to
+    /// allow every bucket its first token. Claimed rows carry a `leaked` flag
+    /// (via the returned request) so the daemon knows which buckets to stamp.
     async fn claim_requests(
         &self,
         limit: usize,
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
+        leak_cooldown: &std::collections::HashSet<(String, String)>,
     ) -> Result<Vec<Request<Claimed>>>;
+
+    /// Append a single event to the `model_filters` log. Used by the controller
+    /// when a model's internal liveness CHANGES (live / coming / absent).
+    ///
+    /// The gate reads only `state` (live ⇒ claim full; coming/absent ⇒ not-live).
+    /// `expected_ready_at` is retained on the type/column for the controller's own
+    /// use but is **not read by the claim gate** — callers may leave it `None`.
+    ///
+    /// This is append-only: there is no delete and no upsert. Retraction is
+    /// appending an `Absent` event. Appending **only on change** (so the log
+    /// stays a transition log rather than a poll log) is the caller's
+    /// responsibility — this function always inserts a row.
+    async fn append_model_filter_event(&self, entry: &ModelFilter) -> Result<()>;
+
+    /// Append a batch of events to the `model_filters` log (one row each, in
+    /// order). Convenience for the controller publishing several transitions in
+    /// one sync. Same append-only / append-on-change semantics as
+    /// [`Storage::append_model_filter_event`].
+    async fn append_model_filter_events(&self, entries: &[ModelFilter]) -> Result<()>;
+
+    /// List the CURRENT state of every model (the latest event per model),
+    /// excluding models whose latest event is an `Absent` tombstone
+    /// (observability / tests).
+    async fn list_model_filters(&self) -> Result<Vec<ModelFilter>>;
 
     /// Update an existing request's state in storage.
     ///
@@ -535,6 +637,22 @@ pub trait DaemonStorage: Send + Sync {
     /// Returns total rows deleted across both tables. Called periodically by
     /// the daemon purge task for right-to-erasure compliance.
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
+
+    /// Purge old `model_filters` events, ALWAYS retaining, per model, the most
+    /// recent `keep_per_model` events (so the current-state lookup and a short
+    /// history window survive) AND every event newer than `retention_secs`
+    /// regardless of count.
+    ///
+    /// Deletes at most `batch_size` rows per call. Returns rows deleted.
+    /// Called periodically by the daemon purge task to bound the append-only
+    /// log. `keep_per_model >= 1` guarantees the latest event per model is
+    /// never purged, so the claim gate never loses a model's current state.
+    async fn purge_model_filter_events(
+        &self,
+        batch_size: i64,
+        keep_per_model: i64,
+        retention_secs: f64,
+    ) -> Result<u64>;
 }
 
 /// Daemon executor trait for runtime orchestration.

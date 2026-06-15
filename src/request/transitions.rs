@@ -143,6 +143,8 @@ impl Request<Pending> {
                 claimed_at: chrono::Utc::now(),
                 retry_attempt: self.state.retry_attempt, // Carry over retry attempt
                 batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
+                // This single-row claim path does not run the leaky-bucket gate.
+                leak: None,
             },
         };
         storage.persist(&request).await?;
