@@ -1,62 +1,78 @@
 # Async Model-Filters Claim Gate (Solution 5)
 
-**Date:** 2026-06-09
-**Status:** Planned
+**Date:** 2026-06-09 (design revised 2026-06-11)
+**Status:** Planned (claim-gate model revised — see below)
 **Linear:** COR-431 (parent), COR-432 (this — fusillade), COR-433 (the controller), COR-434 (control-layer onwards)
 **Design doc:** Linear — "Architecture Options: Hard Guarantees on Async Workloads" (Solution 5)
 
-> **Update (append-only event log).** This plan originally framed `model_filters`
-> as a **current-state table** (one row per model, primary key on `model`, a
-> full-replace `set_model_filters`, claim joining the unique row). It has since
-> been reworked to an **append-only event log**: `model_filters` records every
-> liveness transition, the current state of a model is its **latest event**, and
-> retraction is an explicit `absent` **tombstone** event (never a DELETE). This
-> supersedes the current-state framing throughout. The benefit is that load
-> durations can be **learned from the log** (`coming -> live` gaps) to set future
-> ETAs (`model_load_estimate`), and the history is auditable.
+> **Update (2026-06-11) — liveness-gated leaky bucket supersedes the D_eff/ETA hold gate.**
+> The original plan gated claims on an **effective deadline `D_eff`** (a per-user
+> recent-claims relaxation) and on a model's **`coming(ETA)`** state, with the gate
+> reading `expected_ready_at` and a learned `model_load_estimate` (EWMA). The team
+> has since chosen a simpler, more robust model:
 >
-> **Update (no heartbeat table).** An earlier revision had a separate
-> `model_filters_sync` heartbeat table and made the gate fail-open on its
-> staleness. That table has been **removed**: the gate now simply trusts the
-> latest `model_filters` event per model and **degrades per request** — a
-> `coming` model frozen by a dead/quiet controller stops being held once its ETA
-> passes (`expected_ready_at > now`) or once the request reaches its own
-> deadline, so held work is always eventually released to OpenRouter without any
-> heartbeat or freshness TTL. **All `model_filters_sync` / heartbeat /
-> `model_filters_ttl_ms` / `hb.fresh` mentions below are superseded** — one
-> append-only table, no liveness gate. This also keeps the PR inert to deploy
-> ahead of the controller: with no events, the gate is a no-op.
+> - The gate needs only a **binary "is the model live on our infra?"**. The ETA
+>   is no longer used to decide claims.
+> - **Live, OR no `model_filters` events at all → claim at full model capacity.**
+>   A model with no events is *unmanaged* by the controller — there is no internal
+>   capacity to wait for, so it claims straight through to OpenRouter. Crucially
+>   this makes the gate a **no-op until the controller (COR-433) starts writing
+>   events**, so the change is safe to ship standalone (an empty `model_filters`
+>   table does not throttle anything). *(Revised 2026-06-15 — the earlier "no
+>   events ⇒ not-live" would have throttled ALL async traffic in production before
+>   the controller existed.)*
+> - **Explicit not-live event (`coming`/`absent`) → a per-(user, completion-window)
+>   leaky bucket** that trickles
+>   requests out (→ OpenRouter) at a window-scaled rate, **ramping to full
+>   capacity** as the request nears its completion window. This is **"fail
+>   partially open"** — neither hold-everything (fail closed) nor dump-everything
+>   (fail open).
+>
+> **Retired from the claim decision:** `D_eff`, the recent-claims relaxation and
+> its config (`min_async_ttft_ms`, `serve_margin_ms`, `recent_claims_halflife_ms`,
+> `recent_claims_curve_k`), `expected_ready_at`/ETA in the gate, and
+> `model_load_estimate`/the EWMA. **Retained:** the `model_filters` append-only log
+> (gate reads latest event = `live` vs not), the rank-then-pull claim + its
+> `idx_requests_pending_claim_pull` index, and the per-user fair-scheduling blend
+> (used only to order *claimable* rows for live models).
+>
+> Earlier "append-only event log" and "no heartbeat table" updates still hold and
+> are folded into the design below.
 
 ## Overview
 
-This is the fusillade half of **Solution 5** for the "Hard Guarantees on Async Workloads" project. The goal is to **maximise use of our own GPU infrastructure** for async/batch: don't dispatch work to OpenRouter while internal capacity is live or imminent, but never miss a request's TTFT target by waiting too long.
+This is the fusillade half of **Solution 5** for "Hard Guarantees on Async Workloads". The goal is to **maximise use of our own GPU infrastructure** for async work: don't pay OpenRouter while internal capacity is (or is about to be) live, but never miss a request's completion window.
 
-The mechanism: fusillade gains a `model_filters` table describing, per model, whether it is **live**, **coming** (with an ETA), or **absent** on our infrastructure. The daemon's claim cycle consults it and decides — **per request, against an effective deadline `D_eff`** — whether to claim now (dispatch, which control-layer's onwards routes to internal or OpenRouter) or **hold** the request in the queue to wait for imminent internal capacity.
+fusillade gains a `model_filters` table describing, per model, whether it is **live** on our infrastructure. The daemon's claim cycle reads it and decides, per request:
 
-fusillade does **not** route internal-vs-OpenRouter — it dispatches to `request.endpoint` and control-layer's onwards decides (see Cross-Component Contract). fusillade's only new responsibility is the **claim/hold decision**.
+- **model live** → claim at full model capacity (dispatch → onwards → internal).
+- **model not-live** → **per-(user, completion-window) leaky bucket**: trickle ≤ 1 request per user per leak-interval to OpenRouter, **ramping to full capacity** once the request is within `ramp(window)` of its completion-window deadline.
+
+fusillade does **not** route internal-vs-OpenRouter — it dispatches to `request.endpoint` and control-layer's onwards decides (see Cross-Component Contract). fusillade's only new responsibility is the **claim/throttle decision**.
+
+**Important:** fusillade has no notion of "batch" vs "flex/async" — everything is requests with a **completion window** (`effective_expires_at = COALESCE(b.expires_at, r.created_at + flex_expiry_ms)`). The leak rate and the ramp both derive from that window, so a 24 h "batch" naturally leaks ~negligibly slowly (≈ waits for live) while a 1 h request leaks faster — one uniform mechanism.
 
 ## Context (current behaviour)
 
-- **Claim query** — `Storage::claim_requests` (`src/manager/mod.rs:407`) and its Postgres impl (`src/manager/postgres.rs:1068-1147`). It already: joins `batches`, computes `effective_expires_at = COALESCE(b.expires_at, r.created_at + flex_expiry_ms)`, orders by a blended **user-fairness + SLA-urgency** score (the `user_priority` CTE from `$6/$7` arrays + `urgency_weight` `$8`), and claims per-model up to capacity with `FOR UPDATE … SKIP LOCKED`.
-- **Per-user fair scheduling** (`docs/plans/2026-03-25-per-user-fair-scheduling.md`) — the daemon keeps `user_requests_in_flight: DashMap<String, AtomicUsize>` (`src/daemon/mod.rs:320-347`), snapshots it to a `HashMap` each cycle (`:771-782`), and passes it as `user_active_counts`. **We reuse this snapshot→arrays→CTE pattern.**
-- **Model escalation** (`src/daemon/mod.rs:806-844`) — already swaps a claimed request's `model` to an `escalation_model` when `batch_expires_at - now < escalation_threshold_seconds`. This is the existing near-deadline "use the premium/OR path" hook.
-- **Dispatch** (`src/http.rs:261`) — `format!("{}{}", request.endpoint, request.path)`; no routing logic in fusillade.
-- **Deadline at claim time** — `Claimed.batch_expires_at` (`src/request/types.rs:148`), from the query's `effective_expires_at`.
-- **Migrations** — `sqlx::migrate!("./migrations")` via `migrator()` in `src/lib.rs`; **not auto-run** — the embedding application runs them. Naming: `YYYYMMDDHHmmss_name.{up,down}.sql`.
+- **Claim query** — `Storage::claim_requests` (`src/manager/mod.rs`) and its Postgres impl (`src/manager/postgres.rs`). Already computes `effective_expires_at`, ranks **batches** by a fair-scheduling + urgency blend, and pulls per-model up to capacity with `FOR UPDATE … SKIP LOCKED` (the **rank-then-pull** structure + `idx_requests_pending_claim_pull (model, batch_id, created_at)`, already shipped).
+- **Per-user fair scheduling** — the daemon keeps `user_requests_in_flight` and passes it as `user_active_counts`; used to order claimable rows. **Reused for live-model ordering.**
+- **Model escalation** (`src/daemon/mod.rs`) — swaps a claimed request's `model` to an `escalation_model` near deadline. Under Solution 5 the ramp-to-full-capacity + onwards default-OR fallback subsumes this; leave as-is for the first cut (harmless), revisit in COR-434.
+- **Dispatch** (`src/http.rs`) — `format!("{}{}", request.endpoint, request.path)`; no routing in fusillade.
+- **Migrations** — `sqlx::migrate!("./migrations")`; **not auto-run** — the embedding app runs them. Naming `YYYYMMDDHHmmss_name.{up,down}.sql`.
 
-## Cross-component contract (for context — not all in this repo)
+## Cross-component contract
 
 ```
    the controller (COR-433, embeds this crate, NO daemon)
      • polls dynamo-frontend /v1/models for liveness
-     • computes/retracts expected_ready_at for models it plans to deploy
-     • writes model_filters events (this crate's fns) on state change
+     • writes model_filters events (live / not-live) on state change
+     • reacts to new demand fast (LISTEN/NOTIFY) so not-live → live quickly
      • writes active/inactive to control-layer (for onwards)
                          │ writes
                          ▼
-   fusillade DB:  model_filters (NEW)  ◄── daemon reads in claim cycle (THIS PLAN)
+   fusillade DB:  model_filters  ◄── daemon reads latest-event liveness in claim cycle (THIS PLAN)
                          │
-   control-layer-fusillade daemon: per-request claim/hold using model_filters + D_eff
+   control-layer-fusillade daemon: per-request claim (live=full / not-live=leaky bucket)
                          │ claims → dispatch to request.endpoint
                          ▼
    control-layer onwards (COR-434): skip not-live component, default OpenRouter fallback
@@ -64,238 +80,136 @@ fusillade does **not** route internal-vs-OpenRouter — it dispatches to `reques
             internal backend   |   OpenRouter
 ```
 
-`model_filters` is owned by this crate (migrations included). control-layer-fusillade runs migrations; **the controller embeds the crate with migrations disabled** and a schema-compatible version pin.
+`model_filters` is owned by this crate (migrations included). The controller embeds the crate with **migrations disabled** and a schema-compatible version pin. Making the controller **react to new demand quickly** (NOTIFY rather than only a 30 s poll) shrinks the window where a just-arrived model is still "not-live", so the bucket front-loads less to OR.
 
 ## Design
 
-### 1. `model_filters` — append-only event log
+### 1. `model_filters` — append-only event log (unchanged schema)
 
 ```sql
 CREATE TABLE model_filters (
-    id                BIGSERIAL PRIMARY KEY,                                -- event id
-    model             TEXT NOT NULL,                                        -- NOT unique
+    id                BIGSERIAL PRIMARY KEY,
+    model             TEXT NOT NULL,                                         -- NOT unique
     state             TEXT NOT NULL CHECK (state IN ('live','coming','absent')),
-    expected_ready_at TIMESTAMPTZ,                                          -- set when state = 'coming'
+    expected_ready_at TIMESTAMPTZ,                                           -- no longer read by the gate
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX idx_model_filters_model_created_at
-    ON model_filters (model, created_at DESC);
+CREATE INDEX idx_model_filters_model_created_at ON model_filters (model, created_at DESC);
 ```
 
-Each row is one **liveness transition** appended by the controller. There is **no
-`model` primary key / uniqueness** — many events per model accumulate over time.
-
-- **Current state = latest event per model** (max `created_at`, tie-broken by
-  `id`). The claim query reads it via a `LEFT JOIN LATERAL (… ORDER BY
-  created_at DESC LIMIT 1)`, served by the `(model, created_at DESC)` index.
-- **Absent** = the model's **latest event is `state='absent'`** (an explicit
-  **tombstone**) **OR** the model has **no events at all**. Both are treated
-  identically by the gate: claim now (route to OpenRouter).
-- **Append-on-change is the caller's (the controller's) responsibility.** The write
-  functions always insert; the controller must append only when a model's state
-  actually changes, so the log stays a *transition* log rather than a *poll*
-  log. Retraction = append an `absent` event; there is never a DELETE in the
-  hot path (only the retention purge removes old rows — see §6).
-
-No separate liveness/heartbeat table: the gate trusts the latest event per model
-and degrades per request (see the per-request decision and the top "no heartbeat
-table" note).
+- **Current state = latest event per model** (`ORDER BY created_at DESC, id DESC LIMIT 1`), via the index.
+- The gate reads **`state = 'live'` OR no events ⇒ claim at full capacity**; an **explicit `coming`/`absent` event ⇒ not-live** (leaky-bucket / ramp path). `expected_ready_at` and the `coming` vs `absent` distinction are **no longer used by the claim gate** (kept for the controller's own use / observability; could be dropped in a later migration). The "no events ⇒ claim full" rule keeps the gate a no-op until the controller writes events.
+- Append-on-change remains the controller's responsibility; retraction = append `absent`; no DELETE in the hot path (only the retention purge — §6).
 
 ### 2. Per-request claim decision
 
-For a pending request for model X with effective deadline `D_eff` (below), let `serve` = `serve_margin_ms` (estimated time to actually serve once live):
+For a pending request with completion-window deadline `expires = effective_expires_at` and window duration `W = expires − created_at`:
 
-`model_filters[X]` below means **the latest event for model X** (NULL if no
-events). `absent` covers both "latest event is an `absent` tombstone" and "no
-events at all".
+| Model live? | Within `ramp(W)` of `expires`? | Decision |
+|---|---|---|
+| **live** | — | **Claim** at full model capacity (→ internal) |
+| not-live | **yes** | **Claim** at full model capacity (→ OR) — *deadline ramp* |
+| not-live | no | **Leaky bucket**: claim iff the request's `(user, window-class)` bucket has a token; else **hold** |
 
-| `model_filters[X]` (latest event) | Decision |
-|---|---|
-| `live` | **claim** (→ onwards → internal) |
-| `coming(T)` and `T > now` and `T + serve ≤ D_eff` and `now + serve < D_eff` | **hold** (wait for internal) |
-| `coming(T)` and `T + serve > D_eff` | **claim** (can't wait → onwards → OR) |
-| `coming(T)` and `T ≤ now` (past/stuck ETA) | **claim** (self-heal — controller likely gone → OR) |
-| absent (tombstone latest **or** no events) | **claim** (not coming → onwards → OR) |
-| any, and `now + serve ≥ D_eff` | **claim** (deadline release — onwards/escalation → OR) |
+Held requests stay `pending`, so they keep counting as demand for the controller. There is no fail-open/closed binary — not-live work is **partially** released at the leaky-bucket rate, with the ramp guaranteeing completion.
 
-There is **no heartbeat/freshness gate** — degradation when the controller is gone is per-request (the past-ETA and deadline-release rows), so held work is always eventually released and nothing is held forever.
+### 3. Ramp function
 
-The hold predicate keys off `mf.state = 'coming'`, so a latest event of `live`,
-`absent`, or NULL never holds — exactly the append-only equivalent of the old
-current-state logic.
-
-So a row is **excluded from the claim** (held) iff: `state='coming'` **and** `expected_ready_at > now` **and** `expected_ready_at + serve ≤ D_eff` **and** `now + serve < D_eff`. Everything else is claimable. Held requests stay `pending`, so they keep counting as demand for the controller.
-
-### 3. Effective deadline `D_eff` — TTFT target × fair-share (closes brief ①)
-
-Instead of the raw `effective_expires_at`, hold/release uses an effective deadline that is **tight for idle users and relaxes for sustained consumers**:
+`ramp(W)` = how long before the deadline we abandon the trickle and drain at full capacity. Anchored on the team's two points (1 h → final 10 min, 24 h → final 60 min), which define a sub-linear power curve:
 
 ```
-D_eff = now + min_async_ttft + (effective_expires_at - now - min_async_ttft) * g(recent_claims[user])
-        clamped to [now + min_async_ttft, effective_expires_at]
+ramp_minutes = W_minutes ^ ramp_exponent          (default ramp_exponent = 0.56)
 ```
 
-- `min_async_ttft` — new config, **start 1 min**. The floor TTFT target for a user who deserves full resource. Internal config, **never a published flex/batch SLA**.
-- `recent_claims[user]` — a **decaying per-user recent-CLAIM score** (see §5). Keys off resource *consumed*, not backlog or lifetime, so a 50k batch and a few sequential requests get the same fast initial burst, then relax identically.
-- `g(score) ∈ [0,1]`, increasing, `g(0)=0` — e.g. `score / (score + k)` (saturating) or `LEAST(score / S_max, 1)`. Exact curve is a tuning knob (mirror how `urgency_weight` was introduced as a dial).
-- `effective_expires_at` is the hard ceiling; if it is < `now + min_async_ttft`, it wins.
+- 1 h (60 m) → 60^0.56 ≈ **10 min**; 24 h (1440 m) → 1440^0.56 ≈ **59 min**.
+- Sub-linear: longer windows get a proportionally *smaller* ramp.
+- **Degrades gracefully at the short end**: `ramp(W) → W` as `W → ~1 min`, so a sub-minute window is "always ramping" (full capacity) with no special-case floor.
+- `ramp_exponent` is a config dial (default 0.56 = the two anchors).
+- The `W^exponent` math runs on the **bounded candidate set** the rank-then-pull produces (~capacity rows), never in the per-row scan.
 
-Idle user → `D_eff ≈ now + min_async_ttft` → almost nothing qualifies to hold → served internally if X already live, else OR (responsive). Sustained consumer → `D_eff` near real expiry → work held for the cheap internal path their own volume is provisioning.
+### 4. Leaky bucket (per user, per completion-window)
 
-### 4. Relationship to existing `model_escalations`
+- **Key:** `(user, window-class)`, where `window-class` is the discrete completion window. Small, finite key space → daemon and SQL agree on it.
+- **Window source (no `flex_expiry_ms`, no service-tier semantics in the gate):** `W` derives only from a completion window. **Batch rows** use the batch's real `completion_window`/`expires_at`. **Batchless rows** have no stored window, so `W` is mapped from `requests.service_tier`: `'flex' → 1 h`, NULL/other → 24 h (the only two that reach the claim query — realtime tiers `auto`/`default`/`priority` are inserted `processing`, never `pending`, so the daemon never claims them). This replaces the retired `flex_expiry_ms` scalar; the map lives in `DaemonConfig` (`flex_completion_window_ms` = 1 h, `default_completion_window_ms` = 24 h) and is trivially widened to a full tier map later. fusillade never interprets a tier as a latency/cost class — only as a window lookup.
+- **Capacity 1, refill 1 token per `leak_interval`:**
+  ```
+  leak_interval = W / leaks_per_window               (default leaks_per_window = 60)
+  ```
+  → 1 h window = 1 token/min, 24 h window = 1 token/24 min (≈ 60 leaks per window per user). A long window therefore leaks ≈ negligibly (a 24 h backlog drips ~60 to OR over a day, the rest waits for live or rides the ramp) — this is how "batches effectively wait for live" *emerges* without a type distinction.
+- **Per-user global across models:** one bucket per `(user, window-class)` spans all of that user's not-live models in that window class.
+- **Daemon owns the buckets and the math** — no leak math in SQL. Each cycle the daemon passes in the **cooldown set**: `(user, window-class)` pairs that have leaked recently and are not yet refilled. After a leak it stamps `next_token_at = now + leak_interval` for that pair. The SQL claims **≤ 1 per `(user, window-class)` not in cooldown**.
 
-The **deadline-release** clause (`now + serve ≥ D_eff`) is the new, `D_eff`-aware analogue of the existing escalation trigger. Under Solution 5, a released request dispatched to the composite is routed to OpenRouter by onwards (internal component excluded), so the `model`-swap in `model_escalations` (`:806-844`) becomes **redundant for the OR path** — but harmless. Decision for implementation: either (a) leave `model_escalations` as-is and rely on onwards routing, or (b) retire it once onwards' default-OR fallback (COR-434) is in place. Recommend (a) for the first cut (no behavioural removal), revisit in COR-434.
+### 5. Claim query structure (single round-trip, keeps SKIP LOCKED)
 
-### 5. Load-time learning from the log (`model_load_estimate`)
+Liveness is per requested model: latest `model_filters` event `= 'live'` (the existing `mf` lateral, now reading `state` only — `expected_ready_at` dropped from the gate). The rank-then-pull bounds candidates cheaply; on that bounded set we draw from two sources and UNION them. Each arm keeps **its own** `FOR UPDATE … SKIP LOCKED` (as the existing batch/batchless arms already do — there was never a single literal locked scan), and the result is one round-trip.
 
-Because the log retains every transition, we can **learn how long a model takes
-to load** internally and feed it back as future ETAs:
+Because batch and batchless rows are already separate arms, this is **four arms**, each tagging a `leaked BOOL` carried through `to_claim` → `RETURNING` (the daemon stamps buckets only for `leaked` rows):
 
-- For each model, walk its events in time order and pair every `coming` event
-  with the **next `live`** event. The gap `live.created_at − coming.created_at`
-  is one observed load duration (we use the events' own timestamps — when
-  the controller saw the transition — not `expected_ready_at`, so the estimate
-  reflects *actual* loads).
-- `model_load_estimate(model) -> Option<Duration>` returns an **EWMA** over
-  those samples, newest-weighted (alpha 0.5), or `None` if no `coming → live`
-  transition has been observed. The controller calls this to set the next
-  `expected_ready_at` it publishes.
-- The SQL uses `LEAD()` window functions over the model's events; the Rust side
-  folds the EWMA so the curve stays one tunable place.
+- **Source A (full capacity), batch + batchless** — existing arms, **hold predicate replaced** by the qualifier `is_live(model) OR now + ramp(W) ≥ expires`; `leaked = false`. Ordered by the existing fair-scheduling + urgency blend.
+- **Source B (leaky bucket), batch + batchless** — not-live, before-ramp rows, excluding the daemon's cooldown `(user, window-class)` pairs, **≤ 1 per `(user, window-class)`** via `DISTINCT ON (created_by, window_class)`; `leaked = true`. The batch arm rides `ranked_batches` (a batch is one `(user, window-class)`, so the bounded set is reused — no new unbounded scan); the batchless arm keeps the per-row scan (low flex volume). Batch and batchless window-classes are disjoint (`'flex'` sentinel vs real completion windows), so the two Source-B arms never double-count a bucket.
+
+**Compromise — strict ≤1 is per-model-per-cycle, not single-cycle-global.** Source B sits inside the per-model `LATERAL`, so within one cycle a user with the same window-class across *N* not-live models can leak up to *N* (not 1). The daemon's cooldown set converges it to ≤1 from the next cycle (leak intervals are minute-scale, cycles second-scale), so the steady-state error is bounded and immaterial for a trickle-to-OR valve. Lifting Source B out of the per-model lateral to enforce single-cycle-global ≤1 is possible but materially more complex and deferred.
+
+The window/ramp math is applied **after** the index scans (on the bounded candidate set), per the efficiency requirement.
 
 ### 6. Retention (purge integration)
 
-The append-only log must be bounded. The existing daemon purge task
-(`purge_interval_ms` / `purge_batch_size` / `purge_throttle_ms`) gains a second
-drain loop calling `purge_model_filter_events(batch_size, keep_per_model,
-retention_secs)`:
-
-- A row is eligible for deletion iff it is **both** beyond the most-recent
-  `keep_per_model` events for its model (ranked `created_at DESC, id DESC`)
-  **and** older than `retention_secs`.
-- `keep_per_model` is clamped to `>= 1`, so the **latest event per model is
-  never purged** — the claim gate can never lose a model's current state. The
-  extra history window feeds `model_load_estimate`.
-- New `DaemonConfig` knobs: `model_filters_keep_per_model` (default 50) and
-  `model_filters_retention_ms` (default 7 days), both `#[serde(default)]`.
+Unchanged: the append-only log is bounded by the existing purge task via `purge_model_filter_events(batch_size, keep_per_model, retention_secs)` — a row is deletable iff it is beyond the most-recent `keep_per_model` events for its model **and** older than `retention_secs`; `keep_per_model ≥ 1` so the latest event per model is never purged. (`model_load_estimate` is retired, but retaining a little history remains useful for the controller/observability.)
 
 ## Implementation steps
 
-### Step 1 — Migration: `model_filters` event log + heartbeat
-- `migrations/<ts>_add_model_filters.{up,down}.sql` — append-only event-log
-  table (`id BIGSERIAL` PK, non-unique `model`, `state IN
-  ('live','coming','absent')`, `created_at`), the `(model, created_at DESC)`
-  index, and the `model_filters_sync` heartbeat singleton. `down` drops both.
+### Step 1 — Liveness in the claim query
+- Add a `live_models` CTE (or per-model lateral) over `model_filters`: latest event `state = 'live'`. Replace the existing `D_eff` hold predicate with the **Source A qualifier** `is_live(model) OR now + ramp(W) ≥ expires`.
 
-### Step 2 — Storage trait + Postgres impl (`src/manager/mod.rs`, `src/manager/postgres.rs`)
-- `ModelFilterState` gains an `Absent` variant (the tombstone). `ModelFilter {
-  model, state: ModelFilterState, expected_ready_at: Option<DateTime<Utc>> }`
-  is an **event**, not a unique row.
-- Append-only write API (replaces the old `set_model_filters` /
-  `upsert_model_filter` / `delete_model_filter`):
-  - `append_model_filter_event(&self, entry: &ModelFilter) -> Result<()>` —
-    insert one event + bump the heartbeat.
-  - `append_model_filter_events(&self, entries: &[ModelFilter]) -> Result<()>`
-    — insert a batch of events (one row each, caller order preserved via
-    `WITH ORDINALITY`) + bump the heartbeat once.
-  - **No upsert, no delete.** Retraction = append an `Absent` event. Appending
-    only on *change* is the controller's responsibility.
-- `list_model_filters` — returns the **latest event per model**
-  (`DISTINCT ON (model) … ORDER BY created_at DESC, id DESC`), excluding models
-  whose latest event is an `absent` tombstone (observability/tests).
-- `model_load_estimate(&self, model) -> Result<Option<Duration>>` — see §5.
-- heartbeat read (observability/tests) — unchanged.
-- Extend `claim_requests` signature with the per-user recent-claim snapshot, mirroring `user_active_counts`:
-  ```rust
-  async fn claim_requests(
-      &self,
-      limit: usize,
-      daemon_id: DaemonId,
-      available_capacity: &HashMap<String, usize>,
-      user_active_counts: &HashMap<String, usize>,
-      user_recent_claims: &HashMap<String, f64>,   // NEW
-  ) -> Result<Vec<Request<Claimed>>>;
-  ```
-  (`min_async_ttft_ms`, `serve_margin_ms`, `model_filters_ttl_ms` come from `self.config` like `urgency_weight`/`flex_expiry_ms` already do.)
+### Step 2 — Source B (leaky bucket) in the claim query
+- Add the per-`(user, window-class)` `LIMIT 1` pull for not-live, before-ramp requests, excluding the passed-in cooldown pairs. UNION with Source A; dedupe; apply capacity + global limit; one `FOR UPDATE OF r SKIP LOCKED`.
+- New bind params: cooldown `(user, window-class)` arrays; `ramp_exponent`; `leaks_per_window` (if any window math is done SQL-side) — finalise in the prototype.
+- Regenerate the sqlx cache (`cargo sqlx prepare`).
 
-### Step 3 — Claim SQL (`src/manager/postgres.rs`)
-- Pass new bind params: `$10` recent-claim user_ids `TEXT[]`, `$11` scores `DOUBLE PRECISION[]`, `$12` `min_async_ttft` seconds, `$13` `serve_margin` seconds, `$14` `model_filters_ttl` seconds.
-- In the per-model `LATERAL`, replace the unique-row join with a **latest-event
-  lookup**: `LEFT JOIN LATERAL (SELECT state, expected_ready_at FROM
-  model_filters WHERE model = m.model ORDER BY created_at DESC LIMIT 1) mf ON
-  true` (served by `idx_model_filters_model_created_at`). NULL (no events) and a
-  latest `absent` event both behave as absent because the hold predicate
-  requires `mf.state = 'coming'`. Add the heartbeat scalar subquery as before.
-- Add a recent-claim CTE (like `user_priority`) and compute `D_eff` inline from `effective_expires_at`, `$12`, and `g(score)`.
-- Add the **hold** exclusion to the `WHERE` (a row is skipped iff held):
-  ```sql
-  AND NOT (
-      (hb.updated_at > $3 - make_interval(secs => $14))       -- heartbeat fresh
-      AND mf.state = 'coming'
-      AND mf.expected_ready_at + make_interval(secs => $13) <= <D_eff>
-      AND $3 + make_interval(secs => $13) < <D_eff>           -- not yet at deadline
-  )
-  -- fail-OPEN: there is NO extra heartbeat clause. The hold predicate above is
-  -- gated on `hb.fresh`, so when the heartbeat is stale nothing is held and the
-  -- claim query reverts to baseline (claim normally).
-  ```
-  where `<D_eff>` is the clamped expression from §3. Keep the existing ORDER BY (fairness + urgency) for *ordering among claimable rows*.
-- Regenerate the sqlx cache: `cargo sqlx prepare`.
+### Step 3 — `Storage::claim_requests` signature
+- **Remove** `user_recent_claims`. **Add** the leak **cooldown set** (e.g. parallel `user[]` / `window_class[]` arrays). Keep `user_active_counts` (live-model ordering). The daemon also needs each claimed row's `(user, window-class)` back to stamp buckets — ensure it's in the returned `Request`/`RETURNING`.
 
-### Step 4 — `DaemonConfig` (`src/daemon/mod.rs`, defaults `:274-308`)
-- `min_async_ttft_ms: u64` (default `60_000`)
-- `serve_margin_ms: u64` (default e.g. `0`–`5_000`; start small)
-- `model_filters_ttl_ms: u64` (staleness threshold; default e.g. `30_000`, aligned to the controller poll cadence)
-- `recent_claims_halflife_ms: u64` (decay time constant; default e.g. `120_000`)
-- `recent_claims_curve_k: f64` (the `k`/`S_max` for `g()`; tuning dial, default conservative)
-All `#[serde(default)]`, backward-compatible.
+### Step 4 — `DaemonConfig` (`src/daemon/mod.rs`)
+- **Remove:** `min_async_ttft_ms`, `serve_margin_ms`, `recent_claims_halflife_ms`, `recent_claims_curve_k`, **`flex_expiry_ms`**.
+- **Add:** `claim_ramp_exponent: f64` (default `0.56`), `leaks_per_window: f64` (default `60.0`), **`flex_completion_window_ms: u64`** (default `3_600_000` = 1 h), **`default_completion_window_ms: u64`** (default `86_400_000` = 24 h). All `#[serde(default)]`. The two window scalars are the service-tier→`W` map (§4); batch rows ignore them and use their real `completion_window`.
 
-### Step 5 — Daemon recent-claim counter (`src/daemon/mod.rs`)
-- Add `user_recent_claims: Arc<DashMap<String, (f64 /*score*/, Instant /*last*/)>>` to `Daemon` (`:320-347`).
-- **Increment on claim** at the same point `user_requests_in_flight` is incremented (`:947-952`): decay-then-add (`score = score * 0.5^(Δt/halflife) + 1.0`).
-- **Snapshot before claim** (next to `:771-782`): read each entry, apply decay-on-read to `now`, drop entries that have decayed below ε (keeps the map bounded), produce `HashMap<String, f64>` → pass as `user_recent_claims`.
-- No periodic task needed (decay-on-read).
+### Step 5 — Daemon leaky-bucket state (`src/daemon/mod.rs`)
+- Replace `user_recent_claims` with `leak_buckets: DashMap<(String /*user*/, String /*window-class*/), Instant /*next_token_at*/>`.
+- **Before claim:** derive the cooldown set (pairs with `next_token_at > now`); pass to `claim_requests`.
+- **After claim:** for each claimed *not-live, before-ramp* (leaked) row, set `next_token_at = now + W / leaks_per_window` for its `(user, window-class)`. (Live / ramped claims do not consume a token.) Decay-on-read / prune stale entries to bound the map.
 
-### Step 6 — Embedding support for the controller (no code change expected, verify)
-- Confirm `PostgresRequestManager` / `Storage` is usable without constructing a `Daemon` (it already is — manager and daemon are separate). The controller calls `set_model_filters` / heartbeat only.
-- Ensure migrations are **opt-in** (caller invokes `migrator().run()`); the controller must not run them. Document the version-pin requirement against control-layer-fusillade's deployed schema.
+### Step 6 — Embedding support for the controller (verify only)
+- `PostgresRequestManager` usable without a `Daemon` (already true). Migrations opt-in. Version-pin documented.
 
 ## Out of scope (tracked elsewhere)
-- **Counters table** — *not built*. Adds nothing to the claim decision (which needs `model_filters` + each request's deadline + current backlog); the controller's demand input stays the existing `get_pending_request_counts_by_model_and_window` query.
-- **the controller** liveness poll, ETA computation, `model_filters` writes, control-layer active/inactive — COR-433.
-- **control-layer** onwards skip-not-live + default OpenRouter fallback — COR-434.
-- **Native `service_tier` ingestion** on chat-completions/open-responses — COR-436 (standalone).
+- **Controller NOTIFY / fast reaction**, liveness poll, `model_filters` writes, control-layer active/inactive — COR-433 (the NOTIFY reaction is newly motivated by this design — it shrinks the not-live window).
+- **control-layer** onwards skip-not-live + default-OR fallback — COR-434.
+- **Native `service_tier` ingestion** — COR-436.
 
 ## Tests (`src/manager/postgres.rs`)
-- `test_claim_holds_for_coming_model_when_deadline_allows` — append `coming(T)` with `T+serve ≤ D_eff` ⇒ not claimed; append `live` event ⇒ latest is live ⇒ claimed.
-- `test_claim_releases_coming_model_near_deadline` — `coming(T)` but request near `D_eff` ⇒ claimed (→ OR path).
-- `test_absent_model_claimed_immediately` — no events ⇒ claimed (no hold).
-- `test_tombstone_absent_hides_model` — append `live` then `absent` tombstone ⇒ `list_model_filters` excludes it; both events remain in the log.
-- `test_tombstone_absent_model_is_claimed` — append `coming` then `absent` ⇒ latest is tombstone ⇒ claimed (not held).
-- `test_coming_past_eta_is_released_no_heartbeat` — a `coming` model with a past ETA is released (self-heal), while an in-window `coming` model is still held — no heartbeat involved.
-- `test_d_eff_idle_vs_busy_user` — idle user (no recent claims) gets tight `D_eff` (claimed/released fast); high recent-claim user holds for `coming` model.
-- `test_recent_claims_decay_relaxes_then_tightens` — score decays over time so an idle-again user regains the tight target.
-- `test_append_model_filter_events` — append-only: later events supersede earlier per model (latest wins), every event retained; single-event helper.
-- `test_model_load_estimate` — EWMA of observed `coming → live` gaps; `None` when no transition seen.
-- `test_purge_model_filter_events_retention` — old events purged while the latest event per model (and the retention window) is always kept; `keep_per_model` clamped to ≥ 1.
-- All existing claim tests pass with an empty `model_filters` log + empty `user_recent_claims` (behaviour unchanged when the controller isn't writing).
+- `test_live_model_claims_full_capacity` — live model drains its backlog at capacity (existing rank-then-pull behaviour, no throttle).
+- `test_not_live_leaky_bucket_one_per_user_window` — a not-live model with a far deadline claims ≤ 1 per `(user, window-class)` per cycle; pairs in the cooldown set are skipped.
+- `test_not_live_within_ramp_claims_full_capacity` — a not-live request inside `ramp(W)` of its deadline is claimed at full capacity (→ OR).
+- `test_ramp_scales_with_window` — `ramp(1h) ≈ 10 min`, `ramp(24h) ≈ 60 min`; sub-minute window is always-ramping.
+- `test_leak_rate_scales_with_window` — 1 h window refills 1/min, 24 h window 1/24 min (daemon-side bucket test).
+- `test_live_overrides_everything` — a live model is claimed at full capacity regardless of cooldown/ramp (keep the existing live-claim invariant test).
+- All existing claim tests pass **unchanged** with an empty `model_filters` log: no events ⇒ claim at full capacity (the gate is a no-op). Leaky-bucket tests append an explicit `coming` event to engage Source B.
 
 ## Version strategy
-`Storage::claim_requests` signature changes (new parameter) and `RequestData`/config evolve → `feat!:` **major bump**, consistent with the per-user fair-scheduling rollout. Bundle Steps 1–5 in one PR.
+`Storage::claim_requests` signature changes and `DaemonConfig` fields change → `feat!:` **major bump**. This *replaces* the D_eff mechanism in the same PR (#281) — net deletion of the ETA/EWMA/recent-claims machinery.
 
 ## Verification
 1. `just db-start && just db-setup`
-2. `just test` — existing tests green with empty `model_filters`/`user_recent_claims`
-3. `just test` new tests above
-4. `just lint`
-5. `cargo sqlx prepare --check`
+2. `just test` — existing + new tests green
+3. `just lint`
+4. `cargo sqlx prepare --check`
 
 ## Files to modify
 | File | Change |
 |------|--------|
-| `migrations/<ts>_add_model_filters.{up,down}.sql` | append-only `model_filters` event log + `(model, created_at DESC)` index + `model_filters_sync` heartbeat |
-| `src/manager/mod.rs` | `claim_requests` signature (+`user_recent_claims`); `ModelFilterState` (+`Absent`) / `ModelFilter` event types; `append_model_filter_event(s)`, `list_model_filters` (latest-per-model), `model_load_estimate` trait fns; `DaemonStorage::purge_model_filter_events` |
-| `src/manager/postgres.rs` | claim SQL: latest-event `LEFT JOIN LATERAL`, `D_eff`, hold predicate (per-request self-heal, no heartbeat), new binds; append/list/load-estimate/purge impls; tests |
-| `src/daemon/mod.rs` | `DaemonConfig` fields (incl. `model_filters_keep_per_model`, `model_filters_retention_ms`); purge task drains `model_filters` events; `user_recent_claims` DashMap |
-| `src/daemon/transitions.rs` | `MockDaemonStorage::purge_model_filter_events` |
+| `src/manager/postgres.rs` | claim SQL: `live_models` CTE; Source A qualifier (`is_live OR within ramp`) replacing the hold predicate; Source B leaky-bucket arm (≤1 per `(user, window-class)` not in cooldown); window/ramp math on the bounded candidate set; tests |
+| `src/manager/mod.rs` | `claim_requests` signature (−`user_recent_claims`, +cooldown arrays); return `(user, window-class)` per claimed row |
+| `src/daemon/mod.rs` | `DaemonConfig` (−D_eff configs, +`claim_ramp_exponent`, +`leaks_per_window`); `leak_buckets` DashMap; derive cooldown before claim, stamp after |
 | `.sqlx/query-*.json` | regenerated via `cargo sqlx prepare` |
+
+> The `model_filters` table, the append-only write API, the retention purge, and the rank-then-pull claim + `idx_requests_pending_claim_pull` index are **already implemented** on the branch and are retained; this revision changes the *gate logic on top of them*.

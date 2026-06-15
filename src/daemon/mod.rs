@@ -251,46 +251,40 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub urgency_weight: f64,
 
-    /// Synthetic deadline applied to batchless flex responses when the daemon
-    /// orders claims. Batched rows have `batches.expires_at`; batchless rows
-    /// fall back to `created_at + flex_expiry_ms`. Default 1h (legacy flex SLA).
-    #[serde(default = "default_flex_expiry_ms")]
-    pub flex_expiry_ms: u64,
+    /// Maps a batchless request's `service_tier` → completion window
+    /// (milliseconds). Batchless rows carry no stored completion window, so the
+    /// claim gate derives `W` by looking the tier up here, falling back to
+    /// `default_completion_window_ms` for a NULL or unmapped tier. Batch rows
+    /// ignore this entirely and use their real `batches.completion_window`.
+    /// Default: `{"flex": 3_600_000}` (1 hour).
+    #[serde(default = "default_service_tier_completion_windows_ms")]
+    pub service_tier_completion_windows_ms: HashMap<String, u64>,
 
-    /// Floor TTFT target (milliseconds) for the async model-filters effective
-    /// deadline `D_eff`. An idle user gets `D_eff ≈ now + min_async_ttft`, so
-    /// almost nothing qualifies to hold — responsive. INTERNAL config only;
-    /// never a published flex/batch SLA. Default: 60_000 (1 minute).
-    #[serde(default = "default_min_async_ttft_ms")]
-    pub min_async_ttft_ms: u64,
+    /// Completion window (milliseconds) for batchless requests whose
+    /// `service_tier` is NULL or absent from `service_tier_completion_windows_ms`.
+    /// Default: 86_400_000 (24 hours).
+    #[serde(default = "default_completion_window_ms")]
+    pub default_completion_window_ms: u64,
 
-    /// Estimated time (milliseconds) to actually serve a request once internal
-    /// capacity is live. Used in the hold/release decision (`now + serve` vs
-    /// `D_eff`, `expected_ready_at + serve` vs `D_eff`). Start small.
-    /// Default: 0.
-    #[serde(default)]
-    pub serve_margin_ms: u64,
+    /// Exponent of the deadline ramp `ramp_minutes = W_minutes ^ exponent`:
+    /// how long before a request's completion-window deadline the claim gate
+    /// abandons the leaky-bucket trickle and claims at full capacity (→ OR).
+    /// Sub-linear, so longer windows get a proportionally smaller ramp.
+    /// Default: 0.56 (anchors: 1h→~10min, 24h→~59min).
+    #[serde(default = "default_claim_ramp_exponent")]
+    pub claim_ramp_exponent: f64,
 
-    /// Half-life (milliseconds) of the per-user decaying recent-claim score
-    /// that relaxes `D_eff` for sustained consumers. Default: 120_000.
-    #[serde(default = "default_recent_claims_halflife_ms")]
-    pub recent_claims_halflife_ms: u64,
-
-    /// Curve constant `k` for the saturating relaxation `g(score) = score /
-    /// (score + k)` used in `D_eff`. Larger `k` => a user must consume more
-    /// recent resource before their deadline relaxes. Default: 4.0.
-    ///
-    /// Must be strictly positive: `claim_requests` clamps it to
-    /// `f64::MIN_POSITIVE` before use so a misconfigured `0` (or negative/NaN)
-    /// can't make the denominator `score + k` zero and turn `g(score)` into
-    /// `0/0 = NaN`, which would corrupt the `D_eff` timestamp arithmetic.
-    #[serde(default = "default_recent_claims_curve_k")]
-    pub recent_claims_curve_k: f64,
+    /// Leaky-bucket refills per completion window for a not-live model:
+    /// `leak_interval = W / leaks_per_window`. Larger => faster trickle to
+    /// OpenRouter while a model is not live. Default: 60.0 (1h window → 1
+    /// token/min, 24h window → 1 token/24min).
+    #[serde(default = "default_leaks_per_window")]
+    pub leaks_per_window: f64,
 
     /// Number of most-recent `model_filters` events to ALWAYS retain per model
     /// when the purge task trims the append-only log. Must be >= 1 so the
-    /// current-state lookup never loses a model. The extra history feeds
-    /// `model_load_estimate`. Default: 50.
+    /// current-state lookup (latest event per model) never loses a model. Extra
+    /// history is kept for the controller / observability. Default: 50.
     #[serde(default = "default_model_filters_keep_per_model")]
     pub model_filters_keep_per_model: i64,
 
@@ -310,20 +304,20 @@ fn default_batch_metadata_fields() -> Vec<String> {
     ]
 }
 
-fn default_flex_expiry_ms() -> u64 {
-    3_600_000 // 1 hour
+fn default_service_tier_completion_windows_ms() -> HashMap<String, u64> {
+    HashMap::from([("flex".to_string(), 3_600_000)]) // flex → 1 hour
 }
 
-fn default_min_async_ttft_ms() -> u64 {
-    60_000 // 1 minute
+fn default_completion_window_ms() -> u64 {
+    86_400_000 // 24 hours
 }
 
-fn default_recent_claims_halflife_ms() -> u64 {
-    120_000 // 2 minutes
+fn default_claim_ramp_exponent() -> f64 {
+    0.56
 }
 
-fn default_recent_claims_curve_k() -> f64 {
-    4.0
+fn default_leaks_per_window() -> f64 {
+    60.0
 }
 
 fn default_model_filters_keep_per_model() -> i64 {
@@ -365,11 +359,10 @@ impl Default for DaemonConfig {
             throughput_log_interval_ms: Some(60_000), // Log per-user throughput every minute
             streamable_endpoints: Vec::new(),
             urgency_weight: 0.0,
-            flex_expiry_ms: default_flex_expiry_ms(),
-            min_async_ttft_ms: default_min_async_ttft_ms(),
-            serve_margin_ms: 0,
-            recent_claims_halflife_ms: default_recent_claims_halflife_ms(),
-            recent_claims_curve_k: default_recent_claims_curve_k(),
+            service_tier_completion_windows_ms: default_service_tier_completion_windows_ms(),
+            default_completion_window_ms: default_completion_window_ms(),
+            claim_ramp_exponent: default_claim_ramp_exponent(),
+            leaks_per_window: default_leaks_per_window(),
             model_filters_keep_per_model: default_model_filters_keep_per_model(),
             model_filters_retention_ms: default_model_filters_retention_ms(),
         }
@@ -405,13 +398,14 @@ where
     /// Per-user in-flight request counts across all models, used to prioritise
     /// users with fewer active requests during claim (per-user fair scheduling).
     user_requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
-    /// Per-user decaying recent-CLAIM score, feeding the async model-filters
-    /// effective deadline `D_eff`. Each entry is `(score, last_update)`;
-    /// incremented at claim time (decay-then-add) and decayed-on-read when
-    /// snapshotted. Keys off resource consumed, not backlog, so a large batch
-    /// and a few sequential requests relax identically. See
-    /// `recent_claims_halflife_ms` / `recent_claims_curve_k`.
-    user_recent_claims: Arc<dashmap::DashMap<String, (f64, std::time::Instant)>>,
+    /// Per-`(user, window-class)` leaky-bucket state for not-live models. Each
+    /// entry's value is `next_token_at`: the earliest `Instant` the bucket may
+    /// leak its next request. Before a claim cycle the daemon derives the
+    /// cooldown set (pairs with `next_token_at > now`) and passes it to
+    /// `claim_requests`; after a claim it stamps `next_token_at = now + W /
+    /// leaks_per_window` for each leaked row's pair. Stale entries are pruned on
+    /// read to bound the map. See `leaks_per_window`.
+    leak_buckets: Arc<dashmap::DashMap<(String, String), std::time::Instant>>,
     /// Per-user throughput counters for periodic OTel emission.
     user_throughput: Arc<dashmap::DashMap<String, UserThroughputStats>>,
     requests_processed: Arc<AtomicU64>,
@@ -446,7 +440,7 @@ where
             processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
             user_requests_in_flight: Arc::new(dashmap::DashMap::new()),
-            user_recent_claims: Arc::new(dashmap::DashMap::new()),
+            leak_buckets: Arc::new(dashmap::DashMap::new()),
             user_throughput: Arc::new(dashmap::DashMap::new()),
             requests_processed: Arc::new(AtomicU64::new(0)),
             requests_failed: Arc::new(AtomicU64::new(0)),
@@ -894,38 +888,30 @@ where
                 })
                 .collect();
 
-            // Snapshot per-user decaying recent-claim scores for the async
-            // model-filters D_eff relaxation. Decay-on-read to `now`, drop
-            // entries that have decayed below ε (keeps the map bounded — no
-            // periodic task needed). Score units are "recent claims" with the
-            // configured half-life.
-            let recent_now = std::time::Instant::now();
-            let recent_halflife_secs =
-                (self.config.recent_claims_halflife_ms as f64 / 1000.0).max(f64::MIN_POSITIVE);
-            const RECENT_CLAIMS_EPSILON: f64 = 0.01;
-            let mut decayed_user_ids: Vec<String> = Vec::new();
-            let user_recent_claims: HashMap<String, f64> = self
-                .user_recent_claims
+            // Derive the leaky-bucket cooldown set: `(user, window-class)` pairs
+            // whose bucket has not yet refilled (`next_token_at` in the future).
+            // Source B in the claim query skips these, so each pair leaks ≤ 1
+            // request per `leak_interval`. Prune refilled buckets (next_token_at
+            // already passed) on read to keep the map bounded — a refilled
+            // bucket carries no state until it leaks again.
+            let cooldown_now = std::time::Instant::now();
+            let mut refilled_buckets: Vec<(String, String)> = Vec::new();
+            let leak_cooldown: std::collections::HashSet<(String, String)> = self
+                .leak_buckets
                 .iter()
                 .filter_map(|entry| {
-                    let (score, last) = *entry.value();
-                    let dt = recent_now.saturating_duration_since(last).as_secs_f64();
-                    let decayed = score * 0.5f64.powf(dt / recent_halflife_secs);
-                    if decayed >= RECENT_CLAIMS_EPSILON {
-                        Some((entry.key().clone(), decayed))
+                    if *entry.value() > cooldown_now {
+                        Some(entry.key().clone())
                     } else {
-                        decayed_user_ids.push(entry.key().clone());
+                        refilled_buckets.push(entry.key().clone());
                         None
                     }
                 })
                 .collect();
-            // Prune fully-decayed entries to keep the map bounded.
-            for user_id in decayed_user_ids {
-                self.user_recent_claims
-                    .remove_if(&user_id, |_, (score, last)| {
-                        let dt = recent_now.saturating_duration_since(*last).as_secs_f64();
-                        *score * 0.5f64.powf(dt / recent_halflife_secs) < RECENT_CLAIMS_EPSILON
-                    });
+            // Prune refilled buckets to keep the map bounded.
+            for key in refilled_buckets {
+                self.leak_buckets
+                    .remove_if(&key, |_, next_token_at| *next_token_at <= cooldown_now);
             }
 
             // Claim a batch of pending requests (guaranteed ≤ available capacity per model)
@@ -937,7 +923,7 @@ where
                     self.daemon_id,
                     &available_capacity,
                     &user_active_counts,
-                    &user_recent_claims,
+                    &leak_cooldown,
                 )
                 .await?;
             histogram!("fusillade_claim_duration_seconds")
@@ -950,6 +936,34 @@ where
                 claimed_count = claimed.len(),
                 "Claimed requests from storage"
             );
+
+            // Stamp the leaky bucket for each row claimed via Source B. A leaked
+            // row consumes its `(user, window-class)` token: the bucket may not
+            // leak again until `now + W / leaks_per_window`, which the next
+            // cycle reads back as cooldown. Source A (full-capacity) claims have
+            // `leak == None` and consume no token.
+            {
+                let stamp_now = std::time::Instant::now();
+                let leaks_per_window = self.config.leaks_per_window.max(f64::MIN_POSITIVE);
+                let mut leaked_count = 0u64;
+                for request in &claimed {
+                    if let Some(stamp) = &request.state.leak {
+                        let interval = std::time::Duration::from_secs_f64(
+                            (stamp.window_secs / leaks_per_window).max(0.0),
+                        );
+                        let key = (request.data.created_by.clone(), stamp.window_class.clone());
+                        self.leak_buckets.insert(key, stamp_now + interval);
+                        leaked_count += 1;
+                    }
+                }
+                if leaked_count > 0 {
+                    counter!("fusillade_leaky_bucket_leaks_total").increment(leaked_count);
+                    tracing::debug!(
+                        leaked_count,
+                        "Stamped leaky-bucket tokens for leaked claims"
+                    );
+                }
+            }
 
             // Route requests to escalated models if time is running low
             // This replaces the old SLA racing system with a simpler approach:
@@ -1098,27 +1112,6 @@ where
                         .fetch_add(1, Ordering::Relaxed);
                     gauge!("fusillade_user_requests_in_flight", "user" => user_id.clone(), "completion_window" => completion_window.clone())
                         .increment(1.0);
-
-                    // Bump the per-user decaying recent-claim score (resource
-                    // consumed) at the same site as the in-flight counter:
-                    // decay-then-add so the score reflects recent claim volume
-                    // for the async model-filters D_eff relaxation.
-                    {
-                        let now = std::time::Instant::now();
-                        let halflife_secs = (self.config.recent_claims_halflife_ms as f64 / 1000.0)
-                            .max(f64::MIN_POSITIVE);
-                        // `entry` holds the shard write lock across both the decay
-                        // (and_modify) and the insert, so the read-modify-write is
-                        // atomic — no other thread can observe an interleaved state.
-                        self.user_recent_claims
-                            .entry(user_id.clone())
-                            .and_modify(|(score, last)| {
-                                let dt = now.saturating_duration_since(*last).as_secs_f64();
-                                *score = *score * 0.5f64.powf(dt / halflife_secs) + 1.0;
-                                *last = now;
-                            })
-                            .or_insert((1.0, now));
-                    }
 
                     let process_span = tracing::info_span!(
                         parent: tracing::Span::none(),
@@ -1436,11 +1429,10 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
-            min_async_ttft_ms: 60_000,
-            serve_margin_ms: 0,
-            recent_claims_halflife_ms: 120_000,
-            recent_claims_curve_k: 4.0,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
             model_filters_keep_per_model: 50,
             model_filters_retention_ms: 604_800_000,
         };
@@ -1624,11 +1616,10 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
-            min_async_ttft_ms: 60_000,
-            serve_margin_ms: 0,
-            recent_claims_halflife_ms: 120_000,
-            recent_claims_curve_k: 4.0,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
             model_filters_keep_per_model: 50,
             model_filters_retention_ms: 604_800_000,
         };
@@ -1874,11 +1865,10 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
-            min_async_ttft_ms: 60_000,
-            serve_margin_ms: 0,
-            recent_claims_halflife_ms: 120_000,
-            recent_claims_curve_k: 4.0,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
             model_filters_keep_per_model: 50,
             model_filters_retention_ms: 604_800_000,
         };
@@ -2029,11 +2019,10 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
-            min_async_ttft_ms: 60_000,
-            serve_margin_ms: 0,
-            recent_claims_halflife_ms: 120_000,
-            recent_claims_curve_k: 4.0,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
             model_filters_keep_per_model: 50,
             model_filters_retention_ms: 604_800_000,
         };
@@ -2223,11 +2212,10 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
-            min_async_ttft_ms: 60_000,
-            serve_margin_ms: 0,
-            recent_claims_halflife_ms: 120_000,
-            recent_claims_curve_k: 4.0,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
             model_filters_keep_per_model: 50,
             model_filters_retention_ms: 604_800_000,
         };
@@ -2401,11 +2389,10 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
-            min_async_ttft_ms: 60_000,
-            serve_margin_ms: 0,
-            recent_claims_halflife_ms: 120_000,
-            recent_claims_curve_k: 4.0,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
             model_filters_keep_per_model: 50,
             model_filters_retention_ms: 604_800_000,
         };
@@ -2584,11 +2571,10 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
-            min_async_ttft_ms: 60_000,
-            serve_margin_ms: 0,
-            recent_claims_halflife_ms: 120_000,
-            recent_claims_curve_k: 4.0,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
             model_filters_keep_per_model: 50,
             model_filters_retention_ms: 604_800_000,
         };
@@ -2762,11 +2748,10 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
-            min_async_ttft_ms: 60_000,
-            serve_margin_ms: 0,
-            recent_claims_halflife_ms: 120_000,
-            recent_claims_curve_k: 4.0,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
             model_filters_keep_per_model: 50,
             model_filters_retention_ms: 604_800_000,
         };
@@ -2923,11 +2908,10 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
-            min_async_ttft_ms: 60_000,
-            serve_margin_ms: 0,
-            recent_claims_halflife_ms: 120_000,
-            recent_claims_curve_k: 4.0,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
             model_filters_keep_per_model: 50,
             model_filters_retention_ms: 604_800_000,
         };
@@ -3065,11 +3049,10 @@ mod tests {
             streamable_endpoints: Vec::new(),
             throughput_log_interval_ms: None,
             urgency_weight: 0.0,
-            flex_expiry_ms: 3_600_000,
-            min_async_ttft_ms: 60_000,
-            serve_margin_ms: 0,
-            recent_claims_halflife_ms: 120_000,
-            recent_claims_curve_k: 4.0,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
             model_filters_keep_per_model: 50,
             model_filters_retention_ms: 604_800_000,
         };

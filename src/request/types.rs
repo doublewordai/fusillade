@@ -134,6 +134,21 @@ pub struct Pending {
 
 impl RequestState for Pending {}
 
+/// Leaky-bucket stamp for a request claimed via Source B (the not-live,
+/// before-ramp trickle). Carried on [`Claimed`] as `Some` iff the row was
+/// leaked; the daemon stamps `next_token_at = now + window_secs /
+/// leaks_per_window` for the `(created_by, window_class)` bucket. `None` for
+/// full-capacity (Source A) claims, which consume no token.
+#[derive(Debug, Clone, Serialize)]
+pub struct LeakStamp {
+    /// The bucket's window-class (a batch's `completion_window`, or a batchless
+    /// row's `service_tier` defaulting to `'default'`).
+    pub window_class: String,
+    /// The request's completion-window length in seconds (`W`); the daemon
+    /// divides it by `leaks_per_window` to get the leak interval.
+    pub window_secs: f64,
+}
+
 /// Request has been claimed by a daemon but not yet actively executing.
 ///
 /// This intermediate state helps track which daemon is responsible for
@@ -146,6 +161,10 @@ pub struct Claimed {
     pub retry_attempt: u32,
     /// When the batch expires (carried over from Pending)
     pub batch_expires_at: DateTime<Utc>,
+    /// Set iff this row was claimed via the leaky bucket (Source B); tells the
+    /// daemon which `(user, window-class)` bucket to stamp. `None` for
+    /// full-capacity claims.
+    pub leak: Option<LeakStamp>,
 }
 
 impl RequestState for Claimed {}

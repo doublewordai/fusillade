@@ -354,11 +354,12 @@ pub trait Storage: Send + Sync {
     /// boundary.
     ///
     /// A request's deadline is its batch's `expires_at`. Batchless rows
-    /// (flex/async responses, `batch_id IS NULL`) have no batch expiry, so
-    /// their deadline is synthesized as `created_at + flex_expiry_ms`
-    /// (`DaemonConfig.flex_expiry_ms`, 1h by default) — the same effective
-    /// deadline the claim path uses, so reported queue depth matches what
-    /// the daemon will claim.
+    /// (flex/async responses, `batch_id IS NULL`) have no batch expiry, so their
+    /// deadline is synthesized as `created_at + W`, where `W` is mapped from the
+    /// row's `service_tier` via `DaemonConfig.service_tier_completion_windows_ms`
+    /// (`'flex'` → 1h by default, NULL/unmapped → `default_completion_window_ms`,
+    /// 24h) — the same window the claim path uses, so reported queue depth
+    /// matches what the daemon will claim.
     ///
     /// `start_secs` is optional. When `None`, the lower bound is unbounded
     /// (the query matches every request with a deadline strictly before
@@ -470,22 +471,30 @@ pub trait Storage: Send + Sync {
     /// proximity) via `DaemonConfig::urgency_weight`. See the PostgreSQL
     /// implementation for the composite scoring formula.
     ///
-    /// `user_recent_claims` maps user identifiers to a decaying per-user
-    /// recent-CLAIM score (resource consumed, not backlog). It feeds the
-    /// effective deadline `D_eff` used by the async model-filters hold/release
-    /// gate: idle users get a tight `D_eff` (served fast / released to
-    /// OpenRouter), sustained consumers get a relaxed `D_eff` (work held for
-    /// imminent internal capacity). Pass an empty map to disable the relaxation
-    /// (every user is treated as idle). The gate consults the latest
-    /// `model_filters` event per model; with an empty `model_filters` table the
-    /// gate is a no-op (everything claimable).
+    /// The claim gate consults the latest `model_filters` event per model:
+    /// `state = 'live'` **or no events at all** ⇒ claim at full capacity (a
+    /// model with no events is unmanaged by the controller, so there is no
+    /// internal capacity to wait for — it flows straight through to OpenRouter).
+    /// An EXPLICIT not-live event (`coming`/`absent`) ⇒ the request is either
+    /// claimed at full capacity (→ OpenRouter) when within `ramp(W)` of its
+    /// completion-window deadline, or otherwise released only via the
+    /// per-`(user, window-class)` leaky bucket. So with an empty `model_filters`
+    /// table the gate is a no-op (everything claims at full capacity) — it only
+    /// engages once the controller starts writing not-live events.
+    ///
+    /// `leak_cooldown` is the set of `(user, window-class)` pairs whose leaky
+    /// bucket has no token this cycle (the daemon stamped `next_token_at` in
+    /// the future after a recent leak). Source B skips these pairs, claiming
+    /// ≤ 1 per `(user, window-class)` not in cooldown. Pass an empty set to
+    /// allow every bucket its first token. Claimed rows carry a `leaked` flag
+    /// (via the returned request) so the daemon knows which buckets to stamp.
     async fn claim_requests(
         &self,
         limit: usize,
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
-        user_recent_claims: &std::collections::HashMap<String, f64>,
+        leak_cooldown: &std::collections::HashSet<(String, String)>,
     ) -> Result<Vec<Request<Claimed>>>;
 
     /// Append a single event to the `model_filters` log. Used by the controller
@@ -508,14 +517,6 @@ pub trait Storage: Send + Sync {
     /// excluding models whose latest event is an `Absent` tombstone
     /// (observability / tests).
     async fn list_model_filters(&self) -> Result<Vec<ModelFilter>>;
-
-    /// Estimate how long a model takes to load on internal infrastructure, by
-    /// pairing each `coming` event with the next `live` event for that model in
-    /// the log and computing an exponentially-weighted moving average (EWMA)
-    /// over recent samples (newest-weighted). Returns `None` if no
-    /// `coming -> live` transition has ever been observed. The controller calls this
-    /// to set future `expected_ready_at` ETAs.
-    async fn model_load_estimate(&self, model: &str) -> Result<Option<chrono::Duration>>;
 
     /// Update an existing request's state in storage.
     ///
