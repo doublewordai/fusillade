@@ -1,5 +1,12 @@
 # Changelog
 
+## [18.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v18.0.0...fusillade-v18.0.1) (2026-06-16)
+
+
+### Performance Improvements
+
+* add partial index for the claim query's batchless arms ([#288](https://github.com/doublewordai/fusillade/issues/288)) ([877deee](https://github.com/doublewordai/fusillade/commit/877deee44f227ef8477611e1cf54443614255bea))
+
 ## [18.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v17.3.1...fusillade-v18.0.0) (2026-06-15)
 
 
