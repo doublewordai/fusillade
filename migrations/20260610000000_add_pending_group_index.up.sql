@@ -12,6 +12,15 @@
 -- the batchless (batch_id IS NULL) per-model scan. Batch enumeration itself
 -- (the loose index scan over distinct batch_ids) uses the existing
 -- idx_requests_pending (model, batch_id).
-CREATE INDEX idx_requests_pending_claim_pull
+--
+-- On large production tables this build takes minutes and (non-concurrently)
+-- holds ACCESS EXCLUSIVE for the duration, which can outlast a startup probe
+-- and crash-loop the deploy. Create it CONCURRENTLY before deploying so the
+-- IF NOT EXISTS below becomes a no-op:
+--
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_requests_pending_claim_pull
+--   ON requests (model, batch_id, created_at)
+--   WHERE state = 'pending' AND template_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_requests_pending_claim_pull
     ON requests (model, batch_id, created_at)
     WHERE state = 'pending' AND template_id IS NOT NULL;
