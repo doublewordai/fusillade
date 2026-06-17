@@ -1,5 +1,12 @@
 # Changelog
 
+## [18.0.2](https://github.com/doublewordai/fusillade/compare/fusillade-v18.0.1...fusillade-v18.0.2) (2026-06-17)
+
+
+### Bug Fixes
+
+* make populate_batch idempotent to prevent duplicate batch requests ([#280](https://github.com/doublewordai/fusillade/issues/280)) ([ba84193](https://github.com/doublewordai/fusillade/commit/ba8419355e06bb64d81dfb535dba1b6c72edec30))
+
 ## [18.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v18.0.0...fusillade-v18.0.1) (2026-06-16)
 
 
