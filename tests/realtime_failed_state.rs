@@ -13,8 +13,8 @@
 
 use fusillade::manager::Storage;
 use fusillade::{
-    CreateRealtimeInput, MockHttpClient, PersistCompletedRealtimeInput, PostgresRequestManager,
-    TestDbPools,
+    CreateRealtimeInput, FailureReason, MockHttpClient, PersistCompletedRealtimeInput,
+    PostgresRequestManager, TestDbPools,
 };
 use sqlx::Row;
 use std::sync::Arc;
@@ -90,6 +90,25 @@ async fn fetch_terminal(pool: &sqlx::PgPool, id: Uuid) -> TerminalRow {
     }
 }
 
+/// Assert the `error` column holds a `FailureReason::NonRetriableHttpStatus`
+/// carrying the given status and body. Parses the envelope structurally rather
+/// than substring-matching the serialized JSON.
+fn assert_http_failure(error: Option<String>, status: u16, body: &str) {
+    let raw = error.expect("failed row must carry error (failed_fields_check)");
+    let reason: FailureReason =
+        serde_json::from_str(&raw).expect("error must deserialize as FailureReason");
+    match reason {
+        FailureReason::NonRetriableHttpStatus {
+            status: got_status,
+            body: got_body,
+        } => {
+            assert_eq!(got_status, status);
+            assert_eq!(got_body, body);
+        }
+        other => panic!("expected NonRetriableHttpStatus, got {other:?}"),
+    }
+}
+
 /// UPDATE branch: a row already exists in `processing` (create_realtime ran
 /// inline before a 202), and a non-2xx completion comes back.
 #[sqlx::test]
@@ -106,17 +125,17 @@ async fn persist_realtime_non_2xx_marks_failed_update_path(pool: sqlx::PgPool) {
     let row = fetch_terminal(&pool, id).await;
     assert_eq!(row.state, "failed");
     assert!(row.has_failed_at, "failed row must set failed_at");
-    assert!(!row.has_completed_at, "failed row must not set completed_at");
+    assert!(
+        !row.has_completed_at,
+        "failed row must not set completed_at"
+    );
     assert_eq!(row.response_status, Some(402), "response_status preserved");
     assert_eq!(
         row.response_body.as_deref(),
         Some(body),
         "response_body preserved for the dashboard filter"
     );
-    let error = row.error.expect("failed row must carry error (failed_fields_check)");
-    assert!(error.contains("NonRetriableHttpStatus"), "error is the FailureReason envelope: {error}");
-    assert!(error.contains("402"), "envelope carries the status: {error}");
-    assert!(error.contains("Account balance too low"), "envelope carries the body: {error}");
+    assert_http_failure(row.error, 402, body);
 }
 
 /// INSERT branch: non-background realtime, no row exists yet, so the row is
@@ -126,7 +145,8 @@ async fn persist_realtime_non_2xx_marks_failed_insert_path(pool: sqlx::PgPool) {
     let m = manager(pool.clone()).await;
     let id = Uuid::new_v4();
 
-    let body = r#"{"error":{"code":"service_unavailable","message":"An internal error occurred."}}"#;
+    let body =
+        r#"{"error":{"code":"service_unavailable","message":"An internal error occurred."}}"#;
     m.persist_completed_realtime_batch(&[realtime_input(id, 503, body)])
         .await
         .expect("persist should succeed");
@@ -137,8 +157,7 @@ async fn persist_realtime_non_2xx_marks_failed_insert_path(pool: sqlx::PgPool) {
     assert!(!row.has_completed_at);
     assert_eq!(row.response_status, Some(503));
     assert_eq!(row.response_body.as_deref(), Some(body));
-    let error = row.error.expect("failed row must carry error");
-    assert!(error.contains("NonRetriableHttpStatus") && error.contains("503"));
+    assert_http_failure(row.error, 503, body);
 }
 
 /// Happy path: a 2xx completion still lands in `completed` with no error.
