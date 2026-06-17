@@ -2999,15 +2999,36 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
             })?;
 
+        // Serialize population of the same batch. underway delivers the
+        // create-batch job at-least-once: the task can be reclaimed on
+        // heartbeat expiry and its step re-run, and (since the job sets no
+        // concurrency key) a batch can in principle be enqueued twice. This
+        // transaction-scoped advisory lock — auto-released on commit/rollback —
+        // lets only one populate run at a time *per batch* (different batches
+        // hash to different keys and never contend), so the idempotency guard
+        // below observes a committed prior population rather than racing it. It
+        // is a lightweight advisory lock on a hashed id, not a lock on the
+        // requests table, so it cannot block request writes.
+        sqlx::query!(
+            "SELECT pg_advisory_xact_lock(hashtextextended('fusillade.populate_batch:' || $1::text, 0))",
+            *batch_id as Uuid,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to acquire populate lock: {}", e)))?;
+
         // Bail out if the batch (or its source file) has been cancelled or
         // deleted in the window since the batch was created — otherwise the
         // INSERT below can FK-violate against templates the purger has
-        // already removed.
+        // already removed. `requests_started_at` is read here too, to drive the
+        // idempotency guard below; both come from the batches table (one row by
+        // PK), so this does not touch the requests table.
         let row = sqlx::query!(
             r#"
             SELECT
                 b.completion_window,
                 b.cancelling_at,
+                b.requests_started_at,
                 b.deleted_at AS batch_deleted_at,
                 (SELECT deleted_at FROM files WHERE id = $2) AS file_deleted_at
             FROM batches b
@@ -3019,6 +3040,27 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch state: {}", e)))?;
+
+        // Idempotency: if this batch was already populated, do nothing.
+        // `requests_started_at` is set in the *same transaction* as the INSERT
+        // below, so a committed prior attempt makes it non-NULL while a failed
+        // attempt rolls it back to NULL. This is exactly what distinguishes a
+        // correct retry (prior attempt failed and rolled back → repopulate)
+        // from a duplicate run (prior attempt committed but the at-least-once
+        // job was re-delivered → skip). Without it, the re-delivered job re-runs
+        // the unconditional INSERT and duplicates every request while
+        // total_requests keeps the first run's value, wedging the batch in
+        // "finalizing" forever (terminal_count can never equal total_requests).
+        if row.requests_started_at.is_some() {
+            tx.commit().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e))
+            })?;
+            tracing::info!(
+                batch_id = %batch_id,
+                "Batch already populated; skipping population (idempotent no-op)"
+            );
+            return Ok(());
+        }
 
         if row.batch_deleted_at.is_some() {
             // Deleted before population could run - nothing to populate. The delete
@@ -6990,6 +7032,46 @@ mod tests {
             .populate_batch(batch_id, file_id)
             .await
             .expect("populate_batch is a no-op after batch deleted");
+    }
+
+    // Regression test: underway delivers the create-batch job at-least-once, so
+    // a successful populate can be re-delivered (heartbeat-expiry reclaim, or a
+    // double enqueue since the job sets no concurrency key). Re-running populate
+    // must be a no-op, not a second full insert — otherwise the batch ends up
+    // with 2x request rows while total_requests keeps the first run's value,
+    // wedging it in "finalizing" forever (terminal_count never == total).
+    #[sqlx::test]
+    async fn test_populate_batch_is_idempotent(pool: sqlx::PgPool) {
+        let (manager, file_id, batch_id) = populate_guard_setup(pool).await;
+
+        // First population succeeds and snapshots the single template.
+        manager.populate_batch(batch_id, file_id).await.unwrap();
+        let after_first = manager.get_batch(batch_id).await.unwrap();
+        assert_eq!(
+            after_first.total_requests, 1,
+            "first populate should snapshot the one template"
+        );
+        assert_eq!(
+            manager.get_batch_requests(batch_id).await.unwrap().len(),
+            1,
+            "first populate should create exactly one request row"
+        );
+
+        // Re-delivery of the same job must not duplicate the requests.
+        manager.populate_batch(batch_id, file_id).await.expect(
+            "re-running populate_batch on an already-populated batch should succeed as a no-op",
+        );
+
+        let after_second = manager.get_batch(batch_id).await.unwrap();
+        assert_eq!(
+            after_second.total_requests, 1,
+            "re-population must not change total_requests"
+        );
+        assert_eq!(
+            manager.get_batch_requests(batch_id).await.unwrap().len(),
+            1,
+            "re-population must not create duplicate request rows"
+        );
     }
 
     // =========================================================================
