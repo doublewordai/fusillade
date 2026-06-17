@@ -4590,7 +4590,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 )
             }))
         };
-        let errors: Vec<Option<String>> = records.iter().map(|r| to_failure_error(r)).collect();
+        let errors: Vec<Option<String>> = records.iter().map(&to_failure_error).collect();
 
         // Scope the UPDATE to realtime rows only: `service_tier = 'priority'`
         // and `batch_id IS NULL` together uniquely identify rows that
