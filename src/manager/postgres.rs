@@ -951,7 +951,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 FROM active_request_counts arc
                 JOIN batches b ON arc.batch_id = b.id
                 CROSS JOIN windows w
+                -- Only count rows the daemon can actually claim. This MUST stay in
+                -- sync with the batch eligibility filter in `claim_requests`
+                -- (`ranked_batches`): excluding only `cancelling_at` here while the
+                -- claim path also excludes terminal batches lets a `pending` row
+                -- stranded under an already-completed batch (e.g. a retry that
+                -- raced batch finalization) be reported as claimable forever while
+                -- never actually being claimed.
                 WHERE b.cancelling_at IS NULL
+                  AND b.deleted_at IS NULL
+                  AND b.completed_at IS NULL
+                  AND b.failed_at IS NULL
+                  AND b.cancelled_at IS NULL
                 -- Row-level upper bound: a row that expires after every window's
                 -- end can't contribute to any window's COUNT FILTER, so prune it
                 -- here. Without this, the join reads every active+templated
@@ -1931,6 +1942,48 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "Failed to persist request state after {} attempts",
             MAX_ATTEMPTS
         )))
+    }
+
+    async fn reschedule_for_retry(
+        &self,
+        request_id: RequestId,
+        owner: DaemonId,
+        retry_attempt: u32,
+        not_before: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        // Fenced retry: only re-pend the row if it is still the in-flight claim
+        // held by `owner`. The `state = 'processing' AND daemon_id = $2` guard is
+        // what distinguishes this from the manual retry path (which uses persist()
+        // to intentionally move a terminal `failed` row back to pending). If
+        // another writer has already terminalized this row — and a finalizer has
+        // sealed the parent batch off the back of that — a late retry here would
+        // otherwise orphan a `pending` row under a completed batch.
+        let rows_affected = sqlx::query!(
+            r#"
+            UPDATE requests SET
+                state = 'pending',
+                retry_attempt = $3,
+                not_before = $4,
+                daemon_id = NULL,
+                claimed_at = NULL,
+                started_at = NULL
+            WHERE id = $1
+              AND state = 'processing'
+              AND daemon_id = $2
+            "#,
+            *request_id as Uuid,
+            *owner as Uuid,
+            retry_attempt as i32,
+            not_before,
+        )
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to reschedule request for retry: {}", e))
+        })?
+        .rows_affected();
+
+        Ok(rows_affected > 0)
     }
 
     #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]
@@ -7150,6 +7203,258 @@ mod tests {
         assert_eq!(status.total_requests, 5);
         assert_eq!(status.pending_requests, 0);
         assert_eq!(status.in_progress_requests, 5); // All claimed
+    }
+
+    /// Helper: stand up a manager with a single-request batch, claim it for
+    /// `daemon_id`, and move the row into `processing` (the precondition the
+    /// daemon's fenced retry reschedule runs from).
+    async fn setup_processing_request(
+        pool: &sqlx::PgPool,
+        daemon_id: DaemonId,
+    ) -> (
+        PostgresRequestManager<TestDbPools, MockHttpClient>,
+        RequestId,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        let file_id = manager
+            .create_file(
+                "retry-fence-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"n":0}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        let capacity = HashMap::from([("test".to_string(), 10)]);
+        let claimed = manager
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .expect("claim failed");
+        assert_eq!(claimed.len(), 1);
+        let request_id = claimed[0].data.id;
+
+        // Advance claimed -> processing, keeping the same owner. This mirrors the
+        // daemon's claimed->processing transition without spawning HTTP work.
+        sqlx::query("UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1")
+            .bind(*request_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        (manager, request_id)
+    }
+
+    async fn read_request_row(pool: &sqlx::PgPool, request_id: RequestId) -> (String, i32) {
+        sqlx::query_as::<_, (String, i32)>(
+            "SELECT state, retry_attempt FROM requests WHERE id = $1",
+        )
+        .bind(*request_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Happy path: the owning daemon reschedules its own in-flight request.
+    #[sqlx::test]
+    async fn test_reschedule_for_retry_owner_succeeds(pool: sqlx::PgPool) {
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let (manager, request_id) = setup_processing_request(&pool, daemon_id).await;
+
+        let not_before = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let rescheduled = manager
+            .reschedule_for_retry(request_id, daemon_id, 1, Some(not_before))
+            .await
+            .unwrap();
+
+        assert!(
+            rescheduled,
+            "owner should reschedule its own processing row"
+        );
+        let (state, retry) = read_request_row(&pool, request_id).await;
+        assert_eq!(state, "pending");
+        assert_eq!(retry, 1);
+    }
+
+    /// Regression: a late retry must NOT resurrect a row another writer has
+    /// already terminalized. This is the finalize-then-resurrect race that
+    /// stranded `pending` requests under completed batches.
+    #[sqlx::test]
+    async fn test_reschedule_for_retry_does_not_resurrect_terminal(pool: sqlx::PgPool) {
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let (manager, request_id) = setup_processing_request(&pool, daemon_id).await;
+
+        // Another writer (zombie/duplicate worker) terminalizes the row first.
+        sqlx::query(
+            "UPDATE requests SET state = 'failed', failed_at = NOW(), error = 'terminal', daemon_id = NULL WHERE id = $1",
+        )
+        .bind(*request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let not_before = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let rescheduled = manager
+            .reschedule_for_retry(request_id, daemon_id, 1, Some(not_before))
+            .await
+            .unwrap();
+
+        assert!(!rescheduled, "must not reschedule a terminalized row");
+        let (state, _) = read_request_row(&pool, request_id).await;
+        assert_eq!(
+            state, "failed",
+            "row must stay terminal, not resurrect to pending"
+        );
+    }
+
+    /// A daemon that no longer owns the row (it was reclaimed and re-claimed
+    /// elsewhere) must not be able to reschedule it.
+    #[sqlx::test]
+    async fn test_reschedule_for_retry_wrong_owner_skips(pool: sqlx::PgPool) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let (manager, request_id) = setup_processing_request(&pool, owner).await;
+
+        let other = DaemonId::from(Uuid::new_v4());
+        let rescheduled = manager
+            .reschedule_for_retry(request_id, other, 1, None)
+            .await
+            .unwrap();
+
+        assert!(!rescheduled, "non-owning daemon must not reschedule");
+        let (state, _) = read_request_row(&pool, request_id).await;
+        assert_eq!(
+            state, "processing",
+            "row must remain the owner's in-flight claim"
+        );
+    }
+
+    /// Regression: pending requests stranded under a terminal (completed) batch
+    /// must not be reported as claimable. `get_pending_request_counts_*` has to
+    /// exclude the same terminal batches `claim_requests` excludes, otherwise the
+    /// count reports undrainable phantom queue depth forever.
+    #[sqlx::test]
+    async fn test_pending_counts_exclude_terminal_batches(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        let file_id = manager
+            .create_file(
+                "terminal-count-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"n":0}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        sqlx::query!(
+            "UPDATE batches SET expires_at = $1 WHERE id = $2",
+            now + chrono::Duration::minutes(30),
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let windows = vec![("1h".to_string(), None, 3600)];
+        let states = vec!["pending".to_string()];
+        let model_filter: Vec<String> = vec![];
+
+        // Control: an active batch's pending request is counted.
+        let before = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*before.get("test").unwrap().get("1h").unwrap(), 1);
+
+        // Strand the pending request: the batch gets finalized as completed
+        // while a child is still pending (the finalize-then-resurrect race).
+        sqlx::query!(
+            "UPDATE batches SET finalizing_at = $1, completed_at = $1 WHERE id = $2",
+            now,
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The orphan must no longer be counted as claimable.
+        let after = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after
+                .get("test")
+                .and_then(|m| m.get("1h"))
+                .copied()
+                .unwrap_or(0),
+            0,
+            "pending request under a completed batch must not be counted"
+        );
     }
 
     #[sqlx::test]
