@@ -1,5 +1,12 @@
 # Changelog
 
+## [18.0.3](https://github.com/doublewordai/fusillade/compare/fusillade-v18.0.2...fusillade-v18.0.3) (2026-06-18)
+
+
+### Performance Improvements
+
+* **db:** tighten autovacuum/autoanalyze on requests and batches ([#290](https://github.com/doublewordai/fusillade/issues/290)) ([d0877e3](https://github.com/doublewordai/fusillade/commit/d0877e3a8f4773dee35c75fbe958e90745743cdc))
+
 ## [18.0.2](https://github.com/doublewordai/fusillade/compare/fusillade-v18.0.1...fusillade-v18.0.2) (2026-06-17)
 
 
