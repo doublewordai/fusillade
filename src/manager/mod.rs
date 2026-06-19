@@ -531,6 +531,32 @@ pub trait Storage: Send + Sync {
     where
         AnyRequest: From<Request<T>>;
 
+    /// Reschedule an in-flight request back to `pending` for an automatic retry,
+    /// fenced on the worker that currently owns it.
+    ///
+    /// This is the daemon's per-attempt retry path. Unlike [`Storage::persist`]
+    /// (which matches on `id` only, so the manual retry path can intentionally
+    /// resurrect a `failed` row), this transition is guarded by
+    /// `state = 'processing' AND daemon_id = <owner>`: it applies ONLY if the row
+    /// is still the in-flight claim held by `daemon_id`.
+    ///
+    /// The guard prevents a finalize-then-resurrect race: if another writer (a
+    /// zombie/duplicate worker, or a stale-claim reclaim) has already moved the
+    /// row to a terminal state — and a finalizer has sealed the parent batch as a
+    /// result — a late retry from this worker must NOT flip it back to `pending`,
+    /// orphaning it under a completed batch.
+    ///
+    /// Returns `true` if the row was rescheduled, `false` if the worker no longer
+    /// owns it (lost the race). A `false` result is normal under contention and
+    /// should be logged, not treated as an error.
+    async fn reschedule_for_retry(
+        &self,
+        request_id: RequestId,
+        owner: DaemonId,
+        retry_attempt: u32,
+        not_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool>;
+
     /// List individual requests across batches with filtering and pagination.
     ///
     /// Supports filtering by creator, completion window, status, model(s),

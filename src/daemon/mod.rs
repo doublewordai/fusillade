@@ -1163,6 +1163,10 @@ where
                         // single capture suffices for downstream metrics.
                         let retry_attempt_at_completion = request.state.retry_attempt;
                         let batch_expires_at = request.state.batch_expires_at;
+                        // Capture the owning daemon before the request moves into
+                        // the processor — the fenced retry reschedule needs it to
+                        // prove this worker still holds the in-flight claim.
+                        let owning_daemon_id = request.state.daemon_id;
 
                         // Build the cancellation future the daemon owns. The
                         // processor observes this without needing to know about
@@ -1239,28 +1243,60 @@ where
                                     // Attempt to retry
                                     match failed.can_retry(retry_attempt, retry_config) {
                                         Ok(pending) => {
-                                            // Can retry - persist as Pending
-                                            if let Err(e) = storage.persist(&pending).await {
-                                                tracing::error!(
-                                                    request_id = %request_id,
-                                                    batch_id = ?batch_id,
-                                                    retry_attempt = pending.state.retry_attempt,
-                                                    error = %e,
-                                                    "Failed to persist retry — request orphaned in processing state"
-                                                );
-                                                return Err(e);
+                                            // Fenced retry: only re-pend if we still own the
+                                            // in-flight (processing) row. If another writer has
+                                            // already terminalized it — and a finalizer may have
+                                            // sealed the parent batch as a result — flipping it
+                                            // back to pending here would orphan it under a
+                                            // completed batch (the count/claim mismatch then
+                                            // surfaces it as undrainable queue depth).
+                                            match storage
+                                                .reschedule_for_retry(
+                                                    request_id,
+                                                    owning_daemon_id,
+                                                    pending.state.retry_attempt,
+                                                    pending.state.not_before,
+                                                )
+                                                .await
+                                            {
+                                                Ok(true) => {
+                                                    counter!(
+                                                        "fusillade_requests_retried_total",
+                                                        "model" => model_clone.clone(),
+                                                        "attempt" => (retry_attempt + 1).to_string()
+                                                    ).increment(1);
+                                                    tracing::info!(
+                                                        request_id = %request_id,
+                                                        batch_id = ?batch_id,
+                                                        retry_attempt = retry_attempt + 1,
+                                                        "request.retry_persisted"
+                                                    );
+                                                }
+                                                Ok(false) => {
+                                                    // Lost the race: the row is no longer this
+                                                    // worker's processing claim. Do NOT resurrect.
+                                                    counter!(
+                                                        "fusillade_requests_retry_lost_ownership_total",
+                                                        "model" => model_clone.clone()
+                                                    ).increment(1);
+                                                    tracing::warn!(
+                                                        request_id = %request_id,
+                                                        batch_id = ?batch_id,
+                                                        retry_attempt = retry_attempt + 1,
+                                                        "request.retry_skipped_lost_ownership"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        request_id = %request_id,
+                                                        batch_id = ?batch_id,
+                                                        retry_attempt = pending.state.retry_attempt,
+                                                        error = %e,
+                                                        "Failed to reschedule retry"
+                                                    );
+                                                    return Err(e);
+                                                }
                                             }
-                                            counter!(
-                                                "fusillade_requests_retried_total",
-                                                "model" => model_clone.clone(),
-                                                "attempt" => (retry_attempt + 1).to_string()
-                                            ).increment(1);
-                                            tracing::info!(
-                                                request_id = %request_id,
-                                                batch_id = ?batch_id,
-                                                retry_attempt = retry_attempt + 1,
-                                                "request.retry_persisted"
-                                            );
                                         }
                                         Err(failed) => {
                                             // No retries left - persist as Failed (terminal)
