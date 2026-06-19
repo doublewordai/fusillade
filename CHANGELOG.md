@@ -1,5 +1,16 @@
 # Changelog
 
+## [19.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v18.0.3...fusillade-v19.0.0) (2026-06-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* prevent retry from resurrecting requests under finalized batches ([#295](https://github.com/doublewordai/fusillade/issues/295))
+
+### Bug Fixes
+
+* prevent retry from resurrecting requests under finalized batches ([#295](https://github.com/doublewordai/fusillade/issues/295)) ([fad24a5](https://github.com/doublewordai/fusillade/commit/fad24a5be1a2cdf4b258c7ea676d9e3efc101d13))
+
 ## [18.0.3](https://github.com/doublewordai/fusillade/compare/fusillade-v18.0.2...fusillade-v18.0.3) (2026-06-18)
 
 
