@@ -1,5 +1,12 @@
 # Changelog
 
+## [19.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v19.0.0...fusillade-v19.0.1) (2026-06-22)
+
+
+### Bug Fixes
+
+* mark non-2xx realtime requests as failed ([#292](https://github.com/doublewordai/fusillade/issues/292)) ([03abbd2](https://github.com/doublewordai/fusillade/commit/03abbd2e09c4d376e12624a9447b30c5d6c83679))
+
 ## [19.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v18.0.3...fusillade-v19.0.0) (2026-06-19)
 
 
