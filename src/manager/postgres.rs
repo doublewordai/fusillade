@@ -4662,6 +4662,31 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .collect();
         let response_statuses: Vec<i16> = records.iter().map(|r| r.status_code as i16).collect();
 
+        // 2xx is a completed round-trip; any other status is a failure. Failed
+        // rows must carry `error` + `failed_at` (failed_fields_check); we store
+        // the error in the same NonRetriableHttpStatus envelope fail_request
+        // writes, so the dwctl /responses render recovers status + body from it
+        // via parse_failure_error. response_status/response_body stay populated
+        // for both states (the dashboard listing filters on response_status, and
+        // completed_fields_check needs them on 2xx rows). The state / timestamp
+        // split happens in the SQL CASEs below; `error` is NULL for 2xx here.
+        let to_failure_error = |r: &PersistCompletedRealtimeInput| -> Option<String> {
+            if (200..300).contains(&r.status_code) {
+                return None;
+            }
+            let reason = FailureReason::NonRetriableHttpStatus {
+                status: r.status_code,
+                body: r.response_body.clone(),
+            };
+            Some(serde_json::to_string(&reason).unwrap_or_else(|_| {
+                format!(
+                    r#"{{"type":"NonRetriableHttpStatus","details":{{"status":{},"body":""}}}}"#,
+                    r.status_code
+                )
+            }))
+        };
+        let errors: Vec<Option<String>> = records.iter().map(&to_failure_error).collect();
+
         // Scope the UPDATE to realtime rows only: `service_tier = 'priority'`
         // and `batch_id IS NULL` together uniquely identify rows that
         // create_realtime inserted. Without these predicates a stray
@@ -4671,14 +4696,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let updated_rows = sqlx::query!(
             r#"
             UPDATE requests r
-               SET state = 'completed',
+               SET state = CASE WHEN v.status BETWEEN 200 AND 299 THEN 'completed' ELSE 'failed' END,
                    response_status = v.status,
                    response_body = v.body,
                    response_size = v.size,
-                   completed_at = NOW()
+                   error = v.error,
+                   completed_at = CASE WHEN v.status BETWEEN 200 AND 299 THEN NOW() ELSE NULL END,
+                   failed_at = CASE WHEN v.status BETWEEN 200 AND 299 THEN NULL ELSE NOW() END
               FROM UNNEST(
-                  $1::uuid[], $2::text[], $3::bigint[], $4::smallint[]
-              ) AS v(id, body, size, status)
+                  $1::uuid[], $2::text[], $3::bigint[], $4::smallint[], $5::text[]
+              ) AS v(id, body, size, status, error)
              WHERE r.id = v.id
                AND r.state = 'processing'
                AND r.service_tier = 'priority'
@@ -4689,6 +4716,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             &response_bodies as &[&str],
             &response_sizes as &[i64],
             &response_statuses as &[i16],
+            &errors as &[Option<String>],
         )
         .fetch_all(&mut *tx)
         .await
@@ -4736,6 +4764,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 .collect();
             let insert_response_statuses: Vec<i16> =
                 to_insert.iter().map(|r| r.status_code as i16).collect();
+            let insert_errors: Vec<Option<String>> =
+                to_insert.iter().map(|r| to_failure_error(r)).collect();
 
             sqlx::query!(
                 r#"
@@ -4760,26 +4790,31 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert realtime templates: {}", e)))?;
 
             // Mirror create_realtime's row shape: daemon_id = nil sentinel,
-            // service_tier = 'priority', claimed_at = started_at = completed_at = NOW().
-            // NULLIF(TRIM(...), '') on created_by mirrors create_realtime's
-            // coercion of empty-string to NULL (XOR check rejects empty
-            // attribution loudly rather than silently producing a phantom row).
+            // service_tier = 'priority', claimed_at = started_at = NOW(). 2xx rows
+            // land in 'completed' with completed_at set; any other status lands in
+            // 'failed' with failed_at + error set (failed_fields_check), matching
+            // the UPDATE branch above. NULLIF(TRIM(...), '') on created_by mirrors
+            // create_realtime's coercion of empty-string to NULL (XOR check
+            // rejects empty attribution loudly rather than producing a phantom row).
             sqlx::query!(
                 r#"
                 INSERT INTO requests (
                     id, batch_id, template_id, model, custom_id,
                     state, retry_attempt, service_tier, created_by,
-                    daemon_id, claimed_at, started_at, completed_at,
-                    response_status, response_body, response_size
+                    daemon_id, claimed_at, started_at, completed_at, failed_at,
+                    response_status, response_body, response_size, error
                 )
                 SELECT id, NULL, template_id, model, NULL,
-                       'completed', 0, 'priority', NULLIF(TRIM(created_by), ''),
-                       $1, NOW(), NOW(), NOW(),
-                       status, body, size
+                       CASE WHEN status BETWEEN 200 AND 299 THEN 'completed' ELSE 'failed' END,
+                       0, 'priority', NULLIF(TRIM(created_by), ''),
+                       $1, NOW(), NOW(),
+                       CASE WHEN status BETWEEN 200 AND 299 THEN NOW() ELSE NULL END,
+                       CASE WHEN status BETWEEN 200 AND 299 THEN NULL ELSE NOW() END,
+                       status, body, size, error
                 FROM UNNEST(
                     $2::uuid[], $3::uuid[], $4::text[], $5::text[],
-                    $6::smallint[], $7::text[], $8::bigint[]
-                ) AS v(id, template_id, model, created_by, status, body, size)
+                    $6::smallint[], $7::text[], $8::bigint[], $9::text[]
+                ) AS v(id, template_id, model, created_by, status, body, size, error)
                 ON CONFLICT (id) DO NOTHING
                 "#,
                 Uuid::nil(),
@@ -4790,6 +4825,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 &insert_response_statuses as &[i16],
                 &insert_response_bodies as &[&str],
                 &insert_response_sizes as &[i64],
+                &insert_errors as &[Option<String>],
             )
             .execute(&mut *tx)
             .await
