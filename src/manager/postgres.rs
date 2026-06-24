@@ -3878,6 +3878,139 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         Ok(())
     }
 
+    async fn bulk_delete_data(&self, creator_id: &str, batch_size: i64) -> Result<u64> {
+        // One transaction per chunk: the rows locked via FOR UPDATE SKIP LOCKED
+        // stay locked until commit, and Stage 0's two statements are dependent.
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
+        // Stage 0: Hard-delete batchless (realtime/flex) requests and their
+        // dedicated templates. These have batch_id IS NULL, so they have no
+        // soft-deleted parent batch for the orphan-purge daemon to key off —
+        // if we don't remove them here the erasure is incomplete (the batchless
+        // template still carries the prompt body). This mirrors `delete_request`
+        // in bulk: delete the requests (response_steps cascade), capturing their
+        // template_ids, then delete the templates that are batchless (file_id
+        // IS NULL — file-backed templates are shared and handled via Stage 2).
+        let batchless_template_ids: Vec<Option<Uuid>> = sqlx::query_scalar!(
+            r#"
+            DELETE FROM requests
+            WHERE id IN (
+                SELECT id FROM requests
+                WHERE created_by = $1
+                  AND batch_id IS NULL
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING template_id
+            "#,
+            creator_id,
+            batch_size,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to delete batchless requests: {}", e))
+        })?;
+
+        let batchless_requests = batchless_template_ids.len() as u64;
+
+        let template_ids: Vec<Uuid> = batchless_template_ids.into_iter().flatten().collect();
+        if !template_ids.is_empty() {
+            sqlx::query!(
+                r#"DELETE FROM request_templates WHERE id = ANY($1) AND file_id IS NULL"#,
+                &template_ids,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to delete batchless templates: {}", e))
+            })?;
+        }
+
+        // Stage 1: Soft-delete batches, cancel active ones, and nullify metadata
+        // (it can carry the user's email). Child requests are hard-deleted on a
+        // later pass by the orphan-purge daemon (parent batch deleted_at is set).
+        let batches_affected = sqlx::query_scalar!(
+            r#"
+            WITH to_delete AS (
+                SELECT id FROM batches
+                WHERE created_by = $1
+                  AND deleted_at IS NULL
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE batches b
+            SET deleted_at = NOW(),
+                metadata = NULL,
+                cancelling_at = CASE
+                    WHEN b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL
+                        THEN COALESCE(b.cancelling_at, NOW())
+                    ELSE b.cancelling_at
+                END,
+                cancelled_at = CASE
+                    WHEN b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL
+                        THEN COALESCE(b.cancelled_at, NOW())
+                    ELSE b.cancelled_at
+                END
+            FROM to_delete td
+            WHERE b.id = td.id
+            RETURNING b.id
+            "#,
+            creator_id,
+            batch_size,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to soft-delete user batches: {}", e)))?
+        .len() as u64;
+
+        // Stage 2: Soft-delete files uploaded by this creator. Their templates
+        // are reaped by the orphan-purge daemon once files.deleted_at is set.
+        let files_affected = sqlx::query_scalar!(
+            r#"
+            WITH to_delete AS (
+                SELECT id FROM files
+                WHERE uploaded_by = $1
+                  AND deleted_at IS NULL
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE files f
+            SET deleted_at = NOW(),
+                status = 'deleted'
+            FROM to_delete td
+            WHERE f.id = td.id
+            RETURNING f.id
+            "#,
+            creator_id,
+            batch_size,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to soft-delete user files: {}", e)))?
+        .len() as u64;
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+
+        let total = batchless_requests + batches_affected + files_affected;
+        if total > 0 {
+            tracing::info!(
+                creator_id = %creator_id,
+                batchless_requests,
+                batches = batches_affected,
+                files = files_affected,
+                "Erased creator data"
+            );
+        }
+
+        Ok(total)
+    }
+
     async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
         tracing::debug!(count = ids.len(), "Retrying failed requests");
 
@@ -14138,7 +14271,7 @@ mod tests {
 
         // Only model-a pending should be counted
         assert_eq!(*counts.get("model-a").unwrap().get("15m").unwrap(), 1);
-        assert!(counts.get("model-b").is_none());
+        assert!(!counts.contains_key("model-b"));
 
         // Now include claimed state and remove model filter
         let states = vec!["pending".to_string(), "claimed".to_string()];
@@ -14716,7 +14849,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(pending_only.get("flex-model").is_none());
+        assert!(!pending_only.contains_key("flex-model"));
 
         let active_states = vec![
             "pending".to_string(),
@@ -14774,7 +14907,7 @@ mod tests {
             *excl_priority.get("flex-model").unwrap().get("1h").unwrap(),
             1
         );
-        assert!(excl_priority.get("rt-model").is_none());
+        assert!(!excl_priority.contains_key("rt-model"));
 
         let any_tier = manager
             .get_pending_request_counts_by_model_and_window(
@@ -14804,7 +14937,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(excl_flex.get("flex-model").is_none());
+        assert!(!excl_flex.contains_key("flex-model"));
 
         // Model filter applies to batchless rows too.
         let filtered = manager
@@ -14818,7 +14951,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(filtered.get("flex-model").is_none());
+        assert!(!filtered.contains_key("flex-model"));
     }
 
     // =========================================================================
@@ -16837,5 +16970,332 @@ mod tests {
             .unwrap();
         assert_eq!(result.total_count, 1);
         assert_eq!(result.data[0].id, realtime_id);
+    }
+
+    // ---- bulk_delete_data (right-to-erasure) ----
+
+    /// Create a batchless realtime request for `user`, returning its id.
+    async fn make_realtime(
+        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        user: &str,
+    ) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: id,
+                body: r#"{"model":"gpt-4","input":"secret prompt"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: user.to_string(),
+            })
+            .await
+            .expect("create_realtime should succeed");
+        id
+    }
+
+    async fn count(pool: &sqlx::PgPool, sql_one_arg: &str, arg: &str) -> i64 {
+        // Tiny helper: run a COUNT query with a single text bind. Kept as
+        // dynamic SQL (not query!) only for test brevity; production paths use
+        // compile-checked macros.
+        sqlx::query_scalar::<_, i64>(sql_one_arg)
+            .bind(arg)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn test_bulk_delete_data_erases_batchless_requests_and_templates(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        make_realtime(&manager, "user-A").await;
+        make_realtime(&manager, "user-A").await;
+        make_realtime(&manager, "user-B").await;
+
+        // Before: 3 batchless requests, 3 batchless templates (file_id IS NULL).
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM requests WHERE created_by = $1",
+                "user-A"
+            )
+            .await,
+            2
+        );
+        let templates_before: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "c!" FROM request_templates WHERE file_id IS NULL"#
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(templates_before, 3);
+
+        let total = manager.bulk_delete_data("user-A", 100).await.unwrap();
+        assert_eq!(total, 2, "2 batchless requests erased, no batches/files");
+
+        // user-A's requests gone; user-B untouched.
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM requests WHERE created_by = $1",
+                "user-A"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM requests WHERE created_by = $1",
+                "user-B"
+            )
+            .await,
+            1
+        );
+        // Only user-B's batchless template remains — the body-carrying templates
+        // of user-A's requests are gone (the gap this stage closes).
+        let templates_after: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "c!" FROM request_templates WHERE file_id IS NULL"#
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(templates_after, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_bulk_delete_data_soft_deletes_batches_and_files_nullifying_metadata(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        // Helper to create a file (with one template) + active batch for a user.
+        async fn file_and_batch(
+            manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+            pool: &sqlx::PgPool,
+            user: &str,
+        ) -> (Uuid, Uuid) {
+            let file_id = manager
+                .create_file(
+                    format!("{user}.jsonl"),
+                    None,
+                    vec![RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "/v1/chat/completions".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    }],
+                )
+                .await
+                .unwrap();
+            sqlx::query!(
+                "UPDATE files SET uploaded_by = $1 WHERE id = $2",
+                user,
+                *file_id as Uuid
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+            let batch = manager
+                .create_batch(crate::batch::BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    created_by: Some(user.to_string()),
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+            // Seed PII-bearing metadata to prove it is nullified.
+            sqlx::query!(
+                r#"UPDATE batches SET metadata = '{"email":"someone@x.com"}'::jsonb WHERE id = $1"#,
+                *batch.id as Uuid
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+            (*file_id as Uuid, *batch.id as Uuid)
+        }
+
+        let (file_a, batch_a) = file_and_batch(&manager, &pool, "user-A").await;
+        let (file_b, batch_b) = file_and_batch(&manager, &pool, "user-B").await;
+
+        let total = manager.bulk_delete_data("user-A", 100).await.unwrap();
+        // create_batch also makes virtual output/error files owned by the
+        // creator, so user-A owns 3 files (input + 2 virtual) plus 1 batch.
+        // Assert the return value equals the rows actually soft-deleted rather
+        // than hard-coding the virtual-file count.
+        let soft_batches = count(
+            &pool,
+            "SELECT COUNT(*) FROM batches WHERE created_by = $1 AND deleted_at IS NOT NULL",
+            "user-A",
+        )
+        .await;
+        let soft_files = count(
+            &pool,
+            "SELECT COUNT(*) FROM files WHERE uploaded_by = $1 AND deleted_at IS NOT NULL",
+            "user-A",
+        )
+        .await;
+        assert_eq!(total, (soft_batches + soft_files) as u64);
+        assert!(total >= 2, "at least the batch + input file");
+        // No live (non-deleted) files remain for user-A — virtual files included.
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM files WHERE uploaded_by = $1 AND deleted_at IS NULL",
+                "user-A"
+            )
+            .await,
+            0
+        );
+
+        // Batch A: soft-deleted, cancelled (was active), metadata nullified.
+        let a_batch: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "c!" FROM batches WHERE id = $1 AND deleted_at IS NOT NULL AND metadata IS NULL AND cancelled_at IS NOT NULL"#,
+            batch_a,
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(a_batch, 1);
+        // File A: soft-deleted.
+        let a_file: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "c!" FROM files WHERE id = $1 AND deleted_at IS NOT NULL AND status = 'deleted'"#,
+            file_a,
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(a_file, 1);
+
+        // user-B untouched.
+        let b_untouched: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "c!" FROM batches WHERE id = $1 AND deleted_at IS NULL AND metadata IS NOT NULL"#,
+            batch_b,
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(b_untouched, 1);
+        let b_file: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "c!" FROM files WHERE id = $1 AND deleted_at IS NULL"#,
+            file_b
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(b_file, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_bulk_delete_data_respects_batch_size_and_drains_to_zero(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        for _ in 0..5 {
+            make_realtime(&manager, "user-A").await;
+        }
+
+        // batch_size = 2 → drains 2, 2, 1, then 0.
+        assert_eq!(manager.bulk_delete_data("user-A", 2).await.unwrap(), 2);
+        assert_eq!(manager.bulk_delete_data("user-A", 2).await.unwrap(), 2);
+        assert_eq!(manager.bulk_delete_data("user-A", 2).await.unwrap(), 1);
+        assert_eq!(
+            manager.bulk_delete_data("user-A", 2).await.unwrap(),
+            0,
+            "idempotent once drained"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM requests WHERE created_by = $1",
+                "user-A"
+            )
+            .await,
+            0
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_bulk_delete_data_leaves_file_templates_for_purge_daemon(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let file_id = manager
+            .create_file(
+                "a.jsonl".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "/v1/c".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/c".to_string(),
+                        body: "{}".to_string(),
+                        model: "m".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "/v1/c".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/c".to_string(),
+                        body: "{}".to_string(),
+                        model: "m".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        sqlx::query!(
+            "UPDATE files SET uploaded_by = $1 WHERE id = $2",
+            "user-A",
+            *file_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let file_templates: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "c!" FROM request_templates WHERE file_id = $1"#,
+            *file_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(file_templates, 2);
+
+        // bulk_delete_data soft-deletes the file but does NOT delete its
+        // templates inline — that is the orphan-purge daemon's job.
+        assert_eq!(manager.bulk_delete_data("user-A", 100).await.unwrap(), 1);
+        let still_there: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "c!" FROM request_templates WHERE file_id = $1"#,
+            *file_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(still_there, 2, "templates linger until the purge pass");
+
+        // The existing purge daemon completes the erasure now the file is soft-deleted.
+        manager.purge_orphaned_rows(1000).await.unwrap();
+        let purged: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "c!" FROM request_templates WHERE file_id = $1"#,
+            *file_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(purged, 0, "purge daemon erases the file's templates");
     }
 }

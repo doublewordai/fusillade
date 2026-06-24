@@ -316,6 +316,30 @@ pub trait Storage: Send + Sync {
     /// deleted).
     async fn delete_request(&self, request_id: RequestId) -> Result<()>;
 
+    /// Erase all of a creator's fusillade data, for right-to-erasure compliance.
+    ///
+    /// Processes up to `batch_size` rows per category per call, using
+    /// `FOR UPDATE SKIP LOCKED` so it is safe to run concurrently and under
+    /// load. Returns the total number of rows affected this call; callers
+    /// should loop until it returns 0 to drain everything. Idempotent.
+    ///
+    /// Three categories, keyed on `created_by` / `uploaded_by = creator_id`:
+    /// * **Batchless requests** (`batch_id IS NULL` — realtime/flex) are
+    ///   *hard*-deleted along with their batchless `request_templates` (which
+    ///   carry the prompt body). The orphan-purge daemon never reaches these
+    ///   because they have no soft-deleted parent batch, so they must be
+    ///   removed here or the erasure is incomplete.
+    /// * **Batches** are soft-deleted (cancelled if active) with `metadata`
+    ///   nullified (it can contain the user's email). Their child requests are
+    ///   hard-deleted afterwards by the orphan-purge daemon (`purge_orphaned_rows`).
+    /// * **Files** are soft-deleted; their `request_templates` are likewise
+    ///   reaped by the orphan-purge daemon once `files.deleted_at` is set.
+    ///
+    /// Note: completion is therefore eventually-consistent — when this returns
+    /// 0, all batches/files are soft-deleted and batchless rows are gone, but
+    /// batch/file child rows are erased on the next purge-daemon pass.
+    async fn bulk_delete_data(&self, creator_id: &str, batch_size: i64) -> Result<u64>;
+
     /// Retry failed requests by resetting them to pending state.
     ///
     /// This resets the specified failed requests to pending state with retry_attempt = 0,
