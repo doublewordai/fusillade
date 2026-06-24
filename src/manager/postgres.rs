@@ -3879,6 +3879,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     }
 
     async fn bulk_delete_data(&self, creator_id: &str, batch_size: i64) -> Result<u64> {
+        // Guard invalid chunk sizes before opening a transaction: a negative
+        // LIMIT errors in Postgres, and 0 would do nothing. Treat both as
+        // "nothing more to do" so the caller's loop-until-zero terminates.
+        if batch_size < 1 {
+            return Ok(0);
+        }
+
         // One transaction per chunk: the rows locked via FOR UPDATE SKIP LOCKED
         // stay locked until commit, and Stage 0's two statements are dependent.
         let mut tx =
@@ -17221,6 +17228,29 @@ mod tests {
             )
             .await,
             0
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_bulk_delete_data_nonpositive_batch_size_is_noop(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        make_realtime(&manager, "user-A").await;
+
+        // 0 and negative chunk sizes are no-ops: no panic, no Postgres LIMIT
+        // error, and the user's data is left untouched.
+        assert_eq!(manager.bulk_delete_data("user-A", 0).await.unwrap(), 0);
+        assert_eq!(manager.bulk_delete_data("user-A", -5).await.unwrap(), 0);
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM requests WHERE created_by = $1",
+                "user-A"
+            )
+            .await,
+            1
         );
     }
 

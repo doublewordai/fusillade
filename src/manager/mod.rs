@@ -320,8 +320,12 @@ pub trait Storage: Send + Sync {
     ///
     /// Processes up to `batch_size` rows per category per call, using
     /// `FOR UPDATE SKIP LOCKED` so it is safe to run concurrently and under
-    /// load. Returns the total number of rows affected this call; callers
-    /// should loop until it returns 0 to drain everything. Idempotent.
+    /// load. Returns the count of *top-level* rows processed this call —
+    /// batchless requests deleted plus batches and files soft-deleted. It does
+    /// NOT include the batchless templates removed alongside those requests, nor
+    /// the batch/file child rows the purge daemon reaps later. It is purely a
+    /// loop-termination signal: callers should loop until it returns 0 to drain
+    /// everything. A `batch_size < 1` returns 0 (nothing to do). Idempotent.
     ///
     /// Three categories, keyed on `created_by` / `uploaded_by = creator_id`:
     /// * **Batchless requests** (`batch_id IS NULL` — realtime/flex) are
