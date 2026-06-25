@@ -1709,6 +1709,40 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .collect()
     }
 
+    async fn current_filter_states(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (ModelFilterState, DateTime<Utc>)>> {
+        // Latest event per model = its current state and when that state began.
+        // No state filter: the caller keys on Live/Coming and ignores the rest.
+        // (created_at is NOT NULL; the index on (model, created_at DESC, id DESC)
+        // makes DISTINCT ON deterministic and cheap.)
+        let rows = sqlx::query!(
+            r#"
+            SELECT DISTINCT ON (model)
+                model, state, created_at
+            FROM model_filters
+            ORDER BY model, created_at DESC, id DESC
+            "#
+        )
+        .fetch_all(self.pools.read())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to read current model_filters states: {}",
+                e
+            ))
+        })?;
+
+        rows.into_iter()
+            .map(|row| {
+                let state = ModelFilterState::parse_state(&row.state).ok_or_else(|| {
+                    FusilladeError::Other(anyhow!("Unknown model_filters.state: {}", row.state))
+                })?;
+                Ok((row.model, (state, row.created_at)))
+            })
+            .collect()
+    }
+
     async fn persist<T: RequestState + Clone>(
         &self,
         request: &Request<T>,
@@ -12588,6 +12622,140 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 5, "append-only: every event is retained in the log");
+    }
+
+    #[test]
+    fn test_model_filter_state_roundtrip() {
+        for s in [
+            ModelFilterState::Live,
+            ModelFilterState::Coming,
+            ModelFilterState::Leaving,
+            ModelFilterState::Absent,
+        ] {
+            assert_eq!(
+                ModelFilterState::parse_state(s.as_str()),
+                Some(s),
+                "{s:?} must round-trip through as_str/parse_state"
+            );
+        }
+        assert_eq!(ModelFilterState::Leaving.as_str(), "leaving");
+        assert_eq!(ModelFilterState::parse_state("nonsense"), None);
+    }
+
+    #[sqlx::test]
+    async fn test_current_filter_states_and_leaving(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        manager
+            .append_model_filter_events(&[
+                ModelFilter {
+                    model: "m-drain".to_string(),
+                    state: ModelFilterState::Live,
+                    expected_ready_at: None,
+                },
+                ModelFilter {
+                    model: "m-coming".to_string(),
+                    state: ModelFilterState::Coming,
+                    expected_ready_at: None,
+                },
+                ModelFilter {
+                    model: "m-gone".to_string(),
+                    state: ModelFilterState::Absent,
+                    expected_ready_at: None,
+                },
+            ])
+            .await
+            .unwrap();
+        // m-drain transitions live -> leaving (decided to scale down, still draining).
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "m-drain".to_string(),
+                state: ModelFilterState::Leaving,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+
+        // list_model_filters excludes only `absent`; `leaving` is a current state.
+        let listed = manager.list_model_filters().await.unwrap();
+        let drain = listed.iter().find(|m| m.model == "m-drain").unwrap();
+        assert_eq!(
+            drain.state,
+            ModelFilterState::Leaving,
+            "leaving round-trips through the append-only log"
+        );
+        assert!(
+            listed.iter().all(|m| m.model != "m-gone"),
+            "absent tombstone is excluded from list_model_filters"
+        );
+
+        // current_filter_states returns (state, since) per model, INCLUDING absent.
+        let states = manager.current_filter_states().await.unwrap();
+        assert_eq!(
+            states.get("m-drain").map(|(s, _)| *s),
+            Some(ModelFilterState::Leaving)
+        );
+        assert_eq!(
+            states.get("m-coming").map(|(s, _)| *s),
+            Some(ModelFilterState::Coming)
+        );
+        assert_eq!(
+            states.get("m-gone").map(|(s, _)| *s),
+            Some(ModelFilterState::Absent),
+            "current_filter_states keeps the latest event even when it is a tombstone"
+        );
+
+        // `since` is the latest event's created_at (the leaving event, ~now).
+        let (_, drain_since) = states["m-drain"];
+        let now = Utc::now();
+        assert!(
+            drain_since <= now && now - drain_since < chrono::Duration::minutes(1),
+            "since reflects the recent leaving-event timestamp"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_leaving_treated_as_not_live(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Two requests, same user, far deadline (not within ramp). A `leaving` model
+        // must take the not-live leaky-bucket path (≤1 leaked per cycle), exactly
+        // like `coming`/`absent` — proving the claim gate's `state = 'live'`
+        // predicate treats `leaving` as not-live with no special-casing.
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "u", "drain-model", expires_at).await;
+        setup_filter_request(&manager, &pool, "u", "drain-model", expires_at).await;
+        manager
+            .append_model_filter_event(&ModelFilter {
+                model: "drain-model".to_string(),
+                state: ModelFilterState::Leaving,
+                expected_ready_at: None,
+            })
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("drain-model".to_string(), 5)]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "a leaving model is not-live: leaky-bucket trickles ≤1, not full capacity"
+        );
+        assert!(
+            claimed[0].state.leak.is_some(),
+            "the leaving model's claim is leaked (not-live path)"
+        );
     }
 
     #[sqlx::test]
