@@ -1,5 +1,13 @@
 # Changelog
 
+## [19.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v19.0.1...fusillade-v19.1.0) (2026-06-25)
+
+
+### Features
+
+* add leaving model_filters state + current_filter_states read ([#300](https://github.com/doublewordai/fusillade/issues/300)) ([296b3dc](https://github.com/doublewordai/fusillade/commit/296b3dcd873db78b41d0a4709978a76754b68590))
+* bulk_delete_data on Storage for user right-to-erasure ([#299](https://github.com/doublewordai/fusillade/issues/299)) ([3bd4794](https://github.com/doublewordai/fusillade/commit/3bd47945dd25b005d70a8b1ead3e8260b7025093))
+
 ## [19.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v19.0.0...fusillade-v19.0.1) (2026-06-22)
 
 
