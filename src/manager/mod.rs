@@ -51,9 +51,12 @@ pub enum ModelFilterState {
     /// "gone", but treated identically to `Coming`/`Absent` by the claim gate
     /// (not-live → no new full-capacity claims).
     Leaving,
-    /// Explicit tombstone: the controller is no longer deploying this model. Appended
-    /// (instead of deleting rows) to retract a model from the log. Treated
-    /// identically to "no events" by the claim gate.
+    /// Explicit tombstone: the controller is no longer deploying this model.
+    /// Appended (instead of deleting rows) to retract a model from the log. Treated
+    /// by the claim gate as NOT-LIVE — the same leaky-bucket + deadline-ramp path as
+    /// `Coming`/`Leaving`. NOTE: this is *not* the same as a model with **no events
+    /// at all**: the gate claims a no-events model at full capacity (it is unmanaged
+    /// — `mf.state IS NULL`), whereas an `Absent` model is explicitly held not-live.
     Absent,
 }
 
