@@ -44,9 +44,19 @@ pub enum ModelFilterState {
     /// Internal infrastructure will serve this model soon; `expected_ready_at`
     /// carries the ETA.
     Coming,
-    /// Explicit tombstone: the controller is no longer deploying this model. Appended
-    /// (instead of deleting rows) to retract a model from the log. Treated
-    /// identically to "no events" by the claim gate.
+    /// The controller is draining this model: it has decided to scale the model to
+    /// zero, but the workers are still up finishing their in-flight requests (so it
+    /// stays listed in the gateway's `/v1/models`). Distinguished from `Absent` so
+    /// observers and the controller can tell "scaling down, still serving" from
+    /// "gone", but treated identically to `Coming`/`Absent` by the claim gate
+    /// (not-live → no new full-capacity claims).
+    Leaving,
+    /// Explicit tombstone: the controller is no longer deploying this model.
+    /// Appended (instead of deleting rows) to retract a model from the log. Treated
+    /// by the claim gate as NOT-LIVE — the same leaky-bucket + deadline-ramp path as
+    /// `Coming`/`Leaving`. NOTE: this is *not* the same as a model with **no events
+    /// at all**: the gate claims a no-events model at full capacity (it is unmanaged
+    /// — `mf.state IS NULL`), whereas an `Absent` model is explicitly held not-live.
     Absent,
 }
 
@@ -56,6 +66,7 @@ impl ModelFilterState {
         match self {
             ModelFilterState::Live => "live",
             ModelFilterState::Coming => "coming",
+            ModelFilterState::Leaving => "leaving",
             ModelFilterState::Absent => "absent",
         }
     }
@@ -65,6 +76,7 @@ impl ModelFilterState {
         match s {
             "live" => Some(ModelFilterState::Live),
             "coming" => Some(ModelFilterState::Coming),
+            "leaving" => Some(ModelFilterState::Leaving),
             "absent" => Some(ModelFilterState::Absent),
             _ => None,
         }
@@ -520,6 +532,20 @@ pub trait Storage: Send + Sync {
     /// excluding models whose latest event is an `Absent` tombstone
     /// (observability / tests).
     async fn list_model_filters(&self) -> Result<Vec<ModelFilter>>;
+
+    /// The CURRENT state of every model **and when that state began**: the latest
+    /// event per model as `(state, since)`, where `since` is that event's
+    /// `created_at`. Includes `Absent` (a model's latest event may be a tombstone);
+    /// the caller decides what to do with each state.
+    ///
+    /// This is the controller's read for time-based decisions off the log — a
+    /// `Live` model's `since` is when it went live (minimum-lifetime / anti-thrash),
+    /// a `Coming` model's `since` is when it started launching (a stuck-`coming`
+    /// watchdog). The timestamp comes from the persisted log, not in-memory state,
+    /// so it survives controller restarts.
+    async fn current_filter_states(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (ModelFilterState, chrono::DateTime<chrono::Utc>)>>;
 
     /// Update an existing request's state in storage.
     ///
