@@ -889,8 +889,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         // created_by IS NOT NULL ⟺ batch_id IS NULL (requests_attribution_xor),
         // so filtering created_by already restricts to batchless rows. Served by
-        // idx_requests_user_created_sort: seek created_by, range created_at,
-        // service_tier as an index condition.
+        // idx_requests_user_created_sort: seek created_by, range created_at.
+        // service_tier = 'flex' is a residual filter, not a scan bound (it sits
+        // after the created_at range column in the index), but it stays in the
+        // index so the count can be served index-only without a heap fetch.
         let count = sqlx::query_scalar!(
             r#"
             SELECT COUNT(*) AS "count!"

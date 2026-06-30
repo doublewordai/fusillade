@@ -11,7 +11,9 @@
 -- COR-481: the unverified upload-volume limit counts a user's recent flex
 -- requests with `WHERE created_by = $1 AND created_at >= $2 AND service_tier =
 -- 'flex'`; `idx_requests_user_created_sort` serves it as an index range scan
--- (seek created_by, range created_at, service_tier as an index condition).
+-- (seek created_by, range created_at). `service_tier = 'flex'` sits after the
+-- created_at range column, so it's a residual filter rather than a scan bound,
+-- but keeping it in the index lets the count stay index-only (no heap fetch).
 --
 -- A non-concurrent build holds ACCESS EXCLUSIVE on `requests` for its duration.
 -- Deployments that already ran the backfill script (and any copy-on-write
