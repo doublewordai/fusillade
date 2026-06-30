@@ -811,6 +811,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     }
 }
 
+/// Statement timeout for `get_pending_request_counts_by_model_and_window`.
+/// The query normally runs sub-second on a custom plan; this bounds the blast
+/// radius if a plan ever regresses to a sequential scan, so a single call
+/// fails fast instead of accumulating behind the callers' poll cadence.
+const PENDING_COUNTS_STATEMENT_TIMEOUT_MS: i64 = 30_000;
+
 // Implement Storage trait directly (no delegation)
 #[async_trait]
 /// Returns counts of **claimable** pending requests grouped by model and expiry window.
@@ -890,11 +896,56 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 }
             };
 
-        let pool = if strict {
-            self.pools.write()
+        // This query filters `requests` by a *bound* `state` array and a
+        // parameterized service_tier predicate. Under sqlx's extended protocol,
+        // a long-lived pooled connection settles the prepared statement onto a
+        // generic plan — and because bound params can't be proven to satisfy
+        // the partial indexes' `state IN (...)` / non-priority predicates, that
+        // generic plan falls back to full parallel sequential scans of
+        // `requests`. On large tables each call can take minutes, and for
+        // callers that re-query on a fixed interval the slow calls pile up and
+        // saturate the database.
+        //
+        // Forcing a custom (per-execution) plan lets the planner substitute the
+        // actual parameter values and pick the partial indexes
+        // (idx_requests_active_non_priority_counts, idx_requests_state_model,
+        // idx_requests_completed_flex_decay), turning the scan into a
+        // sub-second index scan. `SET LOCAL` scopes both settings to this
+        // transaction, leaving the pooled connection untouched afterwards.
+        let mut tx = if strict {
+            self.pools.write().begin().await
         } else {
-            self.pools.read()
-        };
+            self.pools.read().begin().await
+        }
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to begin transaction for pending request counts: {}",
+                e
+            ))
+        })?;
+
+        sqlx::query("SET LOCAL plan_cache_mode = force_custom_plan")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to force custom plan for pending request counts: {}",
+                    e
+                ))
+            })?;
+
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = {}",
+            PENDING_COUNTS_STATEMENT_TIMEOUT_MS
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to set statement_timeout for pending request counts: {}",
+                e
+            ))
+        })?;
 
         // Batchless rows have no batch expiry; synthesize the same effective
         // deadline `claim_requests` uses so the reported queue depth matches
@@ -1036,11 +1087,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(priority_decay_window)
         .bind(flex_window_ms)
         .bind(default_window_ms)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!(
                 "Failed to get pending request counts by model and window: {}",
+                e
+            ))
+        })?;
+
+        // Read-only transaction; commit promptly returns the connection (with
+        // its SET LOCAL settings discarded) to the pool.
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to commit pending request counts transaction: {}",
                 e
             ))
         })?;
@@ -14155,6 +14215,108 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("non-negative"));
+    }
+
+    /// Regression for running the pending-counts query on a forced custom plan
+    /// inside its own transaction (so the bound `state`/`service_tier` params
+    /// don't trap it on a sequential-scan generic plan). Drives the active and
+    /// completed-flex *decay* arms together in a single call: the transactional
+    /// wrapper must keep every arm intact and aggregate them correctly.
+    #[sqlx::test]
+    async fn test_pending_counts_active_and_decay_in_one_call(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+        let model = "flex-model";
+
+        // Active arm: a queued (pending) batchless flex request, due ~55min out.
+        let pending_id = Uuid::new_v4();
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: pending_id,
+                body: r#"{"input":"pending"}"#.to_string(),
+                model: model.to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "queue-user".to_string(),
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE requests SET created_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
+            .bind(pending_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Decay arm: a recently-completed flex request (5min ago, inside the
+        // 600s decay window).
+        let done_id = Uuid::new_v4();
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: done_id,
+                body: r#"{"input":"done"}"#.to_string(),
+                model: model.to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "queue-user".to_string(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'processing', daemon_id = gen_random_uuid(),
+                 claimed_at = NOW(), started_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(done_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager
+            .complete_request(RequestId(done_id), r#"{"output":"done"}"#, 200)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE requests SET completed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
+            .bind(done_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let windows = vec![
+            ("1h".to_string(), None, 3600),
+            ("24h".to_string(), None, 86_400),
+        ];
+        let states = vec![
+            "pending".to_string(),
+            "claimed".to_string(),
+            "processing".to_string(),
+        ];
+        let model_filter: Vec<String> = vec![];
+        let exclude_priority = ServiceTierFilter::Exclude(vec![Some("priority".to_string())]);
+
+        let counts = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &exclude_priority,
+                Some(600),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let model_counts = counts.get(model).expect("model must be present");
+        // 1h bucket: active pending (1) + completed-flex decay (1).
+        assert_eq!(*model_counts.get("1h").unwrap(), 2);
+        // 24h bucket: active pending only; decay contributes solely to 1h.
+        assert_eq!(*model_counts.get("24h").unwrap(), 1);
     }
 
     #[sqlx::test]
