@@ -5219,7 +5219,14 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                             Some(body) => match serde_json::from_str(body) {
                                 Ok(json) => json,
                                 Err(e) => {
-                                    tracing::warn!("Failed to parse response body as JSON: {}", e);
+                                    // ZDR: log only the error location/category, never the
+                                    // serde message — it can echo a fragment of the body.
+                                    tracing::warn!(
+                                        line = e.line(),
+                                        column = e.column(),
+                                        category = ?e.classify(),
+                                        "Failed to parse response body as JSON"
+                                    );
                                     serde_json::Value::String(body.to_string())
                                 }
                             },

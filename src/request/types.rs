@@ -277,18 +277,25 @@ impl FailureReason {
     }
 
     /// Returns a human-readable error message for this failure reason.
+    ///
+    /// ZDR: the upstream response `body` is intentionally NOT included — provider
+    /// error bodies can echo prompt/response content, and this message is emitted
+    /// to logs at the daemon's retry/failure sites. Only the status and the body
+    /// length are reported.
     pub fn to_error_message(&self) -> String {
         match self {
             FailureReason::RetriableHttpStatus { status, body } => {
                 format!(
-                    "HTTP request returned retriable status code: {} - {}",
-                    status, body
+                    "HTTP request returned retriable status code: {} ({}-byte body omitted)",
+                    status,
+                    body.len()
                 )
             }
             FailureReason::NonRetriableHttpStatus { status, body } => {
                 format!(
-                    "HTTP request returned error status code: {} - {}",
-                    status, body
+                    "HTTP request returned error status code: {} ({}-byte body omitted)",
+                    status,
+                    body.len()
                 )
             }
             FailureReason::NetworkError { error } => {
@@ -538,5 +545,41 @@ impl From<Request<Failed>> for AnyRequest {
 impl From<Request<Canceled>> for AnyRequest {
     fn from(r: Request<Canceled>) -> Self {
         AnyRequest::Canceled(r)
+    }
+}
+
+#[cfg(test)]
+mod zdr_logging_tests {
+    use super::*;
+
+    /// ZDR (COR-498): the human-readable error string fed to the daemon's
+    /// retry/failure logs must never contain the upstream provider response body.
+    #[test]
+    fn to_error_message_omits_provider_body() {
+        const SENTINEL: &str = "ZDR-SENTINEL-PROVIDER-BODY-7c1e";
+
+        for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 503,
+                body: format!("{{\"completion\":\"{SENTINEL}\"}}"),
+            },
+            FailureReason::NonRetriableHttpStatus {
+                status: 400,
+                body: format!("{{\"error\":\"{SENTINEL}\"}}"),
+            },
+        ] {
+            let msg = reason.to_error_message();
+            assert!(
+                !msg.contains(SENTINEL),
+                "provider response body leaked into error message: {msg}"
+            );
+            // The status must still be present so the log stays diagnostic.
+            assert!(
+                msg.contains(&reason.status_code_label()),
+                "expected status code in message, got: {msg}"
+            );
+            // And the message must be non-empty (daemon asserts this).
+            assert!(!msg.is_empty());
+        }
     }
 }
