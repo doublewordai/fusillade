@@ -1134,9 +1134,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // `leak_interval`). The three arrays are positionally aligned (the i-th
         // entry of each is one triple). Empty => every bucket has its first token
         // available.
-        let cooldown_user_arr: Vec<String> = leak_cooldown.iter().map(|p| p.0.clone()).collect();
-        let cooldown_window_arr: Vec<String> = leak_cooldown.iter().map(|p| p.1.clone()).collect();
-        let cooldown_model_arr: Vec<String> = leak_cooldown.iter().map(|p| p.2.clone()).collect();
+        //
+        // Built in a single pass: `HashSet` iteration order is not a stable
+        // contract across separate `.iter()` calls, so splitting the triple over
+        // three independent iterations could misalign the columns and match the
+        // wrong cooldown in `unnest($13,$14,$15)`.
+        let mut cooldown_user_arr: Vec<String> = Vec::with_capacity(leak_cooldown.len());
+        let mut cooldown_window_arr: Vec<String> = Vec::with_capacity(leak_cooldown.len());
+        let mut cooldown_model_arr: Vec<String> = Vec::with_capacity(leak_cooldown.len());
+        for (user, window, model) in leak_cooldown {
+            cooldown_user_arr.push(user.clone());
+            cooldown_window_arr.push(window.clone());
+            cooldown_model_arr.push(model.clone());
+        }
 
         // Deadline ramp exponent: `ramp_minutes = W_minutes ^ exponent`. A
         // not-live request within `ramp(W)` of its deadline is claimed at full
@@ -12424,8 +12434,11 @@ mod tests {
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("live-model".to_string(), 5)]);
-        let cooldown =
-            HashSet::from([("heavy".to_string(), "24h".to_string(), "live-model".to_string())]);
+        let cooldown = HashSet::from([(
+            "heavy".to_string(),
+            "24h".to_string(),
+            "live-model".to_string(),
+        )]);
         let claimed = manager
             .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
             .await
@@ -12585,8 +12598,7 @@ mod tests {
 
         // model-a's bucket is in cooldown; model-b's is not. model-b leaks one,
         // model-a leaks none — the cooldown is scoped to (user, window, model).
-        let cooldown =
-            HashSet::from([("u".to_string(), "24h".to_string(), "model-a".to_string())]);
+        let cooldown = HashSet::from([("u".to_string(), "24h".to_string(), "model-a".to_string())]);
         let claimed = manager
             .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
             .await
@@ -12624,8 +12636,7 @@ mod tests {
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("nl-ramp".to_string(), 5)]);
-        let cooldown =
-            HashSet::from([("u".to_string(), "24h".to_string(), "nl-ramp".to_string())]);
+        let cooldown = HashSet::from([("u".to_string(), "24h".to_string(), "nl-ramp".to_string())]);
         let claimed = manager
             .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
             .await
