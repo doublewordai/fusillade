@@ -14282,11 +14282,13 @@ mod tests {
             .complete_request(RequestId(done_id), r#"{"output":"done"}"#, 200)
             .await
             .unwrap();
-        sqlx::query("UPDATE requests SET completed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
-            .bind(done_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE requests SET completed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1",
+        )
+        .bind(done_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let windows = vec![
             ("1h".to_string(), None, 3600),
