@@ -288,10 +288,30 @@ async fn custom_processor_can_synthesize_terminal_failure(pool: sqlx::PgPool) {
     let AnyRequest::Failed(req) = fetch_any_request(&manager, request_id).await else {
         panic!("expected Failed variant");
     };
+
+    // The synthesized failure reason still carries the upstream body (it is
+    // persisted), proving the custom processor's terminal outcome propagated.
+    match &req.state.reason {
+        fusillade::request::FailureReason::NonRetriableHttpStatus { status, body } => {
+            assert_eq!(*status, 400, "synthesized status should propagate");
+            assert_eq!(
+                body, "synthetic test failure",
+                "synthesized body should propagate"
+            );
+        }
+        other => panic!("expected NonRetriableHttpStatus, got {other:?}"),
+    }
+
+    // ZDR: to_error_message() is scrubbed — it reports the status but must never
+    // echo the provider response body (see COR-498).
     let err = req.state.reason.to_error_message();
     assert!(
-        err.contains("synthetic test failure"),
-        "expected synthesized failure body in error: {err}"
+        err.contains("400"),
+        "status should appear in error message: {err}"
+    );
+    assert!(
+        !err.contains("synthetic test failure"),
+        "ZDR: provider body must not appear in to_error_message(): {err}"
     );
 
     shutdown_token.cancel();
