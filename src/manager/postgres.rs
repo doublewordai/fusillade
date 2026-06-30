@@ -831,6 +831,90 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 /// If you need counts of all pending requests regardless of claimability, adjust the query
 /// to remove these filters.
 impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManager<P, H> {
+    async fn sum_owner_batch_requests_in_window(
+        &self,
+        owner: &str,
+        completion_window: &str,
+        cutoff: DateTime<Utc>,
+        strict: bool,
+    ) -> Result<i64> {
+        let pool = if strict {
+            self.pools.write()
+        } else {
+            self.pools.read()
+        };
+
+        // Equality on (completion_window, created_by) seeks
+        // idx_batches_completion_window; created_at and the SUM are a residual
+        // over one creditor's batches for one window (a tiny set). SUM over
+        // BIGINT yields NUMERIC, so cast back to BIGINT for an i64 binding.
+        let total = sqlx::query_scalar!(
+            r#"
+            SELECT COALESCE(SUM(total_requests), 0)::BIGINT AS "total!"
+            FROM batches
+            WHERE created_by = $1
+              AND completion_window = $2
+              AND created_at >= $3
+              AND deleted_at IS NULL
+            "#,
+            owner,
+            completion_window,
+            cutoff,
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to sum batch requests for creditor {} in window {}: {}",
+                owner,
+                completion_window,
+                e
+            ))
+        })?;
+
+        Ok(total)
+    }
+
+    async fn count_owner_flex_requests_since(
+        &self,
+        owner: &str,
+        cutoff: DateTime<Utc>,
+        strict: bool,
+    ) -> Result<i64> {
+        let pool = if strict {
+            self.pools.write()
+        } else {
+            self.pools.read()
+        };
+
+        // created_by IS NOT NULL ⟺ batch_id IS NULL (requests_attribution_xor),
+        // so filtering created_by already restricts to batchless rows. Served by
+        // idx_requests_user_created_sort: seek created_by, range created_at,
+        // service_tier as an index condition.
+        let count = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) AS "count!"
+            FROM requests
+            WHERE created_by = $1
+              AND created_at >= $2
+              AND service_tier = 'flex'
+            "#,
+            owner,
+            cutoff,
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to count flex requests for creditor {}: {}",
+                owner,
+                e
+            ))
+        })?;
+
+        Ok(count)
+    }
+
     async fn get_pending_request_counts_by_model_and_window(
         &self,
         windows: &[(String, Option<i64>, i64)], // (label, start_secs, end_secs)

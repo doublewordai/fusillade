@@ -16,6 +16,7 @@ use crate::request::{
     RequestListResult, RequestState, ServiceTierFilter,
 };
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -436,6 +437,46 @@ pub trait Storage: Send + Sync {
         priority_decay_window: Option<i64>,
         strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>>;
+
+    /// Sum the `total_requests` of a creditor's batches for a given completion
+    /// window created on or after `cutoff`.
+    ///
+    /// Used by the control layer to enforce the unverified upload-volume cap at
+    /// batch creation: an unverified creditor may submit at most
+    /// `unverified_requests_per_completion_hour * window_hours` requests within
+    /// a rolling window equal to the completion window. Served by
+    /// `idx_batches_completion_window (completion_window, created_by)`.
+    ///
+    /// - `owner`: the batch `created_by` — the creditor (organization id for org
+    ///   members, user id otherwise).
+    /// - `cutoff`: only batches with `created_at >= cutoff` are counted.
+    /// - `strict`: set `true` to read from the write pool and avoid read lag, so
+    ///   a just-created batch is reflected immediately (required for enforcement).
+    async fn sum_owner_batch_requests_in_window(
+        &self,
+        owner: &str,
+        completion_window: &str,
+        cutoff: DateTime<Utc>,
+        strict: bool,
+    ) -> Result<i64>;
+
+    /// Count a creditor's batchless `flex` requests created on or after `cutoff`.
+    ///
+    /// The flex counterpart of [`Storage::sum_owner_batch_requests_in_window`]:
+    /// flex requests are batchless (`batch_id IS NULL`, attribution via
+    /// `requests.created_by`) and always map to the 1h completion window. Served
+    /// by `idx_requests_user_created_sort (created_by, created_at DESC, id DESC,
+    /// service_tier) WHERE created_by IS NOT NULL`.
+    ///
+    /// - `owner`: the request `created_by` — the creditor id.
+    /// - `cutoff`: only requests with `created_at >= cutoff` are counted.
+    /// - `strict`: set `true` to read from the write pool and avoid read lag.
+    async fn count_owner_flex_requests_since(
+        &self,
+        owner: &str,
+        cutoff: DateTime<Utc>,
+        strict: bool,
+    ) -> Result<i64>;
     ///
     /// Cancel one or more individual pending or in-progress requests.
     ///

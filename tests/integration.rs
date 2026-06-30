@@ -2555,3 +2555,185 @@ mod service_tier {
         assert_eq!(all_result.data.len(), 2);
     }
 }
+
+/// Tests for the per-creditor rolling-window count queries that back the
+/// control layer's unverified upload-volume cap (COR-481).
+mod unverified_volume_counts {
+    use super::*;
+
+    /// Create a batch attributed to `creditor` with `completion_window` and `n`
+    /// templated requests. The batch-status trigger sets `total_requests` to `n`
+    /// as the requests are populated.
+    async fn seed_batch<S: Storage>(
+        manager: &S,
+        creditor: &str,
+        completion_window: &str,
+        n: usize,
+    ) {
+        let templates: Vec<RequestTemplateInput> = (0..n)
+            .map(|_| RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: "{}".to_string(),
+                model: "test-model".to_string(),
+                api_key: "k".to_string(),
+            })
+            .collect();
+        let file_id = manager
+            .create_file(
+                format!("f-{creditor}-{completion_window}-{n}"),
+                None,
+                templates,
+            )
+            .await
+            .unwrap();
+        manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: completion_window.to_string(),
+                metadata: None,
+                created_by: Some(creditor.to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn seed_flex<S: Storage>(manager: &S, creditor: &str) {
+        manager
+            .create_flex(fusillade::CreateFlexInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: r#"{"prompt":"test"}"#.to_string(),
+                model: "test-model".to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: creditor.to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_sum_owner_batch_requests_in_window(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        // user-a: 3 requests in 24h, 2 in 1h. user-b: 5 in 24h (isolation).
+        seed_batch(&manager, "user-a", "24h", 3).await;
+        seed_batch(&manager, "user-a", "1h", 2).await;
+        seed_batch(&manager, "user-b", "24h", 5).await;
+
+        let past = chrono::Utc::now() - chrono::Duration::hours(48);
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        // Scoped by creditor AND completion_window.
+        assert_eq!(
+            manager
+                .sum_owner_batch_requests_in_window("user-a", "24h", past, true)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            manager
+                .sum_owner_batch_requests_in_window("user-a", "1h", past, true)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            manager
+                .sum_owner_batch_requests_in_window("user-b", "24h", past, true)
+                .await
+                .unwrap(),
+            5,
+            "other creditors must not bleed into the count"
+        );
+
+        // A future cutoff excludes the just-created batches.
+        assert_eq!(
+            manager
+                .sum_owner_batch_requests_in_window("user-a", "24h", future, true)
+                .await
+                .unwrap(),
+            0,
+            "created_at < cutoff must be excluded"
+        );
+
+        // Unknown creditor / window → 0.
+        assert_eq!(
+            manager
+                .sum_owner_batch_requests_in_window("nobody", "24h", past, true)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_count_owner_flex_requests_since(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        // user-a: two flex requests + one realtime (must be excluded). Plus a 1h
+        // BATCH (its requests are batched, not batchless flex) and a flex request
+        // for user-b — both must be excluded from user-a's flex count.
+        seed_flex(&manager, "user-a").await;
+        seed_flex(&manager, "user-a").await;
+        manager
+            .create_realtime(fusillade::CreateRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: r#"{"prompt":"test"}"#.to_string(),
+                model: "test-model".to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-a".to_string(),
+            })
+            .await
+            .unwrap();
+        seed_batch(&manager, "user-a", "1h", 4).await;
+        seed_flex(&manager, "user-b").await;
+
+        let past = chrono::Utc::now() - chrono::Duration::hours(48);
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        assert_eq!(
+            manager
+                .count_owner_flex_requests_since("user-a", past, true)
+                .await
+                .unwrap(),
+            2,
+            "counts only batchless flex rows: excludes realtime, batched 1h, and other creditors"
+        );
+        assert_eq!(
+            manager
+                .count_owner_flex_requests_since("user-b", past, true)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            manager
+                .count_owner_flex_requests_since("user-a", future, true)
+                .await
+                .unwrap(),
+            0,
+            "created_at < cutoff must be excluded"
+        );
+    }
+}
