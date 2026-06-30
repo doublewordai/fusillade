@@ -1226,7 +1226,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
-        leak_cooldown: &HashSet<(String, String)>,
+        leak_cooldown: &HashSet<(String, String, String)>,
     ) -> Result<Vec<Request<Claimed>>> {
         // First, unclaim any stale requests (self-healing for daemon crashes)
         let unclaimed_count = self.unclaim_stale_requests().await?;
@@ -1274,12 +1274,25 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .map(|u| *user_active_counts.get(u).unwrap_or(&0) as i64)
             .collect();
 
-        // Leaky-bucket cooldown: `(user, window-class)` pairs that may not leak
-        // this cycle. Source B in the claim SQL anti-joins against these, so a
-        // pair in cooldown is skipped (≤ 1 leak per pair per `leak_interval`).
-        // Empty => every bucket has its first token available.
-        let cooldown_user_arr: Vec<String> = leak_cooldown.iter().map(|p| p.0.clone()).collect();
-        let cooldown_window_arr: Vec<String> = leak_cooldown.iter().map(|p| p.1.clone()).collect();
+        // Leaky-bucket cooldown: `(user, window-class, model)` triples that may
+        // not leak this cycle. Source B in the claim SQL anti-joins against these,
+        // so a triple in cooldown is skipped (≤ 1 leak per triple per
+        // `leak_interval`). The three arrays are positionally aligned (the i-th
+        // entry of each is one triple). Empty => every bucket has its first token
+        // available.
+        //
+        // Built in a single pass: `HashSet` iteration order is not a stable
+        // contract across separate `.iter()` calls, so splitting the triple over
+        // three independent iterations could misalign the columns and match the
+        // wrong cooldown in `unnest($13,$14,$15)`.
+        let mut cooldown_user_arr: Vec<String> = Vec::with_capacity(leak_cooldown.len());
+        let mut cooldown_window_arr: Vec<String> = Vec::with_capacity(leak_cooldown.len());
+        let mut cooldown_model_arr: Vec<String> = Vec::with_capacity(leak_cooldown.len());
+        for (user, window, model) in leak_cooldown {
+            cooldown_user_arr.push(user.clone());
+            cooldown_window_arr.push(window.clone());
+            cooldown_model_arr.push(model.clone());
+        }
 
         // Deadline ramp exponent: `ramp_minutes = W_minutes ^ exponent`. A
         // not-live request within `ramp(W)` of its deadline is claimed at full
@@ -1313,8 +1326,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // or for batchless the service_tier→window map ($10/$11, default $12).
         // The gate claims a row at full capacity when its model is live OR it
         // is within `ramp(W)` of its deadline (Source A); otherwise the
-        // per-(user, window-class) leaky bucket trickles ≤ 1 per cycle (Source
-        // B). See the `to_claim` CTE for the four-arm structure.
+        // per-(user, window-class, model) leaky bucket trickles ≤ 1 per cycle
+        // (Source B). See the `to_claim` CTE for the four-arm structure.
         let rows = sqlx::query!(
             r#"
             -- Two-path claim, bounded for large per-model backlogs.
@@ -1408,7 +1421,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             -- FOR UPDATE … SKIP LOCKED, UNION-ed then capped at `capacity`:
             --   A1/A2 — Source A (full capacity): live OR within ramp(W).
             --   B3/B4 — Source B (leaky bucket): not-live, before-ramp, ≤ 1 per
-            --           (user, window-class) not in the daemon's cooldown set.
+            --           (user, window-class, model) not in the daemon's cooldown
+            --           set. Each arm runs per-model (the `all_models m` lateral
+            --           fixes the model), so the DISTINCT ON (user, window-class)
+            --           inside each arm is effectively per (user, window-class,
+            --           model); the cooldown anti-join keys on the model too.
             -- `leaked` tags Source B rows; `window_class`/`window_secs` ride
             -- along so the daemon stamps the right bucket. `claim_full` is a
             -- plain boolean (never NULL), so a not-live before-ramp row always
@@ -1455,11 +1472,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
                       UNION ALL
                         -- ARM B3 — Source B, BATCH: not-live, before-ramp batches,
-                        -- ≤ 1 per (user, window-class) not in cooldown. DISTINCT ON
-                        -- keeps the best batch per (created_by, window_class) over
-                        -- the bounded `ranked_batches` set, then pulls its 1 oldest
-                        -- pending row. Per-model (cross-model ≤1 is converged by the
-                        -- daemon cooldown set across cycles).
+                        -- ≤ 1 per (user, window-class, model) not in cooldown.
+                        -- This arm is fixed to `m.model`, so DISTINCT ON keeps the
+                        -- best batch per (created_by, window_class) — i.e. per
+                        -- (user, window-class, model) — over the bounded
+                        -- `ranked_batches` set, then pulls its 1 oldest pending
+                        -- row. The cooldown anti-join matches the model too, so a
+                        -- bucket in cooldown for one model still leaks for others.
                         SELECT sb.id, sb.template_id, sb.batch_id, sb.effective_expires_at,
                                sb.leaked, sb.window_class, sb.window_secs,
                                sb.ord_blend, sb.ord_exp, sb.ord_id
@@ -1474,8 +1493,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 FROM ranked_batches rb
                                 WHERE rb.model = m.model AND NOT (rb.claim_full OR rb.within_ramp)
                                   AND NOT EXISTS (
-                                      SELECT 1 FROM unnest($13::TEXT[], $14::TEXT[]) AS cd(u, w)
-                                      WHERE cd.u = rb.created_by AND cd.w = rb.window_class
+                                      SELECT 1 FROM unnest($13::TEXT[], $14::TEXT[], $15::TEXT[]) AS cd(u, w, mdl)
+                                      WHERE cd.u = rb.created_by AND cd.w = rb.window_class AND cd.mdl = rb.model
                                   )
                                 ORDER BY rb.created_by, rb.window_class,
                                          rb.pr ASC, rb.expires_at ASC, rb.batch_id ASC
@@ -1546,7 +1565,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
                       UNION ALL
                         -- ARM B4 — Source B, BATCHLESS (flex): not-live, before-ramp
-                        -- rows, ≤ 1 per (user, window-class) not in cooldown.
+                        -- rows, ≤ 1 per (user, window-class, model) not in cooldown.
                         -- DISTINCT ON can't coexist with FOR UPDATE, so pick the best
                         -- candidate per bucket UNLOCKED, then lock exactly that row
                         -- (SKIP LOCKED; if it's gone/locked the bucket simply leaks
@@ -1600,8 +1619,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                                OR (EXTRACT(EPOCH FROM (e.eff - $3))
                                                    <= power(GREATEST(e.w_secs, 0.0) / 60.0, $9::DOUBLE PRECISION) * 60.0))
                                       AND NOT EXISTS (
-                                          SELECT 1 FROM unnest($13::TEXT[], $14::TEXT[]) AS cd(u, w)
-                                          WHERE cd.u = r.created_by AND cd.w = COALESCE(r.service_tier, 'default')
+                                          SELECT 1 FROM unnest($13::TEXT[], $14::TEXT[], $15::TEXT[]) AS cd(u, w, mdl)
+                                          WHERE cd.u = r.created_by AND cd.w = COALESCE(r.service_tier, 'default') AND cd.mdl = r.model
                                       )
                                 ) cand
                                 ORDER BY cand.created_by, cand.window_class,
@@ -1667,6 +1686,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             default_window_ms,
             &cooldown_user_arr,
             &cooldown_window_arr,
+            &cooldown_model_arr,
         )
         .fetch_all(self.pools.write())
         .await
@@ -12552,8 +12572,8 @@ mod tests {
         )
         .with_config(filter_test_config());
 
-        // A live model is claimed even when this user's (window-class) bucket is
-        // in cooldown — Source A ignores the leaky bucket entirely.
+        // A live model is claimed even when this user's (window-class, model)
+        // bucket is in cooldown — Source A ignores the leaky bucket entirely.
         let expires_at = Utc::now() + chrono::Duration::hours(12);
         setup_filter_request(&manager, &pool, "heavy", "live-model", expires_at).await;
         manager
@@ -12567,7 +12587,11 @@ mod tests {
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("live-model".to_string(), 5)]);
-        let cooldown = HashSet::from([("heavy".to_string(), "24h".to_string())]);
+        let cooldown = HashSet::from([(
+            "heavy".to_string(),
+            "24h".to_string(),
+            "live-model".to_string(),
+        )]);
         let claimed = manager
             .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
             .await
@@ -12621,7 +12645,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let cooldown = HashSet::from([("u".to_string(), "24h".to_string())]);
+        let cooldown = HashSet::from([("u".to_string(), "24h".to_string(), "m".to_string())]);
         let released = manager
             .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
             .await
@@ -12672,7 +12696,8 @@ mod tests {
         assert_eq!(leak.window_class.as_str(), "24h");
 
         // The bucket is now in cooldown => nothing leaks.
-        let cooldown = HashSet::from([("u".to_string(), "24h".to_string())]);
+        let cooldown =
+            HashSet::from([("u".to_string(), "24h".to_string(), "nl-model".to_string())]);
         let claimed = manager
             .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
             .await
@@ -12705,6 +12730,47 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn test_cooldown_is_per_model(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(filter_test_config());
+
+        // Same user, same window-class (24h), but TWO distinct not-live models.
+        // The bucket key is (user, window-class, model), so a cooldown on one
+        // model must NOT block the same user+window on the other model.
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
+        setup_filter_request(&manager, &pool, "u", "model-a", expires_at).await;
+        setup_filter_request(&manager, &pool, "u", "model-b", expires_at).await;
+        mark_not_live(&manager, "model-a").await;
+        mark_not_live(&manager, "model-b").await;
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("model-a".to_string(), 5), ("model-b".to_string(), 5)]);
+
+        // model-a's bucket is in cooldown; model-b's is not. model-b leaks one,
+        // model-a leaks none — the cooldown is scoped to (user, window, model).
+        let cooldown = HashSet::from([("u".to_string(), "24h".to_string(), "model-a".to_string())]);
+        let claimed = manager
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "a per-model cooldown leaves the other model's bucket free to leak"
+        );
+        let leaked = &claimed[0];
+        assert_eq!(
+            leaked.data.model.as_str(),
+            "model-b",
+            "the leaked row is the model NOT in cooldown"
+        );
+        assert!(leaked.state.leak.is_some(), "the model-b claim is leaked");
+    }
+
+    #[sqlx::test]
     async fn test_not_live_within_ramp_claims_full_capacity(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -12723,7 +12789,7 @@ mod tests {
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("nl-ramp".to_string(), 5)]);
-        let cooldown = HashSet::from([("u".to_string(), "24h".to_string())]);
+        let cooldown = HashSet::from([("u".to_string(), "24h".to_string(), "nl-ramp".to_string())]);
         let claimed = manager
             .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
             .await
@@ -12761,7 +12827,8 @@ mod tests {
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("nl-expired".to_string(), 5)]);
         // In cooldown too — the ramp still releases it, leaky bucket irrelevant.
-        let cooldown = HashSet::from([("u".to_string(), "24h".to_string())]);
+        let cooldown =
+            HashSet::from([("u".to_string(), "24h".to_string(), "nl-expired".to_string())]);
         let claimed = manager
             .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
             .await

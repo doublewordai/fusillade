@@ -398,14 +398,14 @@ where
     /// Per-user in-flight request counts across all models, used to prioritise
     /// users with fewer active requests during claim (per-user fair scheduling).
     user_requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
-    /// Per-`(user, window-class)` leaky-bucket state for not-live models. Each
-    /// entry's value is `next_token_at`: the earliest `Instant` the bucket may
-    /// leak its next request. Before a claim cycle the daemon derives the
-    /// cooldown set (pairs with `next_token_at > now`) and passes it to
+    /// Per-`(user, window-class, model)` leaky-bucket state for not-live models.
+    /// Each entry's value is `next_token_at`: the earliest `Instant` the bucket
+    /// may leak its next request. Before a claim cycle the daemon derives the
+    /// cooldown set (triples with `next_token_at > now`) and passes it to
     /// `claim_requests`; after a claim it stamps `next_token_at = now + W /
-    /// leaks_per_window` for each leaked row's pair. Stale entries are pruned on
+    /// leaks_per_window` for each leaked row's triple. Stale entries are pruned on
     /// read to bound the map. See `leaks_per_window`.
-    leak_buckets: Arc<dashmap::DashMap<(String, String), std::time::Instant>>,
+    leak_buckets: Arc<dashmap::DashMap<(String, String, String), std::time::Instant>>,
     /// Per-user throughput counters for periodic OTel emission.
     user_throughput: Arc<dashmap::DashMap<String, UserThroughputStats>>,
     requests_processed: Arc<AtomicU64>,
@@ -888,15 +888,15 @@ where
                 })
                 .collect();
 
-            // Derive the leaky-bucket cooldown set: `(user, window-class)` pairs
-            // whose bucket has not yet refilled (`next_token_at` in the future).
-            // Source B in the claim query skips these, so each pair leaks ≤ 1
-            // request per `leak_interval`. Prune refilled buckets (next_token_at
-            // already passed) on read to keep the map bounded — a refilled
-            // bucket carries no state until it leaks again.
+            // Derive the leaky-bucket cooldown set: `(user, window-class, model)`
+            // triples whose bucket has not yet refilled (`next_token_at` in the
+            // future). Source B in the claim query skips these, so each triple
+            // leaks ≤ 1 request per `leak_interval`. Prune refilled buckets
+            // (next_token_at already passed) on read to keep the map bounded — a
+            // refilled bucket carries no state until it leaks again.
             let cooldown_now = std::time::Instant::now();
-            let mut refilled_buckets: Vec<(String, String)> = Vec::new();
-            let leak_cooldown: std::collections::HashSet<(String, String)> = self
+            let mut refilled_buckets: Vec<(String, String, String)> = Vec::new();
+            let leak_cooldown: std::collections::HashSet<(String, String, String)> = self
                 .leak_buckets
                 .iter()
                 .filter_map(|entry| {
@@ -938,10 +938,12 @@ where
             );
 
             // Stamp the leaky bucket for each row claimed via Source B. A leaked
-            // row consumes its `(user, window-class)` token: the bucket may not
-            // leak again until `now + W / leaks_per_window`, which the next
-            // cycle reads back as cooldown. Source A (full-capacity) claims have
-            // `leak == None` and consume no token.
+            // row consumes its `(user, window-class, model)` token: the bucket
+            // may not leak again until `now + W / leaks_per_window`, which the
+            // next cycle reads back as cooldown. The model is taken from the
+            // claimed row (before any escalation rewrite below), matching the
+            // model the claim query's Source B anti-join keyed on. Source A
+            // (full-capacity) claims have `leak == None` and consume no token.
             {
                 let stamp_now = std::time::Instant::now();
                 let leaks_per_window = self.config.leaks_per_window.max(f64::MIN_POSITIVE);
@@ -951,7 +953,11 @@ where
                         let interval = std::time::Duration::from_secs_f64(
                             (stamp.window_secs / leaks_per_window).max(0.0),
                         );
-                        let key = (request.data.created_by.clone(), stamp.window_class.clone());
+                        let key = (
+                            request.data.created_by.clone(),
+                            stamp.window_class.clone(),
+                            request.data.model.clone(),
+                        );
                         self.leak_buckets.insert(key, stamp_now + interval);
                         leaked_count += 1;
                     }

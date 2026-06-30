@@ -137,8 +137,9 @@ impl RequestState for Pending {}
 /// Leaky-bucket stamp for a request claimed via Source B (the not-live,
 /// before-ramp trickle). Carried on [`Claimed`] as `Some` iff the row was
 /// leaked; the daemon stamps `next_token_at = now + window_secs /
-/// leaks_per_window` for the `(created_by, window_class)` bucket. `None` for
-/// full-capacity (Source A) claims, which consume no token.
+/// leaks_per_window` for the `(created_by, window_class, model)` bucket. `None`
+/// for full-capacity (Source A) claims, which consume no token. The model is
+/// read from the request itself, so it is not carried on the stamp.
 #[derive(Debug, Clone, Serialize)]
 pub struct LeakStamp {
     /// The bucket's window-class (a batch's `completion_window`, or a batchless
@@ -162,8 +163,8 @@ pub struct Claimed {
     /// When the batch expires (carried over from Pending)
     pub batch_expires_at: DateTime<Utc>,
     /// Set iff this row was claimed via the leaky bucket (Source B); tells the
-    /// daemon which `(user, window-class)` bucket to stamp. `None` for
-    /// full-capacity claims.
+    /// daemon which `(user, window-class, model)` bucket to stamp (the model is
+    /// read from the request's `data.model`). `None` for full-capacity claims.
     pub leak: Option<LeakStamp>,
 }
 

@@ -559,15 +559,15 @@ pub trait Storage: Send + Sync {
     /// An EXPLICIT not-live event (`coming`/`absent`) ⇒ the request is either
     /// claimed at full capacity (→ OpenRouter) when within `ramp(W)` of its
     /// completion-window deadline, or otherwise released only via the
-    /// per-`(user, window-class)` leaky bucket. So with an empty `model_filters`
+    /// per-`(user, window-class, model)` leaky bucket. So with an empty `model_filters`
     /// table the gate is a no-op (everything claims at full capacity) — it only
     /// engages once the controller starts writing not-live events.
     ///
-    /// `leak_cooldown` is the set of `(user, window-class)` pairs whose leaky
-    /// bucket has no token this cycle (the daemon stamped `next_token_at` in
-    /// the future after a recent leak). Source B skips these pairs, claiming
-    /// ≤ 1 per `(user, window-class)` not in cooldown. Pass an empty set to
-    /// allow every bucket its first token. Claimed rows carry a `leaked` flag
+    /// `leak_cooldown` is the set of `(user, window-class, model)` triples whose
+    /// leaky bucket has no token this cycle (the daemon stamped `next_token_at`
+    /// in the future after a recent leak). Source B skips these triples, claiming
+    /// ≤ 1 per `(user, window-class, model)` not in cooldown. Pass an empty set
+    /// to allow every bucket its first token. Claimed rows carry a `leaked` flag
     /// (via the returned request) so the daemon knows which buckets to stamp.
     async fn claim_requests(
         &self,
@@ -575,7 +575,7 @@ pub trait Storage: Send + Sync {
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
-        leak_cooldown: &std::collections::HashSet<(String, String)>,
+        leak_cooldown: &std::collections::HashSet<(String, String, String)>,
     ) -> Result<Vec<Request<Claimed>>>;
 
     /// Append a single event to the `model_filters` log. Used by the controller
