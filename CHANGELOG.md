@@ -1,5 +1,19 @@
 # Changelog
 
+## [19.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v19.1.0...fusillade-v19.2.0) (2026-06-30)
+
+
+### Features
+
+* add per-creditor request-count queries for unverified upload limits ([#303](https://github.com/doublewordai/fusillade/issues/303)) ([e412a54](https://github.com/doublewordai/fusillade/commit/e412a5490bab50173bfa62f122ad66189a21abf2))
+* key the leaky-bucket throttle by (user, window-class, model) ([#302](https://github.com/doublewordai/fusillade/issues/302)) ([704c7ef](https://github.com/doublewordai/fusillade/commit/704c7ef2b8c8b0580eb6aec8fa8610adaf9e8b45))
+
+
+### Bug Fixes
+
+* force custom plan for pending-request-counts query ([#306](https://github.com/doublewordai/fusillade/issues/306)) ([5c04d9c](https://github.com/doublewordai/fusillade/commit/5c04d9c051e2281aa9a392cecd5e6d1dc29b674a))
+* stop logging provider response bodies in failure/retry logs ([#304](https://github.com/doublewordai/fusillade/issues/304)) ([5c6a3a3](https://github.com/doublewordai/fusillade/commit/5c6a3a342564eff8f9f1ee3e87b1327c775d176b))
+
 ## [19.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v19.0.1...fusillade-v19.1.0) (2026-06-25)
 
 
