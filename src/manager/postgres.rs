@@ -1051,61 +1051,54 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             WITH windows(label, start_seconds, has_start, end_seconds) AS (
                 SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::int2[], $4::bigint[])
             ),
-            active_request_counts AS (
+            active_batches AS MATERIALIZED (
                 SELECT
-                    r.batch_id,
-                    r.model,
-                    COUNT(*)::BIGINT AS request_count
-                FROM requests r
-                WHERE r.state = ANY($5)
-                -- Batchless rows are counted by batchless_counts below; the
-                -- inner join in batch_counts would drop them anyway, so skip
-                -- scanning them here and keep the two CTEs disjoint.
-                AND r.batch_id IS NOT NULL
-                AND r.template_id IS NOT NULL
-                AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
-                AND (
-                    $9 = 'any'
-                    OR ($9 = 'include' AND (
-                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($7))
-                        OR ($8 AND r.service_tier IS NULL)
-                    ))
-                    OR ($9 = 'exclude' AND (
-                        (r.service_tier IS NULL AND NOT $8)
-                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($7))
-                    ))
-                )
-                GROUP BY r.batch_id, r.model
-            ),
-            batch_counts AS (
-                SELECT
-                    arc.model as model,
-                    w.label as window_label,
-                    COALESCE(SUM(arc.request_count) FILTER (
-                        WHERE (w.has_start = 0 OR b.expires_at >= NOW() + make_interval(secs => w.start_seconds))
-                          AND b.expires_at < NOW() + make_interval(secs => w.end_seconds)
-                    ), 0)::BIGINT as count
-                FROM active_request_counts arc
-                JOIN batches b ON arc.batch_id = b.id
-                CROSS JOIN windows w
-                -- Only count rows the daemon can actually claim. This MUST stay in
-                -- sync with the batch eligibility filter in `claim_requests`
-                -- (`ranked_batches`): excluding only `cancelling_at` here while the
-                -- claim path also excludes terminal batches lets a `pending` row
-                -- stranded under an already-completed batch (e.g. a retry that
-                -- raced batch finalization) be reported as claimable forever while
-                -- never actually being claimed.
+                    b.id,
+                    b.expires_at,
+                    CASE b.completion_window
+                        WHEN '1h' THEN 'flex'::text
+                        WHEN '0s' THEN 'priority'::text
+                        ELSE NULL::text
+                    END AS service_tier
+                FROM batches b
+                -- Only count batches the daemon can actually claim. This MUST
+                -- stay in sync with the batch eligibility filter in
+                -- `claim_requests` (`ranked_batches`).
                 WHERE b.cancelling_at IS NULL
                   AND b.deleted_at IS NULL
                   AND b.completed_at IS NULL
                   AND b.failed_at IS NULL
                   AND b.cancelled_at IS NULL
-                -- Row-level upper bound: a row that expires after every window's
-                -- end can't contribute to any window's COUNT FILTER, so prune it
-                -- here. Without this, the join reads every active+templated
-                -- request and only filters inside the aggregate.
-                AND b.expires_at < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
-                GROUP BY arc.model, w.label
+            ),
+            batch_counts AS (
+                -- Batch-backed counts are an intentionally approximate
+                -- queue-pressure estimate: count the whole non-terminal batch
+                -- from stable per-model totals, rather than re-counting
+                -- high-churn request states on every monitoring poll.
+                SELECT
+                    bmc.model as model,
+                    w.label as window_label,
+                    COALESCE(SUM(bmc.total_requests) FILTER (
+                        WHERE (w.has_start = 0 OR b.expires_at >= NOW() + make_interval(secs => w.start_seconds))
+                          AND b.expires_at < NOW() + make_interval(secs => w.end_seconds)
+                    ), 0)::BIGINT as count
+                FROM active_batches b
+                JOIN batch_model_counts bmc ON bmc.batch_id = b.id
+                CROSS JOIN windows w
+                WHERE ARRAY['pending', 'claimed', 'processing']::text[] && $5::text[]
+                AND (cardinality($6::text[]) = 0 OR bmc.model = ANY($6))
+                AND (
+                    $9 = 'any'
+                    OR ($9 = 'include' AND (
+                        (b.service_tier IS NOT NULL AND b.service_tier = ANY($7))
+                        OR ($8 AND b.service_tier IS NULL)
+                    ))
+                    OR ($9 = 'exclude' AND (
+                        (b.service_tier IS NULL AND NOT $8)
+                        OR (b.service_tier IS NOT NULL AND b.service_tier <> ALL($7))
+                    ))
+                )
+                GROUP BY bmc.model, w.label
             ),
             batchless_counts AS (
                 -- Daemon-claimable rows with no parent batch (flex/async
@@ -3375,6 +3368,26 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to update batch metadata: {}", e)))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO batch_model_counts (batch_id, model, total_requests)
+            SELECT $1, model, COUNT(*)::BIGINT
+            FROM request_templates
+            WHERE file_id = $2
+            GROUP BY model
+            ON CONFLICT (batch_id, model) DO UPDATE
+            SET total_requests = EXCLUDED.total_requests,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(*batch_id as Uuid)
+        .bind(*file_id as Uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to update batch model counts: {}", e))
+        })?;
 
         tx.commit()
             .await
@@ -14709,6 +14722,134 @@ mod tests {
             .unwrap();
 
         assert!(counts_cancelled.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn test_pending_request_counts_estimates_batch_backed_but_keeps_batchless_state_exact(
+        pool: sqlx::PgPool,
+    ) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "file-estimate-batch-backed".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("a1".to_string()),
+                        endpoint: "/v1/chat/completions".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"input":"a1"}"#.to_string(),
+                        model: "model-a".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("b1".to_string()),
+                        endpoint: "/v1/chat/completions".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"input":"b1"}"#.to_string(),
+                        model: "model-b".to_string(),
+                        api_key: "k".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "UPDATE batches SET expires_at = NOW() + INTERVAL '10 minutes' WHERE id = $1",
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The batch-backed arm is now a queue-pressure estimate. It should not
+        // touch `requests` to distinguish pending from claimed rows; otherwise
+        // the monitoring path regresses to the production timeout shape.
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'claimed',
+                daemon_id = $1,
+                claimed_at = NOW()
+            WHERE batch_id = $2 AND model = 'model-b'
+            "#,
+            Uuid::new_v4(),
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let batchless_id = Uuid::new_v4();
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: batchless_id,
+                body: r#"{"input":"batchless"}"#.to_string(),
+                model: "batchless-model".to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "queue-user".to_string(),
+            })
+            .await
+            .unwrap();
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'claimed',
+                daemon_id = $1,
+                claimed_at = NOW(),
+                created_at = NOW() - INTERVAL '5 minutes'
+            WHERE id = $2
+            "#,
+            Uuid::new_v4(),
+            batchless_id,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let counts = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[("15m".to_string(), None, 900)],
+                &["pending".to_string()],
+                &[],
+                &ServiceTierFilter::Any,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*counts.get("model-a").unwrap().get("15m").unwrap(), 1);
+        assert_eq!(*counts.get("model-b").unwrap().get("15m").unwrap(), 1);
+        assert!(
+            !counts.contains_key("batchless-model"),
+            "batchless rows must still honor the requested states exactly"
+        );
     }
 
     #[sqlx::test]
