@@ -2738,6 +2738,115 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_batchless_flex_sets_async_completion_window_metadata(pool: sqlx::PgPool) {
+        let http_client = crate::http::MockHttpClient::new();
+        http_client.add_response(
+            "POST /v1/chat/completions",
+            Ok(crate::http::HttpResponse {
+                status: 200,
+                body: r#"{"id":"chatcmpl-flex","choices":[{"message":{"content":"test"}}]}"#
+                    .to_string(),
+            }),
+        );
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            model_concurrency_limits: {
+                let m = Arc::new(dashmap::DashMap::new());
+                m.insert("test-model".to_string(), 10);
+                m
+            },
+
+            model_escalations: Arc::new(dashmap::DashMap::new()),
+            inject_deadline_priority: false,
+            max_retries: Some(3),
+            stop_before_deadline_ms: None,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            first_chunk_timeout_ms: 5000,
+            chunk_timeout_ms: 5000,
+            body_timeout_ms: 86_400_000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 5000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            stale_daemon_threshold_ms: 30_000,
+            unclaim_batch_size: 100,
+            batch_metadata_fields: vec![
+                "id".to_string(),
+                "created_at".to_string(),
+                "completion_window".to_string(),
+            ],
+            cancellation_poll_interval_ms: 100,
+            purge_interval_ms: 0,
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
+            throughput_log_interval_ms: None,
+            urgency_weight: 0.0,
+            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
+            default_completion_window_ms: 86_400_000,
+            claim_ramp_exponent: 0.56,
+            leaks_per_window: 60.0,
+            model_filters_keep_per_model: 50,
+            model_filters_retention_ms: 604_800_000,
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                Arc::new(http_client.clone()),
+            )
+            .with_config(config),
+        );
+
+        let request_id = uuid::Uuid::new_v4();
+        manager
+            .create_flex(crate::request::CreateFlexInput {
+                request_id,
+                body: r#"{"model":"test-model","messages":[],"service_tier":"flex"}"#.to_string(),
+                model: "test-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                api_key: "batch-key".to_string(),
+                created_by: uuid::Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("create_flex should succeed");
+
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        shutdown_token.cancel();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let calls = http_client.get_calls();
+        assert_eq!(calls.len(), 1, "Expected exactly one HTTP call");
+        assert_eq!(
+            calls[0].batch_metadata.get("completion_window"),
+            Some(&"1h".to_string()),
+            "batchless flex should be identified to downstream analytics as Async"
+        );
+        assert!(
+            calls[0].batch_metadata.contains_key("created_at"),
+            "batchless flex should carry request creation time for historical pricing"
+        );
+        assert!(
+            !calls[0].batch_metadata.contains_key("id"),
+            "batchless flex must not emit an empty synthetic batch id"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_batch_metadata_extracts_fields_from_json_metadata(pool: sqlx::PgPool) {
         let http_client = crate::http::MockHttpClient::new();
         http_client.add_response(
