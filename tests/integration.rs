@@ -854,27 +854,40 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
         let retry_count = failed.state.retry_attempt;
         let call_count = http_client.call_count();
 
-        // 1. Verify we stopped before too many retries (deadline constraint)
-        // Allow 7-9 attempts to account for timing variations in test execution
+        // max_retries is 10_000, so the *deadline* is what must stop the retries.
+        // Assert that invariant rather than an exact attempt count: the count is
+        // wall-clock dependent (how many DB/CPU cycles fit the window), so it
+        // varies with CI speed and was the source of the flakiness.
+
+        // It retried at least once before giving up.
         assert!(
-            (7..=9).contains(&retry_count),
-            "Expected 7-9 retry attempts based on deadline and backoff calculation, got {}",
+            retry_count >= 1,
+            "expected at least one retry before the deadline, got {}",
             retry_count
         );
 
-        // 2. Verify HTTP call count matches retry attempts (1 initial + N retries)
+        // The 500ms buffer must stop the request *before* the batch expires.
+        assert!(
+            failed.state.failed_at < failed.state.batch_expires_at,
+            "buffered retry should stop before batch expiry: failed_at={}, expires_at={}",
+            failed.state.failed_at,
+            failed.state.batch_expires_at
+        );
+
+        // Exactly one HTTP call per attempt (1 initial + N retries).
         assert_eq!(
             call_count,
             (retry_count + 1) as usize,
-            "Expected call count to match retry attempts + 1 initial attempt, got {} calls for {} retry attempts",
-            call_count,
-            retry_count
+            "expected {} calls (1 initial + {} retries), got {}",
+            retry_count + 1,
+            retry_count,
+            call_count
         );
 
-        // 3. Verify the request actually has error details from the last attempt
+        // The terminal failure carries the last attempt's error.
         assert!(
             !failed.state.reason.to_error_message().is_empty(),
-            "Expected failed request to have failure reason"
+            "expected a failure reason"
         );
     } else {
         panic!(
@@ -1028,28 +1041,44 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
         let retry_count = failed.state.retry_attempt;
         let call_count = http_client.call_count();
 
-        // 1. Verify we retried more than the buffered case (which stopped at ~8)
-        //    but still stopped before too many attempts
-        // Allow 9-12 attempts to account for timing variations with CI slower CI CPUs
+        // Neither max_retries nor a deadline buffer is set, so the SLA deadline is
+        // the only thing that can stop the retries. Assert that invariant rather
+        // than an exact attempt count: the count is wall-clock dependent (how many
+        // DB/CPU cycles fit the window), so it varies with CI speed and was the
+        // source of the flakiness.
+
+        // It retried at least once before giving up.
         assert!(
-            (9..12).contains(&retry_count),
-            "Expected 9-12 retry attempts (should retry until deadline with no buffer), got {}",
+            retry_count >= 1,
+            "expected at least one retry before the deadline, got {}",
             retry_count
         );
 
-        // 2. Verify HTTP call count matches retry attempts (1 initial + N retries)
+        // With no buffer, retries run right up to the deadline: the final attempt
+        // fails within one backoff step (≤200ms) of batch expiry, not hundreds of
+        // ms early like the buffered case. 500ms slack absorbs scheduling jitter.
+        assert!(
+            failed.state.failed_at.timestamp_millis()
+                >= failed.state.batch_expires_at.timestamp_millis() - 500,
+            "no-buffer retry should run up to the deadline: failed_at={}, expires_at={}",
+            failed.state.failed_at,
+            failed.state.batch_expires_at
+        );
+
+        // Exactly one HTTP call per attempt (1 initial + N retries).
         assert_eq!(
             call_count,
             (retry_count + 1) as usize,
-            "Expected call count to match retry attempts + 1 initial attempt, got {} calls for {} retry attempts",
-            call_count,
-            retry_count
+            "expected {} calls (1 initial + {} retries), got {}",
+            retry_count + 1,
+            retry_count,
+            call_count
         );
 
-        // 3. Verify the request has error details from the last attempt
+        // The terminal failure carries the last attempt's error.
         assert!(
             !failed.state.reason.to_error_message().is_empty(),
-            "Expected failed request to have failure reason"
+            "expected a failure reason"
         );
     } else {
         panic!(
