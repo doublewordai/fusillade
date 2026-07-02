@@ -428,9 +428,32 @@ pub trait Storage: Send + Sync {
     /// Excludes:
     /// - Requests without a template_id
     /// - Requests in batches being cancelled
+    /// - Batched requests whose submitted completion window is not `"1h"` or `"24h"`
     async fn get_pending_request_counts_by_model_and_window(
         &self,
         windows: &[(String, Option<i64>, i64)],
+        states: &[String],
+        model_filter: &[String],
+        service_tier_filter: &ServiceTierFilter,
+        priority_decay_window: Option<i64>,
+        strict: bool,
+    ) -> Result<HashMap<String, HashMap<String, i64>>>;
+
+    /// Get request counts grouped by model and original SLA priority class.
+    ///
+    /// Unlike [`Storage::get_pending_request_counts_by_model_and_window`], this
+    /// classifies batched rows by the submitted `batches.completion_window`, not
+    /// by time remaining until `expires_at`:
+    /// - `"1h"` -> `"1h"`
+    /// - `"24h"` -> `"24h"`
+    /// - `"1w"` -> `"low_priority"`
+    ///
+    /// Other submitted windows are ignored by this priority-class view.
+    ///
+    /// Batchless flex rows are classified as `"1h"` and other non-priority
+    /// batchless rows as `"24h"`, matching their synthesized claim deadlines.
+    async fn get_pending_request_counts_by_model_and_priority_class(
+        &self,
         states: &[String],
         model_filter: &[String],
         service_tier_filter: &ServiceTierFilter,

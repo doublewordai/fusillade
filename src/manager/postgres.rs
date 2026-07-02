@@ -817,6 +817,31 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 /// fails fast instead of accumulating behind the callers' poll cadence.
 const PENDING_COUNTS_STATEMENT_TIMEOUT_MS: i64 = 30_000;
 
+fn split_service_tier_filter(
+    service_tier_filter: &ServiceTierFilter,
+) -> (Vec<String>, bool, &'static str) {
+    match service_tier_filter {
+        ServiceTierFilter::Any => (Vec::new(), true, "any"),
+        ServiceTierFilter::Include(tiers) => {
+            let (names, has_null) = ServiceTierFilter::split(tiers);
+            (names, has_null, "include")
+        }
+        ServiceTierFilter::Exclude(tiers) => {
+            let (names, has_null) = ServiceTierFilter::split(tiers);
+            (names, has_null, "exclude")
+        }
+    }
+}
+
+fn priority_class_for_completion_window(window: &str) -> Option<&'static str> {
+    match window {
+        "1h" => Some("1h"),
+        "24h" => Some("24h"),
+        "1w" => Some("low_priority"),
+        _ => None,
+    }
+}
+
 // Implement Storage trait directly (no delegation)
 #[async_trait]
 /// Returns counts of **claimable** pending requests grouped by model and expiry window.
@@ -1100,6 +1125,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                   AND b.completed_at IS NULL
                   AND b.failed_at IS NULL
                   AND b.cancelled_at IS NULL
+                  AND b.completion_window IN ('1h', '24h')
                 -- Row-level upper bound: a row that expires after every window's
                 -- end can't contribute to any window's COUNT FILTER, so prune it
                 -- here. Without this, the join reads every active+templated
@@ -1214,6 +1240,227 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 .try_get("count")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read count: {}", e)))?;
             result.entry(model).or_default().insert(window_label, count);
+        }
+
+        Ok(result)
+    }
+
+    async fn get_pending_request_counts_by_model_and_priority_class(
+        &self,
+        states: &[String],
+        model_filter: &[String],
+        service_tier_filter: &ServiceTierFilter,
+        priority_decay_window: Option<i64>,
+        strict: bool,
+    ) -> Result<HashMap<String, HashMap<String, i64>>> {
+        if states.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        if let Some(priority_decay_window) = priority_decay_window
+            && priority_decay_window < 0
+        {
+            return Err(FusilladeError::ValidationError(
+                "priority_decay_window must be non-negative".to_string(),
+            ));
+        }
+
+        let (tier_names, tier_include_null, tier_mode) =
+            split_service_tier_filter(service_tier_filter);
+
+        let mut tx = if strict {
+            self.pools.write().begin().await
+        } else {
+            self.pools.read().begin().await
+        }
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to begin transaction for priority-class pending request counts: {}",
+                e
+            ))
+        })?;
+
+        sqlx::query("SET LOCAL plan_cache_mode = force_custom_plan")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to force custom plan for priority-class pending request counts: {}",
+                    e
+                ))
+            })?;
+
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = {}",
+            PENDING_COUNTS_STATEMENT_TIMEOUT_MS
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to set statement_timeout for priority-class pending request counts: {}",
+                e
+            ))
+        })?;
+
+        let rows = sqlx::query(
+            r#"
+            WITH active_request_counts AS (
+                SELECT
+                    r.batch_id,
+                    r.model,
+                    COUNT(*)::BIGINT AS request_count
+                FROM requests r
+                WHERE r.state = ANY($1)
+                AND r.batch_id IS NOT NULL
+                AND r.template_id IS NOT NULL
+                AND (cardinality($2::text[]) = 0 OR r.model = ANY($2))
+                AND (
+                    $5 = 'any'
+                    OR ($5 = 'include' AND (
+                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($3))
+                        OR ($4 AND r.service_tier IS NULL)
+                    ))
+                    OR ($5 = 'exclude' AND (
+                        (r.service_tier IS NULL AND NOT $4)
+                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($3))
+                    ))
+                )
+                GROUP BY r.batch_id, r.model
+            ),
+            batch_counts AS (
+                SELECT
+                    arc.model AS model,
+                    b.completion_window AS completion_window,
+                    NULL::text AS priority_class,
+                    COALESCE(SUM(arc.request_count), 0)::BIGINT AS count
+                FROM active_request_counts arc
+                JOIN batches b ON arc.batch_id = b.id
+                WHERE b.cancelling_at IS NULL
+                  AND b.deleted_at IS NULL
+                  AND b.completed_at IS NULL
+                  AND b.failed_at IS NULL
+                  AND b.cancelled_at IS NULL
+                  AND b.completion_window IN ('1h', '24h', '1w')
+                GROUP BY arc.model, b.completion_window
+            ),
+            batchless_rows AS (
+                SELECT
+                    r.model AS model,
+                    CASE WHEN r.service_tier = 'flex' THEN '1h' ELSE '24h' END AS priority_class
+                FROM requests r
+                WHERE r.batch_id IS NULL
+                AND r.state = ANY($1)
+                AND r.template_id IS NOT NULL
+                AND (cardinality($2::text[]) = 0 OR r.model = ANY($2))
+                AND (
+                    $5 = 'any'
+                    OR ($5 = 'include' AND (
+                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($3))
+                        OR ($4 AND r.service_tier IS NULL)
+                    ))
+                    OR ($5 = 'exclude' AND (
+                        (r.service_tier IS NULL AND NOT $4)
+                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($3))
+                    ))
+                )
+            ),
+            batchless_counts AS (
+                SELECT
+                    model,
+                    NULL::text AS completion_window,
+                    priority_class,
+                    COUNT(*)::BIGINT AS count
+                FROM batchless_rows
+                GROUP BY model, priority_class
+            ),
+            priority_decay_counts AS (
+                SELECT
+                    r.model AS model,
+                    NULL::text AS completion_window,
+                    '1h'::text AS priority_class,
+                    COUNT(*)::BIGINT AS count
+                FROM requests r
+                WHERE $6::bigint IS NOT NULL
+                AND r.service_tier = 'flex'
+                AND r.state = 'completed'
+                AND r.template_id IS NOT NULL
+                AND r.completed_at >= NOW() - make_interval(secs => $6::bigint)
+                AND r.completed_at <= NOW()
+                AND (cardinality($2::text[]) = 0 OR r.model = ANY($2))
+                GROUP BY r.model
+            )
+            SELECT
+                model,
+                completion_window,
+                priority_class,
+                SUM(count)::BIGINT AS count
+            FROM (
+                SELECT * FROM batch_counts
+                UNION ALL
+                SELECT * FROM batchless_counts
+                UNION ALL
+                SELECT * FROM priority_decay_counts
+            ) counts
+            GROUP BY model, completion_window, priority_class
+            "#,
+        )
+        .bind(states)
+        .bind(model_filter)
+        .bind(&tier_names)
+        .bind(tier_include_null)
+        .bind(tier_mode)
+        .bind(priority_decay_window)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to get pending request counts by model and priority class: {}",
+                e
+            ))
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to commit priority-class pending request counts transaction: {}",
+                e
+            ))
+        })?;
+
+        let mut result: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        for row in rows {
+            let model: String = row
+                .try_get("model")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read model: {}", e)))?;
+            let completion_window: Option<String> =
+                row.try_get("completion_window").map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read completion_window: {}", e))
+                })?;
+            let priority_class: Option<String> = row.try_get("priority_class").map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to read priority_class: {}", e))
+            })?;
+            let count: i64 = row
+                .try_get("count")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read count: {}", e)))?;
+
+            let class = priority_class.as_deref().or_else(|| {
+                completion_window
+                    .as_deref()
+                    .and_then(priority_class_for_completion_window)
+            });
+            if let Some(class) = class {
+                *result
+                    .entry(model)
+                    .or_default()
+                    .entry(class.to_string())
+                    .or_insert(0) += count;
+            }
+        }
+
+        for counts in result.values_mut() {
+            counts.entry("1h".to_string()).or_insert(0);
+            counts.entry("24h".to_string()).or_insert(0);
+            counts.entry("low_priority".to_string()).or_insert(0);
         }
 
         Ok(result)
