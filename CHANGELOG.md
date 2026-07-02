@@ -1,5 +1,12 @@
 # Changelog
 
+## [19.2.1](https://github.com/doublewordai/fusillade/compare/fusillade-v19.2.0...fusillade-v19.2.1) (2026-07-02)
+
+
+### Bug Fixes
+
+* propagate async metadata for batchless flex requests ([#309](https://github.com/doublewordai/fusillade/issues/309)) ([780bfd4](https://github.com/doublewordai/fusillade/commit/780bfd4e7c0037789eff40cb22bf912b55909d99))
+
 ## [19.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v19.1.0...fusillade-v19.2.0) (2026-06-30)
 
 
