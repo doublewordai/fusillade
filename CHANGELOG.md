@@ -1,5 +1,12 @@
 # Changelog
 
+## [19.3.0](https://github.com/doublewordai/fusillade/compare/fusillade-v19.2.1...fusillade-v19.3.0) (2026-07-02)
+
+
+### Features
+
+* add a ResponseTransformer hook for persisted response/error bodies ([#312](https://github.com/doublewordai/fusillade/issues/312)) ([19c4baa](https://github.com/doublewordai/fusillade/commit/19c4baaef321adf6f179c7f4f84f46871ce3b736))
+
 ## [19.2.1](https://github.com/doublewordai/fusillade/compare/fusillade-v19.2.0...fusillade-v19.2.1) (2026-07-02)
 
 
