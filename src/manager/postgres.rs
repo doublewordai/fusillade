@@ -145,6 +145,10 @@ pub struct PostgresRequestManager<P: PoolProvider, H: HttpClient> {
     /// The builder-style [`with_processor`](Self::with_processor) remains
     /// available for tests and consumers that don't have a cycle.
     processor: std::sync::OnceLock<Arc<dyn crate::processor::RequestProcessor<Self, H>>>,
+    /// TRANSITIONAL ZDR hook - see [`crate::transform`]. Transforms response/
+    /// error bodies before persistence; `None` is identity. Remove when stream
+    /// reassembly moves into dwctl.
+    response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
 }
 
 /// Macro for extracting a [`Batch`] from a dynamic query row (PgRow).
@@ -230,6 +234,7 @@ impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> 
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             processor: std::sync::OnceLock::new(),
+            response_transformer: std::sync::OnceLock::new(),
         }
     }
 }
@@ -255,6 +260,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             processor: std::sync::OnceLock::new(),
+            response_transformer: std::sync::OnceLock::new(),
         }
     }
 
@@ -290,6 +296,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         self.processor
             .set(processor)
             .map_err(|_| "processor already set")
+    }
+
+    /// Install the TRANSITIONAL ZDR response transformer - see
+    /// [`crate::transform`]. Remove when stream reassembly moves into dwctl.
+    pub fn set_response_transformer(
+        &self,
+        transformer: Arc<dyn crate::transform::ResponseTransformer>,
+    ) -> std::result::Result<(), &'static str> {
+        self.response_transformer
+            .set(transformer)
+            .map_err(|_| "response transformer already set")
     }
 
     /// Set a custom daemon configuration.
@@ -1918,9 +1935,42 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     {
         const MAX_ATTEMPTS: u32 = 3;
 
+        // TRANSITIONAL ZDR hook (see crate::transform): encrypt the terminal
+        // body ONCE, before the retry loop, so a DB retry can neither re-run
+        // the keystore nor double-encrypt. Only Completed/Failed carry a
+        // persisted body. The daemon (flex/batch) completes through persist(),
+        // so this is the write path ZDR bodies actually flow through -
+        // complete_request/fail_request are reached only by the realtime
+        // tool-loop path, which ZDR rejects at submit.
+        let mut any_request = AnyRequest::from(request.clone());
+        if let Some(transformer) = self.response_transformer.get() {
+            match &mut any_request {
+                AnyRequest::Completed(req) => {
+                    req.state.response_body = transformer
+                        .transform(req.data.id, &req.state.response_body)
+                        .await?;
+                }
+                AnyRequest::Failed(req) => {
+                    // Only the HTTP-status variants carry an upstream response
+                    // body; the rest are internal error strings with no user
+                    // data. The encrypted body sits in the `error` column,
+                    // which retrieval never renders from (it omits the body),
+                    // so this closes the at-rest leak without affecting output.
+                    match &mut req.state.reason {
+                        FailureReason::RetriableHttpStatus { body, .. }
+                        | FailureReason::NonRetriableHttpStatus { body, .. } => {
+                            *body = transformer.transform(req.data.id, body).await?;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
         for attempt in 0..MAX_ATTEMPTS {
             tracing::debug!(request_id = %request.data.id, "Persisting request state");
-            let any_request = AnyRequest::from(request.clone());
+            let any_request = any_request.clone();
 
             let result: Result<Option<RequestId>> = async {
                 match any_request {

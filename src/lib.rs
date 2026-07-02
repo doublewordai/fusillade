@@ -15,6 +15,8 @@ pub mod manager;
 pub mod processor;
 pub mod request;
 pub mod response_step;
+// TRANSITIONAL: ZDR response-body hook; remove when stream reassembly moves to dwctl.
+pub mod transform;
 
 // Re-export commonly used types
 pub use batch::*;
@@ -30,6 +32,7 @@ pub use manager::response_step::PostgresResponseStepManager;
 pub use manager::{DaemonExecutor, ModelFilter, ModelFilterState, Storage};
 pub use processor::{CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry};
 pub use request::*;
+pub use transform::ResponseTransformer;
 pub use response_step::{
     CreateStepInput, ResponseStep, ResponseStepStore, StepId, StepKind, StepState,
 };
