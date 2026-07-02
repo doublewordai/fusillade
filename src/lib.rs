@@ -15,6 +15,8 @@ pub mod manager;
 pub mod processor;
 pub mod request;
 pub mod response_step;
+// TRANSITIONAL: ZDR response-body hook; remove when stream reassembly moves to dwctl.
+pub mod transform;
 
 // Re-export commonly used types
 pub use batch::*;
@@ -33,6 +35,7 @@ pub use request::*;
 pub use response_step::{
     CreateStepInput, ResponseStep, ResponseStepStore, StepId, StepKind, StepState,
 };
+pub use transform::ResponseTransformer;
 
 /// Get the fusillade database migrator
 ///

@@ -145,6 +145,10 @@ pub struct PostgresRequestManager<P: PoolProvider, H: HttpClient> {
     /// The builder-style [`with_processor`](Self::with_processor) remains
     /// available for tests and consumers that don't have a cycle.
     processor: std::sync::OnceLock<Arc<dyn crate::processor::RequestProcessor<Self, H>>>,
+    /// TRANSITIONAL ZDR hook - see [`crate::transform`]. Transforms response/
+    /// error bodies before persistence; `None` is identity. Remove when stream
+    /// reassembly moves into dwctl.
+    response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
 }
 
 /// Macro for extracting a [`Batch`] from a dynamic query row (PgRow).
@@ -230,6 +234,7 @@ impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> 
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             processor: std::sync::OnceLock::new(),
+            response_transformer: std::sync::OnceLock::new(),
         }
     }
 }
@@ -255,6 +260,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             processor: std::sync::OnceLock::new(),
+            response_transformer: std::sync::OnceLock::new(),
         }
     }
 
@@ -290,6 +296,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         self.processor
             .set(processor)
             .map_err(|_| "processor already set")
+    }
+
+    /// Install the TRANSITIONAL ZDR response transformer - see
+    /// [`crate::transform`]. Remove when stream reassembly moves into dwctl.
+    pub fn set_response_transformer(
+        &self,
+        transformer: Arc<dyn crate::transform::ResponseTransformer>,
+    ) -> std::result::Result<(), &'static str> {
+        self.response_transformer
+            .set(transformer)
+            .map_err(|_| "response transformer already set")
     }
 
     /// Set a custom daemon configuration.
@@ -1929,9 +1946,42 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     {
         const MAX_ATTEMPTS: u32 = 3;
 
+        // TRANSITIONAL ZDR hook (see crate::transform): encrypt the terminal
+        // body ONCE, before the retry loop, so a DB retry can neither re-run
+        // the keystore nor double-encrypt. Only Completed/Failed carry a
+        // persisted body. The daemon (flex/batch) completes through persist(),
+        // so this is the write path ZDR bodies actually flow through -
+        // complete_request/fail_request are reached only by the realtime
+        // tool-loop path, which ZDR rejects at submit.
+        let mut any_request = AnyRequest::from(request.clone());
+        if let Some(transformer) = self.response_transformer.get() {
+            match &mut any_request {
+                AnyRequest::Completed(req) => {
+                    req.state.response_body = transformer
+                        .transform(req.data.id, &req.state.response_body)
+                        .await?;
+                }
+                AnyRequest::Failed(req) => {
+                    // Only the HTTP-status variants carry an upstream response
+                    // body; the rest are internal error strings with no user
+                    // data. The encrypted body sits in the `error` column,
+                    // which retrieval never renders from (it omits the body),
+                    // so this closes the at-rest leak without affecting output.
+                    match &mut req.state.reason {
+                        FailureReason::RetriableHttpStatus { body, .. }
+                        | FailureReason::NonRetriableHttpStatus { body, .. } => {
+                            *body = transformer.transform(req.data.id, body).await?;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
         for attempt in 0..MAX_ATTEMPTS {
             tracing::debug!(request_id = %request.data.id, "Persisting request state");
-            let any_request = AnyRequest::from(request.clone());
+            let any_request = any_request.clone();
 
             let result: Result<Option<RequestId>> = async {
                 match any_request {
@@ -7672,6 +7722,255 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    // =========================================================================
+    // ResponseTransformer - the TRANSITIONAL ZDR persist()-time hook. It must run
+    // for Completed and the HTTP-status Failed variants (whose body is upstream
+    // user data), skip the internal-error variants (no user body), and fire
+    // exactly once per persist(): the transform sits before the DB retry loop by
+    // construction, so a retry can neither re-run the keystore nor double-encrypt.
+    // =========================================================================
+
+    /// Test double: prefixes every body it sees with `XFORM:` and counts calls,
+    /// so a test can assert both that the stored body was rewritten and how many
+    /// times the hook actually ran.
+    struct MarkingTransformer {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::transform::ResponseTransformer for MarkingTransformer {
+        async fn transform(&self, _request_id: RequestId, body: &str) -> Result<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(format!("XFORM:{body}"))
+        }
+    }
+
+    /// Claim a single request into an in-flight state and hand back the request
+    /// itself (so the caller can drive it to a terminal state and persist it),
+    /// with an optional transformer installed on the manager. persist() matches
+    /// on id alone, so the exact claimed/processing state does not matter here.
+    async fn claim_one_processing(
+        pool: &sqlx::PgPool,
+        transformer: Option<Arc<dyn crate::transform::ResponseTransformer>>,
+    ) -> (
+        PostgresRequestManager<TestDbPools, MockHttpClient>,
+        Request<Claimed>,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        if let Some(t) = transformer {
+            manager.set_response_transformer(t).unwrap();
+        }
+
+        let file_id = manager
+            .create_file(
+                "transformer-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"n":0}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("test".to_string(), 10)]);
+        let mut claimed = manager
+            .claim_requests(1, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .expect("claim failed");
+        assert_eq!(claimed.len(), 1);
+        (manager, claimed.pop().unwrap())
+    }
+
+    fn completed_from(req: &Request<Claimed>, body: &str) -> Request<Completed> {
+        let now = chrono::Utc::now();
+        Request {
+            data: req.data.clone(),
+            state: Completed {
+                response_status: 200,
+                response_body: body.to_string(),
+                claimed_at: now,
+                started_at: now,
+                completed_at: now,
+                routed_model: req.data.model.clone(),
+            },
+        }
+    }
+
+    fn failed_from(req: &Request<Claimed>, reason: FailureReason) -> Request<Failed> {
+        Request {
+            data: req.data.clone(),
+            state: Failed {
+                reason,
+                failed_at: chrono::Utc::now(),
+                retry_attempt: 0,
+                batch_expires_at: req.state.batch_expires_at,
+                routed_model: req.data.model.clone(),
+            },
+        }
+    }
+
+    async fn stored_response_body(pool: &sqlx::PgPool, id: RequestId) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>("SELECT response_body FROM requests WHERE id = $1")
+            .bind(*id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn stored_failure_reason(pool: &sqlx::PgPool, id: RequestId) -> FailureReason {
+        let error_json: String = sqlx::query_scalar("SELECT error FROM requests WHERE id = $1")
+            .bind(*id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        serde_json::from_str(&error_json).unwrap()
+    }
+
+    /// Completed bodies are upstream user data: the transformer rewrites
+    /// `response_body` before it is stored, and runs exactly once per persist().
+    #[sqlx::test]
+    async fn response_transformer_rewrites_completed_body(pool: sqlx::PgPool) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (manager, req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(MarkingTransformer {
+                calls: calls.clone(),
+            })),
+        )
+        .await;
+
+        manager
+            .persist(&completed_from(&req, "hello"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_response_body(&pool, req.data.id).await.as_deref(),
+            Some("XFORM:hello"),
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "transform must run exactly once per persist (it sits before the DB retry loop)",
+        );
+    }
+
+    /// The HTTP-status Failed variants carry an upstream response body (in the
+    /// persisted `error` column), so that body is rewritten too.
+    #[sqlx::test]
+    async fn response_transformer_rewrites_http_status_failure_body(pool: sqlx::PgPool) {
+        for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 503,
+                body: "boom".to_string(),
+            },
+            FailureReason::NonRetriableHttpStatus {
+                status: 400,
+                body: "bad".to_string(),
+            },
+        ] {
+            let original_body = match &reason {
+                FailureReason::RetriableHttpStatus { body, .. }
+                | FailureReason::NonRetriableHttpStatus { body, .. } => body.clone(),
+                _ => unreachable!(),
+            };
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (manager, req) = claim_one_processing(
+                &pool,
+                Some(Arc::new(MarkingTransformer {
+                    calls: calls.clone(),
+                })),
+            )
+            .await;
+
+            manager.persist(&failed_from(&req, reason)).await.unwrap();
+
+            let stored_body = match stored_failure_reason(&pool, req.data.id).await {
+                FailureReason::RetriableHttpStatus { body, .. }
+                | FailureReason::NonRetriableHttpStatus { body, .. } => body,
+                other => panic!("unexpected reason variant: {other:?}"),
+            };
+            assert_eq!(stored_body, format!("XFORM:{original_body}"));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    /// Internal-error failure variants (timeouts, network errors, ...) carry no
+    /// user body, so the transformer must not touch them.
+    #[sqlx::test]
+    async fn response_transformer_skips_non_http_failure(pool: sqlx::PgPool) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (manager, req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(MarkingTransformer {
+                calls: calls.clone(),
+            })),
+        )
+        .await;
+
+        manager
+            .persist(&failed_from(
+                &req,
+                FailureReason::Timeout {
+                    error: "timed out".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_failure_reason(&pool, req.data.id).await,
+            FailureReason::Timeout {
+                error: "timed out".to_string(),
+            },
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "internal-error variants have no user body to transform",
+        );
+    }
+
+    /// With no transformer installed (the default) persistence is identity: the
+    /// Completed body is stored verbatim.
+    #[sqlx::test]
+    async fn response_transformer_absent_stores_body_verbatim(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+
+        manager
+            .persist(&completed_from(&req, "plaintext"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_response_body(&pool, req.data.id).await.as_deref(),
+            Some("plaintext"),
+        );
     }
 
     /// Happy path: the owning daemon reschedules its own in-flight request.
