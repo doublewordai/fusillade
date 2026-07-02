@@ -32,10 +32,10 @@ pub use manager::response_step::PostgresResponseStepManager;
 pub use manager::{DaemonExecutor, ModelFilter, ModelFilterState, Storage};
 pub use processor::{CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry};
 pub use request::*;
-pub use transform::ResponseTransformer;
 pub use response_step::{
     CreateStepInput, ResponseStep, ResponseStepStore, StepId, StepKind, StepState,
 };
+pub use transform::ResponseTransformer;
 
 /// Get the fusillade database migrator
 ///
