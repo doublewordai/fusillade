@@ -15198,7 +15198,7 @@ mod tests {
         let states = vec!["pending".to_string()];
         let model_filter: Vec<String> = vec![];
 
-        // Any: all three rows counted.
+        // Any: 0s priority batches are not part of deadline-window counts.
         let counts = manager
             .get_pending_request_counts_by_model_and_window(
                 &windows,
@@ -15210,7 +15210,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 3);
+        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 2);
 
         // Exclude("priority"): batch + flex.
         let counts = manager
@@ -15254,7 +15254,8 @@ mod tests {
             .unwrap();
         assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 2);
 
-        // Exclude batch tier (None represents NULL): flex + priority.
+        // Exclude batch tier (None represents NULL): flex only. The priority
+        // batch is filtered out by its submitted 0s completion window.
         let counts = manager
             .get_pending_request_counts_by_model_and_window(
                 &windows,
@@ -15266,7 +15267,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 2);
+        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 1);
 
         // Empty Include matches nothing.
         let counts = manager
