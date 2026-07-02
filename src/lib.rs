@@ -6,6 +6,8 @@
 //!
 //! Batching system with PostgreSQL storage and background daemon for processing requests.
 
+#[cfg(feature = "postgres")]
+pub mod audit;
 pub mod batch;
 pub mod bg_errors;
 pub mod daemon;
@@ -33,6 +35,9 @@ pub use request::*;
 pub use response_step::{
     CreateStepInput, ResponseStep, ResponseStepStore, StepId, StepKind, StepState,
 };
+
+#[cfg(feature = "postgres")]
+pub use audit::{POSTGRES_APPLICATION_NAME, log_postgres_audit_status, with_application_name};
 
 /// Get the fusillade database migrator
 ///
