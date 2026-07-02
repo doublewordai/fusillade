@@ -1708,26 +1708,32 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             // Cache parsed metadata JSON per batch to avoid re-parsing for each request
             let mut parsed_metadata_cache: std::collections::HashMap<
                 Uuid,
-                Option<serde_json::Value>,
+                Option<Arc<serde_json::Value>>,
             > = std::collections::HashMap::new();
 
             all_claimed.extend(rows.into_iter().map(|row| {
-                // Batch metadata is only meaningful for rows that belong to a
-                // batch; batchless responses leave it empty so the daemon's
-                // HTTP path doesn't emit empty `x-fusillade-batch-*` headers.
+                // Real batch rows expose configured batch metadata. Batchless
+                // flex rows still need the synthetic completion window and
+                // creation timestamp so downstream analytics can classify the
+                // request as async without inventing an empty batch id.
                 let mut batch_metadata = std::collections::HashMap::new();
 
-                if let Some(batch_uuid) = row.batch_id {
-                    let parsed_metadata =
-                        parsed_metadata_cache.entry(batch_uuid).or_insert_with(|| {
+                let parsed_metadata = row.batch_id.and_then(|batch_uuid| {
+                    parsed_metadata_cache
+                        .entry(batch_uuid)
+                        .or_insert_with(|| {
                             row.batch_metadata
                                 .as_deref()
                                 .and_then(|s| serde_json::from_str(s).ok())
-                        });
+                                .map(Arc::new)
+                        })
+                        .clone()
+                });
 
-                    for field_name in &self.config.batch_metadata_fields {
-                        // First check if it's a known column field
-                        let value: Option<&str> = match field_name.as_str() {
+                for field_name in &self.config.batch_metadata_fields {
+                    // First check if it's a known column field.
+                    let value: Option<&str> = if row.batch_id.is_some() {
+                        match field_name.as_str() {
                             "id" => Some(&row.batch_id_str),
                             "file_id" => Some(&row.batch_file_id),
                             "endpoint" => Some(&row.batch_endpoint),
@@ -1742,16 +1748,21 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             "errors" => row.batch_errors.as_deref(),
                             "total_requests" => Some(&row.batch_total_requests),
                             _ => None,
-                        };
+                        }
+                    } else {
+                        match field_name.as_str() {
+                            "created_at" => Some(&row.batch_created_at),
+                            "completion_window" => Some(&row.batch_completion_window),
+                            _ => None,
+                        }
+                    };
 
-                        if let Some(v) = value {
+                    if let Some(v) = value {
+                        batch_metadata.insert(field_name.clone(), v.to_string());
+                    } else if let Some(metadata_json) = parsed_metadata.as_ref() {
+                        // Fall back to extracting from metadata JSON for unknown field names.
+                        if let Some(v) = metadata_json.get(field_name).and_then(|v| v.as_str()) {
                             batch_metadata.insert(field_name.clone(), v.to_string());
-                        } else if let Some(metadata_json) = parsed_metadata.as_ref() {
-                            // Fall back to extracting from metadata JSON for unknown field names
-                            if let Some(v) = metadata_json.get(field_name).and_then(|v| v.as_str())
-                            {
-                                batch_metadata.insert(field_name.clone(), v.to_string());
-                            }
                         }
                     }
                 }
