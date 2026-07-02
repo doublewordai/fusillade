@@ -14992,6 +14992,145 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn test_pending_request_counts_priority_classes_only_count_1w_as_low_priority(
+        pool: sqlx::PgPool,
+    ) {
+        use chrono::Duration;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let now = Utc::now();
+        for (model, completion_window, expires_at) in [
+            ("model-b", "1w", now + Duration::hours(23)),
+            ("model-c", "7d", now + Duration::hours(23)),
+            ("model-d", "24h", now + Duration::hours(23)),
+            ("model-e", "1h", now + Duration::minutes(50)),
+        ] {
+            let file_id = manager
+                .create_file(
+                    format!("file-{model}-{completion_window}"),
+                    None,
+                    vec![RequestTemplateInput {
+                        custom_id: Some(format!("{model}-{completion_window}")),
+                        endpoint: "/v1/chat/completions".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"input":"x"}"#.to_string(),
+                        model: model.to_string(),
+                        api_key: "k".to_string(),
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let batch = manager
+                .create_batch(BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: completion_window.to_string(),
+                    metadata: None,
+                    created_by: None,
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+
+            sqlx::query("UPDATE batches SET expires_at = $1 WHERE id = $2")
+                .bind(expires_at)
+                .bind(*batch.id as Uuid)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let states = vec![
+            "pending".to_string(),
+            "claimed".to_string(),
+            "processing".to_string(),
+        ];
+        let model_filter: Vec<String> = vec![];
+        let exclude_priority = ServiceTierFilter::Exclude(vec![Some("priority".to_string())]);
+
+        let priority_counts = manager
+            .get_pending_request_counts_by_model_and_priority_class(
+                &states,
+                &model_filter,
+                &exclude_priority,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let model_b = priority_counts
+            .get("model-b")
+            .unwrap_or_else(|| panic!("expected model-b counts, got {priority_counts:?}"));
+        assert_eq!(model_b.get("1h"), Some(&0));
+        assert_eq!(model_b.get("24h"), Some(&0));
+        assert_eq!(model_b.get("low_priority"), Some(&1));
+        assert!(
+            !priority_counts.contains_key("model-c"),
+            "7d must not be treated as low priority"
+        );
+
+        let model_d = priority_counts
+            .get("model-d")
+            .unwrap_or_else(|| panic!("expected model-d counts, got {priority_counts:?}"));
+        assert_eq!(model_d.get("1h"), Some(&0));
+        assert_eq!(model_d.get("24h"), Some(&1));
+        assert_eq!(model_d.get("low_priority"), Some(&0));
+
+        let model_e = priority_counts
+            .get("model-e")
+            .unwrap_or_else(|| panic!("expected model-e counts, got {priority_counts:?}"));
+        assert_eq!(model_e.get("1h"), Some(&1));
+        assert_eq!(model_e.get("24h"), Some(&0));
+        assert_eq!(model_e.get("low_priority"), Some(&0));
+
+        let deadline_counts = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[
+                    ("1h".to_string(), None, 3600),
+                    ("24h".to_string(), None, 86_400),
+                ],
+                &states,
+                &model_filter,
+                &exclude_priority,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !deadline_counts.contains_key("model-b"),
+            "default deadline counts must filter out submitted 1w requests"
+        );
+        assert!(
+            !deadline_counts.contains_key("model-c"),
+            "default deadline counts must filter out non-high-priority submitted windows"
+        );
+        assert_eq!(
+            deadline_counts
+                .get("model-d")
+                .and_then(|counts| counts.get("24h")),
+            Some(&1)
+        );
+        assert_eq!(
+            deadline_counts
+                .get("model-e")
+                .and_then(|counts| counts.get("1h")),
+            Some(&1)
+        );
+    }
+
+    #[sqlx::test]
     async fn test_pending_request_counts_service_tier_filter(pool: sqlx::PgPool) {
         use chrono::Duration;
 
