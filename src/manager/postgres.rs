@@ -1125,7 +1125,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                   AND b.completed_at IS NULL
                   AND b.failed_at IS NULL
                   AND b.cancelled_at IS NULL
-                  AND b.completion_window IN ('1h', '24h')
+                  AND b.completion_window IS DISTINCT FROM '1w'
                 -- Row-level upper bound: a row that expires after every window's
                 -- end can't contribute to any window's COUNT FILTER, so prune it
                 -- here. Without this, the join reads every active+templated
@@ -15112,9 +15112,11 @@ mod tests {
             !deadline_counts.contains_key("model-b"),
             "default deadline counts must filter out submitted 1w requests"
         );
-        assert!(
-            !deadline_counts.contains_key("model-c"),
-            "default deadline counts must filter out non-high-priority submitted windows"
+        assert_eq!(
+            deadline_counts
+                .get("model-c")
+                .and_then(|counts| counts.get("24h")),
+            Some(&1)
         );
         assert_eq!(
             deadline_counts
@@ -15198,7 +15200,7 @@ mod tests {
         let states = vec!["pending".to_string()];
         let model_filter: Vec<String> = vec![];
 
-        // Any: 0s priority batches are not part of deadline-window counts.
+        // Any: all three rows counted.
         let counts = manager
             .get_pending_request_counts_by_model_and_window(
                 &windows,
@@ -15210,7 +15212,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 2);
+        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 3);
 
         // Exclude("priority"): batch + flex.
         let counts = manager
@@ -15254,8 +15256,7 @@ mod tests {
             .unwrap();
         assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 2);
 
-        // Exclude batch tier (None represents NULL): flex only. The priority
-        // batch is filtered out by its submitted 0s completion window.
+        // Exclude batch tier (None represents NULL): flex + priority.
         let counts = manager
             .get_pending_request_counts_by_model_and_window(
                 &windows,
@@ -15267,7 +15268,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 1);
+        assert_eq!(*counts.get("model-a").unwrap().get("1h").unwrap(), 2);
 
         // Empty Include matches nothing.
         let counts = manager

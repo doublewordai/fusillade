@@ -428,7 +428,7 @@ pub trait Storage: Send + Sync {
     /// Excludes:
     /// - Requests without a template_id
     /// - Requests in batches being cancelled
-    /// - Batched requests whose submitted completion window is not `"1h"` or `"24h"`
+    /// - Batched requests whose submitted completion window is `"1w"`
     async fn get_pending_request_counts_by_model_and_window(
         &self,
         windows: &[(String, Option<i64>, i64)],
@@ -448,7 +448,8 @@ pub trait Storage: Send + Sync {
     /// - `"24h"` -> `"24h"`
     /// - `"1w"` -> `"low_priority"`
     ///
-    /// Other submitted windows are ignored by this priority-class view.
+    /// Other submitted windows are ignored by this priority-class view, but
+    /// still count normally in deadline-window counts.
     ///
     /// Batchless flex rows are classified as `"1h"` and other non-priority
     /// batchless rows as `"24h"`, matching their synthesized claim deadlines.
