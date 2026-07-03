@@ -1958,7 +1958,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             match &mut any_request {
                 AnyRequest::Completed(req) => {
                     req.state.response_body = transformer
-                        .transform(req.data.id, &req.state.response_body)
+                        .transform(&req.data, &req.state.response_body)
                         .await?;
                 }
                 AnyRequest::Failed(req) => {
@@ -1970,7 +1970,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     match &mut req.state.reason {
                         FailureReason::RetriableHttpStatus { body, .. }
                         | FailureReason::NonRetriableHttpStatus { body, .. } => {
-                            *body = transformer.transform(req.data.id, body).await?;
+                            *body = transformer.transform(&req.data, body).await?;
                         }
                         _ => {}
                     }
@@ -7741,9 +7741,25 @@ mod tests {
 
     #[async_trait]
     impl crate::transform::ResponseTransformer for MarkingTransformer {
-        async fn transform(&self, _request_id: RequestId, body: &str) -> Result<String> {
+        async fn transform(&self, _request: &RequestData, body: &str) -> Result<String> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(format!("XFORM:{body}"))
+        }
+    }
+
+    /// Test double that proves the *specific* request being persisted reaches the
+    /// hook: it records the id it was handed and echoes it into the body, so a test
+    /// can assert both that the transformer saw the right request (not some other
+    /// row) and that request fields can influence the transformed output.
+    struct RequestEchoTransformer {
+        seen: Arc<std::sync::Mutex<Option<Uuid>>>,
+    }
+
+    #[async_trait]
+    impl crate::transform::ResponseTransformer for RequestEchoTransformer {
+        async fn transform(&self, request: &RequestData, body: &str) -> Result<String> {
+            *self.seen.lock().unwrap() = Some(request.id.0);
+            Ok(format!("{}:{body}", request.id.0))
         }
     }
 
@@ -7877,6 +7893,36 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "transform must run exactly once per persist (it sits before the DB retry loop)",
+        );
+    }
+
+    /// The hook is handed the *specific* request being persisted, so an
+    /// implementation can read its fields and let them influence the output.
+    /// Guards against regressions that pass the wrong request (or none).
+    #[sqlx::test]
+    async fn response_transformer_receives_the_persisted_request(pool: sqlx::PgPool) {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let (manager, req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(RequestEchoTransformer { seen: seen.clone() })),
+        )
+        .await;
+
+        manager
+            .persist(&completed_from(&req, "hello"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(req.data.id.0),
+            "transformer must be handed the request being persisted",
+        );
+        let expected = format!("{}:hello", req.data.id.0);
+        assert_eq!(
+            stored_response_body(&pool, req.data.id).await.as_deref(),
+            Some(expected.as_str()),
+            "a field read from the passed request influenced the stored body",
         );
     }
 

@@ -18,13 +18,17 @@
 
 use async_trait::async_trait;
 
-use crate::{RequestId, Result};
+use crate::{RequestData, Result};
 
 /// Transforms a response or error body just before persistence. With no
 /// transformer installed (the default) the behaviour is identity.
 #[async_trait]
 pub trait ResponseTransformer: Send + Sync {
-    /// Return the body to persist for `request_id`. Implementations must return
-    /// the input unchanged when they do not apply to this request.
-    async fn transform(&self, request_id: RequestId, body: &str) -> Result<String>;
+    /// Return the body to persist for `request`. Implementations must return the
+    /// input unchanged when they do not apply to this request.
+    ///
+    /// `request` is the request being persisted - its id and `batch_metadata`
+    /// let an implementation decide whether (and how) to transform without a
+    /// separate lookup. `body` is the terminal response/error body to persist.
+    async fn transform(&self, request: &RequestData, body: &str) -> Result<String>;
 }
