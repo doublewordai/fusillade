@@ -320,6 +320,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         self
     }
 
+    fn pending_counts_statement_timeout_ms(&self) -> i64 {
+        self.config.pending_request_counts_timeout_ms as i64
+    }
+
     /// Set the download buffer size for file content streams.
     ///
     /// This is a builder method that can be chained after `new()` or `with_client()`.
@@ -828,12 +832,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     }
 }
 
-/// Statement timeout for `get_pending_request_counts_by_model_and_window`.
-/// The query normally runs sub-second on a custom plan; this bounds the blast
-/// radius if a plan ever regresses to a sequential scan, so a single call
-/// fails fast instead of accumulating behind the callers' poll cadence.
-const PENDING_COUNTS_STATEMENT_TIMEOUT_MS: i64 = 30_000;
-
 // Implement Storage trait directly (no delegation)
 #[async_trait]
 /// Returns counts of **claimable** pending requests grouped by model and expiry window.
@@ -1039,7 +1037,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         sqlx::query(&format!(
             "SET LOCAL statement_timeout = {}",
-            PENDING_COUNTS_STATEMENT_TIMEOUT_MS
+            self.pending_counts_statement_timeout_ms()
         ))
         .execute(&mut *tx)
         .await
@@ -6611,6 +6609,21 @@ mod tests {
         }
     }
 
+    #[sqlx::test]
+    async fn pending_request_counts_statement_timeout_uses_manager_config(pool: sqlx::PgPool) {
+        let config = DaemonConfig {
+            pending_request_counts_timeout_ms: 12_345,
+            ..DaemonConfig::default()
+        };
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(config);
+
+        assert_eq!(manager.pending_counts_statement_timeout_ms(), 12_345);
+    }
+
     // =========================================================================
     // sanitize_outbound_body — unit tests for the storage-layer body strip
     // =========================================================================
@@ -9129,6 +9142,7 @@ mod tests {
         let config = crate::daemon::DaemonConfig {
             claim_timeout_ms: 600000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 1000, // 1 second for testing
             ..Default::default()
         };
@@ -9231,6 +9245,7 @@ mod tests {
         let config = crate::daemon::DaemonConfig {
             claim_timeout_ms: 600000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 1000, // 1 second for testing
             ..Default::default()
         };
@@ -9333,6 +9348,7 @@ mod tests {
         let config = crate::daemon::DaemonConfig {
             claim_timeout_ms: 600000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 60000, // 1 minute
             ..Default::default()
         };

@@ -174,6 +174,13 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution.
     pub processing_timeout_ms: u64,
 
+    /// PostgreSQL statement timeout for pending request count queries (milliseconds).
+    /// This bounds internal queue-depth monitoring work so a slow count query
+    /// fails without accumulating behind callers' poll cadence.
+    /// Default: 60,000 (60 seconds).
+    #[serde(default = "default_pending_request_counts_timeout_ms")]
+    pub pending_request_counts_timeout_ms: u64,
+
     /// Time after a daemon's last heartbeat before its requests are considered
     /// orphaned and returned to pending (milliseconds). Should be significantly
     /// larger than `heartbeat_interval_ms` to avoid reclaiming from live daemons
@@ -312,6 +319,10 @@ fn default_completion_window_ms() -> u64 {
     86_400_000 // 24 hours
 }
 
+fn default_pending_request_counts_timeout_ms() -> u64 {
+    60_000
+}
+
 fn default_claim_ramp_exponent() -> f64 {
     0.56
 }
@@ -347,10 +358,11 @@ impl Default for DaemonConfig {
             status_log_interval_ms: Some(2000), // Log every 2 seconds by default
             heartbeat_interval_ms: 5000,        // Heartbeat every 5 seconds by default
             should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,             // 1 minute
-            processing_timeout_ms: 600000,       // 10 minutes
-            stale_daemon_threshold_ms: 30_000,   // 30 seconds (6× heartbeat interval)
-            unclaim_batch_size: 100,             // Unclaim up to 100 stale requests per poll
+            claim_timeout_ms: 60000,       // 1 minute
+            processing_timeout_ms: 600000, // 10 minutes
+            pending_request_counts_timeout_ms: default_pending_request_counts_timeout_ms(),
+            stale_daemon_threshold_ms: 30_000, // 30 seconds (6× heartbeat interval)
+            unclaim_batch_size: 100,           // Unclaim up to 100 stale requests per poll
             cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
             batch_metadata_fields: default_batch_metadata_fields(),
             purge_interval_ms: 600_000, // 10 minutes
@@ -1423,6 +1435,14 @@ mod tests {
     use crate::manager::{DaemonExecutor, postgres::PostgresRequestManager};
     use std::time::Duration;
 
+    #[test]
+    fn default_pending_request_counts_timeout_is_sixty_seconds() {
+        assert_eq!(
+            DaemonConfig::default().pending_request_counts_timeout_ms,
+            60_000
+        );
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
@@ -1461,6 +1481,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -1648,6 +1669,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -1897,6 +1919,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -2051,6 +2074,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -2244,6 +2268,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -2421,6 +2446,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -2598,6 +2624,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![
@@ -2773,6 +2800,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![
@@ -2884,6 +2912,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![
@@ -3049,6 +3078,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
@@ -3190,6 +3220,7 @@ mod tests {
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60_000,
             stale_daemon_threshold_ms: 30_000,
             unclaim_batch_size: 100,
             batch_metadata_fields: vec![],
