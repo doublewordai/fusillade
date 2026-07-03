@@ -537,7 +537,7 @@ pub trait Storage: Send + Sync {
     // These methods are used by the DaemonExecutor for pulling requests, and then persisting their
     // states as they iterate through them
 
-    /// Atomically claim pending requests for processing.
+    /// Atomically claim pending batchless requests for processing.
     ///
     /// `available_capacity` maps model names to the number of permits the daemon
     /// is currently holding for that model. Only models present in this map will
@@ -569,6 +569,26 @@ pub trait Storage: Send + Sync {
     /// ≤ 1 per `(user, window-class, model)` not in cooldown. Pass an empty set
     /// to allow every bucket its first token. Claimed rows carry a `leaked` flag
     /// (via the returned request) so the daemon knows which buckets to stamp.
+    async fn claim_batchless_requests(
+        &self,
+        limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+        leak_cooldown: &std::collections::HashSet<(String, String, String)>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        self.claim_requests(
+            limit,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+            leak_cooldown,
+        )
+        .await
+    }
+
+    /// Compatibility method for callers and storage implementations that have
+    /// not yet moved to explicit request/batch daemon APIs.
     async fn claim_requests(
         &self,
         limit: usize,
@@ -577,6 +597,30 @@ pub trait Storage: Send + Sync {
         user_active_counts: &std::collections::HashMap<String, usize>,
         leak_cooldown: &std::collections::HashSet<(String, String, String)>,
     ) -> Result<Vec<Request<Claimed>>>;
+
+    /// Atomically claim pending requests that belong to live-model batches.
+    ///
+    /// The batch daemon owns this policy. Implementations should select
+    /// candidate batches before probing request rows, limit selected batches by
+    /// `batch_limit`, and only claim rows whose latest `model_filters` event is
+    /// `live`. No leaky-bucket or deadline-ramp fallback applies here.
+    async fn claim_batch_requests(
+        &self,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        let _ = (
+            limit,
+            batch_limit,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+        );
+        Ok(Vec::new())
+    }
 
     /// Append a single event to the `model_filters` log. Used by the controller
     /// when a model's internal liveness CHANGES (live / coming / absent).
