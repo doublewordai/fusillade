@@ -1,5 +1,12 @@
 # Changelog
 
+## [19.4.1](https://github.com/doublewordai/fusillade/compare/fusillade-v19.4.0...fusillade-v19.4.1) (2026-07-03)
+
+
+### Bug Fixes
+
+* make pending request counts timeout configurable ([#316](https://github.com/doublewordai/fusillade/issues/316)) ([28f62e7](https://github.com/doublewordai/fusillade/commit/28f62e73c96951e3fc59653dea040bea3e14dbcf))
+
 ## [19.4.0](https://github.com/doublewordai/fusillade/compare/fusillade-v19.3.0...fusillade-v19.4.0) (2026-07-03)
 
 
