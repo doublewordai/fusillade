@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH doomed AS (\n                SELECT id, template_id\n                FROM requests\n                WHERE created_by = $1\n                  AND batch_id IS NULL\n                LIMIT $2\n                FOR UPDATE SKIP LOCKED\n            ),\n            deleted AS (\n                DELETE FROM requests r\n                USING doomed d\n                WHERE r.id = d.id\n                RETURNING d.template_id\n            )\n            SELECT template_id FROM deleted\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "template_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "268b01f40a75a91e53f41834b1d59eadf84fec7d67f70a2504ccb52da49cab03"
+}

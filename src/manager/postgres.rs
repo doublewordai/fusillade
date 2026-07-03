@@ -616,6 +616,21 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         Ok(count)
     }
 
+    async fn archive_terminal_batch_requests_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        batch_id: BatchId,
+    ) -> Result<u64> {
+        let archived: i64 = sqlx::query_scalar("SELECT archive_terminal_batch_requests($1)")
+            .bind(*batch_id as Uuid)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to archive terminal batch requests: {}", e))
+            })?;
+
+        Ok(archived as u64)
+    }
+
     /// Check if a file should be expired and mark it as such.
     /// Returns true if the file was marked as expired.
     async fn check_and_mark_expired(&self, file: &mut File) -> Result<bool> {
@@ -871,9 +886,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         let raw_size_sum = sqlx::query_scalar!(
             r#"
             SELECT COALESCE(SUM(response_size), 0)::BIGINT as "sum!"
-            FROM requests
-            WHERE batch_id = $1
-              AND state = $2
+            FROM (
+                SELECT id, response_size
+                FROM requests
+                WHERE batch_id = $1
+                  AND state = $2
+                UNION ALL
+                SELECT id, response_size
+                FROM requests_archive
+                WHERE batch_id = $1
+                  AND state = $2
+                  AND NOT EXISTS (
+                      SELECT 1 FROM requests r WHERE r.id = requests_archive.id
+                  )
+            ) request_rows
             "#,
             *batch.id as Uuid,
             state_filter,
@@ -2047,6 +2073,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             let result: Result<Option<RequestId>> = async {
                 match any_request {
                     AnyRequest::Pending(req) => {
+                        let mut tx = self.pools.write().begin().await.map_err(|e| {
+                            FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+                        })?;
+
                         let rows_affected = sqlx::query!(
                             r#"
                             UPDATE requests SET
@@ -2055,14 +2085,22 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 not_before = $3,
                                 daemon_id = NULL,
                                 claimed_at = NULL,
-                                started_at = NULL
+                                started_at = NULL,
+                                response_status = NULL,
+                                response_body = NULL,
+                                completed_at = NULL,
+                                error = NULL,
+                                failed_at = NULL,
+                                canceled_at = NULL,
+                                response_size = 0,
+                                routed_model = NULL
                             WHERE id = $1
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
                             req.state.not_before,
                         )
-                        .execute(self.pools.write())
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2070,8 +2108,55 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         .rows_affected();
 
                         if rows_affected == 0 {
-                            return Err(FusilladeError::RequestNotFound(req.data.id));
+                            let restored_count: i64 = sqlx::query_scalar(
+                                r#"
+                                WITH moved AS (
+                                    DELETE FROM requests_archive
+                                    WHERE id = $1
+                                      AND state = 'failed'
+                                    RETURNING id, batch_id, template_id, created_at, custom_id,
+                                              model, service_tier, created_by
+                                ),
+                                inserted AS (
+                                    INSERT INTO requests (
+                                        id, batch_id, template_id, state, retry_attempt, not_before,
+                                        daemon_id, claimed_at, started_at, response_status,
+                                        response_body, completed_at, error, failed_at, canceled_at,
+                                        created_at, updated_at, custom_id, response_size, model,
+                                        routed_model, service_tier, created_by
+                                    )
+                                    SELECT id, batch_id, template_id, 'pending', $2, $3,
+                                           NULL, NULL, NULL, NULL,
+                                           NULL, NULL, NULL, NULL, NULL,
+                                           created_at, NOW(), custom_id, 0, model,
+                                           NULL, service_tier, created_by
+                                    FROM moved
+                                    ON CONFLICT (id) DO NOTHING
+                                    RETURNING id
+                                )
+                                SELECT COUNT(*)::BIGINT FROM inserted
+                                "#,
+                            )
+                            .bind(*req.data.id as Uuid)
+                            .bind(req.state.retry_attempt as i32)
+                            .bind(req.state.not_before)
+                            .fetch_one(&mut *tx)
+                            .await
+                            .map_err(|e| {
+                                FusilladeError::Other(anyhow!(
+                                    "Failed to restore request from archive: {}",
+                                    e
+                                ))
+                            })?;
+
+                            if restored_count == 0 {
+                                return Err(FusilladeError::RequestNotFound(req.data.id));
+                            }
                         }
+
+                        tx.commit().await.map_err(|e| {
+                            FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e))
+                        })?;
                     }
                     AnyRequest::Claimed(req) => {
                         let rows_affected = sqlx::query!(
@@ -2136,6 +2221,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                 FusilladeError::Other(anyhow!("Response body too large"))
                             })?;
 
+                        let mut tx = self.pools.write().begin().await.map_err(|e| {
+                            FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+                        })?;
+
                         let rows_affected = sqlx::query!(
                             r#"
                             UPDATE requests SET
@@ -2158,7 +2247,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             response_size,
                             req.state.routed_model,
                         )
-                        .execute(self.pools.write())
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2168,6 +2257,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         if rows_affected == 0 {
                             return Err(FusilladeError::RequestNotFound(req.data.id));
                         }
+
+                        tx.commit().await.map_err(|e| {
+                            FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e))
+                        })?;
                     }
                     AnyRequest::Failed(req) => {
                         // Serialize FailureReason as JSON
@@ -2183,6 +2276,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             calculate_error_message_size(&error_json).ok_or_else(|| {
                                 FusilladeError::Other(anyhow!("Error message too large"))
                             })?;
+
+                        let mut tx = self.pools.write().begin().await.map_err(|e| {
+                            FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+                        })?;
 
                         let rows_affected = sqlx::query!(
                             r#"
@@ -2202,7 +2299,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             response_size,
                             req.state.routed_model,
                         )
-                        .execute(self.pools.write())
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2212,8 +2309,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         if rows_affected == 0 {
                             return Err(FusilladeError::RequestNotFound(req.data.id));
                         }
+
+                        tx.commit().await.map_err(|e| {
+                            FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e))
+                        })?;
                     }
                     AnyRequest::Canceled(req) => {
+                        let mut tx = self.pools.write().begin().await.map_err(|e| {
+                            FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+                        })?;
+
                         let rows_affected = sqlx::query!(
                             r#"
                             UPDATE requests SET
@@ -2224,7 +2329,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             *req.data.id as Uuid,
                             req.state.canceled_at,
                         )
-                        .execute(self.pools.write())
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2234,6 +2339,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         if rows_affected == 0 {
                             return Err(FusilladeError::RequestNotFound(req.data.id));
                         }
+
+                        tx.commit().await.map_err(|e| {
+                            FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e))
+                        })?;
                     }
                 }
 
@@ -2314,14 +2423,38 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let rows = sqlx::query!(
             r#"
+            WITH request_rows AS (
+                SELECT
+                    id, batch_id, template_id, state, retry_attempt, not_before,
+                    daemon_id, claimed_at, started_at, response_status,
+                    response_body, completed_at, error, failed_at, canceled_at,
+                    created_at, updated_at, custom_id, response_size, model,
+                    routed_model, service_tier, created_by
+                FROM requests
+                WHERE id = ANY($1)
+
+                UNION ALL
+
+                SELECT
+                    id, batch_id, template_id, state, retry_attempt, not_before,
+                    daemon_id, claimed_at, started_at, response_status,
+                    response_body, completed_at, error, failed_at, canceled_at,
+                    created_at, updated_at, custom_id, response_size, model,
+                    routed_model, service_tier, created_by
+                FROM requests_archive a
+                WHERE id = ANY($1)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM requests r WHERE r.id = a.id
+                  )
+            )
             SELECT
-                r.id, r.batch_id as "batch_id!", r.template_id as "template_id?", r.state,
+                r.id as "id!", r.batch_id as "batch_id!", r.template_id as "template_id?", r.state as "state!",
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
                 t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
-                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
+                r.retry_attempt as "retry_attempt!", r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at, r.routed_model
-            FROM requests r
+            FROM request_rows r
             LEFT JOIN active_request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
             WHERE r.id = ANY($1)
@@ -2953,10 +3086,30 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 f.source_connection_id, f.source_external_key,
                 b.id as batch_id,
                 b.total_requests,
-                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
-                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests,
-                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.completed_requests
+                    ELSE COALESCE(counts.completed, 0)
+                END::BIGINT as completed_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.failed_requests
+                    ELSE COALESCE(counts.failed, 0)
+                END::BIGINT as failed_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.canceled_requests
+                    ELSE COALESCE(counts.canceled, 0)
+                END::BIGINT as canceled_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.in_progress_requests
+                    ELSE COALESCE(counts.in_progress, 0)
+                END::BIGINT as in_progress_requests,
                 size_calc.calculated_size
             FROM files f
             LEFT JOIN batches b ON (
@@ -2974,7 +3127,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ) counts ON (f.purpose IN ('batch_output', 'batch_error'))
             LEFT JOIN LATERAL (
                 SELECT SUM(r.response_size)::BIGINT as calculated_size
-                FROM requests r
+                FROM (
+                    SELECT id, batch_id, state, response_size
+                    FROM requests
+                    WHERE batch_id = b.id
+                    UNION ALL
+                    SELECT id, batch_id, state, response_size
+                    FROM requests_archive
+                    WHERE batch_id = b.id
+                      AND NOT EXISTS (
+                          SELECT 1 FROM requests active WHERE active.id = requests_archive.id
+                      )
+                ) r
                 WHERE r.batch_id = b.id
                 AND ((f.purpose = 'batch_output' AND r.state = 'completed') OR
                     (f.purpose = 'batch_error' AND r.state = 'failed'))
@@ -3522,11 +3686,36 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.requests_started_at as started_at,
                 b.failed_at,
                 b.created_at,
-                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
-                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
-                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
-                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN 0
+                    ELSE COALESCE(counts.pending, 0)
+                END::BIGINT as pending_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.in_progress_requests
+                    ELSE COALESCE(counts.in_progress, 0)
+                END::BIGINT as in_progress_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.completed_requests
+                    ELSE COALESCE(counts.completed, 0)
+                END::BIGINT as completed_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.failed_requests
+                    ELSE COALESCE(counts.failed, 0)
+                END::BIGINT as failed_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.canceled_requests
+                    ELSE COALESCE(counts.canceled, 0)
+                END::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
@@ -3574,11 +3763,36 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.deleted_at,
                 b.notification_sent_at,
                 b.api_key_id,
-                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
-                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
-                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
-                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN 0
+                    ELSE COALESCE(counts.pending, 0)
+                END::BIGINT as pending_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.in_progress_requests
+                    ELSE COALESCE(counts.in_progress, 0)
+                END::BIGINT as in_progress_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.completed_requests
+                    ELSE COALESCE(counts.completed, 0)
+                END::BIGINT as completed_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.failed_requests
+                    ELSE COALESCE(counts.failed, 0)
+                END::BIGINT as failed_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.canceled_requests
+                    ELSE COALESCE(counts.canceled, 0)
+                END::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN LATERAL (
                 SELECT
@@ -3891,8 +4105,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.deleted_at,
                 b.notification_sent_at,
                 b.api_key_id,
-                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
-                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN 0
+                    ELSE COALESCE(counts.pending, 0)
+                END::BIGINT as pending_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.in_progress_requests
+                    ELSE COALESCE(counts.in_progress, 0)
+                END::BIGINT as in_progress_requests,
                 -- `total_requests` is conserved once population finishes
                 -- (rows inserted at batch creation, never deleted), so
                 -- completed is derivable. Skipping the 'completed' scan
@@ -3905,15 +4129,29 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 -- so all the LATERAL counts are zero. Without the guard,
                 -- `total - 0 - 0 - 0 - 0` would report the missing rows
                 -- as completed instead of 0.
-                CASE WHEN b.requests_started_at IS NULL THEN 0
+                CASE
+                     WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                          AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.completed_requests
+                     WHEN b.requests_started_at IS NULL THEN 0
                      ELSE GREATEST(b.total_requests
                          - COALESCE(counts.pending, 0)
                          - COALESCE(counts.in_progress, 0)
                          - COALESCE(counts.failed, 0)
                          - COALESCE(counts.canceled, 0), 0)
                 END::BIGINT as completed_requests,
-                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.failed_requests
+                    ELSE COALESCE(counts.failed, 0)
+                END::BIGINT as failed_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.canceled_requests
+                    ELSE COALESCE(counts.canceled, 0)
+                END::BIGINT as canceled_requests
             FROM filtered b
             LEFT JOIN LATERAL (
                 SELECT
@@ -3957,11 +4195,36 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 b.requests_started_at as started_at,
                 b.failed_at,
                 b.created_at,
-                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
-                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
-                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
-                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN 0
+                    ELSE COALESCE(counts.pending, 0)
+                END::BIGINT as pending_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.in_progress_requests
+                    ELSE COALESCE(counts.in_progress, 0)
+                END::BIGINT as in_progress_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.completed_requests
+                    ELSE COALESCE(counts.completed, 0)
+                END::BIGINT as completed_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.failed_requests
+                    ELSE COALESCE(counts.failed, 0)
+                END::BIGINT as failed_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.canceled_requests
+                    ELSE COALESCE(counts.canceled, 0)
+                END::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN files f ON f.id = b.file_id
             LEFT JOIN LATERAL (
@@ -4052,25 +4315,31 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         batch_id: BatchId,
         target_state: CascadeTargetState,
     ) -> Result<u64> {
-        let rows_affected = match target_state {
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
+        let updated_ids: Vec<Uuid> = match target_state {
             CascadeTargetState::Canceled => {
-                sqlx::query!(
+                sqlx::query_scalar!(
                     r#"
                     UPDATE requests
                     SET state = 'canceled',
                         canceled_at = COALESCE(canceled_at, NOW())
                     WHERE batch_id = $1
                       AND state IN ('pending', 'claimed', 'processing')
+                    RETURNING id
                     "#,
                     *batch_id as Uuid,
                 )
-                .execute(self.pools.write())
+                .fetch_all(&mut *tx)
                 .await
             }
             CascadeTargetState::Failed => {
                 let default_error = serde_json::to_string(&FailureReason::BatchTerminated)
                     .expect("FailureReason serialization cannot fail");
-                sqlx::query!(
+                sqlx::query_scalar!(
                     r#"
                     UPDATE requests
                     SET state = 'failed',
@@ -4083,24 +4352,35 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         END
                     WHERE batch_id = $1
                       AND state IN ('pending', 'claimed', 'processing')
+                    RETURNING id
                     "#,
                     *batch_id as Uuid,
                     default_error,
                 )
-                .execute(self.pools.write())
+                .fetch_all(&mut *tx)
                 .await
             }
         }
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to cascade batch state to requests: {}", e))
-        })?;
+        })?
+        .into_iter()
+        .collect();
+
+        let rows_affected = updated_ids.len() as u64;
+        let archived_rows = Self::archive_terminal_batch_requests_in_tx(&mut tx, batch_id).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
         tracing::info!(
-            rows_updated = rows_affected.rows_affected(),
+            rows_updated = rows_affected,
+            rows_archived = archived_rows,
             "Cascaded batch state to requests"
         );
 
-        Ok(rows_affected.rows_affected())
+        Ok(rows_affected)
     }
 
     async fn delete_batch(&self, batch_id: BatchId) -> Result<()> {
@@ -4164,13 +4444,20 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
             })?;
 
-        let template_id: Option<Option<Uuid>> = sqlx::query_scalar!(
-            r#"DELETE FROM requests WHERE id = $1 RETURNING template_id"#,
-            *request_id as Uuid,
+        let template_id: Option<Option<Uuid>> = sqlx::query_scalar(
+            r#"
+            SELECT template_id FROM requests WHERE id = $1
+            UNION ALL
+            SELECT template_id FROM requests_archive WHERE id = $1
+            LIMIT 1
+            "#,
         )
+        .bind(*request_id as Uuid)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete request: {}", e)))?;
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to fetch request for deletion: {}", e))
+        })?;
 
         let Some(template_id) = template_id else {
             return Err(FusilladeError::RequestNotFound(request_id));
@@ -4178,6 +4465,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         // template_id is nullable on requests (the orphan purger may have
         // already cleared it). Only chase the template when one is set.
+        sqlx::query!(r#"DELETE FROM requests WHERE id = $1"#, *request_id as Uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete request: {}", e)))?;
+
+        sqlx::query!(
+            r#"DELETE FROM requests_archive WHERE id = $1"#,
+            *request_id as Uuid
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete archived request: {}", e)))?;
+
         if let Some(template_id) = template_id {
             // `file_id IS NULL` restricts deletion to dedicated batchless
             // templates. File-backed (batched) templates are shared and must
@@ -4220,20 +4520,27 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // soft-deleted parent batch for the orphan-purge daemon to key off —
         // if we don't remove them here the erasure is incomplete (the batchless
         // template still carries the prompt body). This mirrors `delete_request`
-        // in bulk: delete the requests (response_steps cascade), capturing their
-        // template_ids, then delete the templates that are batchless (file_id
-        // IS NULL — file-backed templates are shared and handled via Stage 2).
+        // in bulk: delete the request rows (letting response_steps cascade),
+        // capture their template_ids, then delete the templates that are
+        // batchless (file_id IS NULL — file-backed templates are shared and
+        // handled via Stage 2).
         let batchless_template_ids: Vec<Option<Uuid>> = sqlx::query_scalar!(
             r#"
-            DELETE FROM requests
-            WHERE id IN (
-                SELECT id FROM requests
+            WITH doomed AS (
+                SELECT id, template_id
+                FROM requests
                 WHERE created_by = $1
                   AND batch_id IS NULL
                 LIMIT $2
                 FOR UPDATE SKIP LOCKED
+            ),
+            deleted AS (
+                DELETE FROM requests r
+                USING doomed d
+                WHERE r.id = d.id
+                RETURNING d.template_id
             )
-            RETURNING template_id
+            SELECT template_id FROM deleted
             "#,
             creator_id,
             batch_size,
@@ -4411,26 +4718,77 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
             })?;
 
-        let result = sqlx::query!(
+        let count: i64 = sqlx::query_scalar(
             r#"
-            UPDATE requests
-            SET state = 'pending',
-                retry_attempt = 0,
-                not_before = NULL,
-                error = NULL,
-                failed_at = NULL,
-                daemon_id = NULL,
-                claimed_at = NULL,
-                started_at = NULL
-            WHERE batch_id = $1 AND state = 'failed'
+            WITH moved AS (
+                DELETE FROM requests_archive
+                WHERE batch_id = $1
+                RETURNING id, batch_id, template_id, state, retry_attempt, not_before,
+                          daemon_id, claimed_at, started_at, response_status,
+                          response_body, completed_at, error, failed_at, canceled_at,
+                          created_at, updated_at, custom_id, response_size, model,
+                          routed_model, service_tier, created_by
+            ),
+            restored AS (
+                INSERT INTO requests (
+                    id, batch_id, template_id, state, retry_attempt, not_before,
+                    daemon_id, claimed_at, started_at, response_status,
+                    response_body, completed_at, error, failed_at, canceled_at,
+                    created_at, updated_at, custom_id, response_size, model,
+                    routed_model, service_tier, created_by
+                )
+                SELECT id, batch_id, template_id,
+                       CASE WHEN state = 'failed' THEN 'pending' ELSE state END,
+                       CASE WHEN state = 'failed' THEN 0 ELSE retry_attempt END,
+                       CASE WHEN state = 'failed' THEN NULL ELSE not_before END,
+                       CASE WHEN state = 'failed' THEN NULL ELSE daemon_id END,
+                       CASE WHEN state = 'failed' THEN NULL ELSE claimed_at END,
+                       CASE WHEN state = 'failed' THEN NULL ELSE started_at END,
+                       CASE WHEN state = 'failed' THEN NULL ELSE response_status END,
+                       CASE WHEN state = 'failed' THEN NULL ELSE response_body END,
+                       CASE WHEN state = 'failed' THEN NULL ELSE completed_at END,
+                       CASE WHEN state = 'failed' THEN NULL ELSE error END,
+                       CASE WHEN state = 'failed' THEN NULL ELSE failed_at END,
+                       CASE WHEN state = 'failed' THEN NULL ELSE canceled_at END,
+                       created_at, NOW(), custom_id,
+                       CASE WHEN state = 'failed' THEN 0 ELSE response_size END,
+                       model,
+                       CASE WHEN state = 'failed' THEN NULL ELSE routed_model END,
+                       service_tier, created_by
+                FROM moved
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id, state
+            ),
+            legacy AS (
+                UPDATE requests
+                SET state = 'pending',
+                    retry_attempt = 0,
+                    not_before = NULL,
+                    error = NULL,
+                    failed_at = NULL,
+                    daemon_id = NULL,
+                    claimed_at = NULL,
+                    started_at = NULL,
+                    completed_at = NULL,
+                    canceled_at = NULL,
+                    response_status = NULL,
+                    response_body = NULL,
+                    response_size = 0,
+                    routed_model = NULL
+                WHERE batch_id = $1
+                  AND state = 'failed'
+                RETURNING id
+            )
+            SELECT (
+                (SELECT COUNT(*) FROM restored WHERE state = 'pending')
+                + (SELECT COUNT(*) FROM legacy)
+            )::BIGINT
             "#,
-            *batch_id as Uuid,
         )
-        .execute(&mut *tx)
+        .bind(*batch_id as Uuid)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to retry failed requests: {}", e)))?;
-
-        let count = result.rows_affected();
 
         // Reset batch terminal timestamps so lazy finalization can re-evaluate
         // once the retried requests complete. Without this, a stale failed_at
@@ -4442,7 +4800,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 SET completed_at = NULL,
                     failed_at = NULL,
                     finalizing_at = NULL,
-                    notification_sent_at = NULL
+                    notification_sent_at = NULL,
+                    completed_requests = 0,
+                    failed_requests = 0,
+                    canceled_requests = 0,
+                    in_progress_requests = 0
                 WHERE id = $1
                 "#,
                 *batch_id as Uuid,
@@ -4460,21 +4822,45 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         tracing::debug!(%batch_id, count, "Retried failed requests for batch");
 
-        Ok(count)
+        Ok(count as u64)
     }
 
     #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>> {
         let rows = sqlx::query!(
             r#"
+            WITH request_rows AS (
+                SELECT
+                    id, batch_id, template_id, state, retry_attempt, not_before,
+                    daemon_id, claimed_at, started_at, response_status,
+                    response_body, completed_at, error, failed_at, canceled_at,
+                    created_at, updated_at, custom_id, response_size, model,
+                    routed_model, service_tier, created_by
+                FROM requests
+                WHERE batch_id = $1
+
+                UNION ALL
+
+                SELECT
+                    id, batch_id, template_id, state, retry_attempt, not_before,
+                    daemon_id, claimed_at, started_at, response_status,
+                    response_body, completed_at, error, failed_at, canceled_at,
+                    created_at, updated_at, custom_id, response_size, model,
+                    routed_model, service_tier, created_by
+                FROM requests_archive a
+                WHERE batch_id = $1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM requests r WHERE r.id = a.id
+                  )
+            )
             SELECT
-                r.id, r.batch_id as "batch_id!", r.template_id as "template_id?", r.state,
+                r.id as "id!", r.batch_id as "batch_id!", r.template_id as "template_id?", r.state as "state!",
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
                 t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
-                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
+                r.retry_attempt as "retry_attempt!", r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at, r.routed_model
-            FROM requests r
+            FROM request_rows r
             LEFT JOIN active_request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
             WHERE r.batch_id = $1 AND b.deleted_at IS NULL
@@ -5007,6 +5393,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     ) -> Result<()> {
         let pool = self.pools.write();
         let size = response_body.len() as i64;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Try the UPDATE; if it doesn't match, surface whether the row is
         // missing or just in the wrong state. The previous "0 rows → NotFound"
@@ -5022,7 +5412,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         response_body = $3,
                         response_size = $4,
                         completed_at = NOW()
-                  WHERE id = $1 AND state = 'processing'
+                 WHERE id = $1 AND state = 'processing'
                  RETURNING 1
              )
              SELECT EXISTS(SELECT 1 FROM updated) AS matched,
@@ -5033,12 +5423,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(status_code as i16)
         .bind(response_body)
         .bind(size)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete request: {}", e)))?;
 
         match row {
-            Some((true, _)) => Ok(()),
+            Some((true, _)) => {
+                tx.commit().await.map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e))
+                })?;
+                Ok(())
+            }
             Some((false, Some(current_state))) => Err(FusilladeError::RequestStateConflict {
                 id: request_id,
                 current_state,
@@ -5056,6 +5451,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         status_code: u16,
     ) -> Result<()> {
         let pool = self.pools.write();
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         let reason = FailureReason::NonRetriableHttpStatus {
             status: status_code,
@@ -5073,7 +5472,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                         error = $2,
                         response_size = $3,
                         failed_at = NOW()
-                  WHERE id = $1 AND state = 'processing'
+                 WHERE id = $1 AND state = 'processing'
                  RETURNING 1
              )
              SELECT EXISTS(SELECT 1 FROM updated) AS matched,
@@ -5083,12 +5482,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(request_id.0)
         .bind(&error_json)
         .bind(error_size)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail request: {}", e)))?;
 
         match row {
-            Some((true, _)) => Ok(()),
+            Some((true, _)) => {
+                tx.commit().await.map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e))
+                })?;
+                Ok(())
+            }
             Some((false, Some(current_state))) => Err(FusilladeError::RequestStateConflict {
                 id: request_id,
                 current_state,
@@ -5335,11 +5739,36 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 b.deleted_at,
                 b.notification_sent_at,
                 b.api_key_id,
-                COALESCE(counts.pending, 0)::BIGINT as pending_requests,
-                COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests,
-                COALESCE(counts.completed, 0)::BIGINT as completed_requests,
-                COALESCE(counts.failed, 0)::BIGINT as failed_requests,
-                COALESCE(counts.canceled, 0)::BIGINT as canceled_requests
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN 0
+                    ELSE COALESCE(counts.pending, 0)
+                END::BIGINT as pending_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.in_progress_requests
+                    ELSE COALESCE(counts.in_progress, 0)
+                END::BIGINT as in_progress_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.completed_requests
+                    ELSE COALESCE(counts.completed, 0)
+                END::BIGINT as completed_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.failed_requests
+                    ELSE COALESCE(counts.failed, 0)
+                END::BIGINT as failed_requests,
+                CASE
+                    WHEN (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                         AND (b.completed_requests + b.failed_requests + b.canceled_requests) > 0
+                        THEN b.canceled_requests
+                    ELSE COALESCE(counts.canceled, 0)
+                END::BIGINT as canceled_requests
             FROM batches b
             LEFT JOIN LATERAL (
                 SELECT
@@ -5380,11 +5809,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         let terminal_count = completed_requests + failed_requests + canceled_requests;
         let is_terminal = terminal_count == total_requests && total_requests > 0;
 
-        let (finalizing_at, completed_at, failed_at) = if is_terminal
-            && completed_at.is_none()
-            && failed_at.is_none()
-            && cancelled_at.is_none()
-        {
+        let needs_terminal_timestamp =
+            completed_at.is_none() && failed_at.is_none() && cancelled_at.is_none();
+        let (finalizing_at, completed_at, failed_at) = if is_terminal && needs_terminal_timestamp {
             let now = Utc::now();
 
             // Determine which terminal state based on counts
@@ -5396,30 +5823,43 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 (Some(now), None, Some(now))
             };
 
-            // Update the database with the terminal timestamps
-            sqlx::query!(
-                r#"
-                UPDATE batches
-                SET finalizing_at = COALESCE(finalizing_at, $2),
-                    completed_at = COALESCE(completed_at, $3),
-                    failed_at = COALESCE(failed_at, $4)
-                WHERE id = $1
-                "#,
-                *batch_id as Uuid,
-                finalizing,
-                completed,
-                failed,
-            )
-            .execute(self.pools.write()) // Use the provided pool parameter here too
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
-            })?;
-
             (finalizing, completed, failed)
         } else {
             (finalizing_at_db, completed_at, failed_at)
         };
+
+        if is_terminal {
+            let mut tx = self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
+            if needs_terminal_timestamp {
+                sqlx::query!(
+                    r#"
+                    UPDATE batches
+                    SET finalizing_at = COALESCE(finalizing_at, $2),
+                        completed_at = COALESCE(completed_at, $3),
+                        failed_at = COALESCE(failed_at, $4)
+                    WHERE id = $1
+                    "#,
+                    *batch_id as Uuid,
+                    finalizing_at,
+                    completed_at,
+                    failed_at,
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
+                })?;
+            }
+
+            Self::archive_terminal_batch_requests_in_tx(&mut tx, batch_id).await?;
+
+            tx.commit().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e))
+            })?;
+        }
 
         Ok(Batch {
             id: BatchId(row.get("id")),
@@ -5458,10 +5898,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// to prevent duplicate notifications across replicas polling concurrently.
     ///
     /// Request counts (completed, failed, etc.) are computed here via LATERAL JOIN for the
-    /// notification email body but are not persisted — they'll be recomputed on subsequent
-    /// reads. This is acceptable because the counts are cheap to compute (indexed on
-    /// `batch_id` + `state`), the values are immutable once finalized, and storing them
-    /// would add schema complexity and staleness risk for marginal gain.
+    /// notification email body and frozen onto `batches` before rows move to
+    /// `requests_archive`.
     /// Finds terminal batches that haven't had notifications sent yet, atomically
     /// marks them as notified, and returns them for processing.
     ///
@@ -5471,6 +5909,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// poller), but the finalization logic is kept here so this poller remains
     /// self-contained and correct regardless of how callers of get_batch() change.
     pub async fn poll_completed_batches(&self) -> Result<Vec<BatchNotification>> {
+        let mut tx =
+            self.pools.write().begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
         let rows = sqlx::query!(
             r#"
             -- Step 1: Find candidate batches that are terminal by count
@@ -5511,7 +5954,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     completed_at = COALESCE(b.completed_at,
                         CASE WHEN c.completed_requests > 0 THEN NOW() END),
                     failed_at = COALESCE(b.failed_at,
-                        CASE WHEN c.completed_requests = 0 THEN NOW() END)
+                        CASE WHEN c.completed_requests = 0 THEN NOW() END),
+                    completed_requests = c.completed_requests,
+                    failed_requests = c.failed_requests,
+                    canceled_requests = c.canceled_requests,
+                    in_progress_requests = 0
                 FROM candidates c
                 WHERE b.id = c.id
                   AND b.notification_sent_at IS NULL  -- Re-check to handle concurrent pollers
@@ -5531,11 +5978,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             LEFT JOIN files f ON f.id = u.file_id
             "#
         )
-        .fetch_all(self.pools.write())
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to poll completed batches: {}", e))
         })?;
+
+        for row in &rows {
+            Self::archive_terminal_batch_requests_in_tx(&mut tx, BatchId(row.id)).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
         Ok(rows
             .into_iter()
@@ -5776,10 +6231,25 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
             let request_batch = sqlx::query!(
                 r#"
-                SELECT id, custom_id, response_status, response_body, completed_at
-                FROM requests
-                WHERE batch_id = $1
-                  AND state = 'completed'
+                WITH request_rows AS (
+                    SELECT id, custom_id, response_status, response_body, completed_at
+                    FROM requests
+                    WHERE batch_id = $1
+                      AND state = 'completed'
+
+                    UNION ALL
+
+                    SELECT id, custom_id, response_status, response_body, completed_at
+                    FROM requests_archive a
+                    WHERE batch_id = $1
+                      AND state = 'completed'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM requests r WHERE r.id = a.id
+                      )
+                )
+                SELECT id as "id!", custom_id, response_status, response_body, completed_at
+                FROM request_rows
+                WHERE TRUE
                   AND ($2::TIMESTAMPTZ IS NULL OR completed_at > $2 OR (completed_at = $2 AND id > $3))
                   AND ($6::text IS NULL OR LOWER(custom_id) LIKE $6)
                 ORDER BY completed_at ASC, id ASC
@@ -5914,8 +6384,32 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             // Build dynamic query with error filter
             let mut query_builder = QueryBuilder::new(
                 r#"
+                WITH request_rows AS (
+                    SELECT id, batch_id, custom_id, state, error, failed_at
+                    FROM requests
+                    WHERE batch_id = "#,
+            );
+            query_builder.push_bind(batch_id);
+            query_builder.push(
+                r#"
+                      AND state = 'failed'
+
+                    UNION ALL
+
+                    SELECT id, batch_id, custom_id, state, error, failed_at
+                    FROM requests_archive a
+                    WHERE batch_id = "#,
+            );
+            query_builder.push_bind(batch_id);
+            query_builder.push(
+                r#"
+                      AND state = 'failed'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM requests r WHERE r.id = a.id
+                      )
+                )
                 SELECT id, custom_id, error, failed_at
-                FROM requests
+                FROM request_rows
                 WHERE batch_id = "#,
             );
             query_builder.push_bind(batch_id);
@@ -6064,6 +6558,28 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             // The error filter only applies to failed requests
             let mut query_builder = QueryBuilder::new(
                 r#"
+                WITH request_rows AS (
+                    SELECT id, batch_id, template_id, custom_id, model, state, response_body, error
+                    FROM requests
+                    WHERE batch_id = "#,
+            );
+            query_builder.push_bind(*batch_id as Uuid);
+            query_builder.push(
+                r#"
+
+                    UNION ALL
+
+                    SELECT id, batch_id, template_id, custom_id, model, state, response_body, error
+                    FROM requests_archive a
+                    WHERE batch_id = "#,
+            );
+            query_builder.push_bind(*batch_id as Uuid);
+            query_builder.push(
+                r#"
+                      AND NOT EXISTS (
+                          SELECT 1 FROM requests r WHERE r.id = a.id
+                      )
+                )
                 SELECT
                     r.id,
                     r.custom_id,
@@ -6074,7 +6590,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                     r.error,
                     t.line_number
                 FROM request_templates t
-                JOIN requests r ON r.template_id = t.id AND r.batch_id = "#,
+                JOIN request_rows r ON r.template_id = t.id AND r.batch_id = "#,
             );
             query_builder.push_bind(*batch_id as Uuid);
             query_builder.push(" WHERE t.file_id = ");
@@ -6494,18 +7010,18 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         // requests.template_id from corrupting live request data.
         //
         // Uses LATERAL so Postgres resolves the small set of soft-deleted
-        // batch IDs first, then does an index lookup into requests per batch
-        // via idx_requests_batch_id — avoiding a seq scan of the (potentially
-        // huge) requests table. FOR UPDATE SKIP LOCKED enables concurrent
-        // daemons to partition work without blocking.
-        let requests_deleted = sqlx::query!(
+        // batch IDs first, then does indexed lookups into active and archived
+        // request storage per batch. Active request deletes cascade
+        // response_steps through the existing FK.
+        let active_requests_deleted = sqlx::query!(
             r#"
             DELETE FROM requests
             WHERE id IN (
                 SELECT r.id
                 FROM (SELECT id FROM batches WHERE deleted_at IS NOT NULL) b,
                 LATERAL (
-                    SELECT id FROM requests
+                    SELECT id
+                    FROM requests
                     WHERE batch_id = b.id
                     LIMIT $1
                     FOR UPDATE SKIP LOCKED
@@ -6518,6 +7034,31 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         .execute(self.pools.write())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge orphaned requests: {}", e)))?
+        .rows_affected() as i64;
+
+        let archived_requests_deleted = sqlx::query!(
+            r#"
+            DELETE FROM requests_archive
+            WHERE id IN (
+                SELECT r.id
+                FROM (SELECT id FROM batches WHERE deleted_at IS NOT NULL) b,
+                LATERAL (
+                    SELECT id
+                    FROM requests_archive
+                    WHERE batch_id = b.id
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                ) r
+                LIMIT $1
+            )
+            "#,
+            batch_size,
+        )
+        .execute(self.pools.write())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to purge archived orphaned requests: {}", e))
+        })?
         .rows_affected() as i64;
 
         // Step 2: Delete request_templates whose parent file has been soft-deleted.
@@ -6551,6 +7092,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         })?
         .rows_affected() as i64;
 
+        let requests_deleted = active_requests_deleted + archived_requests_deleted;
         let total = (requests_deleted + templates_deleted) as u64;
         if total > 0 {
             tracing::info!(requests_deleted, templates_deleted, "Purged orphaned rows");
@@ -8780,7 +9322,7 @@ mod tests {
 
         // Verify response_size is set for cascaded failures
         let row = sqlx::query!(
-            "SELECT response_size FROM requests WHERE batch_id = $1 AND state = 'failed'",
+            r#"SELECT response_size as "response_size!" FROM requests WHERE batch_id = $1 AND state = 'failed'"#,
             *batch.id as Uuid,
         )
         .fetch_one(&pool)
