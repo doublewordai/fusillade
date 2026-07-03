@@ -1958,7 +1958,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             match &mut any_request {
                 AnyRequest::Completed(req) => {
                     req.state.response_body = transformer
-                        .transform(req.data.id, &req.state.response_body)
+                        .transform(&req.data, &req.state.response_body)
                         .await?;
                 }
                 AnyRequest::Failed(req) => {
@@ -1970,7 +1970,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     match &mut req.state.reason {
                         FailureReason::RetriableHttpStatus { body, .. }
                         | FailureReason::NonRetriableHttpStatus { body, .. } => {
-                            *body = transformer.transform(req.data.id, body).await?;
+                            *body = transformer.transform(&req.data, body).await?;
                         }
                         _ => {}
                     }
@@ -7741,7 +7741,7 @@ mod tests {
 
     #[async_trait]
     impl crate::transform::ResponseTransformer for MarkingTransformer {
-        async fn transform(&self, _request_id: RequestId, body: &str) -> Result<String> {
+        async fn transform(&self, _request: &RequestData, body: &str) -> Result<String> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(format!("XFORM:{body}"))
         }
