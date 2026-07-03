@@ -1,5 +1,12 @@
 # Changelog
 
+## [19.4.0](https://github.com/doublewordai/fusillade/compare/fusillade-v19.3.0...fusillade-v19.4.0) (2026-07-03)
+
+
+### Features
+
+* pass the request to ResponseTransformer ([#314](https://github.com/doublewordai/fusillade/issues/314)) ([e99c36f](https://github.com/doublewordai/fusillade/commit/e99c36f52466293e3078423fb6083d4d3580d81e))
+
 ## [19.3.0](https://github.com/doublewordai/fusillade/compare/fusillade-v19.2.1...fusillade-v19.3.0) (2026-07-02)
 
 
