@@ -7747,6 +7747,22 @@ mod tests {
         }
     }
 
+    /// Test double that proves the *specific* request being persisted reaches the
+    /// hook: it records the id it was handed and echoes it into the body, so a test
+    /// can assert both that the transformer saw the right request (not some other
+    /// row) and that request fields can influence the transformed output.
+    struct RequestEchoTransformer {
+        seen: Arc<std::sync::Mutex<Option<Uuid>>>,
+    }
+
+    #[async_trait]
+    impl crate::transform::ResponseTransformer for RequestEchoTransformer {
+        async fn transform(&self, request: &RequestData, body: &str) -> Result<String> {
+            *self.seen.lock().unwrap() = Some(request.id.0);
+            Ok(format!("{}:{body}", request.id.0))
+        }
+    }
+
     /// Claim a single request into an in-flight state and hand back the request
     /// itself (so the caller can drive it to a terminal state and persist it),
     /// with an optional transformer installed on the manager. persist() matches
@@ -7877,6 +7893,36 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "transform must run exactly once per persist (it sits before the DB retry loop)",
+        );
+    }
+
+    /// The hook is handed the *specific* request being persisted, so an
+    /// implementation can read its fields and let them influence the output.
+    /// Guards against regressions that pass the wrong request (or none).
+    #[sqlx::test]
+    async fn response_transformer_receives_the_persisted_request(pool: sqlx::PgPool) {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let (manager, req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(RequestEchoTransformer { seen: seen.clone() })),
+        )
+        .await;
+
+        manager
+            .persist(&completed_from(&req, "hello"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(req.data.id.0),
+            "transformer must be handed the request being persisted",
+        );
+        let expected = format!("{}:hello", req.data.id.0);
+        assert_eq!(
+            stored_response_body(&pool, req.data.id).await.as_deref(),
+            Some(expected.as_str()),
+            "a field read from the passed request influenced the stored body",
         );
     }
 
