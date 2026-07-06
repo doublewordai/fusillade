@@ -1520,6 +1520,20 @@ mod tests {
         );
     }
 
+    async fn mark_model_live_for_test(
+        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        model: &str,
+    ) {
+        manager
+            .append_model_filter_event(&crate::manager::ModelFilter {
+                model: model.to_string(),
+                state: crate::manager::ModelFilterState::Live,
+                expected_ready_at: None,
+            })
+            .await
+            .expect("failed to mark model live");
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
@@ -1619,6 +1633,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         // Get the created request from the batch
         let requests = manager
@@ -1848,6 +1863,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "gpt-4").await;
 
         // Start the daemon
         let shutdown_token = tokio_util::sync::CancellationToken::new();
@@ -2063,6 +2079,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -2225,6 +2242,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "gpt-4").await;
 
         // Start the daemon
         let shutdown_token = tokio_util::sync::CancellationToken::new();
@@ -2418,6 +2436,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -2599,6 +2618,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -2785,6 +2805,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -3082,6 +3103,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -3244,6 +3266,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -3387,6 +3410,7 @@ mod tests {
             })
             .await
             .unwrap();
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         manager

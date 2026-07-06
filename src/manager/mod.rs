@@ -588,7 +588,12 @@ pub trait Storage: Send + Sync {
     }
 
     /// Compatibility method for callers and storage implementations that have
-    /// not yet moved to explicit request/batch daemon APIs.
+    /// not yet moved to the explicit request daemon API.
+    ///
+    /// New daemon code should call [`Storage::claim_batchless_requests`] or
+    /// [`Storage::claim_batch_requests`] directly. This method is kept
+    /// as a batchless-only alias so the request and batch policies cannot be
+    /// accidentally recombined.
     async fn claim_requests(
         &self,
         limit: usize,
@@ -603,7 +608,8 @@ pub trait Storage: Send + Sync {
     /// The batch daemon owns this policy. Implementations should select
     /// candidate batches before probing request rows, limit selected batches by
     /// `batch_limit`, and only claim rows whose latest `model_filters` event is
-    /// `live`. No leaky-bucket or deadline-ramp fallback applies here.
+    /// explicitly `live`. Models with no filter event are not eligible for batch
+    /// claims. No leaky-bucket or deadline-ramp fallback applies here.
     async fn claim_batch_requests(
         &self,
         limit: usize,

@@ -3,10 +3,26 @@ use fusillade::batch::{BatchInput, RequestTemplateInput};
 use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retry};
 use fusillade::http::{HttpResponse, MockHttpClient};
 use fusillade::manager::postgres::PostgresRequestManager;
-use fusillade::manager::{DaemonExecutor, Storage};
+use fusillade::manager::{DaemonExecutor, ModelFilter, ModelFilterState, Storage};
 use fusillade::request::{ListRequestsFilter, ServiceTierFilter};
 use std::sync::Arc;
 use std::time::Duration;
+
+async fn mark_models_live_for_test(
+    manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+    models: &[&str],
+) {
+    let filters: Vec<ModelFilter> = models
+        .iter()
+        .map(|model| ModelFilter {
+            model: (*model).to_string(),
+            state: ModelFilterState::Live,
+            expected_ready_at: None,
+        })
+        .collect();
+
+    manager.append_model_filter_events(&filters).await.unwrap();
+}
 
 #[sqlx::test]
 #[test_log::test]
@@ -83,6 +99,7 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
         })
         .await
         .expect("Failed to create batch");
+    mark_models_live_for_test(manager.as_ref(), &["test-model"]).await;
 
     // Get the created request from the batch
     let requests = manager
@@ -289,6 +306,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
         })
         .await
         .expect("Failed to create batch");
+    mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
     // Start the daemon
     let shutdown_token = tokio_util::sync::CancellationToken::new();
@@ -490,6 +508,7 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
         })
         .await
         .expect("Failed to create batch");
+    mark_models_live_for_test(manager.as_ref(), &["test-model"]).await;
 
     let requests = manager
         .get_batch_requests(batch.id)
@@ -628,6 +647,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
         })
         .await
         .expect("Failed to create batch");
+    mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
     // Start the daemon
     let shutdown_token = tokio_util::sync::CancellationToken::new();
@@ -793,6 +813,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
         })
         .await
         .expect("Failed to create batch");
+    mark_models_live_for_test(manager.as_ref(), &["test-model"]).await;
 
     let requests = manager
         .get_batch_requests(batch.id)
@@ -963,6 +984,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
         })
         .await
         .expect("Failed to create batch");
+    mark_models_live_for_test(manager.as_ref(), &["test-model"]).await;
 
     let requests = manager
         .get_batch_requests(batch.id)
@@ -1150,6 +1172,7 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
         })
         .await
         .expect("Failed to create batch");
+    mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
     let requests = manager
         .get_batch_requests(batch.id)
@@ -1302,6 +1325,7 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
         })
         .await
         .expect("Failed to create batch");
+    mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
     let requests = manager
         .get_batch_requests(batch.id)
@@ -1448,6 +1472,7 @@ mod batch_results_stream {
             })
             .await
             .expect("Failed to create batch");
+        mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
         // Run daemon to complete requests
         let shutdown_token = tokio_util::sync::CancellationToken::new();
@@ -1625,6 +1650,7 @@ mod batch_results_stream {
             })
             .await
             .expect("Failed to create batch");
+        mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
         // Run daemon to process the request
         let shutdown_token = tokio_util::sync::CancellationToken::new();
@@ -1749,6 +1775,7 @@ mod batch_results_stream {
             })
             .await
             .expect("Failed to create batch");
+        mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
         // Run daemon
         let shutdown_token = tokio_util::sync::CancellationToken::new();
@@ -1873,6 +1900,7 @@ mod batch_results_stream {
             })
             .await
             .expect("Failed to create batch");
+        mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         manager
@@ -2004,6 +2032,7 @@ mod batch_results_stream {
             })
             .await
             .expect("Failed to create batch");
+        mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         manager
@@ -2153,6 +2182,7 @@ mod batch_results_stream {
             })
             .await
             .expect("Failed to create batch");
+        mark_models_live_for_test(manager.as_ref(), &["test-model"]).await;
 
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         manager
