@@ -1120,11 +1120,19 @@ where
                         Ok(RequestCompletionResult::Canceled(_canceled)) => {
                             tracing::Span::current().record("outcome", "canceled");
                             counter!("fusillade_requests_cancelled_total", "model" => model_clone.clone()).increment(1);
+                            // Keep the pre-split counter shape alive so existing
+                            // dashboards/alerts on completed_total{status="cancelled"}
+                            // don't silently break (deprecation window).
+                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled").increment(1);
+                            counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "cancelled", "completion_window" => completion_window.clone()).increment(1);
                             Ok(())
                         }
                         Err(FusilladeError::Shutdown) => {
+                            // Expected during daemon shutdown — treat as a clean
+                            // exit so poll_processing_tasks doesn't log it as a
+                            // background task failure.
                             tracing::Span::current().record("outcome", "shutdown");
-                            Err(FusilladeError::Shutdown)
+                            Ok(())
                         }
                         Err(e) => {
                             tracing::Span::current().record("outcome", "error");

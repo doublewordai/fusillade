@@ -1669,13 +1669,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
     ) -> Result<Vec<Request<Claimed>>> {
-        let unclaimed_count = self.unclaim_stale_requests().await?;
-        if unclaimed_count > 0 {
-            tracing::info!(
-                unclaimed_count,
-                "Unclaimed stale requests before claiming batched rows"
-            );
-        }
+        // NOTE: stale-request reclamation deliberately does NOT run here. The
+        // request daemon's `claim_batchless_requests` already runs
+        // `unclaim_stale_requests` every cycle (and reclaims batched rows too);
+        // repeating it here would double the serialized DB round-trips under
+        // the shared claim mutex for no additional coverage.
 
         let now = Utc::now();
         let mut model_capacity_pairs: Vec<(String, i64)> = available_capacity
@@ -6706,6 +6704,14 @@ mod tests {
         user_active_counts: &HashMap<String, usize>,
     ) -> Vec<Request<Claimed>> {
         mark_models_live_for_test(manager, available_capacity.keys()).await;
+        // The batch claim itself no longer reclaims stale rows — in production
+        // the request daemon's claim cycle runs `unclaim_stale_requests` every
+        // interval (covering batched rows too). Mirror that here so tests that
+        // exercise stale-reclaim via the batch path keep working.
+        manager
+            .unclaim_stale_requests()
+            .await
+            .expect("unclaim stale failed");
         manager
             .claim_batch_requests(
                 limit,
