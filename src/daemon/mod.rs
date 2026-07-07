@@ -124,8 +124,29 @@ pub struct DaemonConfig {
 
     /// Maximum number of batch IDs to select per model in one batch daemon
     /// claim iteration. Values of 0 are treated as 1.
+    ///
+    /// Selecting a single batch per model risks head-of-line blocking /
+    /// undersaturation: if the top-ranked batch has fewer claimable rows than
+    /// the model's capacity (e.g. its remaining rows are backing off on
+    /// `not_before`), leftover capacity is wasted for the cycle even when other
+    /// batches have pending rows. A small pool (default 4) lets the claim spill
+    /// into the next-ranked batches.
     #[serde(default = "default_batch_claim_batch_size")]
     pub batch_claim_batch_size: usize,
+
+    /// Require an explicit `live` model_filters event before the batch daemon
+    /// claims rows for a model.
+    ///
+    /// When false (default), models with **no** filter event are treated as
+    /// live — matching the historical claim behaviour for models scouter does
+    /// not manage (external / always-on providers), which never receive filter
+    /// events. When true, only models whose latest event is `live` are
+    /// batch-claimed. In either mode, batches on not-live models (`coming` /
+    /// `absent`) become claimable once within the deadline ramp
+    /// (`claim_ramp_exponent`) — the SLA escape hatch that lets them overflow
+    /// to fallback providers instead of missing their window.
+    #[serde(default)]
+    pub batch_claim_require_live: bool,
 
     /// How long the batch daemon sleeps between claim iterations.
     ///
@@ -347,7 +368,7 @@ fn default_batch_claim_size() -> usize {
 }
 
 fn default_batch_claim_batch_size() -> usize {
-    1
+    4
 }
 
 fn default_batch_claim_interval_ms() -> u64 {
@@ -380,6 +401,7 @@ impl Default for DaemonConfig {
             claim_interval_ms: 1000,
             batch_claim_size: default_batch_claim_size(),
             batch_claim_batch_size: default_batch_claim_batch_size(),
+            batch_claim_require_live: false,
             batch_claim_interval_ms: default_batch_claim_interval_ms(),
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(0),
@@ -1553,6 +1575,7 @@ mod tests {
             claim_interval_ms: 10, // Very fast for testing
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -1749,6 +1772,7 @@ mod tests {
             claim_interval_ms: 10,
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
             batch_claim_interval_ms: 10,
             model_concurrency_limits,
 
@@ -1999,6 +2023,7 @@ mod tests {
             claim_interval_ms: 10,
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -2162,6 +2187,7 @@ mod tests {
             claim_interval_ms: 10,
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
 
@@ -2356,6 +2382,7 @@ mod tests {
             claim_interval_ms: 10,
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -2538,6 +2565,7 @@ mod tests {
             claim_interval_ms: 10,
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -2720,6 +2748,7 @@ mod tests {
             claim_interval_ms: 10,
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -2900,6 +2929,7 @@ mod tests {
             claim_interval_ms: 10,
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -3015,6 +3045,7 @@ mod tests {
             claim_interval_ms: 10,
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -3186,6 +3217,7 @@ mod tests {
             claim_interval_ms: 10,
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -3332,6 +3364,7 @@ mod tests {
             claim_interval_ms: 10,
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());

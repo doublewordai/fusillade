@@ -1737,9 +1737,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                ORDER BY calc.pr ASC, b.expires_at ASC, b.id ASC
                            ) AS batch_rank
                     FROM all_models m
-                    JOIN latest_model_filters mf
+                    -- Liveness gate: models whose latest filter event is `live`
+                    -- are always eligible. Models with NO filter event (external /
+                    -- always-on providers that scouter does not manage) are only
+                    -- eligible when `batch_claim_require_live` is false (default),
+                    -- matching the historical NULL-is-live claim behaviour. Models
+                    -- whose latest event is `coming`/`absent` are only eligible
+                    -- via the deadline-ramp escape hatch (see WHERE below).
+                    LEFT JOIN latest_model_filters mf
                       ON mf.model = m.model
-                     AND mf.state = 'live'
                     JOIN batches b
                       ON b.cancelling_at IS NULL
                      AND b.deleted_at IS NULL
@@ -1755,7 +1761,21 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             + $9::DOUBLE PRECISION
                                 * LEAST(GREATEST(EXTRACT(EPOCH FROM b.expires_at - $3), 0.0) / 86400.0, 1.0) AS pr
                     ) calc
-                    WHERE EXISTS (
+                    WHERE (
+                            mf.state = 'live'
+                            OR (NOT $10::BOOLEAN AND mf.state IS NULL)
+                            -- SLA escape hatch (deadline ramp): regardless of
+                            -- liveness, once a batch is within ramp(W) of its
+                            -- deadline it becomes claimable at full capacity so
+                            -- it can overflow to fallback providers instead of
+                            -- missing SLA waiting for the model. Same formula
+                            -- as the batchless claim: ramp = (W_minutes ^ $11)
+                            -- minutes (~59min for 24h windows, ~10min for 1h).
+                            OR (EXTRACT(EPOCH FROM (b.expires_at - $3))
+                                    <= power(GREATEST(EXTRACT(EPOCH FROM (b.expires_at - b.created_at)), 0.0) / 60.0,
+                                             $11::DOUBLE PRECISION) * 60.0)
+                          )
+                      AND EXISTS (
                         SELECT 1
                         FROM requests r
                         WHERE r.state = 'pending'
@@ -1841,6 +1861,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             &user_ids_arr,
             &user_counts_arr,
             self.config.urgency_weight,
+            self.config.batch_claim_require_live,
+            self.config.claim_ramp_exponent,
         )
         .fetch_all(self.pools.write())
         .await
@@ -7799,14 +7821,125 @@ mod tests {
             ("coming-model".to_string(), 10),
             ("unmanaged-model".to_string(), 10),
         ]);
+
+        // Strict mode (`batch_claim_require_live = true`): only models whose
+        // latest filter event is `live` are eligible — the unmanaged
+        // (no-event) model is excluded alongside `coming`.
+        let strict_manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            batch_claim_require_live: true,
+            ..Default::default()
+        });
+        let claimed = strict_manager
+            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .await
+            .expect("Failed to claim batch requests");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].data.model, "live-model");
+        assert!(claimed[0].data.batch_id.is_some());
+
+        // Default mode (`batch_claim_require_live = false`): models with NO
+        // filter event (external / always-on providers that scouter does not
+        // manage) are treated as live — the historical claim behaviour.
+        // live-model's only row was claimed above, so this picks up exactly
+        // the unmanaged model; `coming` stays excluded in either mode.
         let claimed = manager
             .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
             .await
             .expect("Failed to claim batch requests");
-
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].data.model, "live-model");
+        assert_eq!(claimed[0].data.model, "unmanaged-model");
         assert!(claimed[0].data.batch_id.is_some());
+    }
+
+    #[sqlx::test]
+    async fn test_claim_batch_requests_deadline_ramp_escape_hatch(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        let file_id = manager
+            .create_file(
+                "ramp-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("ramp".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "ramp-model".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        // Model is explicitly NOT live.
+        manager
+            .append_model_filter_events(&[ModelFilter {
+                model: "ramp-model".to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+            }])
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("ramp-model".to_string(), 10)]);
+
+        // Far from the deadline (1h window → ramp opens ~10 minutes out):
+        // a not-live model's batch is NOT claimable.
+        let claimed = manager
+            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .await
+            .expect("Failed to claim batch requests");
+        assert!(
+            claimed.is_empty(),
+            "not-live batch outside ramp must not be claimed"
+        );
+
+        // Push the batch inside the ramp window (~10 min for a 1h window):
+        // the SLA escape hatch opens regardless of liveness. Shift created_at
+        // too so the batch's window (expires_at - created_at) stays 1h — the
+        // ramp bound is computed from the actual window length.
+        sqlx::query(
+            "UPDATE batches
+             SET created_at = NOW() - interval '56 minutes',
+                 expires_at = NOW() + interval '4 minutes'
+             WHERE id IN (SELECT DISTINCT batch_id FROM requests WHERE model = 'ramp-model')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let claimed = manager
+            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .await
+            .expect("Failed to claim batch requests");
+        assert_eq!(
+            claimed.len(),
+            1,
+            "within-ramp batch must be claimable despite not-live model"
+        );
+        assert_eq!(claimed[0].data.model, "ramp-model");
     }
 
     #[sqlx::test]

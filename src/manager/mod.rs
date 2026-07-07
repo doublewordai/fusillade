@@ -607,9 +607,14 @@ pub trait Storage: Send + Sync {
     ///
     /// The batch daemon owns this policy. Implementations should select
     /// candidate batches before probing request rows, limit selected batches by
-    /// `batch_limit`, and only claim rows whose latest `model_filters` event is
-    /// explicitly `live`. Models with no filter event are not eligible for batch
-    /// claims. No leaky-bucket or deadline-ramp fallback applies here.
+    /// `batch_limit`, and gate on model liveness: models whose latest
+    /// `model_filters` event is `live` are always eligible; models with **no**
+    /// filter event (external / always-on providers that scouter does not
+    /// manage) are eligible unless `DaemonConfig::batch_claim_require_live` is
+    /// set; models whose latest event is `coming`/`absent` are eligible only
+    /// once the batch is within the deadline ramp (`claim_ramp_exponent`) —
+    /// the SLA escape hatch to fallback providers. No leaky-bucket trickle
+    /// applies to batched rows.
     async fn claim_batch_requests(
         &self,
         limit: usize,
