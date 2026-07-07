@@ -634,8 +634,21 @@ pub trait Storage: Send + Sync {
         // doesn't override this would otherwise run a batch daemon that never
         // claims a row — invisible in production until batches stall.
         Err(crate::error::FusilladeError::Other(anyhow::anyhow!(
-            "claim_batch_requests is not implemented for this storage backend"
+            "claim_batch_requests is not implemented for this storage backend \
+             (override it, or return false from supports_batch_claims to run \
+             the daemon request-only)"
         )))
+    }
+
+    /// Whether this backend implements [`Storage::claim_batch_requests`].
+    ///
+    /// The daemon only spawns its batch claim loop when this returns true.
+    /// Defaults to true so a backend that forgets to override BOTH methods
+    /// fails loudly (the default `claim_batch_requests` errors) instead of
+    /// silently never claiming batched rows. A deliberately request-only
+    /// backend should override this to return false.
+    fn supports_batch_claims(&self) -> bool {
+        true
     }
 
     /// Append a single event to the `model_filters` log. Used by the controller

@@ -1533,8 +1533,18 @@ where
         let request_daemon = RequestDaemon::new(self.clone());
         claim_daemons.spawn(async move { request_daemon.run().await });
 
-        let batch_daemon = BatchDaemon::new(self.clone());
-        claim_daemons.spawn(async move { batch_daemon.run().await });
+        // Capability-gated: a claim-loop error is fatal to the whole daemon,
+        // so a deliberately request-only storage backend must be able to opt
+        // out of the batch loop instead of dying on its first cycle.
+        if self.storage.supports_batch_claims() {
+            let batch_daemon = BatchDaemon::new(self.clone());
+            claim_daemons.spawn(async move { batch_daemon.run().await });
+        } else {
+            tracing::info!(
+                daemon_id = %self.daemon_id,
+                "Storage backend does not support batch claims; running request-only"
+            );
+        }
 
         let run_result = loop {
             tokio::select! {
