@@ -745,7 +745,16 @@ where
                 }
             }
 
-            let _claim_guard = self.claim_mutex.lock().await;
+            // Observe shutdown while waiting for the claim mutex — otherwise a
+            // loop blocked behind the other daemon's claim would run one more
+            // full cycle after shutdown is requested.
+            let _claim_guard = tokio::select! {
+                guard = self.claim_mutex.lock() => guard,
+                _ = self.shutdown_token.cancelled() => {
+                    tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
+                    break Ok(());
+                }
+            };
             let available_capacity = self.available_capacity();
             if available_capacity.is_empty() {
                 tracing::trace!(

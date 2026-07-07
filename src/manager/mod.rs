@@ -630,7 +630,12 @@ pub trait Storage: Send + Sync {
             available_capacity,
             user_active_counts,
         );
-        Ok(Vec::new())
+        // Fail loud rather than silently claiming nothing: a backend that
+        // doesn't override this would otherwise run a batch daemon that never
+        // claims a row — invisible in production until batches stall.
+        Err(crate::error::FusilladeError::Other(anyhow::anyhow!(
+            "claim_batch_requests is not implemented for this storage backend"
+        )))
     }
 
     /// Append a single event to the `model_filters` log. Used by the controller
