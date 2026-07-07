@@ -1,0 +1,51 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                WITH request_rows AS (\n                    SELECT id, custom_id, response_status, response_body, completed_at\n                    FROM requests\n                    WHERE batch_id = $1\n                      AND state = 'completed'\n\n                    UNION ALL\n\n                    SELECT id, custom_id, response_status, response_body, completed_at\n                    FROM requests_archive a\n                    WHERE batch_id = $1\n                      AND state = 'completed'\n                      AND NOT EXISTS (\n                          SELECT 1 FROM requests r WHERE r.id = a.id\n                      )\n                )\n                SELECT id as \"id!\", custom_id, response_status, response_body, completed_at\n                FROM request_rows\n                WHERE TRUE\n                  AND ($2::TIMESTAMPTZ IS NULL OR completed_at > $2 OR (completed_at = $2 AND id > $3))\n                  AND ($6::text IS NULL OR LOWER(custom_id) LIKE $6)\n                ORDER BY completed_at ASC, id ASC\n                OFFSET $4\n                LIMIT $5\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "custom_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "response_status",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 3,
+        "name": "response_body",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "d42f9d94ed78f5fe5044eb3242a715bcc96e2b42fa9e9fa3c44a9de39aa318f7"
+}

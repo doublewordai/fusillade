@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.batch_id as \"batch_id!\", r.template_id as \"template_id?\", r.state,\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", t.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at, r.routed_model\n            FROM requests r\n            LEFT JOIN active_request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.batch_id = $1 AND b.deleted_at IS NULL\n            ORDER BY r.created_at ASC\n            ",
+  "query": "\n            WITH request_rows AS (\n                SELECT\n                    id, batch_id, template_id, state, retry_attempt, not_before,\n                    daemon_id, claimed_at, started_at, response_status,\n                    response_body, completed_at, error, failed_at, canceled_at,\n                    created_at, updated_at, custom_id, response_size, model,\n                    routed_model, service_tier, created_by\n                FROM requests\n                WHERE batch_id = $1\n\n                UNION ALL\n\n                SELECT\n                    id, batch_id, template_id, state, retry_attempt, not_before,\n                    daemon_id, claimed_at, started_at, response_status,\n                    response_body, completed_at, error, failed_at, canceled_at,\n                    created_at, updated_at, custom_id, response_size, model,\n                    routed_model, service_tier, created_by\n                FROM requests_archive a\n                WHERE batch_id = $1\n                  AND NOT EXISTS (\n                      SELECT 1 FROM requests r WHERE r.id = a.id\n                  )\n            )\n            SELECT\n                r.id as \"id!\", r.batch_id as \"batch_id!\", r.template_id as \"template_id?\", r.state as \"state!\",\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", t.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt as \"retry_attempt!\", r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at, r.routed_model\n            FROM request_rows r\n            LEFT JOIN active_request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.batch_id = $1 AND b.deleted_at IS NULL\n            ORDER BY r.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
+        "name": "id!",
         "type_info": "Uuid"
       },
       {
@@ -20,7 +20,7 @@
       },
       {
         "ordinal": 3,
-        "name": "state",
+        "name": "state!",
         "type_info": "Text"
       },
       {
@@ -60,7 +60,7 @@
       },
       {
         "ordinal": 11,
-        "name": "retry_attempt",
+        "name": "retry_attempt!",
         "type_info": "Int4"
       },
       {
@@ -130,31 +130,31 @@
       ]
     },
     "nullable": [
+      null,
+      null,
+      null,
+      null,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
       false,
-      true,
-      true,
-      false,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      false,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      false,
-      true
+      null
     ]
   },
-  "hash": "2ec1096e23fdaf33ee361a5d6e65647cb9a184af0bd11b199fc6386646a64e28"
+  "hash": "7954fef975aa01fc0236dedcd7be051632dccc4a232376e927cd2656dfd48e61"
 }
