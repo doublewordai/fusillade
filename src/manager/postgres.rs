@@ -1711,7 +1711,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         let rows = sqlx::query_as!(
             ClaimedRequestRow,
             r#"
-            WITH all_models AS (
+            WITH RECURSIVE all_models AS (
                 SELECT model, capacity
                 FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
             ),
@@ -1726,18 +1726,49 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 WHERE model = ANY($4::TEXT[])
                 ORDER BY model, created_at DESC, id DESC
             ),
+            -- Distinct batch_ids that still have pending rows for each
+            -- capacity-eligible model, via an index-only "loose index scan"
+            -- (hop to the next batch_id > the current one) so enumeration costs
+            -- O(pairs · log N) — bounded by batches-with-pending-work per
+            -- model, never by total pending rows (a naive DISTINCT would scan
+            -- every pending index entry) nor by total open batches (the
+            -- previous models × batches join). Relies on idx_requests_pending
+            -- (model, batch_id).
+            batch_groups AS (
+                SELECT m.model, m.capacity,
+                       (SELECT r.batch_id FROM requests r
+                        WHERE r.state = 'pending' AND r.model = m.model
+                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
+                        ORDER BY r.batch_id LIMIT 1) AS batch_id
+                FROM all_models m
+              UNION ALL
+                SELECT g.model, g.capacity,
+                       (SELECT r.batch_id FROM requests r
+                        WHERE r.state = 'pending' AND r.model = g.model
+                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
+                          AND r.batch_id > g.batch_id
+                        ORDER BY r.batch_id LIMIT 1) AS batch_id
+                FROM batch_groups g WHERE g.batch_id IS NOT NULL
+            ),
             selected_batches AS (
                 SELECT *
                 FROM (
-                    SELECT m.model, m.capacity, b.id AS batch_id,
+                    SELECT g.model, g.capacity, b.id AS batch_id,
                            b.expires_at, b.created_at, b.created_by,
                            COALESCE(b.completion_window, '24h') AS window_class,
                            calc.pr,
                            row_number() OVER (
-                               PARTITION BY m.model
+                               PARTITION BY g.model
                                ORDER BY calc.pr ASC, b.expires_at ASC, b.id ASC
                            ) AS batch_rank
-                    FROM all_models m
+                    FROM batch_groups g
+                    JOIN batches b
+                      ON b.id = g.batch_id
+                     AND b.cancelling_at IS NULL
+                     AND b.deleted_at IS NULL
+                     AND b.completed_at IS NULL
+                     AND b.failed_at IS NULL
+                     AND b.cancelled_at IS NULL
                     -- Liveness gate: models whose latest filter event is `live`
                     -- are always eligible. Models with NO filter event (external /
                     -- always-on providers that scouter does not manage) are only
@@ -1746,13 +1777,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     -- whose latest event is `coming`/`absent` are only eligible
                     -- via the deadline-ramp escape hatch (see WHERE below).
                     LEFT JOIN latest_model_filters mf
-                      ON mf.model = m.model
-                    JOIN batches b
-                      ON b.cancelling_at IS NULL
-                     AND b.deleted_at IS NULL
-                     AND b.completed_at IS NULL
-                     AND b.failed_at IS NULL
-                     AND b.cancelled_at IS NULL
+                      ON mf.model = g.model
                     LEFT JOIN user_priority up ON b.created_by = up.user_id
                     CROSS JOIN LATERAL (
                         SELECT
@@ -1776,12 +1801,15 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                                     <= power(GREATEST(EXTRACT(EPOCH FROM (b.expires_at - b.created_at)), 0.0) / 60.0,
                                              $11::DOUBLE PRECISION) * 60.0)
                           )
+                      -- Claimable-NOW probe (per enumerated pair, so bounded):
+                      -- the loose scan proves pending rows exist, but rows all
+                      -- backing off on not_before shouldn't burn a rank slot.
                       AND EXISTS (
                         SELECT 1
                         FROM requests r
                         WHERE r.state = 'pending'
-                          AND r.model = m.model
-                          AND r.batch_id = b.id
+                          AND r.model = g.model
+                          AND r.batch_id = g.batch_id
                           AND r.template_id IS NOT NULL
                           AND (r.not_before IS NULL OR r.not_before <= $3)
                     )
