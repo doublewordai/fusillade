@@ -119,6 +119,14 @@ pub struct DaemonConfig {
     ///
     /// Batch claiming first selects live batches, then claims pending request
     /// rows from those batches up to this cap.
+    ///
+    /// A value of 0 (the default) inherits `claim_batch_size`, so deployments
+    /// that tuned the old single-loop cap keep their batch claim throughput
+    /// after the daemon split instead of silently dropping to a lower default.
+    /// This cap only bounds the claim transaction size — per-model throttling
+    /// is enforced separately by the concurrency capacities — so it should be
+    /// set at or above the total rows you expect to free per interval across
+    /// all models (sustained completion rate × interval).
     #[serde(default = "default_batch_claim_size")]
     pub batch_claim_size: usize,
 
@@ -364,7 +372,7 @@ fn default_pending_request_counts_timeout_ms() -> u64 {
 }
 
 fn default_batch_claim_size() -> usize {
-    100
+    0 // inherit claim_batch_size (see field docs)
 }
 
 fn default_batch_claim_batch_size() -> usize {
@@ -771,9 +779,15 @@ where
                         .await?
                 }
                 ClaimLoopKind::Batch => {
+                    // 0 = inherit the (often deployment-tuned) single-loop cap.
+                    let batch_claim_size = if self.config.batch_claim_size == 0 {
+                        self.config.claim_batch_size
+                    } else {
+                        self.config.batch_claim_size
+                    };
                     self.storage
                         .claim_batch_requests(
-                            self.config.batch_claim_size,
+                            batch_claim_size,
                             self.config.batch_claim_batch_size,
                             self.daemon_id,
                             &available_capacity,
