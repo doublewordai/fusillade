@@ -756,6 +756,10 @@ where
             }
 
             let total_capacity: usize = available_capacity.values().sum();
+            // Dual-emit: keep the legacy unlabeled series alive alongside the
+            // new per-daemon one so existing dashboards/alerts survive the
+            // split (deprecation window).
+            gauge!("fusillade_claim_capacity").set(total_capacity as f64);
             gauge!("fusillade_claim_capacity", "daemon" => loop_name).set(total_capacity as f64);
 
             let user_active_counts = self.user_active_counts();
@@ -796,8 +800,13 @@ where
                         .await?
                 }
             };
+            // Dual-emit legacy unlabeled histograms during the deprecation
+            // window (see fusillade_claim_capacity above).
+            histogram!("fusillade_claim_duration_seconds")
+                .record(claim_start.elapsed().as_secs_f64());
             histogram!("fusillade_claim_duration_seconds", "daemon" => loop_name)
                 .record(claim_start.elapsed().as_secs_f64());
+            histogram!("fusillade_claim_size").record(claimed.len() as f64);
             histogram!("fusillade_claim_size", "daemon" => loop_name).record(claimed.len() as f64);
 
             tracing::debug!(
@@ -989,6 +998,7 @@ where
                     });
 
                     let batch_expires_at = request.state.batch_expires_at;
+                    let retry_attempt_at_completion = request.state.retry_attempt;
                     let owning_daemon_id = request.state.daemon_id;
 
                     let cancellation: crate::processor::CancellationFuture = Box::pin(async move {
@@ -1024,11 +1034,21 @@ where
                             counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "success", "completion_window" => completion_window.clone()).increment(1);
                             histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
                                 .record(processing_start.elapsed().as_secs_f64());
+                            histogram!("fusillade_retry_attempts_on_success", "model" => model_clone.clone())
+                                .record(retry_attempt_at_completion as f64);
 
                             let completed_at = completed.state.completed_at;
                             let seconds_until_deadline = (batch_expires_at - completed_at).num_milliseconds() as f64 / 1000.0;
                             gauge!("fusillade_request_deadline_margin_seconds", "model" => model_clone.clone(), "status" => "success")
                                 .set(seconds_until_deadline);
+                            if completed_at > batch_expires_at {
+                                counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success").increment(1);
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    batch_id = ?batch_id,
+                                    "Request completed successfully after SLA"
+                                );
+                            }
                             Ok(())
                         }
                         Ok(RequestCompletionResult::Failed(failed)) => {
