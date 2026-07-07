@@ -19,7 +19,7 @@ use fusillade::batch::{BatchInput, RequestTemplateInput};
 use fusillade::daemon::{DaemonConfig, default_should_retry};
 use fusillade::http::{HttpClient, HttpResponse, MockHttpClient};
 use fusillade::manager::postgres::PostgresRequestManager;
-use fusillade::manager::{DaemonExecutor, Storage};
+use fusillade::manager::{DaemonExecutor, ModelFilter, ModelFilterState, Storage};
 use fusillade::processor::{
     CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry,
 };
@@ -75,6 +75,14 @@ async fn submit_one_request(
             api_key_id: None,
             api_key: None,
             total_requests: None,
+        })
+        .await
+        .unwrap();
+    manager
+        .append_model_filter_event(&ModelFilter {
+            model: "test-model".to_string(),
+            state: ModelFilterState::Live,
+            expected_ready_at: None,
         })
         .await
         .unwrap();

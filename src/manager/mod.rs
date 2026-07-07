@@ -537,7 +537,7 @@ pub trait Storage: Send + Sync {
     // These methods are used by the DaemonExecutor for pulling requests, and then persisting their
     // states as they iterate through them
 
-    /// Atomically claim pending requests for processing.
+    /// Atomically claim pending batchless requests for processing.
     ///
     /// `available_capacity` maps model names to the number of permits the daemon
     /// is currently holding for that model. Only models present in this map will
@@ -569,6 +569,31 @@ pub trait Storage: Send + Sync {
     /// ≤ 1 per `(user, window-class, model)` not in cooldown. Pass an empty set
     /// to allow every bucket its first token. Claimed rows carry a `leaked` flag
     /// (via the returned request) so the daemon knows which buckets to stamp.
+    async fn claim_batchless_requests(
+        &self,
+        limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+        leak_cooldown: &std::collections::HashSet<(String, String, String)>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        self.claim_requests(
+            limit,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+            leak_cooldown,
+        )
+        .await
+    }
+
+    /// Compatibility method for callers and storage implementations that have
+    /// not yet moved to the explicit request daemon API.
+    ///
+    /// New daemon code should call [`Storage::claim_batchless_requests`] or
+    /// [`Storage::claim_batch_requests`] directly. This method is kept
+    /// as a batchless-only alias so the request and batch policies cannot be
+    /// accidentally recombined.
     async fn claim_requests(
         &self,
         limit: usize,
@@ -577,6 +602,54 @@ pub trait Storage: Send + Sync {
         user_active_counts: &std::collections::HashMap<String, usize>,
         leak_cooldown: &std::collections::HashSet<(String, String, String)>,
     ) -> Result<Vec<Request<Claimed>>>;
+
+    /// Atomically claim pending requests that belong to live-model batches.
+    ///
+    /// The batch daemon owns this policy. Implementations should select
+    /// candidate batches before probing request rows, limit selected batches by
+    /// `batch_limit`, and gate on model liveness: models whose latest
+    /// `model_filters` event is `live` are always eligible; models with **no**
+    /// filter event (external / always-on providers that scouter does not
+    /// manage) are eligible unless `DaemonConfig::batch_claim_require_live` is
+    /// set; models whose latest event is `coming`/`absent` are eligible only
+    /// once the batch is within the deadline ramp (`claim_ramp_exponent`) —
+    /// the SLA escape hatch to fallback providers. No leaky-bucket trickle
+    /// applies to batched rows.
+    async fn claim_batch_requests(
+        &self,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        let _ = (
+            limit,
+            batch_limit,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+        );
+        // Fail loud rather than silently claiming nothing: a backend that
+        // doesn't override this would otherwise run a batch daemon that never
+        // claims a row — invisible in production until batches stall.
+        Err(crate::error::FusilladeError::Other(anyhow::anyhow!(
+            "claim_batch_requests is not implemented for this storage backend \
+             (override it, or return false from supports_batch_claims to run \
+             the daemon request-only)"
+        )))
+    }
+
+    /// Whether this backend implements [`Storage::claim_batch_requests`].
+    ///
+    /// The daemon only spawns its batch claim loop when this returns true.
+    /// Defaults to true so a backend that forgets to override BOTH methods
+    /// fails loudly (the default `claim_batch_requests` errors) instead of
+    /// silently never claiming batched rows. A deliberately request-only
+    /// backend should override this to return false.
+    fn supports_batch_claims(&self) -> bool {
+        true
+    }
 
     /// Append a single event to the `model_filters` log. Used by the controller
     /// when a model's internal liveness CHANGES (live / coming / absent).

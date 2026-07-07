@@ -17,7 +17,7 @@ use crate::error::Result;
 use crate::http::{HttpClient, HttpResponse};
 use crate::manager::{DaemonStorage, Storage};
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
-use crate::request::{DaemonId, RequestCompletionResult};
+use crate::request::{Claimed, DaemonId, Request, RequestCompletionResult};
 
 pub mod transitions;
 pub mod types;
@@ -114,6 +114,54 @@ pub struct DaemonConfig {
 
     /// How long to sleep between claim iterations
     pub claim_interval_ms: u64,
+
+    /// Maximum number of request rows the batch daemon can claim per iteration.
+    ///
+    /// Batch claiming first selects live batches, then claims pending request
+    /// rows from those batches up to this cap.
+    ///
+    /// A value of 0 (the default) inherits `claim_batch_size`, so deployments
+    /// that tuned the old single-loop cap keep their batch claim throughput
+    /// after the daemon split instead of silently dropping to a lower default.
+    /// This cap only bounds the claim transaction size — per-model throttling
+    /// is enforced separately by the concurrency capacities — so it should be
+    /// set at or above the total rows you expect to free per interval across
+    /// all models (sustained completion rate × interval).
+    #[serde(default = "default_batch_claim_size")]
+    pub batch_claim_size: usize,
+
+    /// Maximum number of batch IDs to select per model in one batch daemon
+    /// claim iteration. Values of 0 are treated as 1.
+    ///
+    /// Selecting a single batch per model risks head-of-line blocking /
+    /// undersaturation: if the top-ranked batch has fewer claimable rows than
+    /// the model's capacity (e.g. its remaining rows are backing off on
+    /// `not_before`), leftover capacity is wasted for the cycle even when other
+    /// batches have pending rows. A small pool (default 4) lets the claim spill
+    /// into the next-ranked batches.
+    #[serde(default = "default_batch_claim_batch_size")]
+    pub batch_claim_batch_size: usize,
+
+    /// Require an explicit `live` model_filters event before the batch daemon
+    /// claims rows for a model.
+    ///
+    /// When false (default), models with **no** filter event are treated as
+    /// live — matching the historical claim behaviour for models scouter does
+    /// not manage (external / always-on providers), which never receive filter
+    /// events. When true, only models whose latest event is `live` are
+    /// batch-claimed. In either mode, batches on not-live models (`coming` /
+    /// `absent`) become claimable once within the deadline ramp
+    /// (`claim_ramp_exponent`) — the SLA escape hatch that lets them overflow
+    /// to fallback providers instead of missing their window.
+    #[serde(default)]
+    pub batch_claim_require_live: bool,
+
+    /// How long the batch daemon sleeps between claim iterations.
+    ///
+    /// A value of 0 inherits `claim_interval_ms`, preserving the old single
+    /// claim-loop cadence unless batch claiming is configured independently.
+    #[serde(default = "default_batch_claim_interval_ms")]
+    pub batch_claim_interval_ms: u64,
 
     /// Maximum number of retry attempts before giving up.
     pub max_retries: Option<u32>,
@@ -323,6 +371,18 @@ fn default_pending_request_counts_timeout_ms() -> u64 {
     60_000
 }
 
+fn default_batch_claim_size() -> usize {
+    0 // inherit claim_batch_size (see field docs)
+}
+
+fn default_batch_claim_batch_size() -> usize {
+    4
+}
+
+fn default_batch_claim_interval_ms() -> u64 {
+    0
+}
+
 fn default_claim_ramp_exponent() -> f64 {
     0.56
 }
@@ -347,6 +407,10 @@ impl Default for DaemonConfig {
             model_escalations: default_model_escalations(),
             inject_deadline_priority: false,
             claim_interval_ms: 1000,
+            batch_claim_size: default_batch_claim_size(),
+            batch_claim_batch_size: default_batch_claim_batch_size(),
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: default_batch_claim_interval_ms(),
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(0),
             backoff_ms: 1000,
@@ -387,6 +451,63 @@ struct UserThroughputStats {
     failed: AtomicU64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimLoopKind {
+    Request,
+    Batch,
+}
+
+/// Daemon responsible for batchless pending requests.
+///
+/// This loop owns the leaky-bucket/deadline-ramp policy for async/flex rows.
+pub struct RequestDaemon<S, H>
+where
+    S: Storage + DaemonStorage,
+    H: HttpClient,
+{
+    core: Arc<Daemon<S, H>>,
+}
+
+impl<S, H> RequestDaemon<S, H>
+where
+    S: Storage + DaemonStorage + 'static,
+    H: HttpClient + 'static,
+{
+    fn new(core: Arc<Daemon<S, H>>) -> Self {
+        Self { core }
+    }
+
+    async fn run(self) -> Result<()> {
+        self.core.run_claim_loop(ClaimLoopKind::Request).await
+    }
+}
+
+/// Daemon responsible for live-model batch requests.
+///
+/// This loop selects batches first, then claims rows from those batches. It does
+/// not use the request daemon's leaky-bucket fallback.
+pub struct BatchDaemon<S, H>
+where
+    S: Storage + DaemonStorage,
+    H: HttpClient,
+{
+    core: Arc<Daemon<S, H>>,
+}
+
+impl<S, H> BatchDaemon<S, H>
+where
+    S: Storage + DaemonStorage + 'static,
+    H: HttpClient + 'static,
+{
+    fn new(core: Arc<Daemon<S, H>>) -> Self {
+        Self { core }
+    }
+
+    async fn run(self) -> Result<()> {
+        self.core.run_claim_loop(ClaimLoopKind::Batch).await
+    }
+}
+
 /// Daemon that processes batched requests.
 ///
 /// The daemon continuously claims pending requests from storage, enforces
@@ -420,6 +541,9 @@ where
     leak_buckets: Arc<dashmap::DashMap<(String, String, String), std::time::Instant>>,
     /// Per-user throughput counters for periodic OTel emission.
     user_throughput: Arc<dashmap::DashMap<String, UserThroughputStats>>,
+    /// Serializes independent claim loops while they compute available
+    /// capacity, claim rows, and increment in-flight counters.
+    claim_mutex: Arc<tokio::sync::Mutex<()>>,
     requests_processed: Arc<AtomicU64>,
     requests_failed: Arc<AtomicU64>,
     shutdown_token: tokio_util::sync::CancellationToken,
@@ -454,6 +578,7 @@ where
             user_requests_in_flight: Arc::new(dashmap::DashMap::new()),
             leak_buckets: Arc::new(dashmap::DashMap::new()),
             user_throughput: Arc::new(dashmap::DashMap::new()),
+            claim_mutex: Arc::new(tokio::sync::Mutex::new(())),
             requests_processed: Arc::new(AtomicU64::new(0)),
             requests_failed: Arc::new(AtomicU64::new(0)),
             shutdown_token,
@@ -477,6 +602,589 @@ where
     pub fn with_processor(mut self, processor: Arc<dyn RequestProcessor<S, H>>) -> Self {
         self.processor = processor;
         self
+    }
+
+    fn poll_processing_tasks(join_set: &mut JoinSet<Result<()>>) {
+        while let Some(result) = join_set.try_join_next() {
+            match result {
+                Ok(Ok(())) => {
+                    tracing::trace!("Task completed successfully");
+                }
+                Ok(Err(e)) => {
+                    crate::background_error!("task_failed", Error, error = %e, "Task failed");
+                }
+                Err(join_error) => {
+                    crate::background_error!("task_panicked", Critical, error = %join_error, "Task panicked");
+                }
+            }
+        }
+    }
+
+    fn available_capacity(&self) -> HashMap<String, usize> {
+        self.config
+            .model_concurrency_limits
+            .iter()
+            .filter_map(|entry| {
+                let model = entry.key().clone();
+                let limit = *entry.value();
+                let in_flight = self
+                    .requests_in_flight
+                    .get(&model)
+                    .map(|e| e.value().load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                let available = limit.saturating_sub(in_flight);
+                if available > 0 {
+                    Some((model, available))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn user_active_counts(&self) -> HashMap<String, usize> {
+        self.user_requests_in_flight
+            .iter()
+            .filter_map(|entry| {
+                let count = entry.value().load(Ordering::Relaxed);
+                if count > 0 {
+                    Some((entry.key().clone(), count))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn leak_cooldown(&self) -> std::collections::HashSet<(String, String, String)> {
+        let cooldown_now = std::time::Instant::now();
+        let mut refilled_buckets: Vec<(String, String, String)> = Vec::new();
+        let leak_cooldown: std::collections::HashSet<(String, String, String)> = self
+            .leak_buckets
+            .iter()
+            .filter_map(|entry| {
+                if *entry.value() > cooldown_now {
+                    Some(entry.key().clone())
+                } else {
+                    refilled_buckets.push(entry.key().clone());
+                    None
+                }
+            })
+            .collect();
+
+        for key in refilled_buckets {
+            self.leak_buckets
+                .remove_if(&key, |_, next_token_at| *next_token_at <= cooldown_now);
+        }
+
+        leak_cooldown
+    }
+
+    fn stamp_leaks(&self, claimed: &[Request<Claimed>]) {
+        let stamp_now = std::time::Instant::now();
+        let leaks_per_window = self.config.leaks_per_window.max(f64::MIN_POSITIVE);
+        let mut leaked_count = 0u64;
+        for request in claimed {
+            if let Some(stamp) = &request.state.leak {
+                let interval = std::time::Duration::from_secs_f64(
+                    (stamp.window_secs / leaks_per_window).max(0.0),
+                );
+                let key = (
+                    request.data.created_by.clone(),
+                    stamp.window_class.clone(),
+                    request.data.model.clone(),
+                );
+                self.leak_buckets.insert(key, stamp_now + interval);
+                leaked_count += 1;
+            }
+        }
+
+        if leaked_count > 0 {
+            counter!("fusillade_leaky_bucket_leaks_total").increment(leaked_count);
+            tracing::debug!(
+                leaked_count,
+                "Stamped leaky-bucket tokens for leaked claims"
+            );
+        }
+    }
+
+    async fn run_claim_loop(self: Arc<Self>, kind: ClaimLoopKind) -> Result<()> {
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        let (loop_name, interval_ms) = match kind {
+            ClaimLoopKind::Request => ("request_daemon", self.config.claim_interval_ms),
+            ClaimLoopKind::Batch => (
+                "batch_daemon",
+                if self.config.batch_claim_interval_ms == 0 {
+                    self.config.claim_interval_ms
+                } else {
+                    self.config.batch_claim_interval_ms
+                },
+            ),
+        };
+
+        tracing::info!(
+            daemon_id = %self.daemon_id,
+            loop_name,
+            interval_ms,
+            "Claim loop started"
+        );
+
+        loop {
+            if self.shutdown_token.is_cancelled() {
+                tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
+                break Ok(());
+            }
+
+            Self::poll_processing_tasks(&mut join_set);
+
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {},
+                _ = self.shutdown_token.cancelled() => {
+                    tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
+                    break Ok(());
+                }
+            }
+
+            // Observe shutdown while waiting for the claim mutex — otherwise a
+            // loop blocked behind the other daemon's claim would run one more
+            // full cycle after shutdown is requested.
+            let _claim_guard = tokio::select! {
+                guard = self.claim_mutex.lock() => guard,
+                _ = self.shutdown_token.cancelled() => {
+                    tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
+                    break Ok(());
+                }
+            };
+            let available_capacity = self.available_capacity();
+            if available_capacity.is_empty() {
+                tracing::trace!(
+                    loop_name,
+                    "No capacity available for any model, skipping claim"
+                );
+                continue;
+            }
+
+            let total_capacity: usize = available_capacity.values().sum();
+            // Dual-emit: keep the legacy unlabeled series alive alongside the
+            // new per-daemon one so existing dashboards/alerts survive the
+            // split (deprecation window).
+            gauge!("fusillade_claim_capacity").set(total_capacity as f64);
+            gauge!("fusillade_claim_capacity", "daemon" => loop_name).set(total_capacity as f64);
+
+            let user_active_counts = self.user_active_counts();
+            let leak_cooldown = if kind == ClaimLoopKind::Request {
+                self.leak_cooldown()
+            } else {
+                std::collections::HashSet::new()
+            };
+
+            let claim_start = std::time::Instant::now();
+            let mut claimed = match kind {
+                ClaimLoopKind::Request => {
+                    self.storage
+                        .claim_batchless_requests(
+                            self.config.claim_batch_size,
+                            self.daemon_id,
+                            &available_capacity,
+                            &user_active_counts,
+                            &leak_cooldown,
+                        )
+                        .await?
+                }
+                ClaimLoopKind::Batch => {
+                    // 0 = inherit the (often deployment-tuned) single-loop cap.
+                    let batch_claim_size = if self.config.batch_claim_size == 0 {
+                        self.config.claim_batch_size
+                    } else {
+                        self.config.batch_claim_size
+                    };
+                    self.storage
+                        .claim_batch_requests(
+                            batch_claim_size,
+                            self.config.batch_claim_batch_size,
+                            self.daemon_id,
+                            &available_capacity,
+                            &user_active_counts,
+                        )
+                        .await?
+                }
+            };
+            // Dual-emit legacy unlabeled histograms during the deprecation
+            // window (see fusillade_claim_capacity above).
+            histogram!("fusillade_claim_duration_seconds")
+                .record(claim_start.elapsed().as_secs_f64());
+            histogram!("fusillade_claim_duration_seconds", "daemon" => loop_name)
+                .record(claim_start.elapsed().as_secs_f64());
+            histogram!("fusillade_claim_size").record(claimed.len() as f64);
+            histogram!("fusillade_claim_size", "daemon" => loop_name).record(claimed.len() as f64);
+
+            tracing::debug!(
+                loop_name,
+                claimed_count = claimed.len(),
+                "Claimed requests from storage"
+            );
+
+            if kind == ClaimLoopKind::Request {
+                self.stamp_leaks(&claimed);
+            }
+
+            self.prepare_claimed_requests(&mut claimed);
+            self.dispatch_claimed_requests(&mut join_set, claimed);
+        }
+    }
+
+    fn prepare_claimed_requests(&self, claimed: &mut [Request<Claimed>]) {
+        for request in claimed.iter_mut() {
+            if let Some(config) = self.config.model_escalations.get(&request.data.model) {
+                let time_remaining = request.state.batch_expires_at - chrono::Utc::now();
+                if time_remaining.num_seconds() < config.escalation_threshold_seconds {
+                    let original_model = request.data.model.clone();
+                    request.data.model = config.escalation_model.clone();
+
+                    if let Ok(mut json) =
+                        serde_json::from_str::<serde_json::Value>(&request.data.body)
+                        && let Some(obj) = json.as_object_mut()
+                    {
+                        obj.insert(
+                            "model".to_string(),
+                            serde_json::Value::String(config.escalation_model.clone()),
+                        );
+                        if let Ok(new_body) = serde_json::to_string(&json) {
+                            request.data.body = new_body;
+                        }
+                    }
+
+                    counter!("fusillade_requests_routed_to_escalation_total", "original_model" => original_model.clone(), "escalation_model" => config.escalation_model.clone()).increment(1);
+                    tracing::info!(
+                        request_id = %request.data.id,
+                        original_model = %original_model,
+                        escalation_model = %config.escalation_model,
+                        time_remaining_seconds = time_remaining.num_seconds(),
+                        threshold_seconds = config.escalation_threshold_seconds,
+                        "Routing request to escalation model due to time pressure"
+                    );
+                }
+            }
+        }
+
+        if self.config.inject_deadline_priority {
+            for request in claimed {
+                let priority: i32 = (-request.state.batch_expires_at.timestamp())
+                    .clamp(i32::MIN as i64, i32::MAX as i64)
+                    as i32;
+
+                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&request.data.body)
+                    && let Some(obj) = json.as_object_mut()
+                {
+                    let nvext = obj.entry("nvext").or_insert_with(|| serde_json::json!({}));
+                    if let Some(nvext_obj) = nvext.as_object_mut() {
+                        let agent_hints = nvext_obj
+                            .entry("agent_hints")
+                            .or_insert_with(|| serde_json::json!({}));
+                        if let Some(hints_obj) = agent_hints.as_object_mut() {
+                            hints_obj.insert(
+                                "priority".to_string(),
+                                serde_json::Value::Number(priority.into()),
+                            );
+                            if let Ok(new_body) = serde_json::to_string(&json) {
+                                request.data.body = new_body;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn dispatch_claimed_requests(
+        self: &Arc<Self>,
+        join_set: &mut JoinSet<Result<()>>,
+        claimed: Vec<Request<Claimed>>,
+    ) {
+        let mut by_model: HashMap<String, Vec<_>> = HashMap::new();
+        for request in claimed {
+            let model = request.data.model.clone();
+            by_model.entry(model).or_default().push(request);
+        }
+
+        tracing::debug!(
+            models = by_model.len(),
+            total_requests = by_model.values().map(|v| v.len()).sum::<usize>(),
+            "Grouped requests by model"
+        );
+
+        for (model, requests) in by_model {
+            tracing::debug!(model = %model, count = requests.len(), "Processing requests for model");
+
+            for request in requests {
+                let request_id = request.data.id;
+                let batch_id = request.data.batch_id;
+
+                tracing::trace!(
+                    request_id = %request_id,
+                    batch_id = ?batch_id,
+                    model = %model,
+                    "Spawning processing task"
+                );
+
+                let model_clone = model.clone();
+                let user_id = request.data.created_by.clone();
+                let completion_window = request
+                    .data
+                    .batch_metadata
+                    .get("completion_window")
+                    .cloned()
+                    .unwrap_or_default();
+                let storage = self.storage.clone();
+                let http_client = (*self.http_client).clone();
+                let processor = self.processor.clone();
+                let retry_config: crate::request::transitions::RetryConfig = (&self.config).into();
+                let requests_in_flight = self.requests_in_flight.clone();
+                let user_throughput = self.user_throughput.clone();
+                let user_requests_in_flight = self.user_requests_in_flight.clone();
+                let requests_processed = self.requests_processed.clone();
+                let requests_failed = self.requests_failed.clone();
+                let should_retry = self.config.should_retry.clone();
+                let shutdown_token = self.shutdown_token.clone();
+                let cancellation_tokens = self.cancellation_tokens.clone();
+
+                let batch_cancellation_token = match batch_id {
+                    Some(bid) => cancellation_tokens.entry(bid).or_default().clone(),
+                    None => tokio_util::sync::CancellationToken::new(),
+                };
+
+                requests_in_flight
+                    .entry(model_clone.clone())
+                    .or_default()
+                    .fetch_add(1, Ordering::Relaxed);
+                gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
+                    .increment(1.0);
+
+                user_requests_in_flight
+                    .entry(user_id.clone())
+                    .or_default()
+                    .fetch_add(1, Ordering::Relaxed);
+                gauge!("fusillade_user_requests_in_flight", "user" => user_id.clone(), "completion_window" => completion_window.clone())
+                    .increment(1.0);
+
+                let process_span = tracing::info_span!(
+                    parent: tracing::Span::none(),
+                    "fusillade.process_request",
+                    trace_id = tracing::field::Empty,
+                    otel.name = "fusillade.process_request",
+                    request_id = %request_id,
+                    batch_id = ?batch_id,
+                    model = %model,
+                    outcome = tracing::field::Empty,
+                );
+
+                join_set.spawn(async move {
+                    let span = tracing::Span::current();
+                    let sc = span.context().span().span_context().clone();
+                    if sc.is_valid() {
+                        span.record("trace_id", tracing::field::display(sc.trace_id()));
+                    }
+
+                    let processing_start = std::time::Instant::now();
+                    let model_for_guard = model_clone.clone();
+                    let user_for_guard = user_id.clone();
+                    let cw_for_guard = completion_window.clone();
+                    let in_flight_for_guard = requests_in_flight.clone();
+                    let user_in_flight_for_guard = user_requests_in_flight.clone();
+                    let _guard = scopeguard::guard((), move |_| {
+                        if let Some(counter) = in_flight_for_guard.get(&model_for_guard) {
+                            counter.value().fetch_sub(1, Ordering::Relaxed);
+                        }
+                        gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
+                        gauge!("fusillade_user_requests_in_flight", "user" => user_for_guard.clone(), "completion_window" => cw_for_guard).decrement(1.0);
+                        if let Some(counter) = user_in_flight_for_guard.get(&user_for_guard) {
+                            let prev = counter.value().fetch_sub(1, Ordering::Relaxed);
+                            drop(counter);
+                            if prev == 1 {
+                                user_in_flight_for_guard.remove(&user_for_guard);
+                            }
+                        }
+                    });
+
+                    let batch_expires_at = request.state.batch_expires_at;
+                    let retry_attempt_at_completion = request.state.retry_attempt;
+                    let owning_daemon_id = request.state.daemon_id;
+
+                    let cancellation: crate::processor::CancellationFuture = Box::pin(async move {
+                        tokio::select! {
+                            _ = batch_cancellation_token.cancelled() => {
+                                crate::request::transitions::CancellationReason::User
+                            }
+                            _ = shutdown_token.cancelled() => {
+                                crate::request::transitions::CancellationReason::Shutdown
+                            }
+                        }
+                    });
+
+                    let completion_result = processor
+                        .process(
+                            request,
+                            http_client,
+                            storage.as_ref(),
+                            should_retry.clone(),
+                            cancellation,
+                        )
+                        .await;
+
+                    match completion_result {
+                        Ok(RequestCompletionResult::Completed(completed)) => {
+                            tracing::Span::current().record("outcome", "completed");
+                            requests_processed.fetch_add(1, Ordering::Relaxed);
+                            user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
+                                completed: AtomicU64::new(0),
+                                failed: AtomicU64::new(0),
+                            }).completed.fetch_add(1, Ordering::Relaxed);
+                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
+                            counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "success", "completion_window" => completion_window.clone()).increment(1);
+                            histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
+                                .record(processing_start.elapsed().as_secs_f64());
+                            histogram!("fusillade_retry_attempts_on_success", "model" => model_clone.clone())
+                                .record(retry_attempt_at_completion as f64);
+
+                            let completed_at = completed.state.completed_at;
+                            let seconds_until_deadline = (batch_expires_at - completed_at).num_milliseconds() as f64 / 1000.0;
+                            gauge!("fusillade_request_deadline_margin_seconds", "model" => model_clone.clone(), "status" => "success")
+                                .set(seconds_until_deadline);
+                            if completed_at > batch_expires_at {
+                                counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success").increment(1);
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    batch_id = ?batch_id,
+                                    "Request completed successfully after SLA"
+                                );
+                            }
+                            Ok(())
+                        }
+                        Ok(RequestCompletionResult::Failed(failed)) => {
+                            tracing::Span::current().record("outcome", "failed");
+                            let retry_attempt = failed.state.retry_attempt;
+                            let reason_label = failed.state.reason.metric_label();
+                            if failed.state.reason.is_retriable() {
+                                match failed.can_retry(retry_attempt, retry_config.clone()) {
+                                    Ok(pending) => {
+                                        let rescheduled = storage
+                                            .reschedule_for_retry(
+                                                request_id,
+                                                owning_daemon_id,
+                                                pending.state.retry_attempt,
+                                                pending.state.not_before,
+                                            )
+                                            .await?;
+                                        if rescheduled {
+                                            counter!(
+                                                "fusillade_requests_retried_total",
+                                                "model" => model_clone.clone(),
+                                                "attempt" => (retry_attempt + 1).to_string()
+                                            )
+                                            .increment(1);
+                                            tracing::info!(
+                                                request_id = %request_id,
+                                                batch_id = ?batch_id,
+                                                retry_attempt = retry_attempt + 1,
+                                                "request.retry_persisted"
+                                            );
+                                        } else {
+                                            counter!(
+                                                "fusillade_requests_retry_lost_ownership_total",
+                                                "model" => model_clone.clone()
+                                            )
+                                            .increment(1);
+                                            tracing::warn!(
+                                                request_id = %request_id,
+                                                batch_id = ?batch_id,
+                                                retry_attempt = retry_attempt + 1,
+                                                "request.retry_skipped_lost_ownership"
+                                            );
+                                        }
+                                        return Ok(());
+                                    }
+                                    Err(failed) => {
+                                        storage.persist(&*failed).await?;
+                                        requests_failed.fetch_add(1, Ordering::Relaxed);
+                                        user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
+                                            completed: AtomicU64::new(0),
+                                            failed: AtomicU64::new(0),
+                                        }).failed.fetch_add(1, Ordering::Relaxed);
+                                        counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
+                                        counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
+                                        histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
+                                            .record(processing_start.elapsed().as_secs_f64());
+                                        if failed.state.failed_at > batch_expires_at {
+                                            counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                            tracing::warn!(
+                                                request_id = %request_id,
+                                                batch_id = ?batch_id,
+                                                "Request failed permanently after SLA"
+                                            );
+                                        }
+                                        tracing::warn!(
+                                            request_id = %request_id,
+                                            batch_id = ?batch_id,
+                                            retry_attempt,
+                                            failure_reason = %failed.state.reason.metric_label(),
+                                            error = %failed.state.reason.to_error_message(),
+                                            "request.terminal_failure"
+                                        );
+                                    }
+                                }
+                            } else {
+                                requests_failed.fetch_add(1, Ordering::Relaxed);
+                                user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
+                                    completed: AtomicU64::new(0),
+                                    failed: AtomicU64::new(0),
+                                }).failed.fetch_add(1, Ordering::Relaxed);
+                                counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
+                                counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
+                                histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
+                                    .record(processing_start.elapsed().as_secs_f64());
+                                if failed.state.failed_at > batch_expires_at {
+                                    counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                    tracing::warn!(
+                                        request_id = %request_id,
+                                        batch_id = ?batch_id,
+                                        "Request failed with non-retriable error after SLA"
+                                    );
+                                }
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    batch_id = ?batch_id,
+                                    failure_reason = %reason_label,
+                                    error = %failed.state.reason.to_error_message(),
+                                    "request.terminal_failure"
+                                );
+                            }
+                            Ok(())
+                        }
+                        Ok(RequestCompletionResult::Canceled(_canceled)) => {
+                            tracing::Span::current().record("outcome", "canceled");
+                            counter!("fusillade_requests_cancelled_total", "model" => model_clone.clone()).increment(1);
+                            // Keep the pre-split counter shape alive so existing
+                            // dashboards/alerts on completed_total{status="cancelled"}
+                            // don't silently break (deprecation window).
+                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled").increment(1);
+                            counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "cancelled", "completion_window" => completion_window.clone()).increment(1);
+                            Ok(())
+                        }
+                        Err(FusilladeError::Shutdown) => {
+                            // Expected during daemon shutdown — treat as a clean
+                            // exit so poll_processing_tasks doesn't log it as a
+                            // background task failure.
+                            tracing::Span::current().record("outcome", "shutdown");
+                            Ok(())
+                        }
+                        Err(e) => {
+                            tracing::Span::current().record("outcome", "error");
+                            Err(e)
+                        }
+                    }
+                }.instrument(process_span));
+            }
+        }
     }
 
     /// Run the daemon loop.
@@ -820,602 +1528,54 @@ where
             });
         }
 
-        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        let mut claim_daemons: JoinSet<Result<()>> = JoinSet::new();
+
+        let request_daemon = RequestDaemon::new(self.clone());
+        claim_daemons.spawn(async move { request_daemon.run().await });
+
+        // Capability-gated: a claim-loop error is fatal to the whole daemon,
+        // so a deliberately request-only storage backend must be able to opt
+        // out of the batch loop instead of dying on its first cycle.
+        if self.storage.supports_batch_claims() {
+            let batch_daemon = BatchDaemon::new(self.clone());
+            claim_daemons.spawn(async move { batch_daemon.run().await });
+        } else {
+            tracing::info!(
+                daemon_id = %self.daemon_id,
+                "Storage backend does not support batch claims; running request-only"
+            );
+        }
 
         let run_result = loop {
-            // Check for shutdown signal
-            if self.shutdown_token.is_cancelled() {
-                tracing::info!("Shutdown signal received, stopping daemon");
-                break Ok(());
-            }
-
-            // Poll for completed tasks (non-blocking)
-            while let Some(result) = join_set.try_join_next() {
-                match result {
-                    Ok(Ok(())) => {
-                        tracing::trace!("Task completed successfully");
-                    }
-                    Ok(Err(e)) => {
-                        crate::background_error!("task_failed", Error, error = %e, "Task failed");
-                    }
-                    Err(join_error) => {
-                        crate::background_error!("task_panicked", Critical, error = %join_error, "Task panicked");
+            tokio::select! {
+                result = claim_daemons.join_next() => {
+                    match result {
+                        Some(Ok(Ok(()))) => {
+                            if claim_daemons.is_empty() {
+                                break Ok(());
+                            }
+                        }
+                        Some(Ok(Err(e))) => {
+                            self.shutdown_token.cancel();
+                            break Err(e);
+                        }
+                        Some(Err(join_error)) => {
+                            self.shutdown_token.cancel();
+                            break Err(FusilladeError::Other(anyhow::anyhow!(
+                                "claim daemon task panicked: {}",
+                                join_error
+                            )));
+                        }
+                        None => break Ok(()),
                     }
                 }
-            }
-
-            tracing::trace!("Sleeping before claiming");
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(self.config.claim_interval_ms)) => {},
                 _ = self.shutdown_token.cancelled() => {
                     tracing::info!("Shutdown signal received, stopping daemon");
                     break Ok(());
                 }
             }
-            // Compute available capacity per model: configured limit minus in-flight.
-            let available_capacity: HashMap<String, usize> = self
-                .config
-                .model_concurrency_limits
-                .iter()
-                .filter_map(|entry| {
-                    let model = entry.key().clone();
-                    let limit = *entry.value();
-                    let in_flight = self
-                        .requests_in_flight
-                        .get(&model)
-                        .map(|e| e.value().load(Ordering::Relaxed))
-                        .unwrap_or(0);
-                    let available = limit.saturating_sub(in_flight);
-                    if available > 0 {
-                        Some((model, available))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if available_capacity.is_empty() {
-                tracing::trace!("No capacity available for any model, skipping claim");
-                continue;
-            }
-
-            // Record available capacity before claiming
-            let total_capacity: usize = available_capacity.values().sum();
-            gauge!("fusillade_claim_capacity").set(total_capacity as f64);
-
-            // Snapshot per-user in-flight counts for fair scheduling.
-            // Users with fewer active requests get prioritised in the claim query.
-            // Only include users with count > 0 to avoid unbounded array growth
-            // (missing users COALESCE to 0 in the SQL query).
-            let user_active_counts: HashMap<String, usize> = self
-                .user_requests_in_flight
-                .iter()
-                .filter_map(|entry| {
-                    let count = entry.value().load(Ordering::Relaxed);
-                    if count > 0 {
-                        Some((entry.key().clone(), count))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Derive the leaky-bucket cooldown set: `(user, window-class, model)`
-            // triples whose bucket has not yet refilled (`next_token_at` in the
-            // future). Source B in the claim query skips these, so each triple
-            // leaks ≤ 1 request per `leak_interval`. Prune refilled buckets
-            // (next_token_at already passed) on read to keep the map bounded — a
-            // refilled bucket carries no state until it leaks again.
-            let cooldown_now = std::time::Instant::now();
-            let mut refilled_buckets: Vec<(String, String, String)> = Vec::new();
-            let leak_cooldown: std::collections::HashSet<(String, String, String)> = self
-                .leak_buckets
-                .iter()
-                .filter_map(|entry| {
-                    if *entry.value() > cooldown_now {
-                        Some(entry.key().clone())
-                    } else {
-                        refilled_buckets.push(entry.key().clone());
-                        None
-                    }
-                })
-                .collect();
-            // Prune refilled buckets to keep the map bounded.
-            for key in refilled_buckets {
-                self.leak_buckets
-                    .remove_if(&key, |_, next_token_at| *next_token_at <= cooldown_now);
-            }
-
-            // Claim a batch of pending requests (guaranteed ≤ available capacity per model)
-            let claim_start = std::time::Instant::now();
-            let mut claimed = self
-                .storage
-                .claim_requests(
-                    self.config.claim_batch_size,
-                    self.daemon_id,
-                    &available_capacity,
-                    &user_active_counts,
-                    &leak_cooldown,
-                )
-                .await?;
-            histogram!("fusillade_claim_duration_seconds")
-                .record(claim_start.elapsed().as_secs_f64());
-
-            // Record claim metrics
-            histogram!("fusillade_claim_size").record(claimed.len() as f64);
-
-            tracing::debug!(
-                claimed_count = claimed.len(),
-                "Claimed requests from storage"
-            );
-
-            // Stamp the leaky bucket for each row claimed via Source B. A leaked
-            // row consumes its `(user, window-class, model)` token: the bucket
-            // may not leak again until `now + W / leaks_per_window`, which the
-            // next cycle reads back as cooldown. The model is taken from the
-            // claimed row (before any escalation rewrite below), matching the
-            // model the claim query's Source B anti-join keyed on. Source A
-            // (full-capacity) claims have `leak == None` and consume no token.
-            {
-                let stamp_now = std::time::Instant::now();
-                let leaks_per_window = self.config.leaks_per_window.max(f64::MIN_POSITIVE);
-                let mut leaked_count = 0u64;
-                for request in &claimed {
-                    if let Some(stamp) = &request.state.leak {
-                        let interval = std::time::Duration::from_secs_f64(
-                            (stamp.window_secs / leaks_per_window).max(0.0),
-                        );
-                        let key = (
-                            request.data.created_by.clone(),
-                            stamp.window_class.clone(),
-                            request.data.model.clone(),
-                        );
-                        self.leak_buckets.insert(key, stamp_now + interval);
-                        leaked_count += 1;
-                    }
-                }
-                if leaked_count > 0 {
-                    counter!("fusillade_leaky_bucket_leaks_total").increment(leaked_count);
-                    tracing::debug!(
-                        leaked_count,
-                        "Stamped leaky-bucket tokens for leaked claims"
-                    );
-                }
-            }
-
-            // Route requests to escalated models if time is running low
-            // This replaces the old SLA racing system with a simpler approach:
-            // at claim time, we check if there's enough time remaining and route
-            // to the escalated model if below threshold
-            for request in &mut claimed {
-                if let Some(config) = self.config.model_escalations.get(&request.data.model) {
-                    let time_remaining = request.state.batch_expires_at - chrono::Utc::now();
-                    if time_remaining.num_seconds() < config.escalation_threshold_seconds {
-                        let original_model = request.data.model.clone();
-                        request.data.model = config.escalation_model.clone();
-
-                        // Update the model field in the request body JSON
-                        if let Ok(mut json) =
-                            serde_json::from_str::<serde_json::Value>(&request.data.body)
-                            && let Some(obj) = json.as_object_mut()
-                        {
-                            obj.insert(
-                                "model".to_string(),
-                                serde_json::Value::String(config.escalation_model.clone()),
-                            );
-                            if let Ok(new_body) = serde_json::to_string(&json) {
-                                request.data.body = new_body;
-                            }
-                        }
-
-                        // No API key swap needed - batch API keys automatically have access
-                        // to escalation models in the onwards routing cache
-                        counter!("fusillade_requests_routed_to_escalation_total", "original_model" => original_model.clone(), "escalation_model" => config.escalation_model.clone()).increment(1);
-                        tracing::info!(
-                            request_id = %request.data.id,
-                            original_model = %original_model,
-                            escalation_model = %config.escalation_model,
-                            time_remaining_seconds = time_remaining.num_seconds(),
-                            threshold_seconds = config.escalation_threshold_seconds,
-                            "Routing request to escalation model due to time pressure"
-                        );
-                    }
-                }
-            }
-
-            // Inject deadline-derived priority hint at
-            // nvext.agent_hints.priority (NVIDIA Dynamo's extension; i32,
-            // higher = more important). Negate the deadline timestamp so
-            // earlier deadlines produce larger values.
-            if self.config.inject_deadline_priority {
-                for request in &mut claimed {
-                    let priority: i32 = (-request.state.batch_expires_at.timestamp())
-                        .clamp(i32::MIN as i64, i32::MAX as i64)
-                        as i32;
-
-                    if let Ok(mut json) =
-                        serde_json::from_str::<serde_json::Value>(&request.data.body)
-                        && let Some(obj) = json.as_object_mut()
-                    {
-                        let nvext = obj.entry("nvext").or_insert_with(|| serde_json::json!({}));
-                        if let Some(nvext_obj) = nvext.as_object_mut() {
-                            let agent_hints = nvext_obj
-                                .entry("agent_hints")
-                                .or_insert_with(|| serde_json::json!({}));
-                            if let Some(hints_obj) = agent_hints.as_object_mut() {
-                                hints_obj.insert(
-                                    "priority".to_string(),
-                                    serde_json::Value::Number(priority.into()),
-                                );
-                                if let Ok(new_body) = serde_json::to_string(&json) {
-                                    request.data.body = new_body;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Group requests by model for better concurrency control visibility
-            let mut by_model: HashMap<String, Vec<_>> = HashMap::new();
-            for request in claimed {
-                let model = request.data.model.clone();
-                by_model.entry(model).or_default().push(request);
-            }
-
-            tracing::debug!(
-                models = by_model.len(),
-                total_requests = by_model.values().map(|v| v.len()).sum::<usize>(),
-                "Grouped requests by model"
-            );
-
-            // Dispatch requests
-            for (model, requests) in by_model {
-                tracing::debug!(model = %model, count = requests.len(), "Processing requests for model");
-
-                for request in requests {
-                    let request_id = request.data.id;
-                    let batch_id = request.data.batch_id;
-
-                    tracing::trace!(
-                        request_id = %request_id,
-                        batch_id = ?batch_id,
-                        model = %model,
-                        "Spawning processing task"
-                    );
-
-                    // Spawn a processing task
-                    let model_clone = model.clone();
-                    let user_id = request.data.created_by.clone();
-                    let completion_window = request
-                        .data
-                        .batch_metadata
-                        .get("completion_window")
-                        .cloned()
-                        .unwrap_or_default();
-                    let storage = self.storage.clone();
-                    let http_client = (*self.http_client).clone();
-                    let processor = self.processor.clone();
-                    let retry_config = (&self.config).into();
-                    let requests_in_flight = self.requests_in_flight.clone();
-                    let user_throughput = self.user_throughput.clone();
-                    let user_requests_in_flight = self.user_requests_in_flight.clone();
-                    let requests_processed = self.requests_processed.clone();
-                    let requests_failed = self.requests_failed.clone();
-                    let should_retry = self.config.should_retry.clone();
-                    let shutdown_token = self.shutdown_token.clone();
-                    let cancellation_tokens = self.cancellation_tokens.clone();
-
-                    // Get or create a cancellation token for this batch.
-                    // All requests in a batch share the same token. Batchless
-                    // responses don't participate in batch cancel and so get a
-                    // standalone token that only the shutdown path can fire.
-                    let batch_cancellation_token = match batch_id {
-                        Some(bid) => cancellation_tokens.entry(bid).or_default().clone(),
-                        None => tokio_util::sync::CancellationToken::new(),
-                    };
-
-                    // Increment per-model in-flight counter and gauge
-                    requests_in_flight
-                        .entry(model_clone.clone())
-                        .or_default()
-                        .fetch_add(1, Ordering::Relaxed);
-                    gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
-                        .increment(1.0);
-
-                    // Increment per-user in-flight counter for fair scheduling
-                    user_requests_in_flight
-                        .entry(user_id.clone())
-                        .or_default()
-                        .fetch_add(1, Ordering::Relaxed);
-                    gauge!("fusillade_user_requests_in_flight", "user" => user_id.clone(), "completion_window" => completion_window.clone())
-                        .increment(1.0);
-
-                    let process_span = tracing::info_span!(
-                        parent: tracing::Span::none(),
-                        "fusillade.process_request",
-                        trace_id = tracing::field::Empty,
-                        otel.name = "fusillade.process_request",
-                        request_id = %request_id,
-                        batch_id = ?batch_id,
-                        model = %model,
-                        outcome = tracing::field::Empty,
-                    );
-
-                    join_set.spawn(async move {
-                        // Record trace_id from OTel context
-                        let span = tracing::Span::current();
-                        let sc = span.context().span().span_context().clone();
-                        if sc.is_valid() {
-                            span.record("trace_id", tracing::field::display(sc.trace_id()));
-                        }
-
-                        // Track processing start time for duration metrics
-                        let processing_start = std::time::Instant::now();
-
-                        // Ensure we decrement the per-model and per-user counters when this task completes
-                        let model_for_guard = model_clone.clone();
-                        let user_for_guard = user_id.clone();
-                        let cw_for_guard = completion_window.clone();
-                        let in_flight_for_guard = requests_in_flight.clone();
-                        let user_in_flight_for_guard = user_requests_in_flight.clone();
-                        let _guard = scopeguard::guard((), move |_| {
-                            if let Some(counter) = in_flight_for_guard.get(&model_for_guard) {
-                                counter.value().fetch_sub(1, Ordering::Relaxed);
-                            }
-                            gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
-                            gauge!("fusillade_user_requests_in_flight", "user" => user_for_guard.clone(), "completion_window" => cw_for_guard).decrement(1.0);
-                            if let Some(counter) = user_in_flight_for_guard.get(&user_for_guard) {
-                                let prev = counter.value().fetch_sub(1, Ordering::Relaxed);
-                                drop(counter);
-                                if prev == 1 {
-                                    // Counter reached zero — remove to prevent unbounded map growth
-                                    user_in_flight_for_guard.remove(&user_for_guard);
-                                }
-                            }
-                        });
-
-                        // Capture retry attempt and batch expiry before moving the
-                        // request into the processor. retry_attempt is preserved
-                        // unchanged across Claimed -> Processing -> terminal, so a
-                        // single capture suffices for downstream metrics.
-                        let retry_attempt_at_completion = request.state.retry_attempt;
-                        let batch_expires_at = request.state.batch_expires_at;
-                        // Capture the owning daemon before the request moves into
-                        // the processor — the fenced retry reschedule needs it to
-                        // prove this worker still holds the in-flight claim.
-                        let owning_daemon_id = request.state.daemon_id;
-
-                        // Build the cancellation future the daemon owns. The
-                        // processor observes this without needing to know about
-                        // the underlying tokens — keeping shutdown ordering a
-                        // daemon concern.
-                        let cancellation: crate::processor::CancellationFuture =
-                            Box::pin(async move {
-                                tokio::select! {
-                                    _ = batch_cancellation_token.cancelled() => {
-                                        crate::request::transitions::CancellationReason::User
-                                    }
-                                    _ = shutdown_token.cancelled() => {
-                                        crate::request::transitions::CancellationReason::Shutdown
-                                    }
-                                }
-                            });
-
-                        // Hand the per-claim work to the processor. The default
-                        // impl emits the same fusillade.state.claimed and
-                        // fusillade.state.processing spans the daemon used to
-                        // emit inline, so observability is unchanged for the
-                        // batch path.
-                        let completion_result = processor
-                            .process(
-                                request,
-                                http_client,
-                                storage.as_ref(),
-                                should_retry.clone(),
-                                cancellation,
-                            )
-                            .await;
-
-                        match completion_result {
-                            Ok(RequestCompletionResult::Completed(completed)) => {
-                                tracing::Span::current().record("outcome", "completed");
-                                requests_processed.fetch_add(1, Ordering::Relaxed);
-                                user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
-                                    completed: AtomicU64::new(0),
-                                    failed: AtomicU64::new(0),
-                                }).completed.fetch_add(1, Ordering::Relaxed);
-                                counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
-                                counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "success", "completion_window" => completion_window.clone()).increment(1);
-                                histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
-                                    .record(processing_start.elapsed().as_secs_f64());
-                                // Record how many retries it took to succeed (0 = first attempt succeeded)
-                                histogram!("fusillade_retry_attempts_on_success", "model" => model_clone.clone())
-                                    .record(retry_attempt_at_completion as f64);
-
-                                // Track requests completing after SLA
-                                if completed.state.completed_at > batch_expires_at {
-                                    counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success").increment(1);
-                                    tracing::warn!(
-                                        request_id = %request_id,
-                                        batch_id = ?batch_id,
-                                        "Request completed successfully after SLA"
-                                    );
-                                }
-
-                                tracing::debug!(request_id = %request_id, retry_attempts = retry_attempt_at_completion, "Request completed successfully");
-                            }
-                            Ok(RequestCompletionResult::Failed(failed)) => {
-                                tracing::Span::current().record("outcome", "failed");
-                                let retry_attempt = failed.state.retry_attempt;
-
-                                // Check if this is a retriable error using the FailureReason
-                                if failed.state.reason.is_retriable() {
-                                    tracing::warn!(
-                                        request_id = %request_id,
-                                        retry_attempt,
-                                        error = %failed.state.reason.to_error_message(),
-                                        "Request failed with retriable error, attempting retry"
-                                    );
-
-                                    // Attempt to retry
-                                    match failed.can_retry(retry_attempt, retry_config) {
-                                        Ok(pending) => {
-                                            // Fenced retry: only re-pend if we still own the
-                                            // in-flight (processing) row. If another writer has
-                                            // already terminalized it — and a finalizer may have
-                                            // sealed the parent batch as a result — flipping it
-                                            // back to pending here would orphan it under a
-                                            // completed batch (the count/claim mismatch then
-                                            // surfaces it as undrainable queue depth).
-                                            match storage
-                                                .reschedule_for_retry(
-                                                    request_id,
-                                                    owning_daemon_id,
-                                                    pending.state.retry_attempt,
-                                                    pending.state.not_before,
-                                                )
-                                                .await
-                                            {
-                                                Ok(true) => {
-                                                    counter!(
-                                                        "fusillade_requests_retried_total",
-                                                        "model" => model_clone.clone(),
-                                                        "attempt" => (retry_attempt + 1).to_string()
-                                                    ).increment(1);
-                                                    tracing::info!(
-                                                        request_id = %request_id,
-                                                        batch_id = ?batch_id,
-                                                        retry_attempt = retry_attempt + 1,
-                                                        "request.retry_persisted"
-                                                    );
-                                                }
-                                                Ok(false) => {
-                                                    // Lost the race: the row is no longer this
-                                                    // worker's processing claim. Do NOT resurrect.
-                                                    counter!(
-                                                        "fusillade_requests_retry_lost_ownership_total",
-                                                        "model" => model_clone.clone()
-                                                    ).increment(1);
-                                                    tracing::warn!(
-                                                        request_id = %request_id,
-                                                        batch_id = ?batch_id,
-                                                        retry_attempt = retry_attempt + 1,
-                                                        "request.retry_skipped_lost_ownership"
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!(
-                                                        request_id = %request_id,
-                                                        batch_id = ?batch_id,
-                                                        retry_attempt = pending.state.retry_attempt,
-                                                        error = %e,
-                                                        "Failed to reschedule retry"
-                                                    );
-                                                    return Err(e);
-                                                }
-                                            }
-                                        }
-                                        Err(failed) => {
-                                            // No retries left - persist as Failed (terminal)
-                                            if let Err(e) = storage.persist(&*failed).await {
-                                                tracing::error!(
-                                                    request_id = %request_id,
-                                                    batch_id = ?batch_id,
-                                                    retry_attempt,
-                                                    error = %e,
-                                                    "Failed to persist terminal failure — request orphaned in processing state"
-                                                );
-                                                return Err(e);
-                                            }
-                                            user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
-                                                completed: AtomicU64::new(0),
-                                                failed: AtomicU64::new(0),
-                                            }).failed.fetch_add(1, Ordering::Relaxed);
-                                            requests_failed.fetch_add(1, Ordering::Relaxed);
-                                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
-                                            counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
-                                            histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
-                                                .record(processing_start.elapsed().as_secs_f64());
-
-                                            // Track requests completing after SLA
-                                            if failed.state.failed_at > batch_expires_at {
-                                                counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
-                                                tracing::warn!(
-                                                    request_id = %request_id,
-                                                    batch_id = ?batch_id,
-                                                    "Request failed permanently after SLA"
-                                                );
-                                            }
-
-                                            tracing::warn!(
-                                                request_id = %request_id,
-                                                batch_id = ?batch_id,
-                                                retry_attempt,
-                                                failure_reason = %failed.state.reason.metric_label(),
-                                                error = %failed.state.reason.to_error_message(),
-                                                "request.terminal_failure"
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    requests_failed.fetch_add(1, Ordering::Relaxed);
-                                    user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
-                                        completed: AtomicU64::new(0),
-                                        failed: AtomicU64::new(0),
-                                    }).failed.fetch_add(1, Ordering::Relaxed);
-                                    counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
-                                    counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
-                                    histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
-                                        .record(processing_start.elapsed().as_secs_f64());
-
-                                    // Track requests completing after SLA
-                                    if failed.state.failed_at > batch_expires_at {
-                                        counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
-                                        tracing::warn!(
-                                            request_id = %request_id,
-                                            batch_id = ?batch_id,
-                                            "Request failed with non-retriable error after SLA"
-                                        );
-                                    }
-
-                                    tracing::warn!(
-                                        request_id = %request_id,
-                                        batch_id = ?batch_id,
-                                        failure_reason = %failed.state.reason.metric_label(),
-                                        error = %failed.state.reason.to_error_message(),
-                                        "request.terminal_failure"
-                                    );
-                                }
-                            }
-                            Ok(RequestCompletionResult::Canceled(_canceled)) => {
-                                tracing::Span::current().record("outcome", "canceled");
-                                counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled").increment(1);
-                                counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "cancelled", "completion_window" => completion_window.clone()).increment(1);
-                                tracing::debug!(request_id = %request_id, "Request canceled by user");
-                            }
-                            Err(FusilladeError::Shutdown) => {
-                                tracing::Span::current().record("outcome", "shutdown");
-                                tracing::info!(request_id = %request_id, "Request aborted due to shutdown");
-                                // Don't count as failed - request will be reclaimed
-                            }
-                            Err(e) => {
-                                tracing::Span::current().record("outcome", "error");
-                                // Unexpected error
-                                tracing::error!(request_id = %request_id, error = %e, "Unexpected error processing request");
-                                return Err(e);
-                            }
-                        }
-
-                        // Note: We don't remove the batch cancellation token here since
-                        // multiple requests in the same batch share it. Tokens are cleaned
-                        // up when the daemon shuts down or batch completes.
-
-                        Ok(())
-                    }.instrument(process_span));
-                }
-            }
         };
+        claim_daemons.abort_all();
 
         // Wait for heartbeat task to complete (it will mark daemon as dead)
         tracing::info!("Waiting for heartbeat task to complete");
@@ -1443,6 +1603,20 @@ mod tests {
         );
     }
 
+    async fn mark_model_live_for_test(
+        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        model: &str,
+    ) {
+        manager
+            .append_model_filter_event(&crate::manager::ModelFilter {
+                model: model.to_string(),
+                state: crate::manager::ModelFilterState::Live,
+                expected_ready_at: None,
+            })
+            .await
+            .expect("failed to mark model live");
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
@@ -1460,6 +1634,10 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10, // Very fast for testing
+            batch_claim_size: 10,
+            batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
                 m.insert("test-model".to_string(), 10);
@@ -1539,6 +1717,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         // Get the created request from the batch
         let requests = manager
@@ -1652,6 +1831,10 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
+            batch_claim_size: 10,
+            batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: 10,
             model_concurrency_limits,
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
@@ -1765,6 +1948,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "gpt-4").await;
 
         // Start the daemon
         let shutdown_token = tokio_util::sync::CancellationToken::new();
@@ -1898,6 +2082,10 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
+            batch_claim_size: 10,
+            batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
                 m.insert("test-model".to_string(), 10);
@@ -1977,6 +2165,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -2057,6 +2246,10 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
+            batch_claim_size: 10,
+            batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
 
             model_escalations: Arc::new(dashmap::DashMap::new()),
@@ -2136,6 +2329,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "gpt-4").await;
 
         // Start the daemon
         let shutdown_token = tokio_util::sync::CancellationToken::new();
@@ -2247,6 +2441,10 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
+            batch_claim_size: 10,
+            batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
                 m.insert("test-model".to_string(), 10);
@@ -2326,6 +2524,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -2425,6 +2624,10 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
+            batch_claim_size: 10,
+            batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
                 m.insert("test-model".to_string(), 10);
@@ -2504,6 +2707,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -2603,6 +2807,10 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
+            batch_claim_size: 10,
+            batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
                 m.insert("test-model".to_string(), 10);
@@ -2687,6 +2895,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -2779,6 +2988,10 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
+            batch_claim_size: 10,
+            batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
                 m.insert("test-model".to_string(), 10);
@@ -2891,6 +3104,10 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
+            batch_claim_size: 10,
+            batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
                 m.insert("test-model".to_string(), 10);
@@ -2978,6 +3195,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -3058,6 +3276,10 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
+            batch_claim_size: 10,
+            batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
                 m.insert("test-model".to_string(), 10);
@@ -3137,6 +3359,7 @@ mod tests {
             })
             .await
             .expect("Failed to create batch");
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let requests = manager
             .get_batch_requests(batch.id)
@@ -3200,6 +3423,10 @@ mod tests {
         let config = DaemonConfig {
             claim_batch_size: 10,
             claim_interval_ms: 10,
+            batch_claim_size: 10,
+            batch_claim_batch_size: 1,
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
                 m.insert("test-model".to_string(), 10);
@@ -3277,6 +3504,7 @@ mod tests {
             })
             .await
             .unwrap();
+        mark_model_live_for_test(manager.as_ref(), "test-model").await;
 
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         manager
