@@ -102,6 +102,50 @@ for req in requests {
 }
 ```
 
+## Claim daemons
+
+As of v20, the daemon runs **two independent claim loops** instead of one:
+
+- **Request daemon** — claims *batchless* pending rows (flex/async responses).
+  Owns the leaky-bucket and deadline-ramp policy: rows for models that are not
+  live trickle out at a bounded rate per `(user, window, model)`.
+- **Batch daemon** — claims rows belonging to batches. It first selects the
+  top-ranked batches per capacity-eligible model (fairness + deadline
+  ordering), then claims rows only from those batches, so claim cost is
+  bounded by batches selected rather than total pending backlog.
+
+Batch claiming is gated on model liveness via the `model_filters` event log:
+models whose latest event is `live` are always claimable; models with **no**
+events (external / always-on providers not managed by a controller) are
+claimable unless `batch_claim_require_live` is set; models explicitly
+`coming`/`absent` are claimable only via the **deadline ramp** — within
+`window_minutes ^ claim_ramp_exponent` minutes of the batch deadline, rows are
+claimed at full capacity regardless of liveness so they can overflow to
+fallback providers rather than miss their window.
+
+Configuration (all optional):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `batch_claim_size` | `0` (inherit `claim_batch_size`) | max rows per batch-claim iteration |
+| `batch_claim_batch_size` | `4` | batches selected per model per iteration (spill-over pool) |
+| `batch_claim_interval_ms` | `0` (inherit `claim_interval_ms`) | batch loop cadence |
+| `batch_claim_require_live` | `false` | require an explicit `live` event to batch-claim |
+| `claim_ramp_exponent` | `0.56` | deadline-ramp curve (~59 min for 24h windows, ~10 min for 1h) |
+
+**Breaking changes relative to v19:**
+
+- `Storage::claim_requests` is now a **batchless-only** compatibility alias;
+  batched rows are claimed exclusively via `Storage::claim_batch_requests`.
+  Custom storage backends must implement `claim_batch_requests` (the default
+  implementation errors) or opt out with `supports_batch_claims() -> false`.
+- The **leaky-bucket trickle no longer applies to batched rows** (flex is
+  unchanged); not-live batches wait for liveness or the deadline ramp.
+- Claim metrics (`fusillade_claim_capacity`, `fusillade_claim_duration_seconds`,
+  `fusillade_claim_size`) gained a `daemon` label (`request_daemon` /
+  `batch_daemon`); unlabeled legacy series are dual-emitted during a
+  deprecation window.
+
 ## Database Setup
 
 Run migrations before first use, by importing the migrator and executing it against your database pool:
