@@ -1,5 +1,17 @@
 # Changelog
 
+## [20.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v19.4.1...fusillade-v20.0.0) (2026-07-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* two claim daemons ([#321](https://github.com/doublewordai/fusillade/issues/321))
+
+### Features
+
+* split request and batch claim daemons ([#318](https://github.com/doublewordai/fusillade/issues/318)) ([e012bb0](https://github.com/doublewordai/fusillade/commit/e012bb0a60bb50b797409946b298bfea42bd3685))
+* two claim daemons ([#321](https://github.com/doublewordai/fusillade/issues/321)) ([fc65a65](https://github.com/doublewordai/fusillade/commit/fc65a65e909bab0b7a0ec3096e93679e909a68d7))
+
 ## [19.4.1](https://github.com/doublewordai/fusillade/compare/fusillade-v19.4.0...fusillade-v19.4.1) (2026-07-03)
 
 
