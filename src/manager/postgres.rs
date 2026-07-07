@@ -1721,8 +1721,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 SELECT * FROM unnest($7::TEXT[], $8::BIGINT[]) AS u(user_id, active_count)
             ),
             latest_model_filters AS (
+                -- Scoped to the capacity-eligible models: DISTINCT ON over the
+                -- whole event log would grow with the table for no benefit.
                 SELECT DISTINCT ON (model) model, state
                 FROM model_filters
+                WHERE model = ANY($4::TEXT[])
                 ORDER BY model, created_at DESC, id DESC
             ),
             selected_batches AS (
