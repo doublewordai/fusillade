@@ -414,9 +414,9 @@ fn default_claim_query_timeout_ms() -> u64 {
     180_000
 }
 
-/// Bound a claim-path database future so a silently severed connection (no
-/// FIN/RST delivered — the await would otherwise block until TCP keepalive)
-/// surfaces as an error instead of freezing the loop. Dropping the timed-out
+/// Bound a database future (claim cycle, heartbeat) so a silently severed
+/// connection (no FIN/RST delivered — the await would otherwise block until
+/// TCP keepalive) surfaces as an error instead of freezing the task. Dropping the timed-out
 /// future closes the in-flight connection; the pool discards it and the
 /// caller retries on a fresh one.
 async fn with_query_timeout<T>(
@@ -427,7 +427,7 @@ async fn with_query_timeout<T>(
     match tokio::time::timeout(timeout, fut).await {
         Ok(result) => result,
         Err(_) => Err(FusilladeError::Other(anyhow::anyhow!(
-            "{what} timed out after {}ms — connection presumed silently severed, dropping it",
+            "{what} timed out after {}ms; dropping the in-flight DB connection to avoid hanging",
             timeout.as_millis()
         ))),
     }
@@ -1389,8 +1389,11 @@ where
                         // fresh connection) instead of freezing this task —
                         // the prod incident of 2026-07-08 hung heartbeats too,
                         // which is what tripped the daemon-down alert.
+                        // 4x the interval (20s at defaults) stays under the
+                        // 30s stale_daemon_threshold, leaving room to retry
+                        // before this daemon's claims become reclaimable.
                         let heartbeat_timeout =
-                            Duration::from_millis(heartbeat_interval_ms.saturating_mul(6));
+                            Duration::from_millis(heartbeat_interval_ms.saturating_mul(4));
                         match with_query_timeout(
                             "heartbeat query",
                             heartbeat_timeout,
@@ -1813,9 +1816,11 @@ mod tests {
 
     #[tokio::test]
     async fn query_timeout_passes_through_completed_results() {
-        let ok = with_query_timeout("test query", Duration::from_millis(50), async { Ok(7usize) })
-            .await
-            .expect("completed future must pass through");
+        let ok = with_query_timeout("test query", Duration::from_millis(50), async {
+            Ok(7usize)
+        })
+        .await
+        .expect("completed future must pass through");
         assert_eq!(ok, 7);
 
         let err = with_query_timeout("test query", Duration::from_millis(50), async {
