@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use fusillade_core::FusilladeError;
 
+mod db;
 pub mod postgres;
 #[path = "response_step.rs"]
 pub mod postgres_response_step;
@@ -107,7 +108,11 @@ where
 }
 
 pub fn is_retryable_db_error(error: &FusilladeError) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
+    is_retryable_db_error_message(&error.to_string())
+}
+
+pub fn is_retryable_db_error_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
     message.contains("pool timed out while waiting for an open connection")
         || message.contains("pooltimedout")
         || message.contains("connection pool timed out")

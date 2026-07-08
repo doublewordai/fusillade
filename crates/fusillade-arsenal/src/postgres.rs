@@ -366,6 +366,26 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         &self.db_retry_config
     }
 
+    fn read_executor(&self) -> crate::db::RetryingPgPool {
+        crate::db::RetryingPgPool::new(self.pools.read(), &self.db_retry_config)
+    }
+
+    fn write_executor(&self) -> crate::db::RetryingPgPool {
+        crate::db::RetryingPgPool::new(self.pools.write(), &self.db_retry_config)
+    }
+
+    async fn begin_read(
+        &self,
+    ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+        crate::db::begin_transaction(self.pools.read(), &self.db_retry_config).await
+    }
+
+    async fn begin_write(
+        &self,
+    ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+        crate::db::begin_transaction(self.pools.write(), &self.db_retry_config).await
+    }
+
     pub fn http_client(&self) -> &Arc<H> {
         &self.http_client
     }
@@ -541,7 +561,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             *batch_id as Uuid,
             serde_json::json!({"message": error_message}),
         )
-        .execute(self.pools.write())
+        .execute(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark batch as failed: {}", e)))?;
 
@@ -563,12 +583,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// This returns a PgListener that can be used to receive notifications
     /// when requests are updated. Uses the write pool (primary) for consistency.
     pub async fn create_listener(&self) -> Result<PgListener> {
-        self.retry_db_operation(|| async {
-            PgListener::connect_with(self.pools.write())
-                .await
-                .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e)))
-        })
-        .await
+        crate::db::connect_listener(self.pools.write(), &self.db_retry_config)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e)))
     }
 }
 
@@ -632,7 +649,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             stale_daemon_threshold_ms.to_string(),
             limit,
         )
-        .execute(self.pools.write())
+        .execute(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to unclaim stale requests: {}", e)))?;
         metrics::histogram!("fusillade_unclaim_stale_duration_seconds")
@@ -675,7 +692,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 "#,
                 *file.id as Uuid,
             )
-            .execute(self.pools.write())
+            .execute(self.write_executor())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark file as expired: {}", e)))?;
 
@@ -781,14 +798,18 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// Returns whether the finalization was performed.
     async fn finalize_file_size(
         pool: &PgPool,
+        retry_config: &crate::DbRetryConfig,
         file_id: FileId,
         estimated_size: i64,
     ) -> Result<bool> {
         let lock_key = Self::file_lock_key(file_id);
+        let mut connection = crate::db::acquire_connection(pool, retry_config)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to acquire connection: {}", e)))?;
 
         // Try to acquire advisory lock (non-blocking)
         let lock_acquired = match sqlx::query_scalar!("SELECT pg_try_advisory_lock($1)", lock_key)
-            .fetch_one(pool)
+            .fetch_one(&mut *connection)
             .await
         {
             Ok(Some(acquired)) => acquired,
@@ -829,13 +850,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             *file_id as Uuid,
             estimated_size,
         )
-        .execute(pool)
+        .execute(&mut *connection)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file size: {}", e)));
 
         // Release the lock - only log if release fails (which is unusual)
         if let Err(e) = sqlx::query_scalar!("SELECT pg_advisory_unlock($1)", lock_key)
-            .fetch_one(pool)
+            .fetch_one(&mut *connection)
             .await
         {
             tracing::warn!(
@@ -873,9 +894,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             if is_complete {
                 // Spawn background finalization - don't block listing
                 let pool = self.pools.write().clone();
+                let retry_config = self.db_retry_config.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = Self::finalize_file_size(&pool, file_id, estimated_size).await {
+                    if let Err(e) =
+                        Self::finalize_file_size(&pool, &retry_config, file_id, estimated_size)
+                            .await
+                    {
                         tracing::warn!("Failed to finalize file size for {}: {}", file_id, e);
                     }
                 });
@@ -916,7 +941,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             *batch.id as Uuid,
             state_filter,
         )
-        .fetch_one(self.pools.write())
+        .fetch_one(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to calculate file size: {}", e)))?;
 
@@ -934,8 +959,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         }
 
         // Batch is complete - try to finalize this file
-        let finalized =
-            Self::finalize_file_size(self.pools.write(), file.id, estimated_size).await?;
+        let finalized = Self::finalize_file_size(
+            self.pools.write(),
+            &self.db_retry_config,
+            file.id,
+            estimated_size,
+        )
+        .await?;
 
         if finalized {
             file.size_finalized = true;
@@ -944,12 +974,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         Ok(())
     }
 
-    /// Internal helper to fetch a file from a specific pool.
+    /// Internal helper to fetch a file from a specific executor.
     ///
-    /// Accepts a pool parameter to control read-after-write consistency.
-    /// Typically used with the primary pool for immediate reads after writes,
-    /// or replica pools for normal reads.
-    async fn get_file_from_pool(&self, file_id: FileId, pool: &PgPool) -> Result<File> {
+    /// Accepts an executor parameter to control read-after-write consistency.
+    /// Typically used with the primary executor for immediate reads after
+    /// writes, or replica executors for normal reads.
+    async fn get_file_from_pool(
+        &self,
+        file_id: FileId,
+        executor: crate::db::RetryingPgPool,
+    ) -> Result<File> {
         let row = sqlx::query!(
             r#"
             SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at, api_key_id, source_connection_id, source_external_key
@@ -958,7 +992,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             "#,
             *file_id as Uuid,
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch file: {}", e)))?
         .ok_or_else(|| FusilladeError::Other(anyhow!("File not found")))?;
@@ -1024,10 +1058,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         cutoff: DateTime<Utc>,
         strict: bool,
     ) -> Result<i64> {
-        let pool = if strict {
-            self.pools.write()
+        let executor = if strict {
+            self.write_executor()
         } else {
-            self.pools.read()
+            self.read_executor()
         };
 
         // Equality on (completion_window, created_by) seeks
@@ -1047,7 +1081,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             completion_window,
             cutoff,
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -1067,10 +1101,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         cutoff: DateTime<Utc>,
         strict: bool,
     ) -> Result<i64> {
-        let pool = if strict {
-            self.pools.write()
+        let executor = if strict {
+            self.write_executor()
         } else {
-            self.pools.read()
+            self.read_executor()
         };
 
         // created_by IS NOT NULL ⟺ batch_id IS NULL (requests_attribution_xor),
@@ -1090,7 +1124,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             owner,
             cutoff,
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -1179,9 +1213,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // sub-second index scan. `SET LOCAL` scopes both settings to this
         // transaction, leaving the pooled connection untouched afterwards.
         let mut tx = if strict {
-            self.pools.write().begin().await
+            self.begin_write().await
         } else {
-            self.pools.read().begin().await
+            self.begin_read().await
         }
         .map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -1675,7 +1709,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             &cooldown_window_arr,
             &cooldown_model_arr,
         )
-        .fetch_all(self.pools.write())
+        .fetch_all(self.write_executor())
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -1931,7 +1965,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             self.config.batch_claim_require_live,
             self.config.claim_ramp_exponent,
         )
-        .fetch_all(self.pools.write())
+        .fetch_all(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to claim batch requests: {}", e)))?;
 
@@ -1995,7 +2029,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             &etas as &[Option<DateTime<Utc>>],
             now,
         )
-        .execute(self.pools.write())
+        .execute(self.write_executor())
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to append model_filters events: {}", e))
@@ -2019,7 +2053,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ORDER BY model
             "#
         )
-        .fetch_all(self.pools.read())
+        .fetch_all(self.read_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to list model_filters: {}", e)))?;
 
@@ -2052,7 +2086,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             ORDER BY model, created_at DESC, id DESC
             "#
         )
-        .fetch_all(self.pools.read())
+        .fetch_all(self.read_executor())
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -2135,7 +2169,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             req.state.retry_attempt as i32,
                             req.state.not_before,
                         )
-                        .execute(self.pools.write())
+                        .execute(self.write_executor())
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2163,7 +2197,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             *req.state.daemon_id as Uuid,
                             req.state.claimed_at,
                         )
-                        .execute(self.pools.write())
+                        .execute(self.write_executor())
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2191,7 +2225,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             req.state.claimed_at,
                             req.state.started_at,
                         )
-                        .execute(self.pools.write())
+                        .execute(self.write_executor())
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2231,7 +2265,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             response_size,
                             req.state.routed_model,
                         )
-                        .execute(self.pools.write())
+                        .execute(self.write_executor())
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2275,7 +2309,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             response_size,
                             req.state.routed_model,
                         )
-                        .execute(self.pools.write())
+                        .execute(self.write_executor())
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2297,7 +2331,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                             *req.data.id as Uuid,
                             req.state.canceled_at,
                         )
-                        .execute(self.pools.write())
+                        .execute(self.write_executor())
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2371,7 +2405,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             retry_attempt as i32,
             not_before,
         )
-        .execute(self.pools.write())
+        .execute(self.write_executor())
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to reschedule request for retry: {}", e))
@@ -2401,7 +2435,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             &uuid_ids,
         )
-        .fetch_all(self.pools.read())
+        .fetch_all(self.read_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch requests: {}", e)))?;
 
@@ -2646,10 +2680,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         use futures::StreamExt;
 
         // Start a transaction for atomic file + templates creation
-        let mut tx =
-            self.pools.write().begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Accumulate metadata as we encounter it
         let mut metadata = FileMetadata::default();
@@ -2876,7 +2910,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn get_file(&self, file_id: FileId) -> Result<File> {
         self.retry_db_operation(|| async {
-            let mut file = self.get_file_from_pool(file_id, self.pools.read()).await?;
+            let mut file = self
+                .get_file_from_pool(file_id, self.read_executor())
+                .await?;
 
             // Check and mark as expired if needed (passive expiration)
             self.check_and_mark_expired(&mut file).await?;
@@ -2892,7 +2928,9 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn get_file_from_primary_pool(&self, file_id: FileId) -> Result<File> {
         self.retry_db_operation(|| async {
-            let mut file = self.get_file_from_pool(file_id, self.pools.write()).await?;
+            let mut file = self
+                .get_file_from_pool(file_id, self.write_executor())
+                .await?;
 
             // Check and mark as expired if needed (passive expiration)
             self.check_and_mark_expired(&mut file).await?;
@@ -2936,7 +2974,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             *file_id as Uuid,
         )
-        .fetch_all(self.pools.read())
+        .fetch_all(self.read_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch template stats: {}", e)))?;
 
@@ -2958,6 +2996,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         search: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
         let pool = self.pools.read().clone();
+        let retry_config = self.db_retry_config.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
@@ -2971,7 +3010,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 "#,
                 *file_id as Uuid,
             )
-            .fetch_one(&pool)
+            .fetch_one(crate::db::RetryingPgPool::new(&pool, &retry_config))
             .await;
 
             let purpose = match file_result {
@@ -2990,14 +3029,16 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             // Route to appropriate streaming logic based on purpose
             match purpose.as_deref() {
                 Some("batch_output") => {
-                    Self::stream_batch_output(pool, file_id, offset, search, tx).await;
+                    Self::stream_batch_output(pool, retry_config, file_id, offset, search, tx)
+                        .await;
                 }
                 Some("batch_error") => {
-                    Self::stream_batch_error(pool, file_id, offset, search, tx).await;
+                    Self::stream_batch_error(pool, retry_config, file_id, offset, search, tx).await;
                 }
                 _ => {
                     // Regular file or purpose='batch': stream request templates
-                    Self::stream_request_templates(pool, file_id, offset, search, tx).await;
+                    Self::stream_request_templates(pool, retry_config, file_id, offset, search, tx)
+                        .await;
                 }
             }
         });
@@ -3015,7 +3056,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 r#"SELECT created_at FROM files WHERE id = $1"#,
                 **after_id as Uuid
             )
-            .fetch_optional(self.pools.read())
+            .fetch_optional(self.read_executor())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch after cursor: {}", e)))?
             .map(|row| row.created_at)
@@ -3123,7 +3164,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let rows = query_builder
             .build()
-            .fetch_all(self.pools.read())
+            .fetch_all(self.read_executor())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list files: {}", e)))?;
 
@@ -3232,10 +3273,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn delete_file(&self, file_id: FileId) -> Result<()> {
         // Use a transaction to ensure atomicity
-        let mut tx =
-            self.pools.write().begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Step 1: Cancel non-terminal batches associated with this file
         // This will:
@@ -3338,7 +3379,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             let _ = self.mark_batch_failed(batch.id, &e.to_string()).await;
             return Err(e);
         }
-        self.get_batch_from_pool(batch.id, self.pools.write()).await
+        self.get_batch_from_pool(batch.id, self.write_executor())
+            .await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -3366,10 +3408,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let total_requests = input.total_requests.unwrap_or(0);
 
-        let mut tx =
-            self.pools.write().begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         let row = sqlx::query!(
             r#"
@@ -3448,10 +3490,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
     #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn populate_batch(&self, batch_id: BatchId, file_id: FileId) -> Result<()> {
-        let mut tx =
-            self.pools.write().begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Serialize population of the same batch. underway delivers the
         // create-batch job at-least-once: the task can be reclaimed on
@@ -3587,7 +3629,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
         self.retry_db_operation(|| async {
-            self.get_batch_from_pool(batch_id, self.pools.read()).await
+            self.get_batch_from_pool(batch_id, self.read_executor())
+                .await
         })
         .await
     }
@@ -3629,7 +3672,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
             let row = query_builder
                 .build()
-                .fetch_optional(self.pools.read())
+                .fetch_optional(self.read_executor())
                 .await
                 .map_err(|e| {
                     FusilladeError::Other(anyhow!("Failed to fetch batch status: {}", e))
@@ -3688,7 +3731,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
                 let row = query_builder
                     .build()
-                    .fetch_optional(self.pools.read())
+                    .fetch_optional(self.read_executor())
                     .await
                     .map_err(|e| {
                         FusilladeError::Other(anyhow!("Failed to get batch by output file: {}", e))
@@ -3703,7 +3746,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
                 let row = query_builder
                     .build()
-                    .fetch_optional(self.pools.read())
+                    .fetch_optional(self.read_executor())
                     .await
                     .map_err(|e| {
                         FusilladeError::Other(anyhow!("Failed to get batch by error file: {}", e))
@@ -3760,7 +3803,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     "#,
                     *after_id as Uuid,
                 )
-                .fetch_optional(self.pools.read())
+                .fetch_optional(self.read_executor())
                 .await
                 .map_err(|e| {
                     FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e))
@@ -3783,7 +3826,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     "#,
                     *after_id as Uuid,
                 )
-                .fetch_optional(self.pools.read())
+                .fetch_optional(self.read_executor())
                 .await
                 .map_err(|e| {
                     FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e))
@@ -4023,7 +4066,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let rows = query_builder
             .build()
-            .fetch_all(self.pools.read())
+            .fetch_all(self.read_executor())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
 
@@ -4068,7 +4111,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         let rows = query_builder
             .build()
-            .fetch_all(self.pools.read())
+            .fetch_all(self.read_executor())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
 
@@ -4095,7 +4138,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             &uuids,
         )
-        .fetch_all(self.pools.read())
+        .fetch_all(self.read_executor())
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to fetch cancelled batch IDs: {}", e))
@@ -4124,7 +4167,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             *batch_id as Uuid,
             now,
         )
-        .execute(self.pools.write())
+        .execute(self.write_executor())
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to set cancellation timestamps: {}", e))
@@ -4151,7 +4194,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     "#,
                     *batch_id as Uuid,
                 )
-                .execute(self.pools.write())
+                .execute(self.write_executor())
                 .await
             }
             CascadeTargetState::Failed => {
@@ -4174,7 +4217,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                     *batch_id as Uuid,
                     default_error,
                 )
-                .execute(self.pools.write())
+                .execute(self.write_executor())
                 .await
             }
         }
@@ -4213,7 +4256,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             *batch_id as Uuid,
         )
-        .execute(self.pools.write())
+        .execute(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to soft-delete batch: {}", e)))?
         .rows_affected();
@@ -4246,10 +4289,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         // write of response_steps will FK-violate (the row is gone) and
         // surface that as an error log without corrupting state. Both are
         // acceptable failure modes for an explicit user-initiated erasure.
-        let mut tx =
-            self.pools.write().begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         let template_id: Option<Option<Uuid>> = sqlx::query_scalar!(
             r#"DELETE FROM requests WHERE id = $1 RETURNING template_id"#,
@@ -4297,10 +4340,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
         // One transaction per chunk: the rows locked via FOR UPDATE SKIP LOCKED
         // stay locked until commit, and Stage 0's two statements are dependent.
-        let mut tx =
-            self.pools.write().begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Stage 0: Hard-delete batchless (realtime/flex) requests and their
         // dedicated templates. These have batch_id IS NULL, so they have no
@@ -4493,10 +4536,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
     async fn retry_failed_requests_for_batch(&self, batch_id: BatchId) -> Result<u64> {
         tracing::debug!(%batch_id, "Retrying all failed requests for batch");
 
-        let mut tx =
-            self.pools.write().begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         let result = sqlx::query!(
             r#"
@@ -4569,7 +4612,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
             *batch_id as Uuid,
         )
-        .fetch_all(self.pools.read())
+        .fetch_all(self.read_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch executions: {}", e)))?;
 
@@ -4768,11 +4811,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         status: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>> {
         let pool = self.pools.read().clone();
+        let retry_config = self.db_retry_config.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
         tokio::spawn(async move {
-            Self::stream_batch_results(pool, batch_id, offset, search, status, tx).await;
+            Self::stream_batch_results(pool, retry_config, batch_id, offset, search, status, tx)
+                .await;
         });
 
         Box::pin(ReceiverStream::new(rx))
@@ -4793,8 +4838,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 "limit must be > 0".to_string(),
             ));
         }
-
-        let pool = self.pools.read();
 
         // Listing is scoped to batchless rows (responses) — those carry
         // `created_by` directly. Real-batch rows have created_by IS NULL and
@@ -4825,8 +4868,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#
         );
         let exact_count: Option<i64> = {
-            let mut tx = pool
-                .begin()
+            let mut tx = self
+                .begin_read()
                 .await
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin count tx: {}", e)))?;
             sqlx::query("SET LOCAL statement_timeout = '100ms'")
@@ -4876,7 +4919,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             .bind(filter.created_after)
             .bind(filter.created_before)
             .bind(filter.service_tiers.as_deref())
-            .fetch_one(pool)
+            .fetch_one(self.read_executor())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to estimate count: {}", e)))?;
 
@@ -4919,7 +4962,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(filter.service_tiers.as_deref())
         .bind(filter.limit)
         .bind(filter.skip)
-        .fetch_all(pool)
+        .fetch_all(self.read_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to list requests: {}", e)))?;
 
@@ -4931,8 +4974,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         &self,
         request_id: crate::request::RequestId,
     ) -> Result<crate::request::RequestDetail> {
-        let pool = self.pools.read();
-
         let detail: crate::request::RequestDetail = sqlx::query_as(
             r#"
             SELECT
@@ -4956,7 +4997,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             "#,
         )
         .bind(request_id.0)
-        .fetch_optional(pool)
+        .fetch_optional(self.read_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to get request detail: {}", e)))?
         .ok_or(FusilladeError::RequestNotFound(request_id))?;
@@ -4966,12 +5007,11 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
     #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
     async fn create_realtime(&self, input: CreateRealtimeInput) -> Result<RequestId> {
-        let pool = self.pools.write();
         let template_id = Uuid::new_v4();
         let now = Utc::now();
 
-        let mut tx = pool
-            .begin()
+        let mut tx = self
+            .begin_write()
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
@@ -5032,11 +5072,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
     #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
     async fn create_flex(&self, input: CreateFlexInput) -> Result<RequestId> {
-        let pool = self.pools.write();
         let template_id = Uuid::new_v4();
 
-        let mut tx = pool
-            .begin()
+        let mut tx = self
+            .begin_write()
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
@@ -5092,7 +5131,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         response_body: &str,
         status_code: u16,
     ) -> Result<()> {
-        let pool = self.pools.write();
         let size = response_body.len() as i64;
 
         // Try the UPDATE; if it doesn't match, surface whether the row is
@@ -5120,7 +5158,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(status_code as i16)
         .bind(response_body)
         .bind(size)
-        .fetch_optional(pool)
+        .fetch_optional(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete request: {}", e)))?;
 
@@ -5142,8 +5180,6 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         error: &str,
         status_code: u16,
     ) -> Result<()> {
-        let pool = self.pools.write();
-
         let reason = FailureReason::NonRetriableHttpStatus {
             status: status_code,
             body: error.to_string(),
@@ -5170,7 +5206,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
         .bind(request_id.0)
         .bind(&error_json)
         .bind(error_size)
-        .fetch_optional(pool)
+        .fetch_optional(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail request: {}", e)))?;
 
@@ -5194,10 +5230,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
             return Ok(());
         }
 
-        let mut tx =
-            self.pools.write().begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Bulk UPDATE for rows that already exist in 'processing' state.
         // These are the background-realtime case: middleware called
@@ -5396,17 +5432,21 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
 // Helper methods for file streaming and virtual file creation
 impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
-    /// Internal helper to fetch a batch from a specific pool.
+    /// Internal helper to fetch a batch from a specific executor.
     ///
     /// This is used when we require read-after-write consistency and must query
-    /// from the same pool where a write was committed. This avoids transaction
+    /// from the same executor where a write was committed. This avoids transaction
     /// isolation issues where a different connection's snapshot might not yet
     /// see the committed data.
     ///
     /// # Arguments
     /// * `batch_id` - The ID of the batch to fetch
-    /// * `pool` - The specific pool to query from (typically write pool after commit)
-    async fn get_batch_from_pool(&self, batch_id: BatchId, pool: &PgPool) -> Result<Batch> {
+    /// * `executor` - The specific executor to query from (typically write after commit)
+    async fn get_batch_from_pool(
+        &self,
+        batch_id: BatchId,
+        executor: crate::db::RetryingPgPool,
+    ) -> Result<Batch> {
         let mut query_builder = QueryBuilder::new(
             r#"
             SELECT
@@ -5445,7 +5485,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
         let row = query_builder
             .build()
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
             .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
@@ -5497,7 +5537,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 completed,
                 failed,
             )
-            .execute(self.pools.write()) // Use the provided pool parameter here too
+            .execute(self.write_executor()) // Use the provided pool parameter here too
             .await
             .map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
@@ -5618,7 +5658,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             LEFT JOIN files f ON f.id = u.file_id
             "#
         )
-        .fetch_all(self.pools.write())
+        .fetch_all(self.write_executor())
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to poll completed batches: {}", e))
@@ -5724,6 +5764,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// Stream request templates from a regular file
     async fn stream_request_templates(
         pool: sqlx::PgPool,
+        retry_config: crate::DbRetryConfig,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -5759,7 +5800,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 BATCH_SIZE,
                 search_pattern.as_deref(),
             )
-            .fetch_all(&pool)
+            .fetch_all(crate::db::RetryingPgPool::new(&pool, &retry_config))
             .await;
 
             match template_batch {
@@ -5812,6 +5853,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// Stream batch output (completed requests) for a virtual output file
     async fn stream_batch_output(
         pool: sqlx::PgPool,
+        retry_config: crate::DbRetryConfig,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -5828,7 +5870,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             "#,
             *file_id as Uuid,
         )
-        .fetch_one(&pool)
+        .fetch_one(crate::db::RetryingPgPool::new(&pool, &retry_config))
         .await;
 
         let batch_id = match batch_result {
@@ -5880,7 +5922,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
                 BATCH_SIZE,
                 search_pattern.as_deref(),
             )
-            .fetch_all(&pool)
+            .fetch_all(crate::db::RetryingPgPool::new(&pool, &retry_config))
             .await;
 
             match request_batch {
@@ -5949,6 +5991,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// Stream batch errors (failed requests) for a virtual error file
     async fn stream_batch_error(
         pool: sqlx::PgPool,
+        retry_config: crate::DbRetryConfig,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -5965,7 +6008,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             "#,
             *file_id as Uuid,
         )
-        .fetch_one(&pool)
+        .fetch_one(crate::db::RetryingPgPool::new(&pool, &retry_config))
         .await;
 
         let (batch_id, _expires_at) = match batch_result {
@@ -6024,7 +6067,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             query_builder.push(" LIMIT ");
             query_builder.push_bind(BATCH_SIZE);
 
-            let request_batch = query_builder.build().fetch_all(&pool).await;
+            let request_batch = query_builder
+                .build()
+                .fetch_all(crate::db::RetryingPgPool::new(&pool, &retry_config))
+                .await;
 
             match request_batch {
                 Ok(requests) => {
@@ -6079,6 +6125,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// This joins requests with their templates to provide input body alongside response/error.
     async fn stream_batch_results(
         pool: sqlx::PgPool,
+        retry_config: crate::DbRetryConfig,
         batch_id: BatchId,
         offset: i64,
         search: Option<String>,
@@ -6094,7 +6141,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             r#"SELECT file_id, expires_at FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
             *batch_id as Uuid,
         )
-        .fetch_optional(&pool)
+        .fetch_optional(crate::db::RetryingPgPool::new(&pool, &retry_config))
         .await
         {
             Ok(Some(row)) => {
@@ -6186,7 +6233,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
             // Query from request_templates joined to requests.
             // For each template, we find the matching request for this batch.
-            let request_batch = query_builder.build().fetch_all(&pool).await;
+            let request_batch = query_builder
+                .build()
+                .fetch_all(crate::db::RetryingPgPool::new(&pool, &retry_config))
+                .await;
 
             match request_batch {
                 Ok(requests) => {
@@ -6313,7 +6363,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
 // Implement DaemonStorage trait
 #[async_trait]
-impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P, H> {
+impl<P: PoolProvider, H: HttpClient + 'static> DaemonStorage for PostgresRequestManager<P, H> {
     async fn persist_daemon<T: DaemonState + Clone>(&self, record: &DaemonRecord<T>) -> Result<()>
     where
         AnyDaemonRecord: From<DaemonRecord<T>>,
@@ -6341,7 +6391,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
                     daemon.data.config_snapshot,
                     daemon.state.started_at,
                 )
-                .execute(self.pools.write())
+                .execute(self.write_executor())
                 .await
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to persist daemon: {}", e)))?;
             }
@@ -6372,7 +6422,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
                     daemon.state.stats.requests_failed as i64,
                     daemon.state.stats.requests_in_flight as i32,
                 )
-                .execute(self.pools.write())
+                .execute(self.write_executor())
                 .await
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to persist daemon: {}", e)))?;
             }
@@ -6403,7 +6453,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
                     daemon.state.final_stats.requests_failed as i64,
                     daemon.state.final_stats.requests_in_flight as i32,
                 )
-                .execute(self.pools.write())
+                .execute(self.write_executor())
                 .await
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to persist daemon: {}", e)))?;
             }
@@ -6424,7 +6474,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
             "#,
             *daemon_id as Uuid,
         )
-        .fetch_one(self.pools.read())
+        .fetch_one(self.read_executor())
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => FusilladeError::Other(anyhow!("Daemon not found")),
@@ -6503,7 +6553,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
             "#,
             status_str,
         )
-        .fetch_all(self.pools.read())
+        .fetch_all(self.read_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to list daemons: {}", e)))?;
 
@@ -6602,7 +6652,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
             "#,
             batch_size,
         )
-        .execute(self.pools.write())
+        .execute(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge orphaned requests: {}", e)))?
         .rows_affected() as i64;
@@ -6631,7 +6681,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
             "#,
             batch_size,
         )
-        .execute(self.pools.write())
+        .execute(self.write_executor())
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to purge orphaned request_templates: {}", e))
@@ -6688,7 +6738,7 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
             keep,
             retention_secs,
         )
-        .execute(self.pools.write())
+        .execute(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge model_filters events: {}", e)))?
         .rows_affected();

@@ -66,7 +66,7 @@
 //! Exponential backoff and retry limits are configured via [`RetryConfig`]:
 //!
 //! ```rust
-//! # use fusillade::request::transitions::RetryConfig;
+//! # use fusillade_core::request::transitions::RetryConfig;
 //! let config = RetryConfig {
 //!     max_retries: Some(1000),
 //!     stop_before_deadline_ms: Some(900_000),
