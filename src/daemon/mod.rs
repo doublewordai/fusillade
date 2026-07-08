@@ -163,6 +163,18 @@ pub struct DaemonConfig {
     #[serde(default = "default_batch_claim_interval_ms")]
     pub batch_claim_interval_ms: u64,
 
+    /// How many consecutive claim-cycle failures a claim loop tolerates
+    /// (with exponential backoff between retries) before it gives up and
+    /// takes the daemon down.
+    ///
+    /// Transient database errors — a connection severed by the server under
+    /// load, a pool acquire timeout, a failover blip — are expected in normal
+    /// operation and must not kill the daemon. Only a persistent run of
+    /// failures (e.g. the database is actually down or misconfigured) should
+    /// be fatal. Default: 10 (≈ several minutes of retries at max backoff).
+    #[serde(default = "default_claim_loop_max_consecutive_failures")]
+    pub claim_loop_max_consecutive_failures: u32,
+
     /// Maximum number of retry attempts before giving up.
     pub max_retries: Option<u32>,
 
@@ -379,6 +391,24 @@ fn default_batch_claim_batch_size() -> usize {
     4
 }
 
+fn default_claim_loop_max_consecutive_failures() -> u32 {
+    10
+}
+
+/// Backoff before retrying a failed claim cycle: exponential in the number of
+/// consecutive failures, based on the claim interval, capped at 30s.
+/// failure 1 → 2×interval, 2 → 4×, 3 → 8×, … capped.
+fn claim_failure_backoff(consecutive_failures: u32, claim_interval_ms: u64) -> Duration {
+    const MAX_BACKOFF_MS: u64 = 30_000;
+    let factor = 2u64.saturating_pow(consecutive_failures.min(16));
+    Duration::from_millis(
+        claim_interval_ms
+            .max(100)
+            .saturating_mul(factor)
+            .min(MAX_BACKOFF_MS),
+    )
+}
+
 fn default_batch_claim_interval_ms() -> u64 {
     0
 }
@@ -410,6 +440,7 @@ impl Default for DaemonConfig {
             batch_claim_size: default_batch_claim_size(),
             batch_claim_batch_size: default_batch_claim_batch_size(),
             batch_claim_require_live: false,
+            claim_loop_max_consecutive_failures: 10,
             batch_claim_interval_ms: default_batch_claim_interval_ms(),
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(0),
@@ -729,6 +760,10 @@ where
             "Claim loop started"
         );
 
+        // Consecutive claim failures (reset on success). Transient DB errors
+        // back off and retry; only a persistent run of failures is fatal.
+        let mut consecutive_claim_failures: u32 = 0;
+
         loop {
             if self.shutdown_token.is_cancelled() {
                 tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
@@ -779,7 +814,7 @@ where
             };
 
             let claim_start = std::time::Instant::now();
-            let mut claimed = match kind {
+            let claim_result = match kind {
                 ClaimLoopKind::Request => {
                     self.storage
                         .claim_batchless_requests(
@@ -789,7 +824,7 @@ where
                             &user_active_counts,
                             &leak_cooldown,
                         )
-                        .await?
+                        .await
                 }
                 ClaimLoopKind::Batch => {
                     // 0 = inherit the (often deployment-tuned) single-loop cap.
@@ -806,7 +841,61 @@ where
                             &available_capacity,
                             &user_active_counts,
                         )
-                        .await?
+                        .await
+                }
+            };
+
+            // Transient DB errors (connection severed by the server under
+            // load, pool acquire timeout, failover blip) must not kill the
+            // daemon: a dead claim loop takes the whole daemon down and — with
+            // a single replica — silently stops all batch processing until a
+            // human bounces the pod (observed 2026-07-08 on staging: Neon
+            // severed the unclaim connection under a wide dispatch burst; the
+            // daemon died inside a pod that kept serving API traffic). Back
+            // off and retry; give up only after
+            // `claim_loop_max_consecutive_failures` in a row, which indicates
+            // a persistent failure rather than a blip.
+            let mut claimed = match claim_result {
+                Ok(claimed) => {
+                    consecutive_claim_failures = 0;
+                    claimed
+                }
+                Err(e) => {
+                    // Release the claim mutex BEFORE backing off — the other
+                    // daemon's claims must not stall behind our retry sleep.
+                    drop(_claim_guard);
+                    consecutive_claim_failures += 1;
+                    counter!("fusillade_claim_loop_errors_total", "daemon" => loop_name)
+                        .increment(1);
+                    if consecutive_claim_failures >= self.config.claim_loop_max_consecutive_failures
+                    {
+                        tracing::error!(
+                            loop_name,
+                            consecutive_claim_failures,
+                            error = %e,
+                            "Claim loop giving up after repeated consecutive failures"
+                        );
+                        break Err(e);
+                    }
+                    let backoff = claim_failure_backoff(
+                        consecutive_claim_failures,
+                        self.config.claim_interval_ms,
+                    );
+                    tracing::warn!(
+                        loop_name,
+                        consecutive_claim_failures,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %e,
+                        "Claim failed; backing off before retry"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {},
+                        _ = self.shutdown_token.cancelled() => {
+                            tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
+                            break Ok(());
+                        }
+                    }
+                    continue;
                 }
             };
             // Dual-emit legacy unlabeled histograms during the deprecation
@@ -1214,6 +1303,11 @@ where
 
         let running_record = daemon_record.start(self.storage.as_ref()).await?;
         tracing::info!("Daemon registered in database");
+        // Liveness signal for dashboards/alerts: 1 while this daemon's run
+        // loop is alive, 0 once it exits (any path). A daemon dying inside a
+        // still-running pod is otherwise invisible to metrics (observed
+        // 2026-07-08: silent claim outage until a human bounced the pod).
+        gauge!("fusillade_daemon_up").set(1.0);
 
         // Spawn periodic heartbeat task
         let storage = self.storage.clone();
@@ -1576,6 +1670,7 @@ where
             }
         };
         claim_daemons.abort_all();
+        gauge!("fusillade_daemon_up").set(0.0);
 
         // Wait for heartbeat task to complete (it will mark daemon as dead)
         tracing::info!("Waiting for heartbeat task to complete");
@@ -1600,6 +1695,37 @@ mod tests {
         assert_eq!(
             DaemonConfig::default().pending_request_counts_timeout_ms,
             60_000
+        );
+    }
+
+    #[test]
+    fn claim_failure_backoff_grows_exponentially_and_caps() {
+        // 1s claim interval: 2s, 4s, 8s, 16s, then capped at 30s.
+        assert_eq!(claim_failure_backoff(1, 1000), Duration::from_millis(2_000));
+        assert_eq!(claim_failure_backoff(2, 1000), Duration::from_millis(4_000));
+        assert_eq!(claim_failure_backoff(3, 1000), Duration::from_millis(8_000));
+        assert_eq!(
+            claim_failure_backoff(4, 1000),
+            Duration::from_millis(16_000)
+        );
+        assert_eq!(
+            claim_failure_backoff(5, 1000),
+            Duration::from_millis(30_000)
+        );
+        // Huge failure counts must not overflow — stays at the cap.
+        assert_eq!(
+            claim_failure_backoff(u32::MAX, 1000),
+            Duration::from_millis(30_000)
+        );
+        // Pathological zero interval is floored so we never hot-loop.
+        assert_eq!(claim_failure_backoff(1, 0), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn default_claim_loop_failure_tolerance_is_ten() {
+        assert_eq!(
+            DaemonConfig::default().claim_loop_max_consecutive_failures,
+            10
         );
     }
 
@@ -1637,6 +1763,7 @@ mod tests {
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
+            claim_loop_max_consecutive_failures: 10,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -1834,6 +1961,7 @@ mod tests {
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
+            claim_loop_max_consecutive_failures: 10,
             batch_claim_interval_ms: 10,
             model_concurrency_limits,
 
@@ -2085,6 +2213,7 @@ mod tests {
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
+            claim_loop_max_consecutive_failures: 10,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -2249,6 +2378,7 @@ mod tests {
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
+            claim_loop_max_consecutive_failures: 10,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
 
@@ -2444,6 +2574,7 @@ mod tests {
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
+            claim_loop_max_consecutive_failures: 10,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -2627,6 +2758,7 @@ mod tests {
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
+            claim_loop_max_consecutive_failures: 10,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -2810,6 +2942,7 @@ mod tests {
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
+            claim_loop_max_consecutive_failures: 10,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -2991,6 +3124,7 @@ mod tests {
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
+            claim_loop_max_consecutive_failures: 10,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -3107,6 +3241,7 @@ mod tests {
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
+            claim_loop_max_consecutive_failures: 10,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -3279,6 +3414,7 @@ mod tests {
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
+            claim_loop_max_consecutive_failures: 10,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -3426,6 +3562,7 @@ mod tests {
             batch_claim_size: 10,
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
+            claim_loop_max_consecutive_failures: 10,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
