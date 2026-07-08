@@ -1,5 +1,12 @@
 # Changelog
 
+## [20.0.2](https://github.com/doublewordai/fusillade/compare/fusillade-v20.0.1...fusillade-v20.0.2) (2026-07-08)
+
+
+### Bug Fixes
+
+* bound claim and heartbeat queries to survive silent connection loss ([#325](https://github.com/doublewordai/fusillade/issues/325)) ([842c287](https://github.com/doublewordai/fusillade/commit/842c2874a29a8ab518afa1cdf1d78f2133e258d5))
+
 ## [20.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v20.0.0...fusillade-v20.0.1) (2026-07-08)
 
 
