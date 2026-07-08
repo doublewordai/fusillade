@@ -1,5 +1,6 @@
 //! Daemon for processing batched requests with per-model concurrency control.
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -174,6 +175,20 @@ pub struct DaemonConfig {
     /// be fatal. Default: 10 (≈ several minutes of retries at max backoff).
     #[serde(default = "default_claim_loop_max_consecutive_failures")]
     pub claim_loop_max_consecutive_failures: u32,
+
+    /// Upper bound on a single claim-cycle database query, in milliseconds.
+    /// This is a deadness detector, not a performance guardrail: claim
+    /// queries normally complete in seconds, but a connection severed
+    /// silently (compute restart, NAT/conntrack drop — nothing delivered to
+    /// the client) leaves the await blocked until TCP keepalive (hours),
+    /// freezing the claim loop inside a healthy-looking pod (observed
+    /// 2026-07-08, staging ×2 + prod). On expiry the in-flight connection is
+    /// dropped and the attempt counts as a transient claim failure, so the
+    /// retry/backoff machinery recovers on a fresh connection. Keep this
+    /// comfortably above any legitimate claim duration (worst ever observed:
+    /// ~101s p95, 2026-07-03, pre-split). Default: 180000 (3 minutes).
+    #[serde(default = "default_claim_query_timeout_ms")]
+    pub claim_query_timeout_ms: u64,
 
     /// Maximum number of retry attempts before giving up.
     pub max_retries: Option<u32>,
@@ -395,6 +410,29 @@ fn default_claim_loop_max_consecutive_failures() -> u32 {
     10
 }
 
+fn default_claim_query_timeout_ms() -> u64 {
+    180_000
+}
+
+/// Bound a database future (claim cycle, heartbeat) so a silently severed
+/// connection (no FIN/RST delivered — the await would otherwise block until
+/// TCP keepalive) surfaces as an error instead of freezing the task. Dropping the timed-out
+/// future closes the in-flight connection; the pool discards it and the
+/// caller retries on a fresh one.
+async fn with_query_timeout<T>(
+    what: &'static str,
+    timeout: Duration,
+    fut: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(FusilladeError::Other(anyhow::anyhow!(
+            "{what} timed out after {}ms; dropping the in-flight DB connection to avoid hanging",
+            timeout.as_millis()
+        ))),
+    }
+}
+
 /// Backoff before retrying a failed claim cycle: exponential in the number of
 /// consecutive failures, based on the claim interval, capped at 30s.
 /// failure 1 → 2×interval, 2 → 4×, 3 → 8×, … capped.
@@ -441,6 +479,7 @@ impl Default for DaemonConfig {
             batch_claim_batch_size: default_batch_claim_batch_size(),
             batch_claim_require_live: false,
             claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
+            claim_query_timeout_ms: default_claim_query_timeout_ms(),
             batch_claim_interval_ms: default_batch_claim_interval_ms(),
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(0),
@@ -814,17 +853,21 @@ where
             };
 
             let claim_start = std::time::Instant::now();
+            let claim_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
             let claim_result = match kind {
                 ClaimLoopKind::Request => {
-                    self.storage
-                        .claim_batchless_requests(
+                    with_query_timeout(
+                        "batchless claim query",
+                        claim_timeout,
+                        self.storage.claim_batchless_requests(
                             self.config.claim_batch_size,
                             self.daemon_id,
                             &available_capacity,
                             &user_active_counts,
                             &leak_cooldown,
-                        )
-                        .await
+                        ),
+                    )
+                    .await
                 }
                 ClaimLoopKind::Batch => {
                     // 0 = inherit the (often deployment-tuned) single-loop cap.
@@ -833,15 +876,18 @@ where
                     } else {
                         self.config.batch_claim_size
                     };
-                    self.storage
-                        .claim_batch_requests(
+                    with_query_timeout(
+                        "batch claim query",
+                        claim_timeout,
+                        self.storage.claim_batch_requests(
                             batch_claim_size,
                             self.config.batch_claim_batch_size,
                             self.daemon_id,
                             &available_capacity,
                             &user_active_counts,
-                        )
-                        .await
+                        ),
+                    )
+                    .await
                 }
             };
 
@@ -1338,7 +1384,23 @@ where
                         // Clone the record so we preserve it if heartbeat fails
                         let current = daemon_record.clone();
                         let heartbeat_start = std::time::Instant::now();
-                        match current.heartbeat(stats, storage.as_ref()).await {
+                        // Bounded so a silently severed connection surfaces as
+                        // a failed heartbeat (logged, retried next tick on a
+                        // fresh connection) instead of freezing this task —
+                        // the prod incident of 2026-07-08 hung heartbeats too,
+                        // which is what tripped the daemon-down alert.
+                        // 4x the interval (20s at defaults) stays under the
+                        // 30s stale_daemon_threshold, leaving room to retry
+                        // before this daemon's claims become reclaimable.
+                        let heartbeat_timeout =
+                            Duration::from_millis(heartbeat_interval_ms.saturating_mul(4));
+                        match with_query_timeout(
+                            "heartbeat query",
+                            heartbeat_timeout,
+                            current.heartbeat(stats, storage.as_ref()),
+                        )
+                        .await
+                        {
                             Ok(updated) => {
                                 histogram!("fusillade_heartbeat_duration_seconds")
                                     .record(heartbeat_start.elapsed().as_secs_f64());
@@ -1733,6 +1795,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn default_claim_query_timeout_is_three_minutes() {
+        assert_eq!(DaemonConfig::default().claim_query_timeout_ms, 180_000);
+    }
+
+    #[tokio::test]
+    async fn query_timeout_converts_hang_into_error() {
+        // A future that never resolves models a query await on a silently
+        // severed connection. The wrapper must surface it as an error so the
+        // claim retry machinery engages instead of freezing forever.
+        let hung = std::future::pending::<Result<()>>();
+        let result = with_query_timeout("test query", Duration::from_millis(50), hung).await;
+        let err = result.expect_err("hung future must time out").to_string();
+        assert!(
+            err.contains("timed out after 50ms"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_timeout_passes_through_completed_results() {
+        let ok = with_query_timeout("test query", Duration::from_millis(50), async {
+            Ok(7usize)
+        })
+        .await
+        .expect("completed future must pass through");
+        assert_eq!(ok, 7);
+
+        let err = with_query_timeout("test query", Duration::from_millis(50), async {
+            Err::<(), _>(FusilladeError::Other(anyhow::anyhow!("real db error")))
+        })
+        .await
+        .expect_err("inner error must pass through");
+        assert!(err.to_string().contains("real db error"));
+    }
+
     async fn mark_model_live_for_test(
         manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
         model: &str,
@@ -1768,6 +1866,7 @@ mod tests {
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
             claim_loop_max_consecutive_failures: 10,
+            claim_query_timeout_ms: 180_000,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -1966,6 +2065,7 @@ mod tests {
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
             claim_loop_max_consecutive_failures: 10,
+            claim_query_timeout_ms: 180_000,
             batch_claim_interval_ms: 10,
             model_concurrency_limits,
 
@@ -2218,6 +2318,7 @@ mod tests {
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
             claim_loop_max_consecutive_failures: 10,
+            claim_query_timeout_ms: 180_000,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -2383,6 +2484,7 @@ mod tests {
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
             claim_loop_max_consecutive_failures: 10,
+            claim_query_timeout_ms: 180_000,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: model_concurrency_limits.clone(),
 
@@ -2579,6 +2681,7 @@ mod tests {
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
             claim_loop_max_consecutive_failures: 10,
+            claim_query_timeout_ms: 180_000,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -2763,6 +2866,7 @@ mod tests {
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
             claim_loop_max_consecutive_failures: 10,
+            claim_query_timeout_ms: 180_000,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -2947,6 +3051,7 @@ mod tests {
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
             claim_loop_max_consecutive_failures: 10,
+            claim_query_timeout_ms: 180_000,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -3129,6 +3234,7 @@ mod tests {
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
             claim_loop_max_consecutive_failures: 10,
+            claim_query_timeout_ms: 180_000,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -3246,6 +3352,7 @@ mod tests {
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
             claim_loop_max_consecutive_failures: 10,
+            claim_query_timeout_ms: 180_000,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -3419,6 +3526,7 @@ mod tests {
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
             claim_loop_max_consecutive_failures: 10,
+            claim_query_timeout_ms: 180_000,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
@@ -3567,6 +3675,7 @@ mod tests {
             batch_claim_batch_size: 1,
             batch_claim_require_live: false,
             claim_loop_max_consecutive_failures: 10,
+            claim_query_timeout_ms: 180_000,
             batch_claim_interval_ms: 10,
             model_concurrency_limits: {
                 let m = Arc::new(dashmap::DashMap::new());
