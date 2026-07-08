@@ -1,5 +1,12 @@
 # Changelog
 
+## [20.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v20.0.0...fusillade-v20.0.1) (2026-07-08)
+
+
+### Bug Fixes
+
+* daemon recovery ([#322](https://github.com/doublewordai/fusillade/issues/322)) ([48a3702](https://github.com/doublewordai/fusillade/commit/48a3702a6bb50ea2e3a1fbf2c2d0f84913d55497))
+
 ## [20.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v19.4.1...fusillade-v20.0.0) (2026-07-07)
 
 
