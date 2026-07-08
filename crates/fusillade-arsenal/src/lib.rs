@@ -113,9 +113,12 @@ pub fn is_retryable_db_error(error: &FusilladeError) -> bool {
         || message.contains("connection pool timed out")
 }
 
+/// Fusillade Arsenal database migrator.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 /// Get the Fusillade Arsenal database migrator.
 ///
 /// Returns a migrator that can be run against a PostgreSQL pool.
-pub fn migrator() -> sqlx::migrate::Migrator {
-    sqlx::migrate!("./migrations")
+pub fn migrator() -> &'static sqlx::migrate::Migrator {
+    &MIGRATOR
 }

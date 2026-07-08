@@ -23,7 +23,7 @@ async fn mark_models_live_for_test(
     manager.append_model_filter_events(&filters).await.unwrap();
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 #[test_log::test]
 async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
     // Setup: Create HTTP client with mock response
@@ -163,7 +163,7 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
     assert_eq!(calls[0].api_key, "test-key");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     // Setup: Create HTTP client with triggered responses
     let http_client = Arc::new(MockHttpClient::new());
@@ -413,7 +413,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     assert_eq!(http_client.call_count(), 5);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
     // Setup: Create HTTP client with failing responses, then success
     let http_client = Arc::new(MockHttpClient::new());
@@ -563,7 +563,7 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) {
     // Setup: Create HTTP client with triggered responses
     let http_client = Arc::new(MockHttpClient::new());
@@ -734,7 +734,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
     assert_eq!(http_client.call_count(), 10);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
     // Test that retries stop when approaching the deadline
     let http_client = Arc::new(MockHttpClient::new());
@@ -904,7 +904,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
     // Test that when neither max_retries nor stop_before_deadline_ms is set,
     // retries stop exactly at the deadline (no buffer)
@@ -1080,7 +1080,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
     // Test: When time remaining before batch expiry is below the escalation threshold,
     // requests are routed to the escalation model at claim time.
@@ -1237,7 +1237,7 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
     // escalated model's response. The model change happens at claim time in the daemon.
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgPool) {
     // Test: When there's enough time remaining (above threshold), requests use original model
 
@@ -1392,7 +1392,7 @@ mod batch_results_stream {
             .await
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_batch_results_basic(pool: sqlx::PgPool) {
         // Test: Basic batch returns all results correctly
         let http_client = Arc::new(MockHttpClient::new());
@@ -1519,7 +1519,7 @@ mod batch_results_stream {
         }
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_batch_results_deleted_file_returns_error(pool: sqlx::PgPool) {
         // Test: When batch's file is deleted, stream returns error
         let http_client = Arc::new(MockHttpClient::new());
@@ -1588,7 +1588,7 @@ mod batch_results_stream {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_output_file_streamable_after_batch_deleted(pool: sqlx::PgPool) {
         // Test: Output files can still be streamed after the batch is soft-deleted
         // This ensures users can download completed results even if the batch is deleted
@@ -1709,7 +1709,7 @@ mod batch_results_stream {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_batch_results_pagination(pool: sqlx::PgPool) {
         // Test: Pagination works correctly with offset
         let http_client = Arc::new(MockHttpClient::new());
@@ -1822,7 +1822,7 @@ mod batch_results_stream {
         assert!(offset_ids.contains(&&"req-4".to_string()));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_batch_results_status_filter(pool: sqlx::PgPool) {
         // Test: Status filter works correctly
         let http_client = Arc::new(MockHttpClient::new());
@@ -1948,7 +1948,7 @@ mod batch_results_stream {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_batch_results_search_filter(pool: sqlx::PgPool) {
         // Test: Search filter works correctly (case-insensitive)
         let http_client = Arc::new(MockHttpClient::new());
@@ -2083,7 +2083,7 @@ mod batch_results_stream {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_retry_failed_requests_for_batch_retries_all(pool: sqlx::PgPool) {
         // Test that retry_failed_requests_for_batch retries both retriable and non-retriable errors
@@ -2249,7 +2249,7 @@ mod queue_counts {
     use fusillade::request::DaemonId;
     use uuid::Uuid;
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_pending_queue_counts_by_model_and_completion_window(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = Arc::new(PostgresRequestManager::with_client(
@@ -2423,7 +2423,7 @@ mod queue_counts {
 mod service_tier {
     use super::*;
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_populate_batch_sets_service_tier(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
@@ -2514,7 +2514,7 @@ mod service_tier {
         assert_eq!(tier_24h, None);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_list_requests_filters_by_service_tier(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
@@ -2649,7 +2649,7 @@ mod unverified_volume_counts {
             .unwrap();
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_sum_owner_batch_requests_in_window(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
@@ -2709,7 +2709,7 @@ mod unverified_volume_counts {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_count_owner_flex_requests_since(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(

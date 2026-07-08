@@ -124,7 +124,7 @@ async fn fetch_any_request(
         .expect("request found")
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 #[test_log::test]
 async fn default_processor_preserves_batch_path(pool: sqlx::PgPool) {
     let http_client = Arc::new(MockHttpClient::new());
@@ -186,7 +186,7 @@ where
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 #[test_log::test]
 async fn custom_processor_is_invoked(pool: sqlx::PgPool) {
     let http_client = Arc::new(MockHttpClient::new());
@@ -272,7 +272,7 @@ where
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 #[test_log::test]
 async fn custom_processor_can_synthesize_terminal_failure(pool: sqlx::PgPool) {
     // No HTTP fixture needed — the processor never calls upstream.
