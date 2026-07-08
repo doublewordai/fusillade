@@ -440,7 +440,7 @@ impl Default for DaemonConfig {
             batch_claim_size: default_batch_claim_size(),
             batch_claim_batch_size: default_batch_claim_batch_size(),
             batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: 10,
+            claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
             batch_claim_interval_ms: default_batch_claim_interval_ms(),
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(0),
@@ -877,10 +877,7 @@ where
                         );
                         break Err(e);
                     }
-                    let backoff = claim_failure_backoff(
-                        consecutive_claim_failures,
-                        self.config.claim_interval_ms,
-                    );
+                    let backoff = claim_failure_backoff(consecutive_claim_failures, interval_ms);
                     tracing::warn!(
                         loop_name,
                         consecutive_claim_failures,
