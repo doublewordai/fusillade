@@ -877,16 +877,23 @@ where
                         );
                         break Err(e);
                     }
+                    // The top of the next iteration already sleeps interval_ms,
+                    // so only sleep the portion of the backoff beyond that —
+                    // the effective retry delay is exactly the backoff schedule.
+                    let base_interval = Duration::from_millis(interval_ms);
                     let backoff = claim_failure_backoff(consecutive_claim_failures, interval_ms);
+                    let retry_delay = base_interval.max(backoff);
+                    let backoff_sleep = retry_delay.saturating_sub(base_interval);
                     tracing::warn!(
                         loop_name,
                         consecutive_claim_failures,
-                        backoff_ms = backoff.as_millis() as u64,
+                        backoff_ms = retry_delay.as_millis() as u64,
+                        sleep_ms = backoff_sleep.as_millis() as u64,
                         error = %e,
                         "Claim failed; backing off before retry"
                     );
                     tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {},
+                        _ = tokio::time::sleep(backoff_sleep) => {},
                         _ = self.shutdown_token.cancelled() => {
                             tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
                             break Ok(());
