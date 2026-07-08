@@ -7,11 +7,9 @@
 //! attempt completing the row out from under a fresh attempt looked
 //! identical to "row was never created".
 
-use fusillade::manager::Storage;
-use fusillade::{
-    CreateRealtimeInput, FusilladeError, MockHttpClient, PostgresRequestManager, RequestId,
-    TestDbPools,
-};
+use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
+use fusillade_core::manager::Storage;
+use fusillade_core::{CreateRealtimeInput, FusilladeError, MockHttpClient, RequestId};
 use std::sync::Arc;
 use uuid::Uuid;
 

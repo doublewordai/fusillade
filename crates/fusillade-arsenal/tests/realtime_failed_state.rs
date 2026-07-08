@@ -11,10 +11,10 @@
 //! Both write branches are covered: the bulk UPDATE (a row already exists in
 //! `processing` from create_realtime) and the synthesize INSERT (no row yet).
 
-use fusillade::manager::Storage;
-use fusillade::{
+use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
+use fusillade_core::manager::Storage;
+use fusillade_core::{
     CreateRealtimeInput, FailureReason, MockHttpClient, PersistCompletedRealtimeInput,
-    PostgresRequestManager, TestDbPools,
 };
 use sqlx::Row;
 use std::sync::Arc;

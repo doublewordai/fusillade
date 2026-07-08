@@ -2,6 +2,12 @@
   "packages": {
     ".": {
       "release-type": "rust"
+    },
+    "crates/fusillade-core": {
+      "release-type": "rust"
+    },
+    "crates/fusillade-arsenal": {
+      "release-type": "rust"
     }
   }
 }

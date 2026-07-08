@@ -14,11 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use fusillade::TestDbPools;
 use fusillade::batch::{BatchInput, RequestTemplateInput};
 use fusillade::daemon::{DaemonConfig, default_should_retry};
 use fusillade::http::{HttpClient, HttpResponse, MockHttpClient};
-use fusillade::manager::postgres::PostgresRequestManager;
 use fusillade::manager::{DaemonExecutor, ModelFilter, ModelFilterState, Storage};
 use fusillade::processor::{
     CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry,
@@ -26,6 +24,7 @@ use fusillade::processor::{
 use fusillade::request::{
     AnyRequest, Claimed, Completed, Failed, Request, RequestCompletionResult,
 };
+use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
 use tokio_util::sync::CancellationToken;
 
 fn fast_test_config() -> DaemonConfig {

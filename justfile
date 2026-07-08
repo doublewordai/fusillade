@@ -26,7 +26,7 @@ db-setup:
     echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade" > .env
 
     echo "Running migrations..."
-    sqlx migrate run
+    sqlx migrate run --source crates/fusillade-arsenal/migrations
 
     echo "✅ Database setup complete!"
 

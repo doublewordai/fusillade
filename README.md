@@ -1,9 +1,12 @@
 # Fusillade
 
 A batching system for HTTP requests with retry logic and per-model concurrency
-control. Requests in their various states are stored persistently in a postgres
-database (see ./migrations/ for the schema), which is connected to with the
-[sqlx](https://github.com/launchbadge/sqlx) library.
+control. The workspace is split into three independently versioned crates:
+`fusillade-core` owns shared request, batch, daemon-record, and storage-trait
+types; `fusillade-arsenal` owns PostgreSQL storage, migrations, and database
+retry behavior; and `fusillade` owns the scheduling daemon and compatibility
+reexports. Arsenal is named for the place that holds queued rounds before the
+daemon fires them.
 
 Lists of requests can be dispatched as 'files', from which 'batches' can be
 spawned. The behaviour is inspired by the OpenAI [Batch API](https://platform.openai.com/docs/guides/batch).
@@ -24,16 +27,20 @@ states as the daemon processes them
 ### Basic Example
 
 ```rust
-use fusillade::{PostgresRequestManager, RequestTemplateInput};
+use fusillade::{DaemonConfig, RequestTemplateInput};
+use fusillade::{PostgresRequestManager, TestDbPools};
 use std::sync::Arc;
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 
 // Setup
 let pool = PgPool::connect("postgresql://localhost/fusillade").await?;
-let manager = Arc::new(PostgresRequestManager::new(pool));
+let pools = TestDbPools::new(pool).await?;
+let manager = Arc::new(PostgresRequestManager::new(pools, DaemonConfig::default()));
 
 // Start the daemon
-let daemon_handle = manager.clone().run()?;
+let shutdown_token = CancellationToken::new();
+let daemon_handle = manager.clone().run(shutdown_token.clone())?;
 
 // Create a file with request templates
 let file_id = manager.create_file(
@@ -64,21 +71,40 @@ println!("Completed: {}/{}", status.completed_requests, status.total_requests);
 Fusillade allows setting per-model concurrency limits:
 
 ```rust
-use std::collections::HashMap;
+use std::sync::Arc;
 use fusillade::DaemonConfig;
+use fusillade::{PostgresRequestManager, TestDbPools};
 
-let mut model_limits = HashMap::new();
-model_limits.insert("gpt-4".to_string(), 5);    // Max 5 concurrent GPT-4 requests
-model_limits.insert("gpt-3.5-turbo".to_string(), 20);
-
-let config = DaemonConfig {
-    model_concurrency_limits: model_limits,
+let mut config = DaemonConfig {
     max_retries: 3,
     backoff_ms: 1000,
     ..Default::default()
 };
+config.model_concurrency_limits.insert("gpt-4".to_string(), 5); // Max 5 concurrent GPT-4 requests
+config.model_concurrency_limits.insert("gpt-3.5-turbo".to_string(), 20);
 
-let manager = Arc::new(PostgresRequestManager::new(pool).with_config(config));
+let pools = TestDbPools::new(pool).await?;
+let manager = Arc::new(PostgresRequestManager::new(pools, config));
+```
+
+### Database Retry Cadence
+
+`fusillade-arsenal` can retry transient SQLx pool-acquire failures such as
+`pool timed out while waiting for an open connection`. Configure the cadence on
+the Postgres client:
+
+```rust
+use fusillade::DaemonConfig;
+use fusillade::{DbRetryConfig, PostgresRequestManager, TestDbPools};
+use std::time::Duration;
+
+let pools = TestDbPools::new(pool).await?;
+let manager = PostgresRequestManager::new(pools, DaemonConfig::default())
+    .with_db_retry_config(DbRetryConfig::new(vec![
+        Duration::from_millis(25),
+        Duration::from_millis(100),
+        Duration::from_millis(250),
+    ]));
 ```
 
 ### Tracking Requests
@@ -151,5 +177,5 @@ Configuration (all optional):
 Run migrations before first use, by importing the migrator and executing it against your database pool:
 
 ```rust
-fusillade::migrator().run(&pool).await?;
+fusillade_arsenal::migrator().run(&pool).await?;
 ```

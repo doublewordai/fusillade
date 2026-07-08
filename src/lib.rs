@@ -6,41 +6,32 @@
 //!
 //! Batching system with PostgreSQL storage and background daemon for processing requests.
 
-pub mod batch;
 pub mod bg_errors;
 pub mod daemon;
-pub mod error;
-pub mod http;
 pub mod manager;
-pub mod processor;
-pub mod request;
-pub mod response_step;
-// TRANSITIONAL: ZDR response-body hook; remove when stream reassembly moves to dwctl.
-pub mod transform;
+
+pub use fusillade_core::{batch, error, http, processor, request, response_step, transform};
 
 // Re-export commonly used types
-pub use batch::*;
 pub use daemon::{Daemon, DaemonConfig, ModelEscalationConfig};
-pub use error::{FusilladeError, Result};
-pub use http::{
+#[cfg(feature = "postgres")]
+pub use fusillade_arsenal::{
+    BatchInsertStrategy, DbRetryConfig, PoolProvider, PostgresRequestManager,
+    PostgresResponseStepManager, TestDbPools, is_retryable_db_error, migrator,
+    retry_transient_db_errors,
+};
+pub use fusillade_core::batch::*;
+pub use fusillade_core::error::{FusilladeError, Result};
+pub use fusillade_core::http::{
     HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient, StreamEvent, StreamEventCallback,
     StreamReassembler,
 };
-pub use manager::postgres::{PoolProvider, PostgresRequestManager, TestDbPools};
-#[cfg(feature = "postgres")]
-pub use manager::response_step::PostgresResponseStepManager;
-pub use manager::{DaemonExecutor, ModelFilter, ModelFilterState, Storage};
-pub use processor::{CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry};
-pub use request::*;
-pub use response_step::{
+pub use fusillade_core::processor::{
+    CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry,
+};
+pub use fusillade_core::request::*;
+pub use fusillade_core::response_step::{
     CreateStepInput, ResponseStep, ResponseStepStore, StepId, StepKind, StepState,
 };
-pub use transform::ResponseTransformer;
-
-/// Get the fusillade database migrator
-///
-/// Returns a migrator that can be run against a connection pool.
-#[cfg(feature = "postgres")]
-pub fn migrator() -> sqlx::migrate::Migrator {
-    sqlx::migrate!("./migrations")
-}
+pub use fusillade_core::transform::ResponseTransformer;
+pub use manager::{DaemonExecutor, DaemonStorage, ModelFilter, ModelFilterState, Storage};

@@ -1,11 +1,12 @@
-//! PostgreSQL implementation of Storage and DaemonExecutor.
+//! PostgreSQL implementation of Fusillade storage.
 //!
-//! This implementation combines PostgreSQL storage with the daemon to provide
-//! a production-ready batching system with persistent storage and real-time updates.
+//! This implementation provides persistent storage and real-time updates. The
+//! scheduling daemon lives in the `fusillade` crate.
 
 use crate::request::AnyRequest;
 use futures::StreamExt;
 pub use sqlx_pool_router::{PoolProvider, TestDbPools};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -18,7 +19,6 @@ use sqlx::Row;
 use sqlx::postgres::{PgListener, PgPool};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
@@ -30,8 +30,8 @@ use crate::batch::{
     RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{
-    AnyDaemonRecord, Daemon, DaemonConfig, DaemonData, DaemonRecord, DaemonState, DaemonStatus,
-    Dead, Initializing, Running,
+    AnyDaemonRecord, DaemonConfig, DaemonData, DaemonRecord, DaemonState, DaemonStatus, Dead,
+    Initializing, Running,
 };
 use crate::error::{FusilladeError, Result};
 use crate::http::HttpClient;
@@ -41,7 +41,6 @@ use crate::request::{
     Request, RequestData, RequestId, RequestState, ServiceTierFilter,
 };
 
-use super::DaemonExecutor;
 use super::utils::{
     calculate_error_message_size, calculate_response_body_size, estimate_error_file_size,
     estimate_output_file_size,
@@ -129,6 +128,7 @@ pub struct PostgresRequestManager<P: PoolProvider, H: HttpClient> {
     pools: P,
     http_client: Arc<H>,
     config: DaemonConfig,
+    db_retry_config: crate::DbRetryConfig,
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
     /// Optional override for the daemon's per-claim processor. `None` uses
@@ -262,6 +262,7 @@ impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> 
             pools,
             http_client,
             config,
+            db_retry_config: crate::DbRetryConfig::default(),
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             processor: std::sync::OnceLock::new(),
@@ -288,6 +289,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
             pools,
             http_client,
             config: DaemonConfig::default(),
+            db_retry_config: crate::DbRetryConfig::default(),
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             processor: std::sync::OnceLock::new(),
@@ -349,6 +351,39 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     pub fn with_config(mut self, config: DaemonConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Set the retry cadence for transient database failures.
+    ///
+    /// The manager retries errors that look like SQLx pool-acquire timeouts,
+    /// including "pool timed out while waiting for an open connection".
+    pub fn with_db_retry_config(mut self, config: crate::DbRetryConfig) -> Self {
+        self.db_retry_config = config;
+        self
+    }
+
+    pub fn db_retry_config(&self) -> &crate::DbRetryConfig {
+        &self.db_retry_config
+    }
+
+    pub fn http_client(&self) -> &Arc<H> {
+        &self.http_client
+    }
+
+    pub fn config(&self) -> &DaemonConfig {
+        &self.config
+    }
+
+    pub fn processor(&self) -> Option<&Arc<dyn crate::processor::RequestProcessor<Self, H>>> {
+        self.processor.get()
+    }
+
+    async fn retry_db_operation<T, Op, Fut>(&self, operation: Op) -> Result<T>
+    where
+        Op: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        crate::retry_transient_db_errors(&self.db_retry_config, operation).await
     }
 
     fn pending_counts_statement_timeout_ms(&self) -> i64 {
@@ -528,9 +563,12 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// This returns a PgListener that can be used to receive notifications
     /// when requests are updated. Uses the write pool (primary) for consistency.
     pub async fn create_listener(&self) -> Result<PgListener> {
-        PgListener::connect_with(self.pools.write())
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e)))
+        self.retry_db_operation(|| async {
+            PgListener::connect_with(self.pools.write())
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e)))
+        })
+        .await
     }
 }
 
@@ -2837,28 +2875,34 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn get_file(&self, file_id: FileId) -> Result<File> {
-        let mut file = self.get_file_from_pool(file_id, self.pools.read()).await?;
+        self.retry_db_operation(|| async {
+            let mut file = self.get_file_from_pool(file_id, self.pools.read()).await?;
 
-        // Check and mark as expired if needed (passive expiration)
-        self.check_and_mark_expired(&mut file).await?;
+            // Check and mark as expired if needed (passive expiration)
+            self.check_and_mark_expired(&mut file).await?;
 
-        // Try to finalize size for virtual output/error files. Uses cached value once finalized
-        self.maybe_finalize_file_size(&mut file).await?;
+            // Try to finalize size for virtual output/error files. Uses cached value once finalized
+            self.maybe_finalize_file_size(&mut file).await?;
 
-        Ok(file)
+            Ok(file)
+        })
+        .await
     }
 
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn get_file_from_primary_pool(&self, file_id: FileId) -> Result<File> {
-        let mut file = self.get_file_from_pool(file_id, self.pools.write()).await?;
+        self.retry_db_operation(|| async {
+            let mut file = self.get_file_from_pool(file_id, self.pools.write()).await?;
 
-        // Check and mark as expired if needed (passive expiration)
-        self.check_and_mark_expired(&mut file).await?;
+            // Check and mark as expired if needed (passive expiration)
+            self.check_and_mark_expired(&mut file).await?;
 
-        // Try to finalize size for virtual output/error files. Uses cached value once finalized
-        self.maybe_finalize_file_size(&mut file).await?;
+            // Try to finalize size for virtual output/error files. Uses cached value once finalized
+            self.maybe_finalize_file_size(&mut file).await?;
 
-        Ok(file)
+            Ok(file)
+        })
+        .await
     }
 
     async fn get_file_content(&self, file_id: FileId) -> Result<Vec<FileContentItem>> {
@@ -3542,13 +3586,17 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 
     #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
-        self.get_batch_from_pool(batch_id, self.pools.read()).await
+        self.retry_db_operation(|| async {
+            self.get_batch_from_pool(batch_id, self.pools.read()).await
+        })
+        .await
     }
 
     #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn get_batch_status(&self, batch_id: BatchId) -> Result<BatchStatus> {
-        let mut query_builder = QueryBuilder::new(
-            r#"
+        self.retry_db_operation(|| async {
+            let mut query_builder = QueryBuilder::new(
+                r#"
             SELECT
                 b.id as batch_id,
                 b.file_id,
@@ -3575,18 +3623,22 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
                 WHERE batch_id = b.id
             ) counts ON TRUE
             WHERE b.id = "#,
-        );
-        query_builder.push_bind(*batch_id as Uuid);
-        query_builder.push(" AND b.deleted_at IS NULL");
+            );
+            query_builder.push_bind(*batch_id as Uuid);
+            query_builder.push(" AND b.deleted_at IS NULL");
 
-        let row = query_builder
-            .build()
-            .fetch_optional(self.pools.read())
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch status: {}", e)))?
-            .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+            let row = query_builder
+                .build()
+                .fetch_optional(self.pools.read())
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to fetch batch status: {}", e))
+                })?
+                .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
 
-        Ok(batch_status_from_dynamic_row!(row))
+            Ok(batch_status_from_dynamic_row!(row))
+        })
+        .await
     }
 
     async fn get_batch_by_output_file_id(
@@ -6646,45 +6698,6 @@ impl<P: PoolProvider, H: HttpClient> DaemonStorage for PostgresRequestManager<P,
         }
 
         Ok(deleted)
-    }
-}
-
-// Implement DaemonExecutor trait
-#[async_trait]
-impl<P: PoolProvider, H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<P, H> {
-    fn http_client(&self) -> &Arc<H> {
-        &self.http_client
-    }
-
-    fn config(&self) -> &DaemonConfig {
-        &self.config
-    }
-
-    fn run(
-        self: Arc<Self>,
-        shutdown_token: tokio_util::sync::CancellationToken,
-    ) -> Result<JoinHandle<Result<()>>> {
-        tracing::info!("Starting PostgreSQL request manager daemon");
-
-        let mut daemon = Daemon::new(
-            self.clone(),
-            self.http_client.clone(),
-            self.config.clone(),
-            shutdown_token,
-        );
-        if let Some(processor) = self.processor.get().cloned() {
-            daemon = daemon.with_processor(processor);
-        }
-        let daemon = Arc::new(daemon);
-
-        let handle = tokio::spawn(async move {
-            // Daemon will poll for cancelled batches periodically
-            daemon.run().await
-        });
-
-        tracing::info!("Daemon spawned successfully");
-
-        Ok(handle)
     }
 }
 
@@ -11620,7 +11633,8 @@ mod tests {
         assert_eq!(content.len(), 0);
     }
 
-    /// Helper to poll for a condition with timeout
+    /// Helper to poll for a condition with timeout.
+    #[cfg(any())]
     async fn wait_for<F, Fut>(mut check: F, timeout: std::time::Duration) -> bool
     where
         F: FnMut() -> Fut,
@@ -11636,6 +11650,9 @@ mod tests {
         false
     }
 
+    // Daemon cancellation coverage lives in the root `fusillade` integration
+    // tests now that Arsenal no longer depends on the daemon crate.
+    #[cfg(any())]
     #[sqlx::test]
     async fn test_batch_cancellation_with_stream(pool: sqlx::PgPool) {
         use crate::http::HttpResponse;

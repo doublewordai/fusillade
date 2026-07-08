@@ -1,10 +1,9 @@
-use fusillade::TestDbPools;
 use fusillade::batch::{BatchInput, RequestTemplateInput};
 use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retry};
 use fusillade::http::{HttpResponse, MockHttpClient};
-use fusillade::manager::postgres::PostgresRequestManager;
 use fusillade::manager::{DaemonExecutor, ModelFilter, ModelFilterState, Storage};
 use fusillade::request::{ListRequestsFilter, ServiceTierFilter};
+use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
 use std::sync::Arc;
 use std::time::Duration;
 
