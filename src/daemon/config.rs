@@ -111,11 +111,11 @@ pub struct DaemonConfig {
     pub batch_claim_interval_ms: u64,
     #[serde(default = "default_claim_loop_max_consecutive_failures")]
     pub claim_loop_max_consecutive_failures: u32,
-    /// Upper bound on a single claim-cycle database query, in milliseconds.
+    /// Upper bound on the daemon's periodic database queries, in milliseconds.
     ///
-    /// This bounds silently severed database connections so the claim loop can
-    /// surface a transient failure and retry on a fresh connection instead of
-    /// waiting for TCP keepalive.
+    /// This bounds silently severed database connections so claim, heartbeat,
+    /// cancellation poll, and purge loops can surface a transient failure and
+    /// continue on a fresh connection instead of waiting for TCP keepalive.
     #[serde(default = "default_claim_query_timeout_ms")]
     pub claim_query_timeout_ms: u64,
     pub max_retries: Option<u32>,
