@@ -3,7 +3,7 @@ use fusillade::batch::{BatchInput, RequestTemplateInput};
 use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retry};
 use fusillade::http::{HttpResponse, MockHttpClient};
 use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
-use fusillade::request::{ListRequestsFilter, ServiceTierFilter};
+use fusillade::request::{Failed, ListRequestsFilter, Request, ServiceTierFilter};
 use fusillade_arsenal::{PostgresRequestManager as PostgresStore, TestDbPools};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +38,34 @@ async fn mark_models_live_for_test(manager: &PostgresStore<TestDbPools>, models:
         .collect();
 
     manager.append_model_filter_events(&filters).await.unwrap();
+}
+
+fn retry_backoff_ms(config: &DaemonConfig, retry_attempt: u32) -> i64 {
+    config
+        .backoff_ms
+        .saturating_mul(config.backoff_factor.saturating_pow(retry_attempt))
+        .min(config.max_backoff_ms) as i64
+}
+
+fn assert_next_retry_would_cross_effective_deadline(
+    failed: &Request<Failed>,
+    config: &DaemonConfig,
+) {
+    let effective_deadline = match config.stop_before_deadline_ms {
+        Some(stop_before_deadline_ms) => {
+            failed.state.batch_expires_at - chrono::Duration::milliseconds(stop_before_deadline_ms)
+        }
+        None => failed.state.batch_expires_at,
+    };
+    let next_retry_at = failed.state.failed_at
+        + chrono::Duration::milliseconds(retry_backoff_ms(config, failed.state.retry_attempt));
+
+    assert!(
+        next_retry_at >= effective_deadline,
+        "expected terminal failure because the next retry at {next_retry_at} would cross effective deadline {effective_deadline}; failed_at={}, retry_attempt={}",
+        failed.state.failed_at,
+        failed.state.retry_attempt
+    );
 }
 
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
@@ -805,7 +833,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
 
     // Start the daemon
     let shutdown_token = CancellationToken::new();
-    postgres_daemon(manager.clone(), http_client.clone(), config)
+    postgres_daemon(manager.clone(), http_client.clone(), config.clone())
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -835,36 +863,20 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
     let results = results.expect("Request should have reached terminal state within timeout");
 
     if let Some(Ok(fusillade::AnyRequest::Failed(failed))) = results.first() {
-        // Calculate expected retry attempts:
-        // - Completion window: 2000ms
-        // - Buffer: 500ms
-        // - Effective deadline: 1500ms
-        // - Backoff sequence: 50ms, 100ms, 200ms, 200ms, 200ms, 200ms, 200ms
-        // - Timeline:
-        //   - Initial attempt: t=0ms (attempt 0)
-        //   - Retry 1: t=50ms (attempt 1)
-        //   - Retry 2: t=150ms (attempt 2)
-        //   - Retry 3: t=350ms (attempt 3)
-        //   - Retry 4: t=550ms (attempt 4)
-        //   - Retry 5: t=750ms (attempt 5)
-        //   - Retry 6: t=950ms (attempt 6)
-        //   - Retry 7: t=1150ms (attempt 7)
-        //   - Retry 8: t=1350ms (attempt 8)
-        //   - Next would be t=1550ms - EXCEEDS 1500ms deadline
-        // Expected: 8 retry attempts (9 total including initial)
-
         let retry_count = failed.state.retry_attempt;
         let call_count = http_client.call_count();
 
-        // 1. Verify we stopped before too many retries (deadline constraint)
-        // Allow 7-9 attempts to account for timing variations in test execution
+        // Verify the daemon stopped because another retry would cross the
+        // configured effective deadline. Absolute attempt counts vary under CI
+        // load because DB and task scheduling overhead consume the same window.
+        assert_next_retry_would_cross_effective_deadline(failed, &config);
         assert!(
-            (7..=9).contains(&retry_count),
-            "Expected 7-9 retry attempts based on deadline and backoff calculation, got {}",
+            retry_count > 0,
+            "Expected at least one retry attempt before the buffered deadline, got {}",
             retry_count
         );
 
-        // 2. Verify HTTP call count matches retry attempts (1 initial + N retries)
+        // Verify HTTP call count matches retry attempts (1 initial + N retries)
         assert_eq!(
             call_count,
             (retry_count + 1) as usize,
@@ -873,7 +885,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
             retry_count
         );
 
-        // 3. Verify the request actually has error details from the last attempt
+        // Verify the request actually has error details from the last attempt
         assert!(
             !failed.state.reason.to_error_message().is_empty(),
             "Expected failed request to have failure reason"
@@ -969,7 +981,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
 
     // Start the daemon
     let shutdown_token = CancellationToken::new();
-    postgres_daemon(manager.clone(), http_client.clone(), config)
+    postgres_daemon(manager.clone(), http_client.clone(), config.clone())
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -999,41 +1011,20 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
     let results = results.expect("Request should have reached terminal state within timeout");
 
     if let Some(Ok(fusillade::AnyRequest::Failed(failed))) = results.first() {
-        // Calculate expected retry attempts with NO buffer:
-        // - Completion window: 2000ms
-        // - Buffer: 0ms (none set)
-        // - Effective deadline: 2000ms
-        // - Backoff sequence: 50ms, 100ms, 200ms, 200ms, 200ms...
-        // - Timeline:
-        //   - Initial attempt: t=0ms (attempt 0)
-        //   - Retry 1: t=50ms (attempt 1)
-        //   - Retry 2: t=150ms (attempt 2)
-        //   - Retry 3: t=350ms (attempt 3)
-        //   - Retry 4: t=550ms (attempt 4)
-        //   - Retry 5: t=750ms (attempt 5)
-        //   - Retry 6: t=950ms (attempt 6)
-        //   - Retry 7: t=1150ms (attempt 7)
-        //   - Retry 8: t=1350ms (attempt 8)
-        //   - Retry 9: t=1550ms (attempt 9)
-        //   - Retry 10: t=1750ms (attempt 10)
-        //   - Retry 11: t=1950ms (attempt 11)
-        //   - Next would be t=2150ms - EXCEEDS 2000ms deadline
-        // Expected: ~11 retry attempts (12 total including initial)
-        // In reality, we will see <11 due to DB calls and CPU overhead in making requests
-
         let retry_count = failed.state.retry_attempt;
         let call_count = http_client.call_count();
 
-        // 1. Verify we retried more than the buffered case (which stopped at ~8)
-        //    but still stopped before too many attempts
-        // Allow 9-12 attempts to account for timing variations with CI slower CI CPUs
+        // Verify retries continue until the actual deadline when no buffer is
+        // configured. Avoid asserting an exact attempt count; CI overhead changes
+        // how many backoff cycles fit inside a two-second completion window.
+        assert_next_retry_would_cross_effective_deadline(failed, &config);
         assert!(
-            (9..12).contains(&retry_count),
-            "Expected 9-12 retry attempts (should retry until deadline with no buffer), got {}",
+            retry_count > 0,
+            "Expected at least one retry attempt before the deadline, got {}",
             retry_count
         );
 
-        // 2. Verify HTTP call count matches retry attempts (1 initial + N retries)
+        // Verify HTTP call count matches retry attempts (1 initial + N retries)
         assert_eq!(
             call_count,
             (retry_count + 1) as usize,
@@ -1042,7 +1033,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
             retry_count
         );
 
-        // 3. Verify the request has error details from the last attempt
+        // Verify the request has error details from the last attempt
         assert!(
             !failed.state.reason.to_error_message().is_empty(),
             "Expected failed request to have failure reason"
