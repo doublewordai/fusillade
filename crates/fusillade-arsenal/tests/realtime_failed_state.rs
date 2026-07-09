@@ -18,7 +18,7 @@ use sqlx::Row;
 use std::sync::Arc;
 use uuid::Uuid;
 
-async fn manager(pool: sqlx::PgPool) -> Arc<PostgresRequestManager<TestDbPools, ()>> {
+async fn manager(pool: sqlx::PgPool) -> Arc<PostgresRequestManager<TestDbPools>> {
     Arc::new(PostgresRequestManager::with_client(
         TestDbPools::new(pool).await.unwrap(),
         Arc::new(()),

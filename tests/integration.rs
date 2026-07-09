@@ -1,16 +1,33 @@
+use fusillade::PostgresDaemon;
 use fusillade::batch::{BatchInput, RequestTemplateInput};
 use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retry};
 use fusillade::http::{HttpResponse, MockHttpClient};
-use fusillade::manager::{DaemonExecutor, ModelFilter, ModelFilterState, Storage};
+use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
 use fusillade::request::{ListRequestsFilter, ServiceTierFilter};
-use fusillade::{PostgresRequestManager, TestDbPools};
+use fusillade_arsenal::{PostgresRequestManager as PostgresStore, TestDbPools};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
-async fn mark_models_live_for_test(
-    manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
-    models: &[&str],
-) {
+type TestStore = PostgresStore<TestDbPools>;
+type TestDaemon = PostgresDaemon<TestDbPools, MockHttpClient>;
+
+async fn postgres_store(pool: sqlx::PgPool, config: &DaemonConfig) -> Arc<TestStore> {
+    Arc::new(PostgresStore::new(
+        TestDbPools::new(pool).await.unwrap(),
+        config.into(),
+    ))
+}
+
+fn postgres_daemon(
+    store: Arc<TestStore>,
+    http_client: Arc<MockHttpClient>,
+    config: DaemonConfig,
+) -> Arc<TestDaemon> {
+    Arc::new(PostgresDaemon::new(store, http_client, config))
+}
+
+async fn mark_models_live_for_test(manager: &PostgresStore<TestDbPools>, models: &[&str]) {
     let filters: Vec<ModelFilter> = models
         .iter()
         .map(|model| ModelFilter {
@@ -59,13 +76,7 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Setup: Create a file and batch to associate with our request
     let file_id = manager
@@ -109,9 +120,8 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
     let request_id = requests[0].id();
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -228,13 +238,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Setup: Create a file with 5 templates, all using "gpt-4"
     let file_id = manager
@@ -308,9 +312,8 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -468,13 +471,7 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Setup: Create a file and batch
     let file_id = manager
@@ -517,9 +514,8 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
     let request_id = requests[0].id();
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -603,13 +599,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Setup: Create a file with 10 requests, all using "gpt-4"
     let templates: Vec<_> = (1..=10)
@@ -649,9 +639,8 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
     mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -773,13 +762,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Create a batch with a very short completion window (2 seconds)
     let file_id = manager
@@ -821,9 +804,8 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
     let request_id = requests[0].id();
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -944,13 +926,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Create a batch with a 2 second completion window
     let file_id = manager
@@ -992,9 +968,8 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
     let request_id = requests[0].id();
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -1131,13 +1106,7 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Create a file with a request using gpt-4
     let file_id = manager
@@ -1181,9 +1150,8 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
     let request_id = requests[0].id();
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -1285,13 +1253,7 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     let file_id = manager
         .create_file(
@@ -1332,9 +1294,8 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
         .expect("Failed to get batch requests");
     let request_id = requests[0].id();
 
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -1382,7 +1343,7 @@ mod batch_results_stream {
 
     /// Helper to collect all results from a batch results stream
     async fn collect_batch_results(
-        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        manager: &PostgresStore<TestDbPools>,
         batch_id: fusillade::batch::BatchId,
     ) -> Vec<fusillade::batch::BatchResultItem> {
         let stream = manager.get_batch_results_stream(batch_id, 0, None, None);
@@ -1421,13 +1382,7 @@ mod batch_results_stream {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         // Create file with 2 templates
         let file_id = manager
@@ -1474,9 +1429,8 @@ mod batch_results_stream {
         mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
         // Run daemon to complete requests
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
@@ -1524,7 +1478,7 @@ mod batch_results_stream {
         // Test: When batch's file is deleted, stream returns error
         let http_client = Arc::new(MockHttpClient::new());
 
-        let manager = Arc::new(PostgresRequestManager::with_client(
+        let manager = Arc::new(PostgresStore::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             http_client,
         ));
@@ -1611,13 +1565,7 @@ mod batch_results_stream {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         let file_id = manager
             .create_file(
@@ -1652,9 +1600,8 @@ mod batch_results_stream {
         mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
         // Run daemon to process the request
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
@@ -1735,13 +1682,7 @@ mod batch_results_stream {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         // Create file with 5 templates
         let templates: Vec<_> = (0..5)
@@ -1777,9 +1718,8 @@ mod batch_results_stream {
         mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
         // Run daemon
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
@@ -1861,13 +1801,7 @@ mod batch_results_stream {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         let templates: Vec<_> = (0..3)
             .map(|i| RequestTemplateInput {
@@ -1901,9 +1835,8 @@ mod batch_results_stream {
             .expect("Failed to create batch");
         mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
@@ -1973,13 +1906,7 @@ mod batch_results_stream {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         let file_id = manager
             .create_file(
@@ -2033,9 +1960,8 @@ mod batch_results_stream {
             .expect("Failed to create batch");
         mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
@@ -2143,13 +2069,7 @@ mod batch_results_stream {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         let templates = (0..4)
             .map(|i| fusillade::RequestTemplateInput {
@@ -2183,9 +2103,8 @@ mod batch_results_stream {
             .expect("Failed to create batch");
         mark_models_live_for_test(manager.as_ref(), &["test-model"]).await;
 
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
@@ -2252,7 +2171,7 @@ mod queue_counts {
     #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_pending_queue_counts_by_model_and_completion_window(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = Arc::new(PostgresRequestManager::with_client(
+        let manager = Arc::new(PostgresStore::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             http_client,
         ));
@@ -2426,7 +2345,6 @@ mod service_tier {
     #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_populate_batch_sets_service_tier(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
         let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
         model_concurrency_limits.insert("test-model".to_string(), 10);
 
@@ -2437,13 +2355,7 @@ mod service_tier {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         let template = RequestTemplateInput {
             custom_id: None,
@@ -2517,7 +2429,6 @@ mod service_tier {
     #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_list_requests_filters_by_service_tier(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
         let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
         model_concurrency_limits.insert("test-model".to_string(), 10);
 
@@ -2528,13 +2439,7 @@ mod service_tier {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         // list_requests is scoped to batchless responses, so create one of
         // each tier via the batchless insert methods.
@@ -2594,7 +2499,7 @@ mod unverified_volume_counts {
     /// templated requests. The batch-status trigger sets `total_requests` to `n`
     /// as the requests are populated.
     async fn seed_batch(
-        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        manager: &PostgresStore<TestDbPools>,
         creditor: &str,
         completion_window: &str,
         n: usize,
@@ -2633,10 +2538,7 @@ mod unverified_volume_counts {
             .unwrap();
     }
 
-    async fn seed_flex(
-        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
-        creditor: &str,
-    ) {
+    async fn seed_flex(manager: &PostgresStore<TestDbPools>, creditor: &str) {
         manager
             .create_flex(fusillade::CreateFlexInput {
                 request_id: uuid::Uuid::new_v4(),
@@ -2655,7 +2557,7 @@ mod unverified_volume_counts {
     #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_sum_owner_batch_requests_in_window(pool: sqlx::PgPool) {
-        let manager = PostgresRequestManager::with_client(
+        let manager = PostgresStore::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         );
@@ -2715,7 +2617,7 @@ mod unverified_volume_counts {
     #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_count_owner_flex_requests_since(pool: sqlx::PgPool) {
-        let manager = PostgresRequestManager::with_client(
+        let manager = PostgresStore::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         );

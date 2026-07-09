@@ -71,3 +71,30 @@ fn daemon_modes_stay_on_root_crate_and_db_retries_stay_in_arsenal() {
         "database retry configuration should remain owned by fusillade-arsenal"
     );
 }
+
+#[test]
+fn root_crate_exposes_postgres_daemon_not_postgres_store() {
+    let root = include_str!("../src/lib.rs");
+    let manager = include_str!("../src/manager/mod.rs");
+
+    assert!(
+        root.contains("PostgresDaemon") || manager.contains("PostgresDaemon"),
+        "the root crate should expose the postgres scheduling runtime"
+    );
+    assert!(
+        !root.contains("PostgresRequestManager")
+            && !manager.contains("pub use postgres::PostgresRequestManager"),
+        "the reusable postgres store should be imported from fusillade-arsenal, not re-exported by the root daemon crate"
+    );
+    for db_only_export in [
+        "DbRetryConfig",
+        "PostgresStorageConfig",
+        "TestDbPools",
+        "migrator",
+    ] {
+        assert!(
+            !root.contains(db_only_export),
+            "{db_only_export} should stay on fusillade-arsenal instead of the root daemon crate"
+        );
+    }
+}

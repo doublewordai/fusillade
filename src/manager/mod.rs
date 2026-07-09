@@ -11,7 +11,7 @@ use crate::http::HttpClient;
 #[cfg(feature = "postgres")]
 mod postgres;
 #[cfg(feature = "postgres")]
-pub use postgres::PostgresRequestManager;
+pub use postgres::PostgresDaemon;
 
 pub use fusillade_core::manager::{DaemonStorage, ModelFilter, ModelFilterState, Storage};
 
@@ -43,45 +43,4 @@ pub trait DaemonExecutor<H: HttpClient>: Send + Sync {
         shutdown_token: tokio_util::sync::CancellationToken,
         mode: crate::daemon::DaemonMode,
     ) -> Result<JoinHandle<Result<()>>>;
-}
-
-#[cfg(feature = "postgres")]
-#[async_trait]
-impl<P, H> DaemonExecutor<H> for PostgresRequestManager<P, H>
-where
-    P: fusillade_arsenal::PoolProvider,
-    H: HttpClient + 'static,
-{
-    fn http_client(&self) -> &Arc<H> {
-        self.http_client()
-    }
-
-    fn config(&self) -> &crate::daemon::DaemonConfig {
-        self.config()
-    }
-
-    fn run_with_mode(
-        self: Arc<Self>,
-        shutdown_token: tokio_util::sync::CancellationToken,
-        mode: crate::daemon::DaemonMode,
-    ) -> Result<JoinHandle<Result<()>>> {
-        tracing::info!(?mode, "Starting PostgreSQL request manager daemon");
-
-        let mut daemon = crate::daemon::Daemon::new(
-            self.storage().clone(),
-            self.http_client().clone(),
-            self.config().clone(),
-            shutdown_token,
-        );
-        if let Some(processor) = self.processor().cloned() {
-            daemon = daemon.with_processor(processor);
-        }
-        let daemon = Arc::new(daemon);
-
-        let handle = tokio::spawn(async move { daemon.run_with_mode(mode).await });
-
-        tracing::info!("Daemon spawned successfully");
-
-        Ok(handle)
-    }
 }

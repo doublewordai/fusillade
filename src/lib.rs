@@ -17,11 +17,6 @@ pub use fusillade_core::{batch, error, request, response_step};
 
 // Re-export commonly used types
 pub use daemon::{Daemon, DaemonConfig, DaemonMode, ModelEscalationConfig};
-#[cfg(feature = "postgres")]
-pub use fusillade_arsenal::{
-    BatchInsertStrategy, DbRetryConfig, PoolProvider, PostgresResponseStepManager,
-    PostgresStorageConfig, TestDbPools, is_retryable_db_error, migrator, retry_transient_db_errors,
-};
 pub use fusillade_core::batch::*;
 pub use fusillade_core::error::{FusilladeError, Result};
 pub use fusillade_core::request::*;
@@ -33,7 +28,9 @@ pub use http::{
     StreamReassembler,
 };
 #[cfg(feature = "postgres")]
-pub use manager::PostgresRequestManager;
-pub use manager::{DaemonExecutor, DaemonStorage, ModelFilter, ModelFilterState, Storage};
+pub use manager::DaemonExecutor;
+#[cfg(feature = "postgres")]
+pub use manager::PostgresDaemon;
+pub use manager::{DaemonStorage, ModelFilter, ModelFilterState, Storage};
 pub use processor::{CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry};
 pub use transform::ResponseTransformer;

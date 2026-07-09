@@ -14,18 +14,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use fusillade::PostgresDaemon;
 use fusillade::batch::{BatchInput, RequestTemplateInput};
 use fusillade::daemon::{DaemonConfig, default_should_retry};
 use fusillade::http::{HttpClient, HttpResponse, MockHttpClient};
-use fusillade::manager::{DaemonExecutor, ModelFilter, ModelFilterState, Storage};
+use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
 use fusillade::processor::{
     CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry,
 };
 use fusillade::request::{
     AnyRequest, Claimed, Completed, Failed, Request, RequestCompletionResult,
 };
-use fusillade::{PostgresRequestManager, TestDbPools};
+use fusillade_arsenal::{PostgresRequestManager as PostgresStore, TestDbPools};
 use tokio_util::sync::CancellationToken;
+
+type TestStore = PostgresStore<TestDbPools>;
+type TestDaemon = PostgresDaemon<TestDbPools, MockHttpClient>;
 
 fn fast_test_config() -> DaemonConfig {
     let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
@@ -48,9 +52,7 @@ fn fast_test_config() -> DaemonConfig {
     }
 }
 
-async fn submit_one_request(
-    manager: &Arc<PostgresRequestManager<TestDbPools, MockHttpClient>>,
-) -> fusillade::request::RequestId {
+async fn submit_one_request(manager: &Arc<TestStore>) -> fusillade::request::RequestId {
     let template = RequestTemplateInput {
         custom_id: None,
         endpoint: "http://upstream".into(),
@@ -89,10 +91,7 @@ async fn submit_one_request(
     requests[0].id()
 }
 
-async fn wait_until_completed(
-    manager: &Arc<PostgresRequestManager<TestDbPools, MockHttpClient>>,
-    request_id: fusillade::request::RequestId,
-) {
+async fn wait_until_completed(manager: &Arc<TestStore>, request_id: fusillade::request::RequestId) {
     let start = std::time::Instant::now();
     loop {
         let req = fetch_any_request(manager, request_id).await;
@@ -111,7 +110,7 @@ async fn wait_until_completed(
 }
 
 async fn fetch_any_request(
-    manager: &Arc<PostgresRequestManager<TestDbPools, MockHttpClient>>,
+    manager: &Arc<TestStore>,
     request_id: fusillade::request::RequestId,
 ) -> AnyRequest {
     manager
@@ -122,6 +121,21 @@ async fn fetch_any_request(
         .next()
         .expect("one result")
         .expect("request found")
+}
+
+async fn postgres_store(pool: sqlx::PgPool, config: &DaemonConfig) -> Arc<TestStore> {
+    Arc::new(PostgresStore::new(
+        TestDbPools::new(pool).await.unwrap(),
+        config.into(),
+    ))
+}
+
+fn postgres_daemon(
+    store: Arc<TestStore>,
+    http_client: Arc<MockHttpClient>,
+    config: DaemonConfig,
+) -> TestDaemon {
+    PostgresDaemon::new(store, http_client, config)
 }
 
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
@@ -137,14 +151,14 @@ async fn default_processor_preserves_batch_path(pool: sqlx::PgPool) {
     );
 
     let shutdown_token = CancellationToken::new();
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(fast_test_config()),
-    );
-    let _handle = manager.clone().run(shutdown_token.clone()).unwrap();
+    let config = fast_test_config();
+    let manager = postgres_store(pool, &config).await;
+    let daemon = Arc::new(postgres_daemon(
+        manager.clone(),
+        http_client.clone(),
+        config,
+    ));
+    let _handle = daemon.run(shutdown_token.clone()).unwrap();
 
     let request_id = submit_one_request(&manager).await;
     wait_until_completed(&manager, request_id).await;
@@ -205,15 +219,12 @@ async fn custom_processor_is_invoked(pool: sqlx::PgPool) {
     });
 
     let shutdown_token = CancellationToken::new();
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(fast_test_config())
-        .with_processor(processor),
+    let config = fast_test_config();
+    let manager = postgres_store(pool, &config).await;
+    let daemon = Arc::new(
+        postgres_daemon(manager.clone(), http_client.clone(), config).with_processor(processor),
     );
-    let _handle = manager.clone().run(shutdown_token.clone()).unwrap();
+    let _handle = daemon.run(shutdown_token.clone()).unwrap();
 
     let request_id = submit_one_request(&manager).await;
     wait_until_completed(&manager, request_id).await;
@@ -279,15 +290,13 @@ async fn custom_processor_can_synthesize_terminal_failure(pool: sqlx::PgPool) {
     let http_client = Arc::new(MockHttpClient::new());
 
     let shutdown_token = CancellationToken::new();
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(fast_test_config())
-        .with_processor(Arc::new(AlwaysFailProcessor)),
+    let config = fast_test_config();
+    let manager = postgres_store(pool, &config).await;
+    let daemon = Arc::new(
+        postgres_daemon(manager.clone(), http_client.clone(), config)
+            .with_processor(Arc::new(AlwaysFailProcessor)),
     );
-    let _handle = manager.clone().run(shutdown_token.clone()).unwrap();
+    let _handle = daemon.run(shutdown_token.clone()).unwrap();
 
     let request_id = submit_one_request(&manager).await;
     wait_until_completed(&manager, request_id).await;

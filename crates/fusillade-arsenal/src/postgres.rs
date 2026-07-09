@@ -7,7 +7,6 @@ use crate::request::AnyRequest;
 use futures::StreamExt;
 pub use sqlx_pool_router::{PoolProvider, TestDbPools};
 use std::future::Future;
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -90,21 +89,18 @@ fn sanitize_outbound_body(body: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// PostgreSQL implementation of the Storage and DaemonExecutor traits.
+/// PostgreSQL implementation of the Fusillade storage traits.
 ///
-/// This manager uses PostgreSQL for persistent storage and runs a daemon for processing requests.
+/// This manager uses PostgreSQL for persistent request storage.
 /// It leverages Postgres LISTEN/NOTIFY for real-time status updates.
 ///
 /// # Example
 /// ```ignore
-/// use fusillade::PostgresRequestManager;
+/// use fusillade_arsenal::PostgresRequestManager;
 /// use sqlx::PgPool;
 ///
 /// let pool = PgPool::connect("postgresql://localhost/fusillade").await?;
 /// let manager = Arc::new(PostgresRequestManager::new(TestDbPools::new(pool).await.unwrap(), Default::default()));
-///
-/// // Start processing
-/// let handle = manager.clone().run()?;
 ///
 /// // Create files and batches
 /// let file_id = manager.create_file(name, description, templates).await?;
@@ -125,7 +121,7 @@ impl Default for BatchInsertStrategy {
     }
 }
 
-pub struct PostgresRequestManager<P: PoolProvider, H = ()> {
+pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
     db_retry_config: crate::DbRetryConfig,
@@ -135,7 +131,6 @@ pub struct PostgresRequestManager<P: PoolProvider, H = ()> {
     /// error bodies before persistence; `None` is identity. Remove when stream
     /// reassembly moves into dwctl.
     response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
-    _http_client: PhantomData<fn() -> H>,
 }
 
 struct ClaimedRequestRow {
@@ -236,25 +231,14 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             response_transformer: std::sync::OnceLock::new(),
-            _http_client: PhantomData,
         }
     }
-}
 
-impl<P: PoolProvider, H> PostgresRequestManager<P, H> {
     /// Compatibility constructor for callers that still build storage beside an
     /// HTTP client. Arsenal owns only storage, so the client is ignored here.
-    pub fn with_client(pools: P, http_client: Arc<H>) -> Self {
+    pub fn with_client<H>(pools: P, http_client: Arc<H>) -> Self {
         let _ = http_client;
-        Self {
-            pools,
-            config: PostgresStorageConfig::default(),
-            db_retry_config: crate::DbRetryConfig::default(),
-            download_buffer_size: 100,
-            batch_insert_strategy: BatchInsertStrategy::default(),
-            response_transformer: std::sync::OnceLock::new(),
-            _http_client: PhantomData,
-        }
+        Self::new(pools, PostgresStorageConfig::default())
     }
 
     /// Install the TRANSITIONAL ZDR response transformer - see
@@ -270,10 +254,7 @@ impl<P: PoolProvider, H> PostgresRequestManager<P, H> {
 
     /// Set a custom daemon configuration.
     ///
-    /// This is a builder method that can be chained after `with_client()`.
-    /// Note: timeout fields in the config do not affect the HTTP client, which
-    /// is fixed at construction. Use `new()` to build a default client with
-    /// timeouts derived from the config.
+    /// This is a builder method that can be chained after `new()`.
     pub fn with_config(mut self, config: PostgresStorageConfig) -> Self {
         self.config = config;
         self
@@ -533,7 +514,7 @@ impl<P: PoolProvider, H> PostgresRequestManager<P, H> {
 }
 
 // Additional methods for PostgresRequestManager (not part of Storage trait)
-impl<P: PoolProvider, H> PostgresRequestManager<P, H> {
+impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Unclaim stale requests that have been stuck in "claimed" or "processing" states
     /// for longer than the configured timeouts. This handles daemon crashes.
     ///
@@ -993,7 +974,7 @@ impl<P: PoolProvider, H> PostgresRequestManager<P, H> {
 ///
 /// If you need counts of all pending requests regardless of claimability, adjust the query
 /// to remove these filters.
-impl<P: PoolProvider, H> Storage for PostgresRequestManager<P, H> {
+impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     async fn sum_owner_batch_requests_in_window(
         &self,
         owner: &str,
@@ -5374,7 +5355,7 @@ impl<P: PoolProvider, H> Storage for PostgresRequestManager<P, H> {
 }
 
 // Helper methods for file streaming and virtual file creation
-impl<P: PoolProvider, H> PostgresRequestManager<P, H> {
+impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Internal helper to fetch a batch from a specific executor.
     ///
     /// This is used when we require read-after-write consistency and must query
@@ -6306,7 +6287,7 @@ impl<P: PoolProvider, H> PostgresRequestManager<P, H> {
 
 // Implement DaemonStorage trait
 #[async_trait]
-impl<P: PoolProvider, H> DaemonStorage for PostgresRequestManager<P, H> {
+impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
     async fn persist_daemon<T: DaemonState + Clone>(&self, record: &DaemonRecord<T>) -> Result<()>
     where
         AnyDaemonRecord: From<DaemonRecord<T>>,
@@ -6722,7 +6703,7 @@ mod tests {
     }
 
     async fn mark_models_live_for_test(
-        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        manager: &PostgresRequestManager<TestDbPools>,
         models: impl IntoIterator<Item = impl AsRef<str>>,
     ) {
         let filters: Vec<ModelFilter> = models
@@ -6738,7 +6719,7 @@ mod tests {
     }
 
     async fn claim_batch_requests_for_test(
-        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        manager: &PostgresRequestManager<TestDbPools>,
         limit: usize,
         batch_limit: usize,
         daemon_id: DaemonId,
@@ -7620,11 +7601,7 @@ mod tests {
 
     async fn populate_guard_setup(
         pool: sqlx::PgPool,
-    ) -> (
-        Arc<PostgresRequestManager<TestDbPools, MockHttpClient>>,
-        FileId,
-        BatchId,
-    ) {
+    ) -> (Arc<PostgresRequestManager<TestDbPools>>, FileId, BatchId) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = Arc::new(PostgresRequestManager::with_client(
             TestDbPools::new(pool).await.unwrap(),
@@ -8171,10 +8148,7 @@ mod tests {
     async fn setup_processing_request(
         pool: &sqlx::PgPool,
         daemon_id: DaemonId,
-    ) -> (
-        PostgresRequestManager<TestDbPools, MockHttpClient>,
-        RequestId,
-    ) {
+    ) -> (PostgresRequestManager<TestDbPools>, RequestId) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -8285,10 +8259,7 @@ mod tests {
     async fn claim_one_processing(
         pool: &sqlx::PgPool,
         transformer: Option<Arc<dyn crate::transform::ResponseTransformer>>,
-    ) -> (
-        PostgresRequestManager<TestDbPools, MockHttpClient>,
-        Request<Claimed>,
-    ) {
+    ) -> (PostgresRequestManager<TestDbPools>, Request<Claimed>) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -12998,7 +12969,7 @@ mod tests {
 
         // -- Helper: create file + batch for a user with a given completion window --
         async fn setup_user_batch(
-            manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+            manager: &PostgresRequestManager<TestDbPools>,
             user: &str,
             completion_window: &str,
         ) -> BatchId {
@@ -13134,7 +13105,7 @@ mod tests {
 
         // A batch with `n` pending requests for `model`, expiring at `expires_at`.
         async fn setup_batch_n(
-            manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+            manager: &PostgresRequestManager<TestDbPools>,
             pool: &sqlx::PgPool,
             label: &str,
             model: &str,
@@ -13267,7 +13238,7 @@ mod tests {
     /// Create a single pending batchless request for `model` owned by `user`,
     /// then place its synthesized default-window deadline at `expires_at`.
     async fn setup_filter_request(
-        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        manager: &PostgresRequestManager<TestDbPools>,
         pool: &sqlx::PgPool,
         user: &str,
         model: &str,
@@ -13341,10 +13312,7 @@ mod tests {
     /// Append an explicit not-live (`coming`) event so the model takes the
     /// leaky-bucket / ramp path. A model with NO events is "unmanaged" and
     /// claims at full capacity, so the leaky-bucket tests must mark it.
-    async fn mark_not_live(
-        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
-        model: &str,
-    ) {
+    async fn mark_not_live(manager: &PostgresRequestManager<TestDbPools>, model: &str) {
         manager
             .append_model_filter_event(&ModelFilter {
                 model: model.to_string(),
@@ -18315,7 +18283,7 @@ mod tests {
 
     /// Create a batchless realtime request for `user`, returning its id.
     async fn make_realtime(
-        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        manager: &PostgresRequestManager<TestDbPools>,
         user: &str,
     ) -> uuid::Uuid {
         let id = uuid::Uuid::new_v4();
@@ -18419,7 +18387,7 @@ mod tests {
 
         // Helper to create a file (with one template) + active batch for a user.
         async fn file_and_batch(
-            manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+            manager: &PostgresRequestManager<TestDbPools>,
             pool: &sqlx::PgPool,
             user: &str,
         ) -> (Uuid, Uuid) {
