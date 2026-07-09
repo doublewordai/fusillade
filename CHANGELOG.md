@@ -1,5 +1,12 @@
 # Changelog
 
+## [20.0.3](https://github.com/doublewordai/fusillade/compare/fusillade-v20.0.2...fusillade-v20.0.3) (2026-07-09)
+
+
+### Bug Fixes
+
+* bound cancellation poll and purge queries against silent connect… ([#327](https://github.com/doublewordai/fusillade/issues/327)) ([7ee9d9f](https://github.com/doublewordai/fusillade/commit/7ee9d9f1e4e4deff16e3f1810bd44404f93768d6))
+
 ## [20.0.2](https://github.com/doublewordai/fusillade/compare/fusillade-v20.0.1...fusillade-v20.0.2) (2026-07-08)
 
 
