@@ -176,17 +176,20 @@ pub struct DaemonConfig {
     #[serde(default = "default_claim_loop_max_consecutive_failures")]
     pub claim_loop_max_consecutive_failures: u32,
 
-    /// Upper bound on a single claim-cycle database query, in milliseconds.
-    /// This is a deadness detector, not a performance guardrail: claim
-    /// queries normally complete in seconds, but a connection severed
-    /// silently (compute restart, NAT/conntrack drop — nothing delivered to
-    /// the client) leaves the await blocked until TCP keepalive (hours),
-    /// freezing the claim loop inside a healthy-looking pod (observed
-    /// 2026-07-08, staging ×2 + prod). On expiry the in-flight connection is
-    /// dropped and the attempt counts as a transient claim failure, so the
-    /// retry/backoff machinery recovers on a fresh connection. Keep this
-    /// comfortably above any legitimate claim duration (worst ever observed:
-    /// ~101s p95, 2026-07-03, pre-split). Default: 180000 (3 minutes).
+    /// Upper bound on the daemon's periodic database queries, in
+    /// milliseconds: the claim-cycle queries, the cancellation/finalization
+    /// poll, and the purge loops. This is a deadness detector, not a
+    /// performance guardrail: these queries normally complete in seconds,
+    /// but a connection severed silently (compute restart, NAT/conntrack
+    /// drop — nothing delivered to the client) leaves the await blocked
+    /// until TCP keepalive (hours), freezing the loop inside a
+    /// healthy-looking pod (observed 2026-07-08, staging ×2 + prod). On
+    /// expiry the in-flight connection is dropped and the attempt counts as
+    /// a transient failure for that loop's existing error handling (claim
+    /// loops retry with backoff; poll/purge log and pick up on the next
+    /// tick). Keep this comfortably above any legitimate claim duration
+    /// (worst ever observed: ~101s p95, 2026-07-03, pre-split).
+    /// Default: 180000 (3 minutes).
     #[serde(default = "default_claim_query_timeout_ms")]
     pub claim_query_timeout_ms: u64,
 
@@ -1541,7 +1544,8 @@ where
         let shutdown_token = self.shutdown_token.clone();
         let cancellation_poll_interval_ms = self.config.cancellation_poll_interval_ms;
         // Same deadness detector as the claim loops — these queries are all
-        // bounded, so a hit can only mean a dead connection.
+        // bounded, so a timeout strongly suggests a dead/stalled connection
+        // (or a stalled pool acquisition), never a legitimately long query.
         let poll_query_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
 
         tokio::spawn(async move {
