@@ -7,6 +7,7 @@ use crate::request::AnyRequest;
 use futures::StreamExt;
 pub use sqlx_pool_router::{PoolProvider, TestDbPools};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use super::{DaemonStorage, ModelFilter, ModelFilterState, Storage};
+use crate::PostgresStorageConfig;
 use crate::batch::{
     Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchNotification,
     BatchOutputItem, BatchResponseDetails, BatchStatus, File, FileContentItem, FileId,
@@ -30,11 +32,10 @@ use crate::batch::{
     RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{
-    AnyDaemonRecord, DaemonConfig, DaemonData, DaemonRecord, DaemonState, DaemonStatus, Dead,
-    Initializing, Running,
+    AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStatus, Dead, Initializing,
+    Running,
 };
 use crate::error::{FusilladeError, Result};
-use crate::http::HttpClient;
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateFlexInput, CreateRealtimeInput,
     DaemonId, Failed, FailureReason, LeakStamp, Pending, PersistCompletedRealtimeInput, Processing,
@@ -124,31 +125,17 @@ impl Default for BatchInsertStrategy {
     }
 }
 
-pub struct PostgresRequestManager<P: PoolProvider, H: HttpClient> {
+pub struct PostgresRequestManager<P: PoolProvider, H = ()> {
     pools: P,
-    http_client: Arc<H>,
-    config: DaemonConfig,
+    config: PostgresStorageConfig,
     db_retry_config: crate::DbRetryConfig,
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
-    /// Optional override for the daemon's per-claim processor. `None` uses
-    /// [`DefaultRequestProcessor`] inside the daemon, preserving the
-    /// existing batch path. `Some(_)` is threaded through to
-    /// [`Daemon::with_processor`] when [`run`](Self::run) starts the
-    /// background worker.
-    ///
-    /// Wrapped in a [`OnceLock`] to support late wiring: in production
-    /// `dwctl` constructs the manager first (so the response-store can
-    /// reference it), then constructs the processor (which needs the
-    /// response-store), then injects the processor here via
-    /// [`set_processor`](Self::set_processor) before the daemon starts.
-    /// The builder-style [`with_processor`](Self::with_processor) remains
-    /// available for tests and consumers that don't have a cycle.
-    processor: std::sync::OnceLock<Arc<dyn crate::processor::RequestProcessor<Self, H>>>,
     /// TRANSITIONAL ZDR hook - see [`crate::transform`]. Transforms response/
     /// error bodies before persistence; `None` is identity. Remove when stream
     /// reassembly moves into dwctl.
     response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
+    _http_client: PhantomData<fn() -> H>,
 }
 
 struct ClaimedRequestRow {
@@ -239,96 +226,35 @@ macro_rules! batch_status_from_dynamic_row {
     };
 }
 
-impl<P: PoolProvider> PostgresRequestManager<P, crate::http::ReqwestHttpClient> {
-    /// Create a new PostgreSQL request manager with the default Reqwest HTTP client.
-    ///
-    /// The HTTP client is configured with the timeout values from the provided config.
-    ///
-    /// # Example
-    /// ```ignore
-    /// use fusillade::{PostgresRequestManager, SinglePool};
-    ///
-    /// let pools = TestDbPools::new(pool).await.unwrap();
-    /// let manager = PostgresRequestManager::new(pools, my_config);
-    /// ```
-    pub fn new(pools: P, config: DaemonConfig) -> Self {
-        let http_client = Arc::new(crate::http::ReqwestHttpClient::new(
-            std::time::Duration::from_millis(config.first_chunk_timeout_ms),
-            std::time::Duration::from_millis(config.chunk_timeout_ms),
-            std::time::Duration::from_millis(config.body_timeout_ms),
-            config.streamable_endpoints.clone(),
-        ));
+impl<P: PoolProvider> PostgresRequestManager<P> {
+    /// Create a new PostgreSQL storage manager.
+    pub fn new(pools: P, config: PostgresStorageConfig) -> Self {
         Self {
             pools,
-            http_client,
             config,
             db_retry_config: crate::DbRetryConfig::default(),
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
-            processor: std::sync::OnceLock::new(),
             response_transformer: std::sync::OnceLock::new(),
+            _http_client: PhantomData,
         }
     }
 }
 
-impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
-    /// Create a PostgreSQL request manager with a custom HTTP client.
-    ///
-    /// Uses the default daemon configuration. Customize with `.with_config()` if needed.
-    ///
-    /// # Example
-    /// ```ignore
-    /// use fusillade::SinglePool;
-    ///
-    /// let pools = TestDbPools::new(pool).await.unwrap();
-    /// let manager = PostgresRequestManager::with_client(pools, Arc::new(my_client))
-    ///     .with_config(my_config);
-    /// ```
+impl<P: PoolProvider, H> PostgresRequestManager<P, H> {
+    /// Compatibility constructor for callers that still build storage beside an
+    /// HTTP client. Arsenal owns only storage, so the client is ignored here.
     pub fn with_client(pools: P, http_client: Arc<H>) -> Self {
+        let _ = http_client;
         Self {
             pools,
-            http_client,
-            config: DaemonConfig::default(),
+            config: PostgresStorageConfig::default(),
             db_retry_config: crate::DbRetryConfig::default(),
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
-            processor: std::sync::OnceLock::new(),
             response_transformer: std::sync::OnceLock::new(),
+            _http_client: PhantomData,
         }
-    }
-
-    /// Override the daemon's per-claim processor.
-    ///
-    /// By default the manager runs the daemon with
-    /// [`DefaultRequestProcessor`], preserving the existing batch path. Use
-    /// this builder to plug in a custom [`RequestProcessor`] (e.g. dwctl's
-    /// multi-step Open Responses dispatcher).
-    pub fn with_processor(
-        self,
-        processor: Arc<dyn crate::processor::RequestProcessor<Self, H>>,
-    ) -> Self {
-        // Builder form: use OnceLock::set, ignore the result because by
-        // construction we're the only writer here.
-        let _ = self.processor.set(processor);
-        self
-    }
-
-    /// Inject the per-claim processor after the manager has already been
-    /// Arc-wrapped. Returns `Err` if a processor is already set (callers
-    /// should set it exactly once).
-    ///
-    /// This is the late-wiring entry point: dwctl needs the manager to
-    /// exist before it can build a `FusilladeResponseStore`, which in
-    /// turn is needed to build the `DwctlRequestProcessor`. After all
-    /// three are constructed, this method attaches the processor before
-    /// `run()` starts the daemon.
-    pub fn set_processor(
-        &self,
-        processor: Arc<dyn crate::processor::RequestProcessor<Self, H>>,
-    ) -> std::result::Result<(), &'static str> {
-        self.processor
-            .set(processor)
-            .map_err(|_| "processor already set")
     }
 
     /// Install the TRANSITIONAL ZDR response transformer - see
@@ -348,9 +274,13 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     /// Note: timeout fields in the config do not affect the HTTP client, which
     /// is fixed at construction. Use `new()` to build a default client with
     /// timeouts derived from the config.
-    pub fn with_config(mut self, config: DaemonConfig) -> Self {
+    pub fn with_config(mut self, config: PostgresStorageConfig) -> Self {
         self.config = config;
         self
+    }
+
+    pub fn set_config(&mut self, config: PostgresStorageConfig) {
+        self.config = config;
     }
 
     /// Set the retry cadence for transient database failures.
@@ -360,6 +290,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
     pub fn with_db_retry_config(mut self, config: crate::DbRetryConfig) -> Self {
         self.db_retry_config = config;
         self
+    }
+
+    pub fn set_db_retry_config(&mut self, config: crate::DbRetryConfig) {
+        self.db_retry_config = config;
     }
 
     pub fn db_retry_config(&self) -> &crate::DbRetryConfig {
@@ -386,16 +320,8 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         crate::db::begin_transaction(self.pools.write(), &self.db_retry_config).await
     }
 
-    pub fn http_client(&self) -> &Arc<H> {
-        &self.http_client
-    }
-
-    pub fn config(&self) -> &DaemonConfig {
+    pub fn config(&self) -> &PostgresStorageConfig {
         &self.config
-    }
-
-    pub fn processor(&self) -> Option<&Arc<dyn crate::processor::RequestProcessor<Self, H>>> {
-        self.processor.get()
     }
 
     async fn retry_db_operation<T, Op, Fut>(&self, operation: Op) -> Result<T>
@@ -515,6 +441,10 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         self
     }
 
+    pub fn set_download_buffer_size(&mut self, buffer_size: usize) {
+        self.download_buffer_size = buffer_size;
+    }
+
     /// Set the batch insert strategy for template insertion.
     ///
     /// This is a builder method that can be chained after `new()` or `with_client()`.
@@ -544,6 +474,19 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
         }
         self.batch_insert_strategy = strategy;
         self
+    }
+
+    pub fn set_batch_insert_strategy(&mut self, strategy: BatchInsertStrategy) {
+        match strategy {
+            BatchInsertStrategy::Batched { batch_size } => {
+                assert!(
+                    batch_size > 0,
+                    "batch_size must be greater than 0, got {}",
+                    batch_size
+                );
+            }
+        }
+        self.batch_insert_strategy = strategy;
     }
 
     /// Mark a batch as permanently failed.
@@ -590,7 +533,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 }
 
 // Additional methods for PostgresRequestManager (not part of Storage trait)
-impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
+impl<P: PoolProvider, H> PostgresRequestManager<P, H> {
     /// Unclaim stale requests that have been stuck in "claimed" or "processing" states
     /// for longer than the configured timeouts. This handles daemon crashes.
     ///
@@ -1050,7 +993,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 ///
 /// If you need counts of all pending requests regardless of claimability, adjust the query
 /// to remove these filters.
-impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManager<P, H> {
+impl<P: PoolProvider, H> Storage for PostgresRequestManager<P, H> {
     async fn sum_owner_batch_requests_in_window(
         &self,
         owner: &str,
@@ -5431,7 +5374,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> Storage for PostgresRequestManage
 }
 
 // Helper methods for file streaming and virtual file creation
-impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
+impl<P: PoolProvider, H> PostgresRequestManager<P, H> {
     /// Internal helper to fetch a batch from a specific executor.
     ///
     /// This is used when we require read-after-write consistency and must query
@@ -6363,7 +6306,7 @@ impl<P: PoolProvider, H: HttpClient + 'static> PostgresRequestManager<P, H> {
 
 // Implement DaemonStorage trait
 #[async_trait]
-impl<P: PoolProvider, H: HttpClient + 'static> DaemonStorage for PostgresRequestManager<P, H> {
+impl<P: PoolProvider, H> DaemonStorage for PostgresRequestManager<P, H> {
     async fn persist_daemon<T: DaemonState + Clone>(&self, record: &DaemonRecord<T>) -> Result<()>
     where
         AnyDaemonRecord: From<DaemonRecord<T>>,
@@ -6757,11 +6700,19 @@ mod tests {
     use crate::TestDbPools;
     use crate::batch::FileStreamResult;
     use crate::daemon::{
-        AnyDaemonRecord, DaemonData, DaemonRecord, DaemonStats, DaemonStatus, Dead, Initializing,
-        Running,
+        AnyDaemonRecord, DaemonConfig, DaemonData, DaemonRecord, DaemonStats, DaemonStatus, Dead,
+        Initializing, Running,
     };
-    use crate::http::MockHttpClient;
     use chrono::Timelike;
+
+    #[derive(Debug, Clone, Default)]
+    struct MockHttpClient;
+
+    impl MockHttpClient {
+        fn new() -> Self {
+            Self
+        }
+    }
 
     fn expect_stream_success(result: FileStreamResult) -> FileId {
         match result {
@@ -11397,14 +11348,8 @@ mod tests {
     async fn test_per_daemon_limit_allows_independent_claiming(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
 
-        // Set up manager with per-model limit of 3
+        // Capacity is supplied explicitly to the storage claim call below.
         let config = crate::daemon::DaemonConfig::default();
-        config
-            .model_concurrency_limits
-            .insert("model-a".to_string(), 3);
-        config
-            .model_concurrency_limits
-            .insert("model-b".to_string(), 3);
 
         let manager = Arc::new(
             PostgresRequestManager::with_client(
@@ -11705,7 +11650,7 @@ mod tests {
     #[cfg(any())]
     #[sqlx::test]
     async fn test_batch_cancellation_with_stream(pool: sqlx::PgPool) {
-        use crate::http::HttpResponse;
+        use crate::request::HttpResponse;
         use std::time::Duration;
 
         let http_client = Arc::new(MockHttpClient::new());

@@ -25,3 +25,49 @@ fn workspace_contains_the_three_release_packages() {
         );
     }
 }
+
+#[test]
+fn core_is_limited_to_store_contracts() {
+    let manifest = include_str!("../crates/fusillade-core/Cargo.toml");
+    let lib = include_str!("../crates/fusillade-core/src/lib.rs");
+
+    for dependency in [
+        "reqwest",
+        "eventsource-stream",
+        "openai-reassembler",
+        "metrics",
+        "hostname",
+    ] {
+        assert!(
+            !manifest.lines().any(|line| line.starts_with(dependency)),
+            "fusillade-core should not depend on daemon/runtime crate {dependency}"
+        );
+    }
+
+    for module in [
+        "pub mod daemon;",
+        "pub mod http;",
+        "pub mod processor;",
+        "pub mod transform;",
+    ] {
+        assert!(
+            !lib.contains(module),
+            "fusillade-core should only expose shared storage contracts, not {module}"
+        );
+    }
+}
+
+#[test]
+fn daemon_modes_stay_on_root_crate_and_db_retries_stay_in_arsenal() {
+    let root = include_str!("../src/lib.rs");
+    let arsenal = include_str!("../crates/fusillade-arsenal/src/lib.rs");
+
+    assert!(
+        root.contains("DaemonMode"),
+        "daemon mode selection should remain part of the root daemon crate"
+    );
+    assert!(
+        arsenal.contains("DbRetryConfig"),
+        "database retry configuration should remain owned by fusillade-arsenal"
+    );
+}

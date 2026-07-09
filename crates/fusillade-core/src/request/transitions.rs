@@ -104,21 +104,14 @@
 
 use std::sync::Arc;
 
-use metrics::counter;
-use serde_json;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::{
-    FusilladeError,
-    error::Result,
-    http::{HttpClient, HttpResponse},
-    manager::Storage,
-};
+use crate::{FusilladeError, error::Result, manager::Storage};
 
 use super::types::{
-    Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, Pending, Processing, Request,
-    RequestCompletionResult,
+    Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, HttpResponse, Pending,
+    Processing, Request, RequestCompletionResult,
 };
 
 /// Reason for cancelling a request.
@@ -188,13 +181,15 @@ impl Request<Claimed> {
         Ok(request)
     }
 
-    pub async fn process<H: HttpClient + 'static, S: Storage>(
+    pub async fn process<S, Fut>(
         self,
-        http_client: H,
         storage: &S,
-    ) -> Result<Request<Processing>> {
-        let request_data = self.data.clone();
-
+        response_fut: Fut,
+    ) -> Result<Request<Processing>>
+    where
+        S: Storage,
+        Fut: std::future::Future<Output = Result<HttpResponse>> + Send + 'static,
+    {
         // Create a channel for the HTTP result
         let (tx, rx) = tokio::sync::mpsc::channel(1);
 
@@ -203,9 +198,7 @@ impl Request<Claimed> {
         let current_span = tracing::Span::current();
         let task_handle = tokio::spawn(
             async move {
-                let result = http_client
-                    .execute(&request_data, &request_data.api_key)
-                    .await;
+                let result = response_fut.await;
                 let _ = tx.send(result).await; // Ignore send errors (receiver dropped)
             }
             .instrument(current_span),
@@ -278,12 +271,6 @@ impl Request<Failed> {
         if let Some(max_retries) = config.max_retries
             && retry_attempt >= max_retries
         {
-            counter!(
-                "fusillade_retry_denied_total",
-                "model" => self.data.model.clone(),
-                "reason" => "max_retries"
-            )
-            .increment(1);
             return Err(Box::new(self));
         }
 
@@ -299,12 +286,6 @@ impl Request<Failed> {
 
         // Check if the next retry would start before the effective deadline
         if not_before >= effective_deadline {
-            counter!(
-                "fusillade_retry_denied_total",
-                "model" => self.data.model.clone(),
-                "reason" => "deadline"
-            )
-            .increment(1);
             return Err(Box::new(self));
         }
 
@@ -403,23 +384,6 @@ impl Request<Processing> {
 
                 // Check if this response should be retried
                 if should_retry(&http_response) {
-                    // Extract error code from OpenAI-compatible error envelope
-                    // (e.g. {"error": {"code": "service_unavailable"}}) for metric labelling,
-                    // allowing alerts to distinguish upstream error classes.
-                    let error_code = serde_json::from_str::<serde_json::Value>(&http_response.body)
-                        .ok()
-                        .and_then(|v| v.get("error")?.get("code")?.as_str().map(String::from))
-                        .unwrap_or_default();
-
-                    // Record retriable HTTP status for observability
-                    counter!(
-                        "fusillade_http_status_retriable_total",
-                        "model" => self.data.model.clone(),
-                        "status" => http_response.status.to_string(),
-                        "code" => error_code,
-                    )
-                    .increment(1);
-
                     // Treat as failure for retry purposes
                     let failed_state = Failed {
                         reason: FailureReason::RetriableHttpStatus {
@@ -475,16 +439,14 @@ impl Request<Processing> {
             }
             Some(Err(e)) => {
                 let reason = match &e {
-                    FusilladeError::HttpClient(reqwest_err) if reqwest_err.is_builder() => {
+                    FusilladeError::HttpRequestBuilder(error) => {
                         FailureReason::RequestBuilderError {
-                            error: reqwest_err.to_string(),
+                            error: error.clone(),
                         }
                     }
-                    FusilladeError::HttpClient(reqwest_err) if reqwest_err.is_timeout() => {
-                        FailureReason::Timeout {
-                            error: reqwest_err.to_string(),
-                        }
-                    }
+                    FusilladeError::HttpClientTimeout(error) => FailureReason::Timeout {
+                        error: error.clone(),
+                    },
                     FusilladeError::FirstChunkTimeout(msg) => {
                         FailureReason::Timeout { error: msg.clone() }
                     }

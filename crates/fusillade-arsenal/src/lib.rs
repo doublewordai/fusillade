@@ -9,6 +9,7 @@ mod db;
 pub mod postgres;
 #[path = "response_step.rs"]
 pub mod postgres_response_step;
+pub mod transform;
 mod utils;
 
 pub use fusillade_core::manager::{DaemonStorage, ModelFilter, ModelFilterState, Storage};
@@ -16,37 +17,113 @@ pub use fusillade_core::request::AnyRequest;
 pub use fusillade_core::response_step;
 pub use postgres::{BatchInsertStrategy, PoolProvider, PostgresRequestManager, TestDbPools};
 pub use postgres_response_step::PostgresResponseStepManager;
+pub use transform::ResponseTransformer;
 
 pub mod batch {
     pub use fusillade_core::batch::*;
 }
 
 pub mod daemon {
-    pub use fusillade_core::daemon::*;
-}
-
-pub mod error {
-    pub use fusillade_core::error::*;
-}
-
-pub mod http {
-    pub use fusillade_core::http::*;
+    pub use crate::PostgresStorageConfig as DaemonConfig;
+    pub use fusillade_core::daemon_record::*;
 }
 
 pub mod manager {
     pub use fusillade_core::manager::*;
 }
 
-pub mod processor {
-    pub use fusillade_core::processor::*;
+pub mod error {
+    pub use fusillade_core::error::*;
 }
 
 pub mod request {
     pub use fusillade_core::request::*;
 }
 
-pub mod transform {
-    pub use fusillade_core::transform::*;
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PostgresStorageConfig {
+    #[serde(default = "default_pending_request_counts_timeout_ms")]
+    pub pending_request_counts_timeout_ms: u64,
+    #[serde(default = "default_batch_metadata_fields")]
+    pub batch_metadata_fields: Vec<String>,
+    pub claim_timeout_ms: u64,
+    pub processing_timeout_ms: u64,
+    pub stale_daemon_threshold_ms: u64,
+    pub unclaim_batch_size: usize,
+    #[serde(default = "default_service_tier_completion_windows_ms")]
+    pub service_tier_completion_windows_ms: std::collections::HashMap<String, u64>,
+    #[serde(default = "default_completion_window_ms")]
+    pub default_completion_window_ms: u64,
+    #[serde(default = "default_claim_ramp_exponent")]
+    pub claim_ramp_exponent: f64,
+    #[serde(default)]
+    pub urgency_weight: f64,
+    #[serde(default)]
+    pub batch_claim_require_live: bool,
+    #[serde(default = "default_leaks_per_window")]
+    pub leaks_per_window: f64,
+    #[serde(default = "default_model_filters_keep_per_model")]
+    pub model_filters_keep_per_model: i64,
+    #[serde(default = "default_model_filters_retention_ms")]
+    pub model_filters_retention_ms: u64,
+}
+
+fn default_batch_metadata_fields() -> Vec<String> {
+    vec![
+        "id".to_string(),
+        "endpoint".to_string(),
+        "created_at".to_string(),
+        "completion_window".to_string(),
+    ]
+}
+
+fn default_service_tier_completion_windows_ms() -> std::collections::HashMap<String, u64> {
+    std::collections::HashMap::from([("flex".to_string(), 3_600_000)])
+}
+
+fn default_completion_window_ms() -> u64 {
+    86_400_000
+}
+
+fn default_pending_request_counts_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_claim_ramp_exponent() -> f64 {
+    0.56
+}
+
+fn default_leaks_per_window() -> f64 {
+    60.0
+}
+
+fn default_model_filters_keep_per_model() -> i64 {
+    50
+}
+
+fn default_model_filters_retention_ms() -> u64 {
+    604_800_000
+}
+
+impl Default for PostgresStorageConfig {
+    fn default() -> Self {
+        Self {
+            pending_request_counts_timeout_ms: default_pending_request_counts_timeout_ms(),
+            batch_metadata_fields: default_batch_metadata_fields(),
+            claim_timeout_ms: 60_000,
+            processing_timeout_ms: 600_000,
+            stale_daemon_threshold_ms: 30_000,
+            unclaim_batch_size: 100,
+            service_tier_completion_windows_ms: default_service_tier_completion_windows_ms(),
+            default_completion_window_ms: default_completion_window_ms(),
+            claim_ramp_exponent: default_claim_ramp_exponent(),
+            urgency_weight: 0.0,
+            batch_claim_require_live: false,
+            leaks_per_window: default_leaks_per_window(),
+            model_filters_keep_per_model: default_model_filters_keep_per_model(),
+            model_filters_retention_ms: default_model_filters_retention_ms(),
+        }
+    }
 }
 
 /// Retry cadence for transient database failures.

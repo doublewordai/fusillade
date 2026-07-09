@@ -71,8 +71,24 @@ pub struct ModelEscalationConfig {
     pub escalation_threshold_seconds: i64,
 }
 
+/// Which claim loops a daemon process should run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonMode {
+    /// Run both batchless request claims and batch claims.
+    #[default]
+    Both,
+    /// Run only the batchless request claim loop.
+    RequestOnly,
+    /// Run only the batch claim loop.
+    BatchOnly,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
+    /// Claim-loop mode for this daemon process.
+    #[serde(default)]
+    pub mode: DaemonMode,
     pub claim_batch_size: usize,
     #[serde(
         default = "default_model_concurrency_limits",
@@ -205,6 +221,7 @@ fn default_model_filters_retention_ms() -> u64 {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            mode: DaemonMode::default(),
             claim_batch_size: 100,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             model_escalations: default_model_escalations(),

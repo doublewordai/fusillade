@@ -24,7 +24,7 @@ use fusillade::processor::{
 use fusillade::request::{
     AnyRequest, Claimed, Completed, Failed, Request, RequestCompletionResult,
 };
-use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
+use fusillade::{PostgresRequestManager, TestDbPools};
 use tokio_util::sync::CancellationToken;
 
 fn fast_test_config() -> DaemonConfig {

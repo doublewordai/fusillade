@@ -173,28 +173,3 @@ impl From<DaemonRecord<Dead>> for AnyDaemonRecord {
         AnyDaemonRecord::Dead(d)
     }
 }
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Get the current hostname.
-pub fn get_hostname() -> String {
-    hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-/// Get the current process ID.
-pub fn get_pid() -> i32 {
-    std::process::id() as i32
-}
-
-/// Get a version string (currently returns "dev", can be replaced with git hash or semver).
-pub fn get_version() -> String {
-    option_env!("GIT_HASH")
-        .or(option_env!("CARGO_PKG_VERSION"))
-        .unwrap_or("dev")
-        .to_string()
-}

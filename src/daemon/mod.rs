@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+pub mod config;
+
 use metrics::{counter, gauge, histogram};
 use tokio::task::JoinSet;
 
@@ -20,13 +22,12 @@ use crate::manager::{DaemonStorage, Storage};
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
 use crate::request::{Claimed, DaemonId, Request, RequestCompletionResult};
 
-pub use fusillade_core::daemon::{
-    AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
-    Initializing, Running, get_hostname, get_pid, get_version,
+pub use config::{
+    DaemonConfig, DaemonMode, ModelEscalationConfig, ShouldRetryFn, default_should_retry,
 };
-
-pub use fusillade_core::daemon::{
-    DaemonConfig, ModelEscalationConfig, ShouldRetryFn, default_should_retry,
+pub use fusillade_core::daemon_record::{
+    AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
+    Initializing, Running,
 };
 
 /// Per-user throughput counters, reset after each emission cycle.
@@ -52,6 +53,49 @@ fn claim_failure_backoff(consecutive_failures: u32, claim_interval_ms: u64) -> D
             .saturating_mul(factor)
             .min(MAX_BACKOFF_MS),
     )
+}
+
+fn claim_loop_kinds_for_mode(
+    mode: DaemonMode,
+    supports_batch_claims: bool,
+) -> Result<Vec<ClaimLoopKind>> {
+    match mode {
+        DaemonMode::Both => {
+            if supports_batch_claims {
+                Ok(vec![ClaimLoopKind::Request, ClaimLoopKind::Batch])
+            } else {
+                Ok(vec![ClaimLoopKind::Request])
+            }
+        }
+        DaemonMode::RequestOnly => Ok(vec![ClaimLoopKind::Request]),
+        DaemonMode::BatchOnly => {
+            if supports_batch_claims {
+                Ok(vec![ClaimLoopKind::Batch])
+            } else {
+                Err(FusilladeError::Other(anyhow::anyhow!(
+                    "batch-only daemon mode requires storage that supports batch claims"
+                )))
+            }
+        }
+    }
+}
+
+fn get_hostname() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn get_pid() -> i32 {
+    std::process::id() as i32
+}
+
+fn get_version() -> String {
+    option_env!("GIT_HASH")
+        .or(option_env!("CARGO_PKG_VERSION"))
+        .unwrap_or("dev")
+        .to_string()
 }
 
 /// Bound database futures so a silently severed connection surfaces as an
@@ -861,6 +905,16 @@ where
     /// The daemon periodically polls for cancelled batches and aborts in-flight requests.
     #[tracing::instrument(name = "fusillade.daemon.run", skip(self), fields(daemon_id = %self.daemon_id))]
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        let mode = self.config.mode;
+        self.run_with_mode(mode).await
+    }
+
+    /// Run the daemon loop with an explicit claim-loop mode.
+    ///
+    /// This overrides [`DaemonConfig::mode`] for callers that run separate
+    /// binaries and want the mode selected outside serialized configuration.
+    #[tracing::instrument(name = "fusillade.daemon.run_with_mode", skip(self), fields(daemon_id = %self.daemon_id, mode = ?mode))]
+    pub async fn run_with_mode(self: Arc<Self>, mode: DaemonMode) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
 
         // Register daemon in database
@@ -1203,21 +1257,27 @@ where
         }
 
         let mut claim_daemons: JoinSet<Result<()>> = JoinSet::new();
+        let supports_batch_claims = self.storage.supports_batch_claims();
+        let claim_loop_kinds = claim_loop_kinds_for_mode(mode, supports_batch_claims)?;
 
-        let request_daemon = RequestDaemon::new(self.clone());
-        claim_daemons.spawn(async move { request_daemon.run().await });
-
-        // Capability-gated: a claim-loop error is fatal to the whole daemon,
-        // so a deliberately request-only storage backend must be able to opt
-        // out of the batch loop instead of dying on its first cycle.
-        if self.storage.supports_batch_claims() {
-            let batch_daemon = BatchDaemon::new(self.clone());
-            claim_daemons.spawn(async move { batch_daemon.run().await });
-        } else {
+        if mode == DaemonMode::Both && !supports_batch_claims {
             tracing::info!(
                 daemon_id = %self.daemon_id,
                 "Storage backend does not support batch claims; running request-only"
             );
+        }
+
+        for claim_loop_kind in claim_loop_kinds {
+            match claim_loop_kind {
+                ClaimLoopKind::Request => {
+                    let request_daemon = RequestDaemon::new(self.clone());
+                    claim_daemons.spawn(async move { request_daemon.run().await });
+                }
+                ClaimLoopKind::Batch => {
+                    let batch_daemon = BatchDaemon::new(self.clone());
+                    claim_daemons.spawn(async move { batch_daemon.run().await });
+                }
+            }
         }
 
         let run_result = loop {
@@ -1290,6 +1350,43 @@ mod tests {
         assert_eq!(
             DaemonConfig::default().claim_loop_max_consecutive_failures,
             10
+        );
+    }
+
+    #[test]
+    fn daemon_mode_defaults_to_both_and_roundtrips_through_config() {
+        assert_eq!(DaemonConfig::default().mode, DaemonMode::Both);
+
+        let mut config = DaemonConfig::default();
+        config.mode = DaemonMode::BatchOnly;
+
+        let json = serde_json::to_value(&config).expect("config should serialize");
+        assert_eq!(json["mode"], serde_json::json!("batch_only"));
+
+        let decoded: DaemonConfig =
+            serde_json::from_value(json).expect("config should deserialize");
+        assert_eq!(decoded.mode, DaemonMode::BatchOnly);
+    }
+
+    #[test]
+    fn daemon_mode_selects_the_expected_claim_loops() {
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::Both, true).expect("both should be supported"),
+            vec![ClaimLoopKind::Request, ClaimLoopKind::Batch]
+        );
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::RequestOnly, true)
+                .expect("request-only should be supported"),
+            vec![ClaimLoopKind::Request]
+        );
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::BatchOnly, true)
+                .expect("batch-only should be supported"),
+            vec![ClaimLoopKind::Batch]
+        );
+        assert!(
+            claim_loop_kinds_for_mode(DaemonMode::BatchOnly, false).is_err(),
+            "batch-only mode should fail loudly when storage cannot claim batches"
         );
     }
 

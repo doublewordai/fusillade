@@ -3,7 +3,7 @@ use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retr
 use fusillade::http::{HttpResponse, MockHttpClient};
 use fusillade::manager::{DaemonExecutor, ModelFilter, ModelFilterState, Storage};
 use fusillade::request::{ListRequestsFilter, ServiceTierFilter};
-use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
+use fusillade::{PostgresRequestManager, TestDbPools};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2593,8 +2593,8 @@ mod unverified_volume_counts {
     /// Create a batch attributed to `creditor` with `completion_window` and `n`
     /// templated requests. The batch-status trigger sets `total_requests` to `n`
     /// as the requests are populated.
-    async fn seed_batch<S: Storage>(
-        manager: &S,
+    async fn seed_batch(
+        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
         creditor: &str,
         completion_window: &str,
         n: usize,
@@ -2633,7 +2633,10 @@ mod unverified_volume_counts {
             .unwrap();
     }
 
-    async fn seed_flex<S: Storage>(manager: &S, creditor: &str) {
+    async fn seed_flex(
+        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        creditor: &str,
+    ) {
         manager
             .create_flex(fusillade::CreateFlexInput {
                 request_id: uuid::Uuid::new_v4(),

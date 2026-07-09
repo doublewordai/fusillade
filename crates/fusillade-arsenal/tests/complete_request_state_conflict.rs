@@ -9,14 +9,14 @@
 
 use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
 use fusillade_core::manager::Storage;
-use fusillade_core::{CreateRealtimeInput, FusilladeError, MockHttpClient, RequestId};
+use fusillade_core::{CreateRealtimeInput, FusilladeError, RequestId};
 use std::sync::Arc;
 use uuid::Uuid;
 
-async fn manager(pool: sqlx::PgPool) -> Arc<PostgresRequestManager<TestDbPools, MockHttpClient>> {
+async fn manager(pool: sqlx::PgPool) -> Arc<PostgresRequestManager<TestDbPools, ()>> {
     Arc::new(PostgresRequestManager::with_client(
         TestDbPools::new(pool).await.unwrap(),
-        Arc::new(MockHttpClient::new()),
+        Arc::new(()),
     ))
 }
 

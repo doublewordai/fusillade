@@ -4,29 +4,19 @@
 //! enabling testability with mock implementations.
 
 use crate::error::Result;
+pub use crate::request::HttpResponse;
 /// Function signature for stream reassemblers.
 ///
 /// A reassembler takes a slice of collected SSE events and produces a single
 /// response body string. Use [`openai_reassembler::reassemble`] for
 /// OpenAI-compatible endpoints.
 pub type StreamReassembler = fn(&[eventsource_stream::Event]) -> anyhow::Result<String>;
-use crate::types::RequestData;
+use crate::request::RequestData;
 use async_trait::async_trait;
 use opentelemetry::trace::TraceContextExt;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-
-/// Response from an HTTP request.
-/// TODO: How will we deal with streaming responses? Right now we buffer the whole response before
-/// writing it back
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HttpResponse {
-    /// HTTP status code
-    pub status: u16,
-    /// Response body as a string
-    pub body: String,
-}
 
 /// One Server-Sent Event parsed from an upstream streaming response.
 ///
@@ -242,6 +232,16 @@ fn fire_callback(on_event: Option<&dyn StreamEventCallback>, event: &eventsource
     }
 }
 
+fn map_reqwest_error(error: reqwest::Error) -> crate::error::FusilladeError {
+    if error.is_builder() {
+        crate::error::FusilladeError::HttpRequestBuilder(error.to_string())
+    } else if error.is_timeout() {
+        crate::error::FusilladeError::HttpClientTimeout(error.to_string())
+    } else {
+        crate::error::FusilladeError::HttpClient(error.to_string())
+    }
+}
+
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
     async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse> {
@@ -379,11 +379,11 @@ impl ReqwestHttpClient {
                     "HTTP request failed"
                 );
             }
-            e
+            map_reqwest_error(e)
         })?;
 
         let status = response.status().as_u16();
-        let body = response.text().await?;
+        let body = response.text().await.map_err(map_reqwest_error)?;
 
         tracing::debug!(
             request_id = %request.id,
@@ -423,7 +423,7 @@ impl ReqwestHttpClient {
                 let resp = req
                     .send()
                     .await
-                    .map_err(|e| -> crate::error::FusilladeError { e.into() })
+                    .map_err(map_reqwest_error)
                     .inspect_err(|e| {
                         tracing::error!(
                             request_id = %request.id,
@@ -768,7 +768,7 @@ impl Drop for InFlightGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::RequestId;
+    use crate::request::RequestId;
 
     #[tokio::test]
     async fn test_mock_client_basic() {
@@ -1282,12 +1282,8 @@ mod tests {
 
         // Verify it's a builder error and map to FailureReason (same logic as transitions.rs)
         let reason = match err {
-            crate::error::FusilladeError::HttpClient(ref reqwest_err)
-                if reqwest_err.is_builder() =>
-            {
-                FailureReason::RequestBuilderError {
-                    error: reqwest_err.to_string(),
-                }
+            crate::error::FusilladeError::HttpRequestBuilder(error) => {
+                FailureReason::RequestBuilderError { error }
             }
             _ => panic!("Expected HttpClient builder error, got: {:?}", err),
         };

@@ -44,9 +44,17 @@ pub enum FusilladeError {
     #[error("Validation error: {0}")]
     ValidationError(String),
 
-    /// HTTP client error
+    /// HTTP client error.
     #[error("HTTP request failed: {0}")]
-    HttpClient(#[from] reqwest::Error),
+    HttpClient(String),
+
+    /// HTTP request builder error.
+    #[error("HTTP request builder failed: {0}")]
+    HttpRequestBuilder(String),
+
+    /// HTTP client timeout.
+    #[error("HTTP request timed out: {0}")]
+    HttpClientTimeout(String),
 
     /// Timed out waiting for response headers + first body chunk (time-to-first-token).
     /// Only used for streaming requests. Handles servers (like vLLM) that return

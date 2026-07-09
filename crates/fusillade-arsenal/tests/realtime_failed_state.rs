@@ -13,17 +13,15 @@
 
 use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
 use fusillade_core::manager::Storage;
-use fusillade_core::{
-    CreateRealtimeInput, FailureReason, MockHttpClient, PersistCompletedRealtimeInput,
-};
+use fusillade_core::{CreateRealtimeInput, FailureReason, PersistCompletedRealtimeInput};
 use sqlx::Row;
 use std::sync::Arc;
 use uuid::Uuid;
 
-async fn manager(pool: sqlx::PgPool) -> Arc<PostgresRequestManager<TestDbPools, MockHttpClient>> {
+async fn manager(pool: sqlx::PgPool) -> Arc<PostgresRequestManager<TestDbPools, ()>> {
     Arc::new(PostgresRequestManager::with_client(
         TestDbPools::new(pool).await.unwrap(),
-        Arc::new(MockHttpClient::new()),
+        Arc::new(()),
     ))
 }
 

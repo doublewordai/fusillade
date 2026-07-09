@@ -13,7 +13,15 @@ use uuid::Uuid;
 
 use crate::batch::{BatchId, TemplateId};
 use crate::error::Result;
-use crate::http::HttpResponse;
+
+/// Response from an upstream request execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// Response body as a string.
+    pub body: String,
+}
 
 /// Database state for filtering and querying requests.
 ///

@@ -126,7 +126,10 @@ where
         // Span 1: claimed -> processing (HTTP request kicked off)
         let processing = async {
             tracing::debug!("Sending batch request to inference endpoint");
-            request.process(http, storage).await
+            let request_data = request.data.clone();
+            let api_key = request_data.api_key.clone();
+            let response_fut = async move { http.execute(&request_data, &api_key).await };
+            request.process(storage, response_fut).await
         }
         .instrument(tracing::info_span!(
             "fusillade.state.claimed",

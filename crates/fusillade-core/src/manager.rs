@@ -7,7 +7,7 @@ use crate::batch::{
     Batch, BatchId, BatchInput, BatchStatus, File, FileContentItem, FileFilter, FileId,
     FileStreamItem, FileStreamResult, ListBatchesFilter, OutputFileType, RequestTemplateInput,
 };
-use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
+use crate::daemon_record::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::request::{
     AnyRequest, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput, DaemonId,

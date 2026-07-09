@@ -66,8 +66,8 @@ impl DaemonRecord<Running> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{AnyDaemonRecord, DaemonData, DaemonStatus};
     use super::*;
+    use crate::daemon_record::types::{AnyDaemonRecord, DaemonData, DaemonState, DaemonStatus};
     use crate::request::DaemonId;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
@@ -81,7 +81,7 @@ mod tests {
 
     #[async_trait]
     impl DaemonStorage for MockDaemonStorage {
-        async fn persist_daemon<T: super::super::types::DaemonState + Clone>(
+        async fn persist_daemon<T: DaemonState + Clone>(
             &self,
             record: &DaemonRecord<T>,
         ) -> Result<()>
