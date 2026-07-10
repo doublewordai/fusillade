@@ -37,11 +37,14 @@ test *args="":
 test-release-scripts:
     bash .github/scripts/test-publish-crate.sh
 
+test-arsenal-sqlx-cache:
+    bash .github/scripts/test-arsenal-sqlx-cache.sh
+
 # Lint
 lint:
     cargo fmt --check
     cargo clippy -- -D warnings
-    cargo sqlx prepare --check
+    cd crates/fusillade-arsenal && cargo sqlx prepare --check
 
 # Format
 fmt:
@@ -50,6 +53,7 @@ fmt:
 # CI pipeline
 ci:
     just test-release-scripts
+    just test-arsenal-sqlx-cache
     just db-setup
     cargo llvm-cov --lcov --output-path lcov.info
     just lint
