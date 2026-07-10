@@ -34,6 +34,9 @@ db-setup:
 test *args="":
     cargo test {{args}}
 
+test-release-scripts:
+    bash .github/scripts/test-publish-crate.sh
+
 # Lint
 lint:
     cargo fmt --check
@@ -46,6 +49,7 @@ fmt:
 
 # CI pipeline
 ci:
+    just test-release-scripts
     just db-setup
     cargo llvm-cov --lcov --output-path lcov.info
     just lint
