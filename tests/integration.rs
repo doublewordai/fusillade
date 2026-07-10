@@ -1,9 +1,9 @@
 use fusillade::PostgresDaemon;
 use fusillade::batch::{BatchInput, RequestTemplateInput};
-use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retry};
+use fusillade::daemon::{DaemonConfig, DaemonMode, ModelEscalationConfig, default_should_retry};
 use fusillade::http::{HttpResponse, MockHttpClient};
 use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
-use fusillade::request::{Failed, ListRequestsFilter, Request, ServiceTierFilter};
+use fusillade::request::{Failed, ListRequestsFilter, Request, RequestId, ServiceTierFilter};
 use fusillade_arsenal::{PostgresRequestManager as PostgresStore, TestDbPools};
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,6 +66,291 @@ fn assert_next_retry_would_cross_effective_deadline(
         failed.state.failed_at,
         failed.state.retry_attempt
     );
+}
+
+fn daemon_mode_test_config() -> DaemonConfig {
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("daemon-mode-model".to_string(), 10);
+
+    DaemonConfig {
+        claim_batch_size: 10,
+        claim_interval_ms: 10,
+        batch_claim_size: 10,
+        batch_claim_batch_size: 10,
+        batch_claim_interval_ms: 10,
+        model_concurrency_limits,
+        max_retries: Some(0),
+        stop_before_deadline_ms: None,
+        backoff_ms: 100,
+        backoff_factor: 2,
+        max_backoff_ms: 1000,
+        status_log_interval_ms: None,
+        heartbeat_interval_ms: 10000,
+        should_retry: Arc::new(default_should_retry),
+        claim_timeout_ms: 60000,
+        processing_timeout_ms: 600000,
+        cancellation_poll_interval_ms: 100,
+        ..Default::default()
+    }
+}
+
+async fn create_daemon_mode_batch_request(manager: &TestStore) -> RequestId {
+    let file_id = manager
+        .create_file(
+            "daemon-mode-batch-file".to_string(),
+            None,
+            vec![RequestTemplateInput {
+                custom_id: Some("daemon-mode-batch".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/daemon-mode-batch".to_string(),
+                body: r#"{"prompt":"batch"}"#.to_string(),
+                model: "daemon-mode-model".to_string(),
+                api_key: "batch-key".to_string(),
+            }],
+        )
+        .await
+        .expect("Failed to create daemon mode file");
+
+    let batch = manager
+        .create_batch(BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            created_by: None,
+            api_key_id: None,
+            api_key: None,
+            total_requests: None,
+        })
+        .await
+        .expect("Failed to create daemon mode batch");
+
+    let requests = manager
+        .get_batch_requests(batch.id)
+        .await
+        .expect("Failed to get daemon mode batch requests");
+    assert_eq!(requests.len(), 1);
+    requests[0].id()
+}
+
+async fn create_daemon_mode_flex_request(manager: &TestStore) -> RequestId {
+    manager
+        .create_flex(fusillade::CreateFlexInput {
+            request_id: uuid::Uuid::new_v4(),
+            body: r#"{"prompt":"flex"}"#.to_string(),
+            model: "daemon-mode-model".to_string(),
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/daemon-mode-flex".to_string(),
+            api_key: "flex-key".to_string(),
+            created_by: "daemon-mode-user".to_string(),
+        })
+        .await
+        .expect("Failed to create daemon mode flex request")
+}
+
+struct RequestSnapshot {
+    state: String,
+    response_status: Option<i16>,
+    response_body: Option<String>,
+}
+
+async fn get_request_snapshot(pool: &sqlx::PgPool, request_id: RequestId) -> RequestSnapshot {
+    let row: Option<(String, Option<i16>, Option<String>)> =
+        sqlx::query_as("SELECT state, response_status, response_body FROM requests WHERE id = $1")
+            .bind(*request_id as uuid::Uuid)
+            .fetch_optional(pool)
+            .await
+            .expect("Failed to get daemon mode request state");
+
+    let Some((state, response_status, response_body)) = row else {
+        panic!("Daemon mode request {request_id} was not returned");
+    };
+
+    RequestSnapshot {
+        state,
+        response_status,
+        response_body,
+    }
+}
+
+async fn wait_for_request_state(
+    pool: &sqlx::PgPool,
+    request_id: RequestId,
+    expected_state: &str,
+) -> RequestSnapshot {
+    let start = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(5);
+
+    loop {
+        let snapshot = get_request_snapshot(pool, request_id).await;
+        if snapshot.state == expected_state {
+            return snapshot;
+        }
+
+        if start.elapsed() >= timeout {
+            panic!(
+                "Timed out waiting for request {request_id} to become {expected_state}; remained {}",
+                snapshot.state
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_completed_request(
+    pool: &sqlx::PgPool,
+    request_id: RequestId,
+    expected_body: &str,
+) {
+    let snapshot = wait_for_request_state(pool, request_id, "completed").await;
+    assert_eq!(snapshot.response_status, Some(200));
+    assert_eq!(snapshot.response_body.as_deref(), Some(expected_body));
+}
+
+async fn assert_request_pending(pool: &sqlx::PgPool, request_id: RequestId) {
+    let snapshot = get_request_snapshot(pool, request_id).await;
+    assert!(
+        snapshot.state == "pending",
+        "expected request {request_id} to remain pending, got {}",
+        snapshot.state
+    );
+}
+
+async fn stop_daemon(
+    shutdown_token: CancellationToken,
+    handle: tokio::task::JoinHandle<fusillade::Result<()>>,
+    label: &str,
+) {
+    shutdown_token.cancel();
+    let join_result = tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap_or_else(|_| panic!("{label} daemon did not stop within timeout"));
+    let daemon_result =
+        join_result.unwrap_or_else(|err| panic!("{label} daemon task panicked: {err}"));
+    daemon_result.unwrap_or_else(|err| panic!("{label} daemon returned error: {err}"));
+}
+
+fn add_daemon_mode_responses(http_client: &MockHttpClient, body: &'static str, path: &str) {
+    http_client.add_response(
+        &format!("POST {path}"),
+        Ok(HttpResponse {
+            status: 200,
+            body: body.to_string(),
+        }),
+    );
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+#[test_log::test]
+async fn test_daemon_mode_batch_only_then_request_only_split_runtime_work(pool: sqlx::PgPool) {
+    let batch_http_client = Arc::new(MockHttpClient::new());
+    add_daemon_mode_responses(
+        batch_http_client.as_ref(),
+        r#"{"result":"batch"}"#,
+        "/v1/daemon-mode-batch",
+    );
+    let request_http_client = Arc::new(MockHttpClient::new());
+    add_daemon_mode_responses(
+        request_http_client.as_ref(),
+        r#"{"result":"flex"}"#,
+        "/v1/daemon-mode-flex",
+    );
+
+    let config = daemon_mode_test_config();
+    let manager = postgres_store(pool.clone(), &config).await;
+    mark_models_live_for_test(manager.as_ref(), &["daemon-mode-model"]).await;
+
+    let batch_request_id = create_daemon_mode_batch_request(manager.as_ref()).await;
+    let flex_request_id = create_daemon_mode_flex_request(manager.as_ref()).await;
+
+    assert_request_pending(&pool, batch_request_id).await;
+    assert_request_pending(&pool, flex_request_id).await;
+
+    let batch_shutdown = CancellationToken::new();
+    let batch_handle = postgres_daemon(manager.clone(), batch_http_client.clone(), config.clone())
+        .run_with_mode(batch_shutdown.clone(), DaemonMode::BatchOnly)
+        .expect("Failed to start BatchOnly daemon");
+
+    wait_for_completed_request(&pool, batch_request_id, r#"{"result":"batch"}"#).await;
+    assert_request_pending(&pool, flex_request_id).await;
+    assert_eq!(batch_http_client.call_count(), 1);
+    assert_eq!(request_http_client.call_count(), 0);
+
+    stop_daemon(batch_shutdown, batch_handle, "BatchOnly").await;
+
+    let request_shutdown = CancellationToken::new();
+    let request_handle =
+        postgres_daemon(manager.clone(), request_http_client.clone(), config.clone())
+            .run_with_mode(request_shutdown.clone(), DaemonMode::RequestOnly)
+            .expect("Failed to start RequestOnly daemon");
+
+    wait_for_completed_request(&pool, flex_request_id, r#"{"result":"flex"}"#).await;
+    assert_eq!(batch_http_client.call_count(), 1);
+    assert_eq!(request_http_client.call_count(), 1);
+
+    let batch_calls = batch_http_client.get_calls();
+    assert_eq!(batch_calls[0].path, "/v1/daemon-mode-batch");
+    assert_eq!(batch_calls[0].api_key, "batch-key");
+
+    let request_calls = request_http_client.get_calls();
+    assert_eq!(request_calls[0].path, "/v1/daemon-mode-flex");
+    assert_eq!(request_calls[0].api_key, "flex-key");
+
+    stop_daemon(request_shutdown, request_handle, "RequestOnly").await;
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+#[test_log::test]
+async fn test_daemon_modes_concurrently_handle_only_their_own_work(pool: sqlx::PgPool) {
+    let batch_http_client = Arc::new(MockHttpClient::new());
+    add_daemon_mode_responses(
+        batch_http_client.as_ref(),
+        r#"{"result":"batch"}"#,
+        "/v1/daemon-mode-batch",
+    );
+    let request_http_client = Arc::new(MockHttpClient::new());
+    add_daemon_mode_responses(
+        request_http_client.as_ref(),
+        r#"{"result":"flex"}"#,
+        "/v1/daemon-mode-flex",
+    );
+
+    let config = daemon_mode_test_config();
+    let manager = postgres_store(pool.clone(), &config).await;
+    mark_models_live_for_test(manager.as_ref(), &["daemon-mode-model"]).await;
+
+    let batch_request_id = create_daemon_mode_batch_request(manager.as_ref()).await;
+    let flex_request_id = create_daemon_mode_flex_request(manager.as_ref()).await;
+
+    let batch_shutdown = CancellationToken::new();
+    let batch_handle = postgres_daemon(manager.clone(), batch_http_client.clone(), config.clone())
+        .run_with_mode(batch_shutdown.clone(), DaemonMode::BatchOnly)
+        .expect("Failed to start concurrent BatchOnly daemon");
+    let request_shutdown = CancellationToken::new();
+    let request_handle =
+        postgres_daemon(manager.clone(), request_http_client.clone(), config.clone())
+            .run_with_mode(request_shutdown.clone(), DaemonMode::RequestOnly)
+            .expect("Failed to start concurrent RequestOnly daemon");
+
+    wait_for_completed_request(&pool, batch_request_id, r#"{"result":"batch"}"#).await;
+    wait_for_completed_request(&pool, flex_request_id, r#"{"result":"flex"}"#).await;
+
+    assert_eq!(batch_http_client.call_count(), 1);
+    assert_eq!(request_http_client.call_count(), 1);
+
+    let batch_calls = batch_http_client.get_calls();
+    assert_eq!(batch_calls[0].path, "/v1/daemon-mode-batch");
+    assert_eq!(batch_calls[0].api_key, "batch-key");
+
+    let request_calls = request_http_client.get_calls();
+    assert_eq!(request_calls[0].path, "/v1/daemon-mode-flex");
+    assert_eq!(request_calls[0].api_key, "flex-key");
+
+    stop_daemon(batch_shutdown, batch_handle, "concurrent BatchOnly").await;
+    stop_daemon(request_shutdown, request_handle, "concurrent RequestOnly").await;
 }
 
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
