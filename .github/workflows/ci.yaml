@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
   release:
-    types: [published, edited]
+    types: [published]
   workflow_dispatch:
 
 jobs:
@@ -59,10 +59,15 @@ jobs:
     if: github.event_name == 'release' && !github.event.release.prerelease
     runs-on: depot-ubuntu-24.04
     needs: test
+    concurrency:
+      group: crates-io-publish
+      cancel-in-progress: false
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -70,4 +75,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Publish to crates.io
-        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: .github/scripts/publish-crate.sh "$RELEASE_TAG"

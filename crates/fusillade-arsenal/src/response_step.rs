@@ -34,11 +34,29 @@ pub use sqlx_pool_router::PoolProvider;
 /// path rather than re-using these methods.
 pub struct PostgresResponseStepManager<P: PoolProvider> {
     pools: P,
+    db_retry_config: crate::DbRetryConfig,
 }
 
 impl<P: PoolProvider> PostgresResponseStepManager<P> {
     pub fn new(pools: P) -> Self {
-        Self { pools }
+        Self {
+            pools,
+            db_retry_config: crate::DbRetryConfig::default(),
+        }
+    }
+
+    /// Set the retry cadence for transient pool acquisition failures.
+    pub fn with_db_retry_config(mut self, config: crate::DbRetryConfig) -> Self {
+        self.db_retry_config = config;
+        self
+    }
+
+    pub fn db_retry_config(&self) -> &crate::DbRetryConfig {
+        &self.db_retry_config
+    }
+
+    fn write_executor(&self) -> crate::db::RetryingPgPool {
+        crate::db::RetryingPgPool::new(self.pools.write(), &self.db_retry_config)
     }
 }
 
@@ -81,10 +99,10 @@ const STEP_COLUMNS: &str = "id, request_id, prev_step_id, parent_step_id, step_k
 /// Look up the current state of a step. Used by the lifecycle update
 /// methods to disambiguate "row not found" from "row in unexpected state"
 /// after a 0-rows-affected update.
-async fn fetch_state(pool: &sqlx::PgPool, id: StepId) -> Result<Option<String>> {
+async fn fetch_state(executor: crate::db::RetryingPgPool, id: StepId) -> Result<Option<String>> {
     sqlx::query("SELECT state FROM response_steps WHERE id = $1")
         .bind(id.0)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map(|opt| opt.map(|row| row.get::<String, _>("state")))
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch step state: {}", e)))
@@ -93,7 +111,6 @@ async fn fetch_state(pool: &sqlx::PgPool, id: StepId) -> Result<Option<String>> 
 #[async_trait]
 impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     async fn create_step(&self, input: CreateStepInput) -> Result<StepId> {
-        let pool = self.pools.write();
         let id = input.id.unwrap_or_else(Uuid::new_v4);
 
         sqlx::query(
@@ -108,7 +125,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         .bind(input.step_kind.as_str())
         .bind(input.step_sequence)
         .bind(&input.request_payload)
-        .execute(pool)
+        .execute(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert response_step: {}", e)))?;
 
@@ -117,11 +134,10 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
 
     async fn get_step(&self, id: StepId) -> Result<Option<ResponseStep>> {
         // Reads go through the primary pool; see the type-level doc for why.
-        let pool = self.pools.write();
         let query = format!("SELECT {} FROM response_steps WHERE id = $1", STEP_COLUMNS);
         let row = sqlx::query(&query)
             .bind(id.0)
-            .fetch_optional(pool)
+            .fetch_optional(self.write_executor())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch response_step: {}", e)))?;
 
@@ -130,14 +146,13 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
 
     async fn get_step_by_request(&self, request_id: RequestId) -> Result<Option<ResponseStep>> {
         // Uses response_steps_request_id_unique partial index for O(log n) lookup.
-        let pool = self.pools.write();
         let query = format!(
             "SELECT {} FROM response_steps WHERE request_id = $1",
             STEP_COLUMNS
         );
         let row = sqlx::query(&query)
             .bind(request_id.0)
-            .fetch_optional(pool)
+            .fetch_optional(self.write_executor())
             .await
             .map_err(|e| {
                 FusilladeError::Other(anyhow!(
@@ -161,7 +176,6 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         // The two sets are disjoint (the head's parent_step_id is NULL
         // by invariant, and descendants have a distinct id), so UNION
         // ALL — cheaper than UNION's dedup — is correct.
-        let pool = self.pools.write();
         let query = format!(
             "SELECT {cols} FROM response_steps WHERE id = $1 \
              UNION ALL \
@@ -171,7 +185,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         );
         let rows = sqlx::query(&query)
             .bind(head_step_id.0)
-            .fetch_all(pool)
+            .fetch_all(self.write_executor())
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list response_steps: {}", e)))?;
 
@@ -179,21 +193,20 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     }
 
     async fn mark_step_processing(&self, id: StepId) -> Result<()> {
-        let pool = self.pools.write();
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'processing', started_at = NOW(), updated_at = NOW() \
              WHERE id = $1 AND state = 'pending'",
         )
         .bind(id.0)
-        .execute(pool)
+        .execute(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark step as processing: {}", e)))?;
 
         if result.rows_affected() == 0 {
             // Idempotent: the row may already be processing or terminal under
             // crash recovery; surface only if the row is genuinely missing.
-            if fetch_state(pool, id).await?.is_none() {
+            if fetch_state(self.write_executor(), id).await?.is_none() {
                 return Err(FusilladeError::Other(anyhow!(
                     "response_step not found: {}",
                     id
@@ -205,7 +218,6 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     }
 
     async fn complete_step(&self, id: StepId, response: serde_json::Value) -> Result<()> {
-        let pool = self.pools.write();
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'completed', \
@@ -216,12 +228,12 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         )
         .bind(id.0)
         .bind(&response)
-        .execute(pool)
+        .execute(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete response_step: {}", e)))?;
 
         if result.rows_affected() == 0 {
-            return Err(match fetch_state(pool, id).await? {
+            return Err(match fetch_state(self.write_executor(), id).await? {
                 Some(state) => FusilladeError::Other(anyhow!(
                     "response_step {} not in completable state (current: {})",
                     id,
@@ -235,7 +247,6 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     }
 
     async fn fail_step(&self, id: StepId, error: serde_json::Value) -> Result<()> {
-        let pool = self.pools.write();
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'failed', \
@@ -246,12 +257,12 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         )
         .bind(id.0)
         .bind(&error)
-        .execute(pool)
+        .execute(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail response_step: {}", e)))?;
 
         if result.rows_affected() == 0 {
-            return Err(match fetch_state(pool, id).await? {
+            return Err(match fetch_state(self.write_executor(), id).await? {
                 Some(state) => FusilladeError::Other(anyhow!(
                     "response_step {} not in failable state (current: {})",
                     id,
@@ -265,7 +276,6 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     }
 
     async fn cancel_step(&self, id: StepId) -> Result<()> {
-        let pool = self.pools.write();
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'canceled', \
@@ -274,12 +284,12 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
              WHERE id = $1 AND state IN ('pending', 'processing')",
         )
         .bind(id.0)
-        .execute(pool)
+        .execute(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel response_step: {}", e)))?;
 
         if result.rows_affected() == 0 {
-            return Err(match fetch_state(pool, id).await? {
+            return Err(match fetch_state(self.write_executor(), id).await? {
                 Some(state) => FusilladeError::Other(anyhow!(
                     "response_step {} not in cancelable state (current: {})",
                     id,
@@ -293,7 +303,6 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     }
 
     async fn requeue_step_for_retry(&self, id: StepId) -> Result<()> {
-        let pool = self.pools.write();
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'pending', \
@@ -303,12 +312,12 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
              WHERE id = $1 AND state = 'processing'",
         )
         .bind(id.0)
-        .execute(pool)
+        .execute(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to requeue response_step: {}", e)))?;
 
         if result.rows_affected() == 0 {
-            return Err(match fetch_state(pool, id).await? {
+            return Err(match fetch_state(self.write_executor(), id).await? {
                 Some(state) => FusilladeError::Other(anyhow!(
                     "response_step {} not in retryable state (current: {})",
                     id,

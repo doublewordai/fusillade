@@ -7,18 +7,16 @@
 //! attempt completing the row out from under a fresh attempt looked
 //! identical to "row was never created".
 
-use fusillade::manager::Storage;
-use fusillade::{
-    CreateRealtimeInput, FusilladeError, MockHttpClient, PostgresRequestManager, RequestId,
-    TestDbPools,
-};
+use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
+use fusillade_core::manager::Storage;
+use fusillade_core::{CreateRealtimeInput, FusilladeError, RequestId};
 use std::sync::Arc;
 use uuid::Uuid;
 
-async fn manager(pool: sqlx::PgPool) -> Arc<PostgresRequestManager<TestDbPools, MockHttpClient>> {
+async fn manager(pool: sqlx::PgPool) -> Arc<PostgresRequestManager<TestDbPools>> {
     Arc::new(PostgresRequestManager::with_client(
         TestDbPools::new(pool).await.unwrap(),
-        Arc::new(MockHttpClient::new()),
+        Arc::new(()),
     ))
 }
 

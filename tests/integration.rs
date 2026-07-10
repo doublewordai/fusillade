@@ -1,17 +1,33 @@
-use fusillade::TestDbPools;
+use fusillade::PostgresDaemon;
 use fusillade::batch::{BatchInput, RequestTemplateInput};
 use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retry};
 use fusillade::http::{HttpResponse, MockHttpClient};
-use fusillade::manager::postgres::PostgresRequestManager;
-use fusillade::manager::{DaemonExecutor, ModelFilter, ModelFilterState, Storage};
-use fusillade::request::{ListRequestsFilter, ServiceTierFilter};
+use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
+use fusillade::request::{Failed, ListRequestsFilter, Request, ServiceTierFilter};
+use fusillade_arsenal::{PostgresRequestManager as PostgresStore, TestDbPools};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
-async fn mark_models_live_for_test(
-    manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
-    models: &[&str],
-) {
+type TestStore = PostgresStore<TestDbPools>;
+type TestDaemon = PostgresDaemon<TestDbPools, MockHttpClient>;
+
+async fn postgres_store(pool: sqlx::PgPool, config: &DaemonConfig) -> Arc<TestStore> {
+    Arc::new(PostgresStore::new(
+        TestDbPools::new(pool).await.unwrap(),
+        config.into(),
+    ))
+}
+
+fn postgres_daemon(
+    store: Arc<TestStore>,
+    http_client: Arc<MockHttpClient>,
+    config: DaemonConfig,
+) -> Arc<TestDaemon> {
+    Arc::new(PostgresDaemon::new(store, http_client, config))
+}
+
+async fn mark_models_live_for_test(manager: &PostgresStore<TestDbPools>, models: &[&str]) {
     let filters: Vec<ModelFilter> = models
         .iter()
         .map(|model| ModelFilter {
@@ -24,7 +40,35 @@ async fn mark_models_live_for_test(
     manager.append_model_filter_events(&filters).await.unwrap();
 }
 
-#[sqlx::test]
+fn retry_backoff_ms(config: &DaemonConfig, retry_attempt: u32) -> i64 {
+    config
+        .backoff_ms
+        .saturating_mul(config.backoff_factor.saturating_pow(retry_attempt))
+        .min(config.max_backoff_ms) as i64
+}
+
+fn assert_next_retry_would_cross_effective_deadline(
+    failed: &Request<Failed>,
+    config: &DaemonConfig,
+) {
+    let effective_deadline = match config.stop_before_deadline_ms {
+        Some(stop_before_deadline_ms) => {
+            failed.state.batch_expires_at - chrono::Duration::milliseconds(stop_before_deadline_ms)
+        }
+        None => failed.state.batch_expires_at,
+    };
+    let next_retry_at = failed.state.failed_at
+        + chrono::Duration::milliseconds(retry_backoff_ms(config, failed.state.retry_attempt));
+
+    assert!(
+        next_retry_at >= effective_deadline,
+        "expected terminal failure because the next retry at {next_retry_at} would cross effective deadline {effective_deadline}; failed_at={}, retry_attempt={}",
+        failed.state.failed_at,
+        failed.state.retry_attempt
+    );
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 #[test_log::test]
 async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
     // Setup: Create HTTP client with mock response
@@ -60,13 +104,7 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Setup: Create a file and batch to associate with our request
     let file_id = manager
@@ -110,9 +148,8 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
     let request_id = requests[0].id();
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -164,7 +201,7 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
     assert_eq!(calls[0].api_key, "test-key");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     // Setup: Create HTTP client with triggered responses
     let http_client = Arc::new(MockHttpClient::new());
@@ -229,13 +266,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Setup: Create a file with 5 templates, all using "gpt-4"
     let file_id = manager
@@ -309,9 +340,8 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -414,7 +444,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     assert_eq!(http_client.call_count(), 5);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
     // Setup: Create HTTP client with failing responses, then success
     let http_client = Arc::new(MockHttpClient::new());
@@ -469,13 +499,7 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Setup: Create a file and batch
     let file_id = manager
@@ -518,9 +542,8 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
     let request_id = requests[0].id();
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -564,7 +587,7 @@ async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) {
     // Setup: Create HTTP client with triggered responses
     let http_client = Arc::new(MockHttpClient::new());
@@ -604,13 +627,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Setup: Create a file with 10 requests, all using "gpt-4"
     let templates: Vec<_> = (1..=10)
@@ -650,9 +667,8 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
     mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -735,7 +751,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
     assert_eq!(http_client.call_count(), 10);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
     // Test that retries stop when approaching the deadline
     let http_client = Arc::new(MockHttpClient::new());
@@ -774,13 +790,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Create a batch with a very short completion window (2 seconds)
     let file_id = manager
@@ -822,9 +832,8 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
     let request_id = requests[0].id();
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config.clone())
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -854,36 +863,20 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
     let results = results.expect("Request should have reached terminal state within timeout");
 
     if let Some(Ok(fusillade::AnyRequest::Failed(failed))) = results.first() {
-        // Calculate expected retry attempts:
-        // - Completion window: 2000ms
-        // - Buffer: 500ms
-        // - Effective deadline: 1500ms
-        // - Backoff sequence: 50ms, 100ms, 200ms, 200ms, 200ms, 200ms, 200ms
-        // - Timeline:
-        //   - Initial attempt: t=0ms (attempt 0)
-        //   - Retry 1: t=50ms (attempt 1)
-        //   - Retry 2: t=150ms (attempt 2)
-        //   - Retry 3: t=350ms (attempt 3)
-        //   - Retry 4: t=550ms (attempt 4)
-        //   - Retry 5: t=750ms (attempt 5)
-        //   - Retry 6: t=950ms (attempt 6)
-        //   - Retry 7: t=1150ms (attempt 7)
-        //   - Retry 8: t=1350ms (attempt 8)
-        //   - Next would be t=1550ms - EXCEEDS 1500ms deadline
-        // Expected: 8 retry attempts (9 total including initial)
-
         let retry_count = failed.state.retry_attempt;
         let call_count = http_client.call_count();
 
-        // 1. Verify we stopped before too many retries (deadline constraint)
-        // Allow 7-9 attempts to account for timing variations in test execution
+        // Verify the daemon stopped because another retry would cross the
+        // configured effective deadline. Absolute attempt counts vary under CI
+        // load because DB and task scheduling overhead consume the same window.
+        assert_next_retry_would_cross_effective_deadline(failed, &config);
         assert!(
-            (7..=9).contains(&retry_count),
-            "Expected 7-9 retry attempts based on deadline and backoff calculation, got {}",
+            retry_count > 0,
+            "Expected at least one retry attempt before the buffered deadline, got {}",
             retry_count
         );
 
-        // 2. Verify HTTP call count matches retry attempts (1 initial + N retries)
+        // Verify HTTP call count matches retry attempts (1 initial + N retries)
         assert_eq!(
             call_count,
             (retry_count + 1) as usize,
@@ -892,7 +885,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
             retry_count
         );
 
-        // 3. Verify the request actually has error details from the last attempt
+        // Verify the request actually has error details from the last attempt
         assert!(
             !failed.state.reason.to_error_message().is_empty(),
             "Expected failed request to have failure reason"
@@ -905,7 +898,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
     // Test that when neither max_retries nor stop_before_deadline_ms is set,
     // retries stop exactly at the deadline (no buffer)
@@ -945,13 +938,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Create a batch with a 2 second completion window
     let file_id = manager
@@ -993,9 +980,8 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
     let request_id = requests[0].id();
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config.clone())
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -1025,41 +1011,20 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
     let results = results.expect("Request should have reached terminal state within timeout");
 
     if let Some(Ok(fusillade::AnyRequest::Failed(failed))) = results.first() {
-        // Calculate expected retry attempts with NO buffer:
-        // - Completion window: 2000ms
-        // - Buffer: 0ms (none set)
-        // - Effective deadline: 2000ms
-        // - Backoff sequence: 50ms, 100ms, 200ms, 200ms, 200ms...
-        // - Timeline:
-        //   - Initial attempt: t=0ms (attempt 0)
-        //   - Retry 1: t=50ms (attempt 1)
-        //   - Retry 2: t=150ms (attempt 2)
-        //   - Retry 3: t=350ms (attempt 3)
-        //   - Retry 4: t=550ms (attempt 4)
-        //   - Retry 5: t=750ms (attempt 5)
-        //   - Retry 6: t=950ms (attempt 6)
-        //   - Retry 7: t=1150ms (attempt 7)
-        //   - Retry 8: t=1350ms (attempt 8)
-        //   - Retry 9: t=1550ms (attempt 9)
-        //   - Retry 10: t=1750ms (attempt 10)
-        //   - Retry 11: t=1950ms (attempt 11)
-        //   - Next would be t=2150ms - EXCEEDS 2000ms deadline
-        // Expected: ~11 retry attempts (12 total including initial)
-        // In reality, we will see <11 due to DB calls and CPU overhead in making requests
-
         let retry_count = failed.state.retry_attempt;
         let call_count = http_client.call_count();
 
-        // 1. Verify we retried more than the buffered case (which stopped at ~8)
-        //    but still stopped before too many attempts
-        // Allow 9-12 attempts to account for timing variations with CI slower CI CPUs
+        // Verify retries continue until the actual deadline when no buffer is
+        // configured. Avoid asserting an exact attempt count; CI overhead changes
+        // how many backoff cycles fit inside a two-second completion window.
+        assert_next_retry_would_cross_effective_deadline(failed, &config);
         assert!(
-            (9..12).contains(&retry_count),
-            "Expected 9-12 retry attempts (should retry until deadline with no buffer), got {}",
+            retry_count > 0,
+            "Expected at least one retry attempt before the deadline, got {}",
             retry_count
         );
 
-        // 2. Verify HTTP call count matches retry attempts (1 initial + N retries)
+        // Verify HTTP call count matches retry attempts (1 initial + N retries)
         assert_eq!(
             call_count,
             (retry_count + 1) as usize,
@@ -1068,7 +1033,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
             retry_count
         );
 
-        // 3. Verify the request has error details from the last attempt
+        // Verify the request has error details from the last attempt
         assert!(
             !failed.state.reason.to_error_message().is_empty(),
             "Expected failed request to have failure reason"
@@ -1081,7 +1046,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
     // Test: When time remaining before batch expiry is below the escalation threshold,
     // requests are routed to the escalation model at claim time.
@@ -1132,13 +1097,7 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     // Create a file with a request using gpt-4
     let file_id = manager
@@ -1182,9 +1141,8 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
     let request_id = requests[0].id();
 
     // Start the daemon
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -1238,7 +1196,7 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
     // escalated model's response. The model change happens at claim time in the daemon.
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgPool) {
     // Test: When there's enough time remaining (above threshold), requests use original model
 
@@ -1286,13 +1244,7 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
         ..Default::default()
     };
 
-    let manager = Arc::new(
-        PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client.clone(),
-        )
-        .with_config(config),
-    );
+    let manager = postgres_store(pool.clone(), &config).await;
 
     let file_id = manager
         .create_file(
@@ -1333,9 +1285,8 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
         .expect("Failed to get batch requests");
     let request_id = requests[0].id();
 
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    manager
-        .clone()
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
         .run(shutdown_token.clone())
         .expect("Failed to start daemon");
 
@@ -1383,7 +1334,7 @@ mod batch_results_stream {
 
     /// Helper to collect all results from a batch results stream
     async fn collect_batch_results(
-        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
+        manager: &PostgresStore<TestDbPools>,
         batch_id: fusillade::batch::BatchId,
     ) -> Vec<fusillade::batch::BatchResultItem> {
         let stream = manager.get_batch_results_stream(batch_id, 0, None, None);
@@ -1393,7 +1344,7 @@ mod batch_results_stream {
             .await
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_batch_results_basic(pool: sqlx::PgPool) {
         // Test: Basic batch returns all results correctly
         let http_client = Arc::new(MockHttpClient::new());
@@ -1422,13 +1373,7 @@ mod batch_results_stream {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         // Create file with 2 templates
         let file_id = manager
@@ -1475,9 +1420,8 @@ mod batch_results_stream {
         mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
         // Run daemon to complete requests
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
@@ -1520,12 +1464,12 @@ mod batch_results_stream {
         }
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_batch_results_deleted_file_returns_error(pool: sqlx::PgPool) {
         // Test: When batch's file is deleted, stream returns error
         let http_client = Arc::new(MockHttpClient::new());
 
-        let manager = Arc::new(PostgresRequestManager::with_client(
+        let manager = Arc::new(PostgresStore::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             http_client,
         ));
@@ -1589,7 +1533,7 @@ mod batch_results_stream {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_output_file_streamable_after_batch_deleted(pool: sqlx::PgPool) {
         // Test: Output files can still be streamed after the batch is soft-deleted
         // This ensures users can download completed results even if the batch is deleted
@@ -1612,13 +1556,7 @@ mod batch_results_stream {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         let file_id = manager
             .create_file(
@@ -1653,9 +1591,8 @@ mod batch_results_stream {
         mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
         // Run daemon to process the request
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
@@ -1710,7 +1647,7 @@ mod batch_results_stream {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_batch_results_pagination(pool: sqlx::PgPool) {
         // Test: Pagination works correctly with offset
         let http_client = Arc::new(MockHttpClient::new());
@@ -1736,13 +1673,7 @@ mod batch_results_stream {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         // Create file with 5 templates
         let templates: Vec<_> = (0..5)
@@ -1778,9 +1709,8 @@ mod batch_results_stream {
         mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
         // Run daemon
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
@@ -1823,7 +1753,7 @@ mod batch_results_stream {
         assert!(offset_ids.contains(&&"req-4".to_string()));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_batch_results_status_filter(pool: sqlx::PgPool) {
         // Test: Status filter works correctly
         let http_client = Arc::new(MockHttpClient::new());
@@ -1862,13 +1792,7 @@ mod batch_results_stream {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         let templates: Vec<_> = (0..3)
             .map(|i| RequestTemplateInput {
@@ -1902,9 +1826,8 @@ mod batch_results_stream {
             .expect("Failed to create batch");
         mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
@@ -1949,7 +1872,7 @@ mod batch_results_stream {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_batch_results_search_filter(pool: sqlx::PgPool) {
         // Test: Search filter works correctly (case-insensitive)
         let http_client = Arc::new(MockHttpClient::new());
@@ -1974,13 +1897,7 @@ mod batch_results_stream {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         let file_id = manager
             .create_file(
@@ -2034,9 +1951,8 @@ mod batch_results_stream {
             .expect("Failed to create batch");
         mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
@@ -2084,7 +2000,7 @@ mod batch_results_stream {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_retry_failed_requests_for_batch_retries_all(pool: sqlx::PgPool) {
         // Test that retry_failed_requests_for_batch retries both retriable and non-retriable errors
@@ -2144,13 +2060,7 @@ mod batch_results_stream {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         let templates = (0..4)
             .map(|i| fusillade::RequestTemplateInput {
@@ -2184,9 +2094,8 @@ mod batch_results_stream {
             .expect("Failed to create batch");
         mark_models_live_for_test(manager.as_ref(), &["test-model"]).await;
 
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
 
@@ -2250,10 +2159,10 @@ mod queue_counts {
     use fusillade::request::DaemonId;
     use uuid::Uuid;
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     async fn test_pending_queue_counts_by_model_and_completion_window(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = Arc::new(PostgresRequestManager::with_client(
+        let manager = Arc::new(PostgresStore::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             http_client,
         ));
@@ -2424,10 +2333,9 @@ mod queue_counts {
 mod service_tier {
     use super::*;
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_populate_batch_sets_service_tier(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
         let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
         model_concurrency_limits.insert("test-model".to_string(), 10);
 
@@ -2438,13 +2346,7 @@ mod service_tier {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         let template = RequestTemplateInput {
             custom_id: None,
@@ -2515,10 +2417,9 @@ mod service_tier {
         assert_eq!(tier_24h, None);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_list_requests_filters_by_service_tier(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
         let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
         model_concurrency_limits.insert("test-model".to_string(), 10);
 
@@ -2529,13 +2430,7 @@ mod service_tier {
             ..Default::default()
         };
 
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
+        let manager = postgres_store(pool.clone(), &config).await;
 
         // list_requests is scoped to batchless responses, so create one of
         // each tier via the batchless insert methods.
@@ -2594,8 +2489,8 @@ mod unverified_volume_counts {
     /// Create a batch attributed to `creditor` with `completion_window` and `n`
     /// templated requests. The batch-status trigger sets `total_requests` to `n`
     /// as the requests are populated.
-    async fn seed_batch<S: Storage>(
-        manager: &S,
+    async fn seed_batch(
+        manager: &PostgresStore<TestDbPools>,
         creditor: &str,
         completion_window: &str,
         n: usize,
@@ -2634,7 +2529,7 @@ mod unverified_volume_counts {
             .unwrap();
     }
 
-    async fn seed_flex<S: Storage>(manager: &S, creditor: &str) {
+    async fn seed_flex(manager: &PostgresStore<TestDbPools>, creditor: &str) {
         manager
             .create_flex(fusillade::CreateFlexInput {
                 request_id: uuid::Uuid::new_v4(),
@@ -2650,10 +2545,10 @@ mod unverified_volume_counts {
             .unwrap();
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_sum_owner_batch_requests_in_window(pool: sqlx::PgPool) {
-        let manager = PostgresRequestManager::with_client(
+        let manager = PostgresStore::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         );
@@ -2710,10 +2605,10 @@ mod unverified_volume_counts {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
     #[test_log::test]
     async fn test_count_owner_flex_requests_since(pool: sqlx::PgPool) {
-        let manager = PostgresRequestManager::with_client(
+        let manager = PostgresStore::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         );

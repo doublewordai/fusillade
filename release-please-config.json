@@ -1,7 +1,22 @@
 {
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "rust",
+  "include-component-in-tag": true,
+  "tag-separator": "-",
+  "always-link-local": true,
+  "plugins": ["cargo-workspace"],
   "packages": {
     ".": {
-      "release-type": "rust"
+      "component": "fusillade",
+      "package-name": "fusillade"
+    },
+    "crates/fusillade-core": {
+      "component": "fusillade-core",
+      "package-name": "fusillade-core"
+    },
+    "crates/fusillade-arsenal": {
+      "component": "fusillade-arsenal",
+      "package-name": "fusillade-arsenal"
     }
   }
 }

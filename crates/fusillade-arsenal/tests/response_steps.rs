@@ -18,9 +18,9 @@
 //! - There is no chain-uniqueness constraint; idempotency is the
 //!   transition function's responsibility (chain-walk frontier check).
 
-use fusillade::request::RequestId;
-use fusillade::response_step::{CreateStepInput, ResponseStepStore, StepKind, StepState};
-use fusillade::{PostgresResponseStepManager, TestDbPools};
+use fusillade_arsenal::{PostgresResponseStepManager, TestDbPools};
+use fusillade_core::request::RequestId;
+use fusillade_core::response_step::{CreateStepInput, ResponseStepStore, StepKind, StepState};
 use serde_json::json;
 use uuid::Uuid;
 

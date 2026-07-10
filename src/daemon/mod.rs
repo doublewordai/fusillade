@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+pub mod config;
+
 use metrics::{counter, gauge, histogram};
 use tokio::task::JoinSet;
 
@@ -15,413 +17,89 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::FusilladeError;
 use crate::batch::BatchId;
 use crate::error::Result;
-use crate::http::{HttpClient, HttpResponse};
+use crate::http::HttpClient;
 use crate::manager::{DaemonStorage, Storage};
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
 use crate::request::{Claimed, DaemonId, Request, RequestCompletionResult};
 
-pub mod transitions;
-pub mod types;
-
-pub use types::{
+pub use config::{
+    DaemonConfig, DaemonMode, ModelEscalationConfig, ShouldRetryFn, default_should_retry,
+};
+pub use fusillade_core::daemon_record::{
     AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
     Initializing, Running,
 };
 
-/// Predicate function to determine if a response should be retried.
-///
-/// Takes an HTTP response and returns true if the request should be retried.
-pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
-
-/// Default retry predicate: retry on server errors (5xx), rate limits (429), timeouts (408), and not found (404).
-pub fn default_should_retry(response: &HttpResponse) -> bool {
-    response.status >= 500
-        || response.status == 429
-        || response.status == 408
-        || response.status == 404
+/// Per-user throughput counters, reset after each emission cycle.
+struct UserThroughputStats {
+    completed: AtomicU64,
+    failed: AtomicU64,
 }
 
-/// Default function for creating the should_retry Arc
-fn default_should_retry_fn() -> ShouldRetryFn {
-    Arc::new(default_should_retry)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimLoopKind {
+    Request,
+    Batch,
 }
 
-/// Default model escalations (empty map)
-fn default_model_escalations() -> Arc<dashmap::DashMap<String, ModelEscalationConfig>> {
-    Arc::new(dashmap::DashMap::new())
+/// Backoff before retrying a failed claim cycle: exponential in the number of
+/// consecutive failures, based on the claim interval, capped at 30s.
+fn claim_failure_backoff(consecutive_failures: u32, claim_interval_ms: u64) -> Duration {
+    const MAX_BACKOFF_MS: u64 = 30_000;
+    let factor = 2u64.saturating_pow(consecutive_failures.min(16));
+    Duration::from_millis(
+        claim_interval_ms
+            .max(100)
+            .saturating_mul(factor)
+            .min(MAX_BACKOFF_MS),
+    )
 }
 
-/// Default escalation threshold (15 minutes)
-/// This should be greater than the processing timeout (10 minutes) to allow
-/// a processing request to fall back to pending before escalation kicks in.
-fn default_escalation_threshold_seconds() -> i64 {
-    900
+fn claim_loop_kinds_for_mode(
+    mode: DaemonMode,
+    supports_batch_claims: bool,
+) -> Result<Vec<ClaimLoopKind>> {
+    match mode {
+        DaemonMode::Both => {
+            if supports_batch_claims {
+                Ok(vec![ClaimLoopKind::Request, ClaimLoopKind::Batch])
+            } else {
+                Ok(vec![ClaimLoopKind::Request])
+            }
+        }
+        DaemonMode::RequestOnly => Ok(vec![ClaimLoopKind::Request]),
+        DaemonMode::BatchOnly => {
+            if supports_batch_claims {
+                Ok(vec![ClaimLoopKind::Batch])
+            } else {
+                Err(FusilladeError::Other(anyhow::anyhow!(
+                    "batch-only daemon mode requires storage that supports batch claims"
+                )))
+            }
+        }
+    }
 }
 
-/// Model-based escalation configuration for routing requests to a different model
-/// at claim time when approaching SLA deadline.
-///
-/// When a request is claimed with less than `escalation_threshold_seconds` remaining
-/// before batch expiry, it will be routed to the `escalation_model` instead of the
-/// original model. The batch API key automatically has access to escalation models
-/// in the onwards routing cache (no separate API key needed).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ModelEscalationConfig {
-    /// The model to escalate to (e.g., "o1-preview" for requests using "gpt-4")
-    pub escalation_model: String,
-
-    /// Time threshold in seconds - escalate when time remaining before batch expiry
-    /// is less than this value. Default: 900 (15 minutes)
-    #[serde(default = "default_escalation_threshold_seconds")]
-    pub escalation_threshold_seconds: i64,
+fn get_hostname() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Configuration for the daemon.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct DaemonConfig {
-    /// Maximum number of requests to claim in each iteration
-    pub claim_batch_size: usize,
-
-    /// Per-model concurrency limits (shared, can be updated dynamically).
-    ///
-    /// This map is the authoritative set of models the daemon will process.
-    /// Models not present in this map will not be claimed. The caller (e.g.
-    /// the control layer) is responsible for populating this with all known
-    /// models and their concurrency limits.
-    pub model_concurrency_limits: Arc<dashmap::DashMap<String, usize>>,
-
-    /// Per-model escalation configurations for SLA-based model switching
-    /// Maps model name -> escalation config (e.g., "gpt-4" -> "o1-preview")
-    /// When a request is escalated, it's routed to the escalation_model by the control layer
-    #[serde(skip, default = "default_model_escalations")]
-    pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
-
-    /// Inject a deadline-derived priority hint into every outbound request
-    /// body at `nvext.agent_hints.priority` (NVIDIA Dynamo's unified priority
-    /// extension; the field is an `i32` where higher values mean "more
-    /// important" at the API layer, and Dynamo normalizes per backend).
-    ///
-    /// The injected value is the negated Unix timestamp (seconds) of the batch
-    /// SLA deadline: more-urgent (earlier) deadlines produce larger numbers.
-    /// Using the absolute deadline rather than seconds-remaining means two
-    /// requests with the same deadline share a priority regardless of when
-    /// they were claimed, so the router can tie-break on arrival time.
-    ///
-    /// Existing values at `nvext.agent_hints.priority` are overwritten;
-    /// existing `nvext` / `agent_hints` objects are merged into, not
-    /// replaced. Bodies that do not parse as JSON objects are left alone.
-    #[serde(default)]
-    pub inject_deadline_priority: bool,
-
-    /// How long to sleep between claim iterations
-    pub claim_interval_ms: u64,
-
-    /// Maximum number of request rows the batch daemon can claim per iteration.
-    ///
-    /// Batch claiming first selects live batches, then claims pending request
-    /// rows from those batches up to this cap.
-    ///
-    /// A value of 0 (the default) inherits `claim_batch_size`, so deployments
-    /// that tuned the old single-loop cap keep their batch claim throughput
-    /// after the daemon split instead of silently dropping to a lower default.
-    /// This cap only bounds the claim transaction size — per-model throttling
-    /// is enforced separately by the concurrency capacities — so it should be
-    /// set at or above the total rows you expect to free per interval across
-    /// all models (sustained completion rate × interval).
-    #[serde(default = "default_batch_claim_size")]
-    pub batch_claim_size: usize,
-
-    /// Maximum number of batch IDs to select per model in one batch daemon
-    /// claim iteration. Values of 0 are treated as 1.
-    ///
-    /// Selecting a single batch per model risks head-of-line blocking /
-    /// undersaturation: if the top-ranked batch has fewer claimable rows than
-    /// the model's capacity (e.g. its remaining rows are backing off on
-    /// `not_before`), leftover capacity is wasted for the cycle even when other
-    /// batches have pending rows. A small pool (default 4) lets the claim spill
-    /// into the next-ranked batches.
-    #[serde(default = "default_batch_claim_batch_size")]
-    pub batch_claim_batch_size: usize,
-
-    /// Require an explicit `live` model_filters event before the batch daemon
-    /// claims rows for a model.
-    ///
-    /// When false (default), models with **no** filter event are treated as
-    /// live — matching the historical claim behaviour for models scouter does
-    /// not manage (external / always-on providers), which never receive filter
-    /// events. When true, only models whose latest event is `live` are
-    /// batch-claimed. In either mode, batches on not-live models (`coming` /
-    /// `absent`) become claimable once within the deadline ramp
-    /// (`claim_ramp_exponent`) — the SLA escape hatch that lets them overflow
-    /// to fallback providers instead of missing their window.
-    #[serde(default)]
-    pub batch_claim_require_live: bool,
-
-    /// How long the batch daemon sleeps between claim iterations.
-    ///
-    /// A value of 0 inherits `claim_interval_ms`, preserving the old single
-    /// claim-loop cadence unless batch claiming is configured independently.
-    #[serde(default = "default_batch_claim_interval_ms")]
-    pub batch_claim_interval_ms: u64,
-
-    /// How many consecutive claim-cycle failures a claim loop tolerates
-    /// (with exponential backoff between retries) before it gives up and
-    /// takes the daemon down.
-    ///
-    /// Transient database errors — a connection severed by the server under
-    /// load, a pool acquire timeout, a failover blip — are expected in normal
-    /// operation and must not kill the daemon. Only a persistent run of
-    /// failures (e.g. the database is actually down or misconfigured) should
-    /// be fatal. Default: 10 (≈ several minutes of retries at max backoff).
-    #[serde(default = "default_claim_loop_max_consecutive_failures")]
-    pub claim_loop_max_consecutive_failures: u32,
-
-    /// Upper bound on the daemon's periodic database queries, in
-    /// milliseconds: the claim-cycle queries, the cancellation/finalization
-    /// poll, and the purge loops. This is a deadness detector, not a
-    /// performance guardrail: these queries normally complete in seconds,
-    /// but a connection severed silently (compute restart, NAT/conntrack
-    /// drop — nothing delivered to the client) leaves the await blocked
-    /// until TCP keepalive (hours), freezing the loop inside a
-    /// healthy-looking pod (observed 2026-07-08, staging ×2 + prod). On
-    /// expiry the in-flight connection is dropped and the attempt counts as
-    /// a transient failure for that loop's existing error handling (claim
-    /// loops retry with backoff; poll/purge log and pick up on the next
-    /// tick). Keep this comfortably above any legitimate claim duration
-    /// (worst ever observed: ~101s p95, 2026-07-03, pre-split).
-    /// Default: 180000 (3 minutes).
-    #[serde(default = "default_claim_query_timeout_ms")]
-    pub claim_query_timeout_ms: u64,
-
-    /// Maximum number of retry attempts before giving up.
-    pub max_retries: Option<u32>,
-
-    /// Stop retrying (including escalations) this many milliseconds before the batch expires.
-    ///
-    /// - **Negative** (e.g., -300000 = -5 min): Retry for a buffer window AFTER SLA deadline (recommended)
-    /// - **Zero**: Stop exactly at SLA deadline
-    /// - **Positive**: Stop BEFORE SLA deadline (terminates retryable errors within the SLA deadline, avoid!)
-    /// - **None**: No deadline awareness
-    ///
-    /// Default: 0 (stop retrying/escalating on SLA deadline)
-    pub stop_before_deadline_ms: Option<i64>,
-
-    /// Base backoff duration in milliseconds (will be exponentially increased)
-    pub backoff_ms: u64,
-
-    /// Factor by which the backoff_ms is increased with each retry
-    pub backoff_factor: u64,
-
-    /// Maximum backoff time in milliseconds
-    pub max_backoff_ms: u64,
-
-    /// Timeout for receiving response headers (connect + time-to-first-token) in milliseconds.
-    /// This should be generous enough to cover slow model inference starts.
-    /// Default: 86,400,000 (24 hours).
-    pub first_chunk_timeout_ms: u64,
-
-    /// Timeout for receiving the next chunk of response body in milliseconds.
-    /// Once the server starts streaming, each inter-chunk gap must be shorter
-    /// than this value or the request is considered stalled.
-    /// Default: 86,400,000 (24 hours).
-    pub chunk_timeout_ms: u64,
-
-    /// Timeout for the entire response body in milliseconds.
-    /// Catches slow-drip responses that never trip the per-chunk timeout
-    /// but take an unreasonable total time.
-    /// Default: 86,400,000 (24 hours).
-    pub body_timeout_ms: u64,
-
-    /// Interval for logging daemon status (requests in flight) in milliseconds
-    /// Set to None to disable periodic status logging
-    pub status_log_interval_ms: Option<u64>,
-
-    /// Interval for sending heartbeats to update daemon status in database (milliseconds)
-    pub heartbeat_interval_ms: u64,
-
-    /// Predicate function to determine if a response should be retried.
-    /// Defaults to retrying 5xx, 429, 408, and 404 status codes.
-    #[serde(skip, default = "default_should_retry_fn")]
-    pub should_retry: ShouldRetryFn,
-
-    /// Maximum time a request can stay in "claimed" state before being unclaimed
-    /// and returned to pending (milliseconds). This handles daemon crashes.
-    pub claim_timeout_ms: u64,
-
-    /// Maximum time a request can stay in "processing" state before being unclaimed
-    /// and returned to pending (milliseconds). This handles daemon crashes during execution.
-    pub processing_timeout_ms: u64,
-
-    /// PostgreSQL statement timeout for pending request count queries (milliseconds).
-    /// This bounds internal queue-depth monitoring work so a slow count query
-    /// fails without accumulating behind callers' poll cadence.
-    /// Default: 60,000 (60 seconds).
-    #[serde(default = "default_pending_request_counts_timeout_ms")]
-    pub pending_request_counts_timeout_ms: u64,
-
-    /// Time after a daemon's last heartbeat before its requests are considered
-    /// orphaned and returned to pending (milliseconds). Should be significantly
-    /// larger than `heartbeat_interval_ms` to avoid reclaiming from live daemons
-    /// that are merely slow. Also reclaims from daemons explicitly marked dead.
-    /// Default: 30,000 (30 seconds, 6× the default heartbeat interval).
-    pub stale_daemon_threshold_ms: u64,
-
-    /// Maximum number of stale requests to unclaim in a single poll cycle.
-    /// Limits database load when many requests become stale simultaneously (e.g., daemon crash).
-    pub unclaim_batch_size: usize,
-
-    /// Interval for polling batches to perform finalization and check for cancellations (milliseconds).
-    ///
-    /// This polling loop serves two purposes:
-    /// 1. **Batch Finalization**: Fetches active batches and triggers lazy finalization
-    ///    (computing completion timestamps when all requests reach terminal states)
-    /// 2. **Cancellation Detection**: Checks if any active batches have been cancelled
-    ///    and aborts their in-flight requests
-    ///
-    /// Default: 5000ms (5 seconds)
-    pub cancellation_poll_interval_ms: u64,
-
-    /// Batch table column names to include as request headers.
-    /// These values are sent as `x-fusillade-batch-{column}` headers with each request.
-    /// Example: ["id", "created_by", "endpoint"] produces headers like:
-    ///   - x-fusillade-batch-id
-    ///   - x-fusillade-batch-created-by
-    ///   - x-fusillade-batch-endpoint
-    #[serde(default = "default_batch_metadata_fields")]
-    pub batch_metadata_fields: Vec<String>,
-
-    /// Interval for running the orphaned row purge task (milliseconds).
-    /// Deletes orphaned request_templates and requests whose parent file/batch
-    /// has been soft-deleted, for right-to-erasure compliance.
-    /// Set to 0 to disable purging. Default: 3,600,000 (1 hour).
-    pub purge_interval_ms: u64,
-
-    /// Maximum number of orphaned rows to delete per purge iteration.
-    /// Each iteration deletes up to this many requests and this many request_templates.
-    /// Default: 1000.
-    pub purge_batch_size: i64,
-
-    /// Throttle delay between consecutive purge batches within a single drain
-    /// cycle (milliseconds). Prevents sustained high DB load when many orphans
-    /// exist. Default: 100.
-    pub purge_throttle_ms: u64,
-
-    /// Interval for emitting per-user throughput metrics via structured logs (milliseconds).
-    /// Set to None to disable per-user throughput logging.
-    /// Default: 60_000 (1 minute).
-    pub throughput_log_interval_ms: Option<u64>,
-
-    /// Request paths that should use SSE streaming.
-    ///
-    /// When a request's path matches one of these entries, an `X-Fusillade-Stream`
-    /// header is sent with the request and the response is read as an SSE stream,
-    /// then reassembled into the equivalent non-streaming JSON format.
-    ///
-    /// The upstream proxy (onwards) is responsible for injecting `"stream": true`
-    /// and `"stream_options": {"include_usage": true}` into the request body
-    /// when it sees this header.
-    ///
-    /// Example: `vec!["/v1/chat/completions", "/v1/completions"]`
-    #[serde(default)]
-    pub streamable_endpoints: Vec<String>,
-
-    /// Weight controlling how much SLA urgency influences claim scheduling (0.0–1.0).
-    ///
-    /// Blends per-user fairness with batch deadline urgency when ordering claims:
-    /// - `0.0`: Pure user-fairness (users with fewer in-flight requests go first)
-    /// - `1.0`: Pure deadline urgency (batches closest to expiry go first)
-    /// - `0.3`: Recommended starting point
-    ///
-    /// Default: `0.0` (backward-compatible, pure user-fairness).
-    #[serde(default)]
-    pub urgency_weight: f64,
-
-    /// Maps a batchless request's `service_tier` → completion window
-    /// (milliseconds). Batchless rows carry no stored completion window, so the
-    /// claim gate derives `W` by looking the tier up here, falling back to
-    /// `default_completion_window_ms` for a NULL or unmapped tier. Batch rows
-    /// ignore this entirely and use their real `batches.completion_window`.
-    /// Default: `{"flex": 3_600_000}` (1 hour).
-    #[serde(default = "default_service_tier_completion_windows_ms")]
-    pub service_tier_completion_windows_ms: HashMap<String, u64>,
-
-    /// Completion window (milliseconds) for batchless requests whose
-    /// `service_tier` is NULL or absent from `service_tier_completion_windows_ms`.
-    /// Default: 86_400_000 (24 hours).
-    #[serde(default = "default_completion_window_ms")]
-    pub default_completion_window_ms: u64,
-
-    /// Exponent of the deadline ramp `ramp_minutes = W_minutes ^ exponent`:
-    /// how long before a request's completion-window deadline the claim gate
-    /// abandons the leaky-bucket trickle and claims at full capacity (→ OR).
-    /// Sub-linear, so longer windows get a proportionally smaller ramp.
-    /// Default: 0.56 (anchors: 1h→~10min, 24h→~59min).
-    #[serde(default = "default_claim_ramp_exponent")]
-    pub claim_ramp_exponent: f64,
-
-    /// Leaky-bucket refills per completion window for a not-live model:
-    /// `leak_interval = W / leaks_per_window`. Larger => faster trickle to
-    /// OpenRouter while a model is not live. Default: 60.0 (1h window → 1
-    /// token/min, 24h window → 1 token/24min).
-    #[serde(default = "default_leaks_per_window")]
-    pub leaks_per_window: f64,
-
-    /// Number of most-recent `model_filters` events to ALWAYS retain per model
-    /// when the purge task trims the append-only log. Must be >= 1 so the
-    /// current-state lookup (latest event per model) never loses a model. Extra
-    /// history is kept for the controller / observability. Default: 50.
-    #[serde(default = "default_model_filters_keep_per_model")]
-    pub model_filters_keep_per_model: i64,
-
-    /// Minimum age (milliseconds) before a `model_filters` event beyond the
-    /// per-model keep window is eligible for purging. Events newer than this
-    /// are retained regardless of count. Default: 604_800_000 (7 days).
-    #[serde(default = "default_model_filters_retention_ms")]
-    pub model_filters_retention_ms: u64,
+fn get_pid() -> i32 {
+    std::process::id() as i32
 }
 
-fn default_batch_metadata_fields() -> Vec<String> {
-    vec![
-        "id".to_string(),
-        "endpoint".to_string(),
-        "created_at".to_string(),
-        "completion_window".to_string(),
-    ]
+fn get_version() -> String {
+    option_env!("GIT_HASH")
+        .or(option_env!("CARGO_PKG_VERSION"))
+        .unwrap_or("dev")
+        .to_string()
 }
 
-fn default_service_tier_completion_windows_ms() -> HashMap<String, u64> {
-    HashMap::from([("flex".to_string(), 3_600_000)]) // flex → 1 hour
-}
-
-fn default_completion_window_ms() -> u64 {
-    86_400_000 // 24 hours
-}
-
-fn default_pending_request_counts_timeout_ms() -> u64 {
-    60_000
-}
-
-fn default_batch_claim_size() -> usize {
-    0 // inherit claim_batch_size (see field docs)
-}
-
-fn default_batch_claim_batch_size() -> usize {
-    4
-}
-
-fn default_claim_loop_max_consecutive_failures() -> u32 {
-    10
-}
-
-fn default_claim_query_timeout_ms() -> u64 {
-    180_000
-}
-
-/// Bound a database future (claim cycle, heartbeat) so a silently severed
-/// connection (no FIN/RST delivered — the await would otherwise block until
-/// TCP keepalive) surfaces as an error instead of freezing the task. Dropping the timed-out
-/// future closes the in-flight connection; the pool discards it and the
-/// caller retries on a fresh one.
+/// Bound database futures so a silently severed connection surfaces as an
+/// error instead of freezing the daemon task until TCP keepalive.
 async fn with_query_timeout<T>(
     what: &'static str,
     timeout: Duration,
@@ -434,100 +112,6 @@ async fn with_query_timeout<T>(
             timeout.as_millis()
         ))),
     }
-}
-
-/// Backoff before retrying a failed claim cycle: exponential in the number of
-/// consecutive failures, based on the claim interval, capped at 30s.
-/// failure 1 → 2×interval, 2 → 4×, 3 → 8×, … capped.
-fn claim_failure_backoff(consecutive_failures: u32, claim_interval_ms: u64) -> Duration {
-    const MAX_BACKOFF_MS: u64 = 30_000;
-    let factor = 2u64.saturating_pow(consecutive_failures.min(16));
-    Duration::from_millis(
-        claim_interval_ms
-            .max(100)
-            .saturating_mul(factor)
-            .min(MAX_BACKOFF_MS),
-    )
-}
-
-fn default_batch_claim_interval_ms() -> u64 {
-    0
-}
-
-fn default_claim_ramp_exponent() -> f64 {
-    0.56
-}
-
-fn default_leaks_per_window() -> f64 {
-    60.0
-}
-
-fn default_model_filters_keep_per_model() -> i64 {
-    50
-}
-
-fn default_model_filters_retention_ms() -> u64 {
-    604_800_000 // 7 days
-}
-
-impl Default for DaemonConfig {
-    fn default() -> Self {
-        Self {
-            claim_batch_size: 100,
-            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            model_escalations: default_model_escalations(),
-            inject_deadline_priority: false,
-            claim_interval_ms: 1000,
-            batch_claim_size: default_batch_claim_size(),
-            batch_claim_batch_size: default_batch_claim_batch_size(),
-            batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
-            claim_query_timeout_ms: default_claim_query_timeout_ms(),
-            batch_claim_interval_ms: default_batch_claim_interval_ms(),
-            max_retries: Some(1000),
-            stop_before_deadline_ms: Some(0),
-            backoff_ms: 1000,
-            backoff_factor: 2,
-            max_backoff_ms: 10000,
-            first_chunk_timeout_ms: 540_000,    // 9 minutes
-            chunk_timeout_ms: 540_000,          // 9 minutes
-            body_timeout_ms: 60_000,            // 1 minute
-            status_log_interval_ms: Some(2000), // Log every 2 seconds by default
-            heartbeat_interval_ms: 5000,        // Heartbeat every 5 seconds by default
-            should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,       // 1 minute
-            processing_timeout_ms: 600000, // 10 minutes
-            pending_request_counts_timeout_ms: default_pending_request_counts_timeout_ms(),
-            stale_daemon_threshold_ms: 30_000, // 30 seconds (6× heartbeat interval)
-            unclaim_batch_size: 100,           // Unclaim up to 100 stale requests per poll
-            cancellation_poll_interval_ms: 5000, // Poll every 5 seconds by default
-            batch_metadata_fields: default_batch_metadata_fields(),
-            purge_interval_ms: 600_000, // 10 minutes
-            purge_batch_size: 1000,
-            purge_throttle_ms: 100,
-            throughput_log_interval_ms: Some(60_000), // Log per-user throughput every minute
-            streamable_endpoints: Vec::new(),
-            urgency_weight: 0.0,
-            service_tier_completion_windows_ms: default_service_tier_completion_windows_ms(),
-            default_completion_window_ms: default_completion_window_ms(),
-            claim_ramp_exponent: default_claim_ramp_exponent(),
-            leaks_per_window: default_leaks_per_window(),
-            model_filters_keep_per_model: default_model_filters_keep_per_model(),
-            model_filters_retention_ms: default_model_filters_retention_ms(),
-        }
-    }
-}
-
-/// Per-user throughput counters, reset after each emission cycle.
-struct UserThroughputStats {
-    completed: AtomicU64,
-    failed: AtomicU64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaimLoopKind {
-    Request,
-    Batch,
 }
 
 /// Daemon responsible for batchless pending requests.
@@ -802,8 +386,6 @@ where
             "Claim loop started"
         );
 
-        // Consecutive claim failures (reset on success). Transient DB errors
-        // back off and retry; only a persistent run of failures is fatal.
         let mut consecutive_claim_failures: u32 = 0;
 
         loop {
@@ -894,24 +476,12 @@ where
                 }
             };
 
-            // Transient DB errors (connection severed by the server under
-            // load, pool acquire timeout, failover blip) must not kill the
-            // daemon: a dead claim loop takes the whole daemon down and — with
-            // a single replica — silently stops all batch processing until a
-            // human bounces the pod (observed 2026-07-08 on staging: Neon
-            // severed the unclaim connection under a wide dispatch burst; the
-            // daemon died inside a pod that kept serving API traffic). Back
-            // off and retry; give up only after
-            // `claim_loop_max_consecutive_failures` in a row, which indicates
-            // a persistent failure rather than a blip.
             let mut claimed = match claim_result {
                 Ok(claimed) => {
                     consecutive_claim_failures = 0;
                     claimed
                 }
                 Err(e) => {
-                    // Release the claim mutex BEFORE backing off — the other
-                    // daemon's claims must not stall behind our retry sleep.
                     drop(_claim_guard);
                     consecutive_claim_failures += 1;
                     counter!("fusillade_claim_loop_errors_total", "daemon" => loop_name)
@@ -926,9 +496,7 @@ where
                         );
                         break Err(e);
                     }
-                    // The top of the next iteration already sleeps interval_ms,
-                    // so only sleep the portion of the backoff beyond that —
-                    // the effective retry delay is exactly the backoff schedule.
+
                     let base_interval = Duration::from_millis(interval_ms);
                     let backoff = claim_failure_backoff(consecutive_claim_failures, interval_ms);
                     let retry_delay = base_interval.max(backoff);
@@ -1337,15 +905,25 @@ where
     /// The daemon periodically polls for cancelled batches and aborts in-flight requests.
     #[tracing::instrument(name = "fusillade.daemon.run", skip(self), fields(daemon_id = %self.daemon_id))]
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        let mode = self.config.mode;
+        self.run_with_mode(mode).await
+    }
+
+    /// Run the daemon loop with an explicit claim-loop mode.
+    ///
+    /// This overrides [`DaemonConfig::mode`] for callers that run separate
+    /// binaries and want the mode selected outside serialized configuration.
+    #[tracing::instrument(name = "fusillade.daemon.run_with_mode", skip(self), fields(daemon_id = %self.daemon_id, mode = ?mode))]
+    pub async fn run_with_mode(self: Arc<Self>, mode: DaemonMode) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
 
         // Register daemon in database
         let daemon_record = DaemonRecord {
             data: DaemonData {
                 id: self.daemon_id,
-                hostname: types::get_hostname(),
-                pid: types::get_pid(),
-                version: types::get_version(),
+                hostname: get_hostname(),
+                pid: get_pid(),
+                version: get_version(),
                 config_snapshot: serde_json::to_value(&self.config)
                     .expect("Failed to serialize daemon config"),
             },
@@ -1356,11 +934,6 @@ where
 
         let running_record = daemon_record.start(self.storage.as_ref()).await?;
         tracing::info!("Daemon registered in database");
-        // Liveness signal for dashboards/alerts: 1 while this daemon's run
-        // loop is alive, 0 once it exits (any path). A daemon dying inside a
-        // still-running pod is otherwise invisible to metrics (observed
-        // 2026-07-08: silent claim outage until a human bounced the pod).
-        gauge!("fusillade_daemon_up").set(1.0);
 
         // Spawn periodic heartbeat task
         let storage = self.storage.clone();
@@ -1387,14 +960,6 @@ where
                         // Clone the record so we preserve it if heartbeat fails
                         let current = daemon_record.clone();
                         let heartbeat_start = std::time::Instant::now();
-                        // Bounded so a silently severed connection surfaces as
-                        // a failed heartbeat (logged, retried next tick on a
-                        // fresh connection) instead of freezing this task —
-                        // the prod incident of 2026-07-08 hung heartbeats too,
-                        // which is what tripped the daemon-down alert.
-                        // 4x the interval (20s at defaults) stays under the
-                        // 30s stale_daemon_threshold, leaving room to retry
-                        // before this daemon's claims become reclaimable.
                         let heartbeat_timeout =
                             Duration::from_millis(heartbeat_interval_ms.saturating_mul(4));
                         match with_query_timeout(
@@ -1543,9 +1108,9 @@ where
         let storage = self.storage.clone();
         let shutdown_token = self.shutdown_token.clone();
         let cancellation_poll_interval_ms = self.config.cancellation_poll_interval_ms;
-        // Same deadness detector as the claim loops — these queries are all
-        // bounded, so a timeout strongly suggests a dead/stalled connection
-        // (or a stalled pool acquisition), never a legitimately long query.
+        // Same deadness detector as the claim loops. These queries are bounded,
+        // so a timeout strongly suggests a dead/stalled connection or pool
+        // acquisition rather than legitimately long work.
         let poll_query_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
 
         tokio::spawn(async move {
@@ -1574,10 +1139,8 @@ where
                             .set(active_batch_ids.len() as f64);
 
                         // Single bulk query to find which active batches have been cancelled.
-                        // Bounded like the claim queries: a PK-set lookup can never
-                        // legitimately run long, but a silently severed connection wedged
-                        // this poll for ~25 min twice on 2026-07-09 (a stuck poll means
-                        // cancelled batches keep spending and finalization stalls).
+                        // If a silently severed connection wedges this poll, cancelled batches
+                        // keep spending and finalization stalls, so bound it like claims.
                         match with_query_timeout(
                             "cancellation poll query",
                             poll_query_timeout,
@@ -1716,21 +1279,27 @@ where
         }
 
         let mut claim_daemons: JoinSet<Result<()>> = JoinSet::new();
+        let supports_batch_claims = self.storage.supports_batch_claims();
+        let claim_loop_kinds = claim_loop_kinds_for_mode(mode, supports_batch_claims)?;
 
-        let request_daemon = RequestDaemon::new(self.clone());
-        claim_daemons.spawn(async move { request_daemon.run().await });
-
-        // Capability-gated: a claim-loop error is fatal to the whole daemon,
-        // so a deliberately request-only storage backend must be able to opt
-        // out of the batch loop instead of dying on its first cycle.
-        if self.storage.supports_batch_claims() {
-            let batch_daemon = BatchDaemon::new(self.clone());
-            claim_daemons.spawn(async move { batch_daemon.run().await });
-        } else {
+        if mode == DaemonMode::Both && !supports_batch_claims {
             tracing::info!(
                 daemon_id = %self.daemon_id,
                 "Storage backend does not support batch claims; running request-only"
             );
+        }
+
+        for claim_loop_kind in claim_loop_kinds {
+            match claim_loop_kind {
+                ClaimLoopKind::Request => {
+                    let request_daemon = RequestDaemon::new(self.clone());
+                    claim_daemons.spawn(async move { request_daemon.run().await });
+                }
+                ClaimLoopKind::Batch => {
+                    let batch_daemon = BatchDaemon::new(self.clone());
+                    claim_daemons.spawn(async move { batch_daemon.run().await });
+                }
+            }
         }
 
         let run_result = loop {
@@ -1763,7 +1332,6 @@ where
             }
         };
         claim_daemons.abort_all();
-        gauge!("fusillade_daemon_up").set(0.0);
 
         // Wait for heartbeat task to complete (it will mark daemon as dead)
         tracing::info!("Waiting for heartbeat task to complete");
@@ -1778,22 +1346,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestDbPools;
-    use crate::http::{HttpResponse, MockHttpClient};
-    use crate::manager::{DaemonExecutor, postgres::PostgresRequestManager};
-    use std::time::Duration;
-
-    #[test]
-    fn default_pending_request_counts_timeout_is_sixty_seconds() {
-        assert_eq!(
-            DaemonConfig::default().pending_request_counts_timeout_ms,
-            60_000
-        );
-    }
 
     #[test]
     fn claim_failure_backoff_grows_exponentially_and_caps() {
-        // 1s claim interval: 2s, 4s, 8s, 16s, then capped at 30s.
         assert_eq!(claim_failure_backoff(1, 1000), Duration::from_millis(2_000));
         assert_eq!(claim_failure_backoff(2, 1000), Duration::from_millis(4_000));
         assert_eq!(claim_failure_backoff(3, 1000), Duration::from_millis(8_000));
@@ -1805,12 +1360,10 @@ mod tests {
             claim_failure_backoff(5, 1000),
             Duration::from_millis(30_000)
         );
-        // Huge failure counts must not overflow — stays at the cap.
         assert_eq!(
             claim_failure_backoff(u32::MAX, 1000),
             Duration::from_millis(30_000)
         );
-        // Pathological zero interval is floored so we never hot-loop.
         assert_eq!(claim_failure_backoff(1, 0), Duration::from_millis(200));
     }
 
@@ -1823,15 +1376,49 @@ mod tests {
     }
 
     #[test]
+    fn daemon_mode_defaults_to_both_and_roundtrips_through_config() {
+        assert_eq!(DaemonConfig::default().mode, DaemonMode::Both);
+
+        let mut config = DaemonConfig::default();
+        config.mode = DaemonMode::BatchOnly;
+
+        let json = serde_json::to_value(&config).expect("config should serialize");
+        assert_eq!(json["mode"], serde_json::json!("batch_only"));
+
+        let decoded: DaemonConfig =
+            serde_json::from_value(json).expect("config should deserialize");
+        assert_eq!(decoded.mode, DaemonMode::BatchOnly);
+    }
+
+    #[test]
+    fn daemon_mode_selects_the_expected_claim_loops() {
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::Both, true).expect("both should be supported"),
+            vec![ClaimLoopKind::Request, ClaimLoopKind::Batch]
+        );
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::RequestOnly, true)
+                .expect("request-only should be supported"),
+            vec![ClaimLoopKind::Request]
+        );
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::BatchOnly, true)
+                .expect("batch-only should be supported"),
+            vec![ClaimLoopKind::Batch]
+        );
+        assert!(
+            claim_loop_kinds_for_mode(DaemonMode::BatchOnly, false).is_err(),
+            "batch-only mode should fail loudly when storage cannot claim batches"
+        );
+    }
+
+    #[test]
     fn default_claim_query_timeout_is_three_minutes() {
         assert_eq!(DaemonConfig::default().claim_query_timeout_ms, 180_000);
     }
 
     #[tokio::test]
     async fn query_timeout_converts_hang_into_error() {
-        // A future that never resolves models a query await on a silently
-        // severed connection. The wrapper must surface it as an error so the
-        // claim retry machinery engages instead of freezing forever.
         let hung = std::future::pending::<Result<()>>();
         let result = with_query_timeout("test query", Duration::from_millis(50), hung).await;
         let err = result.expect_err("hung future must time out").to_string();
@@ -1856,1969 +1443,5 @@ mod tests {
         .await
         .expect_err("inner error must pass through");
         assert!(err.to_string().contains("real db error"));
-    }
-
-    async fn mark_model_live_for_test(
-        manager: &PostgresRequestManager<TestDbPools, MockHttpClient>,
-        model: &str,
-    ) {
-        manager
-            .append_model_filter_event(&crate::manager::ModelFilter {
-                model: model.to_string(),
-                state: crate::manager::ModelFilterState::Live,
-                expected_ready_at: None,
-            })
-            .await
-            .expect("failed to mark model live");
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
-        // Setup: Create HTTP client with mock response
-        let http_client = Arc::new(MockHttpClient::new());
-        http_client.add_response(
-            "POST /v1/test",
-            Ok(HttpResponse {
-                status: 200,
-                body: r#"{"result":"success"}"#.to_string(),
-            }),
-        );
-
-        // Setup: Create manager with fast claim interval (no sleeping)
-        let config = DaemonConfig {
-            claim_batch_size: 10,
-            claim_interval_ms: 10, // Very fast for testing
-            batch_claim_size: 10,
-            batch_claim_batch_size: 1,
-            batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: 10,
-            claim_query_timeout_ms: 180_000,
-            batch_claim_interval_ms: 10,
-            model_concurrency_limits: {
-                let m = Arc::new(dashmap::DashMap::new());
-                m.insert("test-model".to_string(), 10);
-                m
-            },
-
-            model_escalations: Arc::new(dashmap::DashMap::new()),
-            inject_deadline_priority: false,
-            max_retries: Some(3),
-            stop_before_deadline_ms: None,
-            backoff_ms: 100,
-            backoff_factor: 2,
-            max_backoff_ms: 1000,
-            first_chunk_timeout_ms: 5000,
-            chunk_timeout_ms: 5000,
-            body_timeout_ms: 86_400_000,
-            status_log_interval_ms: None, // Disable status logging in tests
-            heartbeat_interval_ms: 5000,
-            should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
-            pending_request_counts_timeout_ms: 60_000,
-            stale_daemon_threshold_ms: 30_000,
-            unclaim_batch_size: 100,
-            batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100, // Fast polling for tests
-            purge_interval_ms: 0,               // Disabled in tests
-            purge_batch_size: 1000,
-            purge_throttle_ms: 100,
-            streamable_endpoints: Vec::new(),
-            throughput_log_interval_ms: None,
-            urgency_weight: 0.0,
-            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
-            default_completion_window_ms: 86_400_000,
-            claim_ramp_exponent: 0.56,
-            leaks_per_window: 60.0,
-            model_filters_keep_per_model: 50,
-            model_filters_retention_ms: 604_800_000,
-        };
-
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
-
-        // Setup: Create a file and batch to associate with our request
-        let file_id = manager
-            .create_file(
-                "test-file".to_string(),
-                Some("Test file".to_string()),
-                vec![crate::RequestTemplateInput {
-                    custom_id: None,
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/test".to_string(),
-                    body: r#"{"prompt":"test"}"#.to_string(),
-                    model: "test-model".to_string(),
-                    api_key: "test-key".to_string(),
-                }],
-            )
-            .await
-            .expect("Failed to create file");
-
-        let batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .expect("Failed to create batch");
-        mark_model_live_for_test(manager.as_ref(), "test-model").await;
-
-        // Get the created request from the batch
-        let requests = manager
-            .get_batch_requests(batch.id)
-            .await
-            .expect("Failed to get batch requests");
-        assert_eq!(requests.len(), 1);
-        let request_id = requests[0].id();
-
-        // Start the daemon
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
-            .run(shutdown_token.clone())
-            .expect("Failed to start daemon");
-
-        // Poll for completion (with timeout)
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(5);
-        let mut completed = false;
-
-        while start.elapsed() < timeout {
-            let results = manager
-                .get_requests(vec![request_id])
-                .await
-                .expect("Failed to get request");
-
-            if let Some(Ok(any_request)) = results.first()
-                && any_request.is_terminal()
-            {
-                if let crate::AnyRequest::Completed(req) = any_request {
-                    // Verify the request was completed successfully
-                    assert_eq!(req.state.response_status, 200);
-                    assert_eq!(req.state.response_body, r#"{"result":"success"}"#);
-                    completed = true;
-                    break;
-                } else {
-                    panic!(
-                        "Request reached terminal state but was not completed: {:?}",
-                        any_request
-                    );
-                }
-            }
-
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        // Stop the daemon
-        shutdown_token.cancel();
-
-        // Assert that the request completed
-        assert!(
-            completed,
-            "Request did not complete within timeout. Check daemon processing."
-        );
-
-        // Verify HTTP client was called exactly once
-        assert_eq!(http_client.call_count(), 1);
-        let calls = http_client.get_calls();
-        assert_eq!(calls[0].method, "POST");
-        assert_eq!(calls[0].path, "/v1/test");
-        assert_eq!(calls[0].api_key, "test-key");
-    }
-
-    #[sqlx::test]
-    async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
-        // Setup: Create HTTP client with triggered responses
-        let http_client = Arc::new(MockHttpClient::new());
-
-        // Add 5 triggered responses for our 5 requests
-        let trigger1 = http_client.add_response_with_trigger(
-            "POST /v1/test",
-            Ok(HttpResponse {
-                status: 200,
-                body: r#"{"result":"1"}"#.to_string(),
-            }),
-        );
-        let trigger2 = http_client.add_response_with_trigger(
-            "POST /v1/test",
-            Ok(HttpResponse {
-                status: 200,
-                body: r#"{"result":"2"}"#.to_string(),
-            }),
-        );
-        let trigger3 = http_client.add_response_with_trigger(
-            "POST /v1/test",
-            Ok(HttpResponse {
-                status: 200,
-                body: r#"{"result":"3"}"#.to_string(),
-            }),
-        );
-        let trigger4 = http_client.add_response_with_trigger(
-            "POST /v1/test",
-            Ok(HttpResponse {
-                status: 200,
-                body: r#"{"result":"4"}"#.to_string(),
-            }),
-        );
-        let trigger5 = http_client.add_response_with_trigger(
-            "POST /v1/test",
-            Ok(HttpResponse {
-                status: 200,
-                body: r#"{"result":"5"}"#.to_string(),
-            }),
-        );
-
-        // Setup: Create manager with concurrency limit of 2 for "gpt-4"
-        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
-        model_concurrency_limits.insert("gpt-4".to_string(), 2);
-
-        let config = DaemonConfig {
-            claim_batch_size: 10,
-            claim_interval_ms: 10,
-            batch_claim_size: 10,
-            batch_claim_batch_size: 1,
-            batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: 10,
-            claim_query_timeout_ms: 180_000,
-            batch_claim_interval_ms: 10,
-            model_concurrency_limits,
-
-            model_escalations: Arc::new(dashmap::DashMap::new()),
-            inject_deadline_priority: false,
-            max_retries: Some(3),
-            stop_before_deadline_ms: None,
-            backoff_ms: 100,
-            backoff_factor: 2,
-            max_backoff_ms: 1000,
-            first_chunk_timeout_ms: 5000,
-            chunk_timeout_ms: 5000,
-            body_timeout_ms: 86_400_000,
-            status_log_interval_ms: None,
-            heartbeat_interval_ms: 5000,
-            should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
-            pending_request_counts_timeout_ms: 60_000,
-            stale_daemon_threshold_ms: 30_000,
-            unclaim_batch_size: 100,
-            batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100, // Fast polling for tests
-            purge_interval_ms: 0,               // Disabled in tests
-            purge_batch_size: 1000,
-            purge_throttle_ms: 100,
-            streamable_endpoints: Vec::new(),
-            throughput_log_interval_ms: None,
-            urgency_weight: 0.0,
-            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
-            default_completion_window_ms: 86_400_000,
-            claim_ramp_exponent: 0.56,
-            leaks_per_window: 60.0,
-            model_filters_keep_per_model: 50,
-            model_filters_retention_ms: 604_800_000,
-        };
-
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
-
-        // Setup: Create a file with 5 templates, all using "gpt-4"
-        let file_id = manager
-            .create_file(
-                "test-file".to_string(),
-                Some("Test concurrency limits".to_string()),
-                vec![
-                    crate::RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/v1/test".to_string(),
-                        body: r#"{"prompt":"test1"}"#.to_string(),
-                        model: "gpt-4".to_string(),
-                        api_key: "test-key".to_string(),
-                    },
-                    crate::RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/v1/test".to_string(),
-                        body: r#"{"prompt":"test2"}"#.to_string(),
-                        model: "gpt-4".to_string(),
-                        api_key: "test-key".to_string(),
-                    },
-                    crate::RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/v1/test".to_string(),
-                        body: r#"{"prompt":"test3"}"#.to_string(),
-                        model: "gpt-4".to_string(),
-                        api_key: "test-key".to_string(),
-                    },
-                    crate::RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/v1/test".to_string(),
-                        body: r#"{"prompt":"test4"}"#.to_string(),
-                        model: "gpt-4".to_string(),
-                        api_key: "test-key".to_string(),
-                    },
-                    crate::RequestTemplateInput {
-                        custom_id: None,
-                        endpoint: "https://api.example.com".to_string(),
-                        method: "POST".to_string(),
-                        path: "/v1/test".to_string(),
-                        body: r#"{"prompt":"test5"}"#.to_string(),
-                        model: "gpt-4".to_string(),
-                        api_key: "test-key".to_string(),
-                    },
-                ],
-            )
-            .await
-            .expect("Failed to create file");
-
-        let batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .expect("Failed to create batch");
-        mark_model_live_for_test(manager.as_ref(), "gpt-4").await;
-
-        // Start the daemon
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
-            .run(shutdown_token.clone())
-            .expect("Failed to start daemon");
-
-        // Wait for exactly 2 requests to be in-flight (respecting concurrency limit)
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(2);
-        let mut reached_limit = false;
-
-        while start.elapsed() < timeout {
-            let in_flight = http_client.in_flight_count();
-            if in_flight == 2 {
-                reached_limit = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        assert!(
-            reached_limit,
-            "Expected exactly 2 requests in-flight, got {}",
-            http_client.in_flight_count()
-        );
-
-        // Verify exactly 2 are in-flight (not more)
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            http_client.in_flight_count(),
-            2,
-            "Concurrency limit violated: more than 2 requests in-flight"
-        );
-
-        // Trigger completion of first request
-        trigger1.send(()).unwrap();
-
-        // Wait for the third request to start
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(2);
-        let mut third_started = false;
-
-        while start.elapsed() < timeout {
-            if http_client.call_count() >= 3 {
-                third_started = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        assert!(
-            third_started,
-            "Third request should have started after first completed"
-        );
-
-        // Verify still only 2 in-flight
-        assert_eq!(
-            http_client.in_flight_count(),
-            2,
-            "Should maintain concurrency limit of 2"
-        );
-
-        // Complete remaining requests to clean up
-        trigger2.send(()).unwrap();
-        trigger3.send(()).unwrap();
-        trigger4.send(()).unwrap();
-        trigger5.send(()).unwrap();
-
-        // Wait for all requests to complete
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(5);
-        let mut all_completed = false;
-
-        while start.elapsed() < timeout {
-            let status = manager
-                .get_batch_status(batch.id)
-                .await
-                .expect("Failed to get batch status");
-
-            if status.completed_requests == 5 {
-                all_completed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        // Stop the daemon
-        shutdown_token.cancel();
-
-        assert!(all_completed, "All 5 requests should have completed");
-
-        // Verify all 5 HTTP calls were made
-        assert_eq!(http_client.call_count(), 5);
-    }
-
-    #[sqlx::test]
-    async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
-        // Setup: Create HTTP client with failing responses, then success
-        let http_client = Arc::new(MockHttpClient::new());
-
-        // First attempt: fails with 500
-        http_client.add_response(
-            "POST /v1/test",
-            Ok(HttpResponse {
-                status: 500,
-                body: r#"{"error":"internal error"}"#.to_string(),
-            }),
-        );
-
-        // Second attempt: fails with 503
-        http_client.add_response(
-            "POST /v1/test",
-            Ok(HttpResponse {
-                status: 503,
-                body: r#"{"error":"service unavailable"}"#.to_string(),
-            }),
-        );
-
-        // Third attempt: succeeds
-        http_client.add_response(
-            "POST /v1/test",
-            Ok(HttpResponse {
-                status: 200,
-                body: r#"{"result":"success after retries"}"#.to_string(),
-            }),
-        );
-
-        // Setup: Create manager with fast backoff for testing
-        let config = DaemonConfig {
-            claim_batch_size: 10,
-            claim_interval_ms: 10,
-            batch_claim_size: 10,
-            batch_claim_batch_size: 1,
-            batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: 10,
-            claim_query_timeout_ms: 180_000,
-            batch_claim_interval_ms: 10,
-            model_concurrency_limits: {
-                let m = Arc::new(dashmap::DashMap::new());
-                m.insert("test-model".to_string(), 10);
-                m
-            },
-
-            model_escalations: Arc::new(dashmap::DashMap::new()),
-            inject_deadline_priority: false,
-            max_retries: Some(5),
-            stop_before_deadline_ms: None,
-            backoff_ms: 10, // Very fast backoff for testing
-            backoff_factor: 2,
-            max_backoff_ms: 100,
-            first_chunk_timeout_ms: 5000,
-            chunk_timeout_ms: 5000,
-            body_timeout_ms: 86_400_000,
-            status_log_interval_ms: None,
-            heartbeat_interval_ms: 5000,
-            should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
-            pending_request_counts_timeout_ms: 60_000,
-            stale_daemon_threshold_ms: 30_000,
-            unclaim_batch_size: 100,
-            batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100,
-            purge_interval_ms: 0, // Disabled in tests
-            purge_batch_size: 1000,
-            purge_throttle_ms: 100,
-            streamable_endpoints: Vec::new(),
-            throughput_log_interval_ms: None,
-            urgency_weight: 0.0,
-            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
-            default_completion_window_ms: 86_400_000,
-            claim_ramp_exponent: 0.56,
-            leaks_per_window: 60.0,
-            model_filters_keep_per_model: 50,
-            model_filters_retention_ms: 604_800_000,
-        };
-
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
-
-        // Setup: Create a file and batch
-        let file_id = manager
-            .create_file(
-                "test-file".to_string(),
-                Some("Test retry logic".to_string()),
-                vec![crate::RequestTemplateInput {
-                    custom_id: None,
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/test".to_string(),
-                    body: r#"{"prompt":"test"}"#.to_string(),
-                    model: "test-model".to_string(),
-                    api_key: "test-key".to_string(),
-                }],
-            )
-            .await
-            .expect("Failed to create file");
-
-        let batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .expect("Failed to create batch");
-        mark_model_live_for_test(manager.as_ref(), "test-model").await;
-
-        let requests = manager
-            .get_batch_requests(batch.id)
-            .await
-            .expect("Failed to get batch requests");
-        assert_eq!(requests.len(), 1);
-        let request_id = requests[0].id();
-
-        // Start the daemon
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
-            .run(shutdown_token.clone())
-            .expect("Failed to start daemon");
-
-        // Poll for completion (with timeout)
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(5);
-        let mut completed = false;
-
-        while start.elapsed() < timeout {
-            let results = manager
-                .get_requests(vec![request_id])
-                .await
-                .expect("Failed to get request");
-
-            if let Some(Ok(any_request)) = results.first()
-                && let crate::AnyRequest::Completed(req) = any_request
-            {
-                // Verify the request eventually completed successfully
-                assert_eq!(req.state.response_status, 200);
-                assert_eq!(
-                    req.state.response_body,
-                    r#"{"result":"success after retries"}"#
-                );
-                completed = true;
-                break;
-            }
-
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        // Stop the daemon
-        shutdown_token.cancel();
-
-        assert!(completed, "Request should have completed after retries");
-
-        // Verify the request was attempted 3 times (2 failures + 1 success)
-        assert_eq!(
-            http_client.call_count(),
-            3,
-            "Expected 3 HTTP calls (2 failed attempts + 1 success)"
-        );
-    }
-
-    #[sqlx::test]
-    async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) {
-        // Setup: Create HTTP client with triggered responses
-        let http_client = Arc::new(MockHttpClient::new());
-
-        // Add 10 triggered responses
-        let mut triggers = vec![];
-        for i in 1..=10 {
-            let trigger = http_client.add_response_with_trigger(
-                "POST /v1/test",
-                Ok(HttpResponse {
-                    status: 200,
-                    body: format!(r#"{{"result":"{}"}}"#, i),
-                }),
-            );
-            triggers.push(trigger);
-        }
-
-        // Setup: Start with concurrency limit of 2 for "gpt-4"
-        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
-        model_concurrency_limits.insert("gpt-4".to_string(), 2);
-
-        let config = DaemonConfig {
-            claim_batch_size: 10,
-            claim_interval_ms: 10,
-            batch_claim_size: 10,
-            batch_claim_batch_size: 1,
-            batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: 10,
-            claim_query_timeout_ms: 180_000,
-            batch_claim_interval_ms: 10,
-            model_concurrency_limits: model_concurrency_limits.clone(),
-
-            model_escalations: Arc::new(dashmap::DashMap::new()),
-            inject_deadline_priority: false,
-            max_retries: Some(3),
-            stop_before_deadline_ms: None,
-            backoff_ms: 100,
-            backoff_factor: 2,
-            max_backoff_ms: 1000,
-            first_chunk_timeout_ms: 5000,
-            chunk_timeout_ms: 5000,
-            body_timeout_ms: 86_400_000,
-            status_log_interval_ms: None,
-            heartbeat_interval_ms: 5000,
-            should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
-            pending_request_counts_timeout_ms: 60_000,
-            stale_daemon_threshold_ms: 30_000,
-            unclaim_batch_size: 100,
-            batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100,
-            purge_interval_ms: 0, // Disabled in tests
-            purge_batch_size: 1000,
-            purge_throttle_ms: 100,
-            streamable_endpoints: Vec::new(),
-            throughput_log_interval_ms: None,
-            urgency_weight: 0.0,
-            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
-            default_completion_window_ms: 86_400_000,
-            claim_ramp_exponent: 0.56,
-            leaks_per_window: 60.0,
-            model_filters_keep_per_model: 50,
-            model_filters_retention_ms: 604_800_000,
-        };
-
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
-
-        // Setup: Create a file with 10 requests, all using "gpt-4"
-        let templates: Vec<_> = (1..=10)
-            .map(|i| crate::RequestTemplateInput {
-                custom_id: None,
-                endpoint: "https://api.example.com".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/test".to_string(),
-                body: format!(r#"{{"prompt":"test{}"}}"#, i),
-                model: "gpt-4".to_string(),
-                api_key: "test-key".to_string(),
-            })
-            .collect();
-
-        let file_id = manager
-            .create_file(
-                "test-file".to_string(),
-                Some("Test dynamic limits".to_string()),
-                templates,
-            )
-            .await
-            .expect("Failed to create file");
-
-        let batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .expect("Failed to create batch");
-        mark_model_live_for_test(manager.as_ref(), "gpt-4").await;
-
-        // Start the daemon
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
-            .run(shutdown_token.clone())
-            .expect("Failed to start daemon");
-
-        // Wait for exactly 2 requests to be in-flight (initial limit)
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(2);
-        let mut reached_initial_limit = false;
-
-        while start.elapsed() < timeout {
-            let in_flight = http_client.in_flight_count();
-            if in_flight == 2 {
-                reached_initial_limit = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        assert!(
-            reached_initial_limit,
-            "Expected exactly 2 requests in-flight with initial limit"
-        );
-
-        // Increase the limit to 5
-        model_concurrency_limits.insert("gpt-4".to_string(), 5);
-
-        // Wait a bit for the daemon to pick up the new limit
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Complete one request to free up a permit and trigger daemon to check limits
-        triggers.remove(0).send(()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Now we should see up to 5 requests in flight
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(2);
-        let mut reached_new_limit = false;
-
-        while start.elapsed() < timeout {
-            let in_flight = http_client.in_flight_count();
-            if in_flight >= 4 {
-                // Should see at least 4-5 in flight with new limit
-                reached_new_limit = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        assert!(
-            reached_new_limit,
-            "Expected more requests in-flight after limit increase, got {}",
-            http_client.in_flight_count()
-        );
-
-        // Now decrease the limit to 3
-        model_concurrency_limits.insert("gpt-4".to_string(), 3);
-
-        // Complete remaining requests
-        for trigger in triggers {
-            trigger.send(()).unwrap();
-        }
-
-        // Wait for all requests to complete
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(5);
-        let mut all_completed = false;
-
-        while start.elapsed() < timeout {
-            let status = manager
-                .get_batch_status(batch.id)
-                .await
-                .expect("Failed to get batch status");
-
-            if status.completed_requests == 10 {
-                all_completed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        // Stop the daemon
-        shutdown_token.cancel();
-
-        assert!(all_completed, "All 10 requests should have completed");
-        assert_eq!(http_client.call_count(), 10);
-    }
-
-    #[sqlx::test]
-    async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
-        // Test that retries stop when approaching the deadline
-        let http_client = Arc::new(MockHttpClient::new());
-
-        // All requests will fail
-        for _ in 0..20 {
-            http_client.add_response(
-                "POST /v1/test",
-                Ok(HttpResponse {
-                    status: 500,
-                    body: r#"{"error":"server error"}"#.to_string(),
-                }),
-            );
-        }
-
-        // Use deadline-aware retry with a short completion window and short buffer
-        let config = DaemonConfig {
-            claim_batch_size: 10,
-            claim_interval_ms: 10,
-            batch_claim_size: 10,
-            batch_claim_batch_size: 1,
-            batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: 10,
-            claim_query_timeout_ms: 180_000,
-            batch_claim_interval_ms: 10,
-            model_concurrency_limits: {
-                let m = Arc::new(dashmap::DashMap::new());
-                m.insert("test-model".to_string(), 10);
-                m
-            },
-
-            model_escalations: Arc::new(dashmap::DashMap::new()),
-            inject_deadline_priority: false,
-            max_retries: Some(10_000),
-            stop_before_deadline_ms: Some(500), // 500ms buffer before deadline
-            backoff_ms: 50,
-            backoff_factor: 2,
-            max_backoff_ms: 200,
-            first_chunk_timeout_ms: 5000,
-            chunk_timeout_ms: 5000,
-            body_timeout_ms: 86_400_000,
-            status_log_interval_ms: None,
-            heartbeat_interval_ms: 5000,
-            should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
-            pending_request_counts_timeout_ms: 60_000,
-            stale_daemon_threshold_ms: 30_000,
-            unclaim_batch_size: 100,
-            batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100,
-            purge_interval_ms: 0, // Disabled in tests
-            purge_batch_size: 1000,
-            purge_throttle_ms: 100,
-            streamable_endpoints: Vec::new(),
-            throughput_log_interval_ms: None,
-            urgency_weight: 0.0,
-            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
-            default_completion_window_ms: 86_400_000,
-            claim_ramp_exponent: 0.56,
-            leaks_per_window: 60.0,
-            model_filters_keep_per_model: 50,
-            model_filters_retention_ms: 604_800_000,
-        };
-
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
-
-        // Create a batch with a very short completion window (2 seconds)
-        let file_id = manager
-            .create_file(
-                "test-file".to_string(),
-                Some("Test deadline cutoff".to_string()),
-                vec![crate::RequestTemplateInput {
-                    custom_id: None,
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/test".to_string(),
-                    body: r#"{"prompt":"test"}"#.to_string(),
-                    model: "test-model".to_string(),
-                    api_key: "test-key".to_string(),
-                }],
-            )
-            .await
-            .expect("Failed to create file");
-
-        let batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "2s".to_string(), // Very short window
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .expect("Failed to create batch");
-        mark_model_live_for_test(manager.as_ref(), "test-model").await;
-
-        let requests = manager
-            .get_batch_requests(batch.id)
-            .await
-            .expect("Failed to get batch requests");
-        let request_id = requests[0].id();
-
-        // Start the daemon
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
-            .run(shutdown_token.clone())
-            .expect("Failed to start daemon");
-
-        // Wait for the deadline to pass
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        // Check the request state
-        let results = manager
-            .get_requests(vec![request_id])
-            .await
-            .expect("Failed to get request");
-
-        shutdown_token.cancel();
-
-        if let Some(Ok(crate::AnyRequest::Failed(failed))) = results.first() {
-            // Calculate expected retry attempts:
-            // - Completion window: 2000ms
-            // - Buffer: 500ms
-            // - Effective deadline: 1500ms
-            // - Backoff sequence: 50ms, 100ms, 200ms, 200ms, 200ms, 200ms, 200ms
-            // - Timeline:
-            //   - Initial attempt: t=0ms (attempt 0)
-            //   - Retry 1: t=50ms (attempt 1)
-            //   - Retry 2: t=150ms (attempt 2)
-            //   - Retry 3: t=350ms (attempt 3)
-            //   - Retry 4: t=550ms (attempt 4)
-            //   - Retry 5: t=750ms (attempt 5)
-            //   - Retry 6: t=950ms (attempt 6)
-            //   - Retry 7: t=1150ms (attempt 7)
-            //   - Retry 8: t=1350ms (attempt 8)
-            //   - Next would be t=1550ms - EXCEEDS 1500ms deadline
-            // Expected: 8 retry attempts (9 total including initial)
-
-            let retry_count = failed.state.retry_attempt;
-            let call_count = http_client.call_count();
-
-            // 1. Verify we stopped before too many retries (deadline constraint)
-            // Allow 4-9 attempts to account for timing variations in test execution,
-            // parallel test execution overhead, and query overhead from batch metadata fields
-            assert!(
-                (4..=9).contains(&retry_count),
-                "Expected 4-9 retry attempts based on deadline and backoff calculation, got {}",
-                retry_count
-            );
-
-            // 2. Verify HTTP call count matches retry attempts (1 initial + N retries)
-            assert_eq!(
-                call_count,
-                (retry_count + 1) as usize,
-                "Expected call count to match retry attempts + 1 initial attempt, got {} calls for {} retry attempts",
-                call_count,
-                retry_count
-            );
-
-            // 3. Verify the request actually has error details from the last attempt
-            assert!(
-                !failed.state.reason.to_error_message().is_empty(),
-                "Expected failed request to have failure reason"
-            );
-        } else {
-            panic!(
-                "Expected request to be in Failed state, got {:?}",
-                results.first()
-            );
-        }
-    }
-
-    #[sqlx::test]
-    async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
-        // Test that when neither max_retries nor stop_before_deadline_ms is set,
-        // retries stop exactly at the deadline (no buffer)
-        let http_client = Arc::new(MockHttpClient::new());
-
-        // All requests will fail
-        for _ in 0..20 {
-            http_client.add_response(
-                "POST /v1/test",
-                Ok(HttpResponse {
-                    status: 500,
-                    body: r#"{"error":"server error"}"#.to_string(),
-                }),
-            );
-        }
-
-        // No max_retries, no stop_before_deadline_ms
-        let config = DaemonConfig {
-            claim_batch_size: 10,
-            claim_interval_ms: 10,
-            batch_claim_size: 10,
-            batch_claim_batch_size: 1,
-            batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: 10,
-            claim_query_timeout_ms: 180_000,
-            batch_claim_interval_ms: 10,
-            model_concurrency_limits: {
-                let m = Arc::new(dashmap::DashMap::new());
-                m.insert("test-model".to_string(), 10);
-                m
-            },
-
-            model_escalations: Arc::new(dashmap::DashMap::new()),
-            inject_deadline_priority: false,
-            max_retries: None,             // No retry limit
-            stop_before_deadline_ms: None, // No buffer - should retry until deadline
-            backoff_ms: 50,
-            backoff_factor: 2,
-            max_backoff_ms: 200,
-            first_chunk_timeout_ms: 5000,
-            chunk_timeout_ms: 5000,
-            body_timeout_ms: 86_400_000,
-            status_log_interval_ms: None,
-            heartbeat_interval_ms: 5000,
-            should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
-            pending_request_counts_timeout_ms: 60_000,
-            stale_daemon_threshold_ms: 30_000,
-            unclaim_batch_size: 100,
-            batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100,
-            purge_interval_ms: 0, // Disabled in tests
-            purge_batch_size: 1000,
-            purge_throttle_ms: 100,
-            streamable_endpoints: Vec::new(),
-            throughput_log_interval_ms: None,
-            urgency_weight: 0.0,
-            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
-            default_completion_window_ms: 86_400_000,
-            claim_ramp_exponent: 0.56,
-            leaks_per_window: 60.0,
-            model_filters_keep_per_model: 50,
-            model_filters_retention_ms: 604_800_000,
-        };
-
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
-
-        // Create a batch with a 2 second completion window
-        let file_id = manager
-            .create_file(
-                "test-file".to_string(),
-                Some("Test no limits retry".to_string()),
-                vec![crate::RequestTemplateInput {
-                    custom_id: None,
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/test".to_string(),
-                    body: r#"{"prompt":"test"}"#.to_string(),
-                    model: "test-model".to_string(),
-                    api_key: "test-key".to_string(),
-                }],
-            )
-            .await
-            .expect("Failed to create file");
-
-        let batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "2s".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .expect("Failed to create batch");
-        mark_model_live_for_test(manager.as_ref(), "test-model").await;
-
-        let requests = manager
-            .get_batch_requests(batch.id)
-            .await
-            .expect("Failed to get batch requests");
-        let request_id = requests[0].id();
-
-        // Start the daemon
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
-            .run(shutdown_token.clone())
-            .expect("Failed to start daemon");
-
-        // Wait for the deadline to pass
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        // Check the request state
-        let results = manager
-            .get_requests(vec![request_id])
-            .await
-            .expect("Failed to get request");
-
-        shutdown_token.cancel();
-
-        if let Some(Ok(crate::AnyRequest::Failed(failed))) = results.first() {
-            // Calculate expected retry attempts with NO buffer:
-            // - Completion window: 2000ms
-            // - Buffer: 0ms (none set)
-            // - Effective deadline: 2000ms
-            // - Backoff sequence: 50ms, 100ms, 200ms, 200ms, 200ms...
-            // - Timeline:
-            //   - Initial attempt: t=0ms (attempt 0)
-            //   - Retry 1: t=50ms (attempt 1)
-            //   - Retry 2: t=150ms (attempt 2)
-            //   - Retry 3: t=350ms (attempt 3)
-            //   - Retry 4: t=550ms (attempt 4)
-            //   - Retry 5: t=750ms (attempt 5)
-            //   - Retry 6: t=950ms (attempt 6)
-            //   - Retry 7: t=1150ms (attempt 7)
-            //   - Retry 8: t=1350ms (attempt 8)
-            //   - Retry 9: t=1550ms (attempt 9)
-            //   - Retry 10: t=1750ms (attempt 10)
-            //   - Retry 11: t=1950ms (attempt 11)
-            //   - Next would be t=2150ms - EXCEEDS 2000ms deadline
-            // Expected: ~11 retry attempts (12 total including initial)
-            // In reality, we will see <11 due to DB calls and CPU overhead in making requests
-
-            let retry_count = failed.state.retry_attempt;
-            let call_count = http_client.call_count();
-
-            // 1. Verify we retried more than the buffered case (which stopped at ~8)
-            //    but still stopped before too many attempts
-            // Allow 6-12 attempts to account for timing variations with CI slower CI CPUs,
-            // parallel test execution overhead, and query overhead from batch metadata fields
-            assert!(
-                (6..12).contains(&retry_count),
-                "Expected 6-12 retry attempts (should retry until deadline with no buffer), got {}",
-                retry_count
-            );
-
-            // 2. Verify HTTP call count matches retry attempts (1 initial + N retries)
-            assert_eq!(
-                call_count,
-                (retry_count + 1) as usize,
-                "Expected call count to match retry attempts + 1 initial attempt, got {} calls for {} retry attempts",
-                call_count,
-                retry_count
-            );
-
-            // 3. Verify the request has error details from the last attempt
-            assert!(
-                !failed.state.reason.to_error_message().is_empty(),
-                "Expected failed request to have failure reason"
-            );
-        } else {
-            panic!(
-                "Expected request to be in Failed state, got {:?}",
-                results.first()
-            );
-        }
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_batch_metadata_headers_passed_through(pool: sqlx::PgPool) {
-        let http_client = crate::http::MockHttpClient::new();
-        http_client.add_response(
-            "POST /v1/chat/completions",
-            Ok(crate::http::HttpResponse {
-                status: 200,
-                body: r#"{"id":"chatcmpl-123","choices":[{"message":{"content":"test"}}]}"#
-                    .to_string(),
-            }),
-        );
-
-        let config = DaemonConfig {
-            claim_batch_size: 10,
-            claim_interval_ms: 10,
-            batch_claim_size: 10,
-            batch_claim_batch_size: 1,
-            batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: 10,
-            claim_query_timeout_ms: 180_000,
-            batch_claim_interval_ms: 10,
-            model_concurrency_limits: {
-                let m = Arc::new(dashmap::DashMap::new());
-                m.insert("test-model".to_string(), 10);
-                m
-            },
-
-            model_escalations: Arc::new(dashmap::DashMap::new()),
-            inject_deadline_priority: false,
-            max_retries: Some(3),
-            stop_before_deadline_ms: None,
-            backoff_ms: 100,
-            backoff_factor: 2,
-            max_backoff_ms: 1000,
-            first_chunk_timeout_ms: 5000,
-            chunk_timeout_ms: 5000,
-            body_timeout_ms: 86_400_000,
-            status_log_interval_ms: None,
-            heartbeat_interval_ms: 5000,
-            should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
-            pending_request_counts_timeout_ms: 60_000,
-            stale_daemon_threshold_ms: 30_000,
-            unclaim_batch_size: 100,
-            batch_metadata_fields: vec![
-                "id".to_string(),
-                "endpoint".to_string(),
-                "created_at".to_string(),
-                "completion_window".to_string(),
-            ],
-            cancellation_poll_interval_ms: 100,
-            purge_interval_ms: 0, // Disabled in tests
-            purge_batch_size: 1000,
-            purge_throttle_ms: 100,
-            streamable_endpoints: Vec::new(),
-            throughput_log_interval_ms: None,
-            urgency_weight: 0.0,
-            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
-            default_completion_window_ms: 86_400_000,
-            claim_ramp_exponent: 0.56,
-            leaks_per_window: 60.0,
-            model_filters_keep_per_model: 50,
-            model_filters_retention_ms: 604_800_000,
-        };
-
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                Arc::new(http_client.clone()),
-            )
-            .with_config(config),
-        );
-
-        // Create a batch
-        let file_id = manager
-            .create_file(
-                "test-file".to_string(),
-                Some("Test batch metadata".to_string()),
-                vec![crate::RequestTemplateInput {
-                    custom_id: None,
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/chat/completions".to_string(),
-                    body: r#"{"prompt":"test"}"#.to_string(),
-                    model: "test-model".to_string(),
-                    api_key: "test-key".to_string(),
-                }],
-            )
-            .await
-            .expect("Failed to create file");
-
-        let batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: Some("test-user".to_string()),
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .expect("Failed to create batch");
-        mark_model_live_for_test(manager.as_ref(), "test-model").await;
-
-        let requests = manager
-            .get_batch_requests(batch.id)
-            .await
-            .expect("Failed to get batch requests");
-        let request_id = requests[0].id();
-
-        // Start the daemon
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
-            .run(shutdown_token.clone())
-            .expect("Failed to start daemon");
-
-        // Wait for request to be processed
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        shutdown_token.cancel();
-
-        // Wait a bit for shutdown
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Verify the request was completed
-        let results = manager
-            .get_requests(vec![request_id])
-            .await
-            .expect("Failed to get request");
-
-        assert_eq!(results.len(), 1);
-        assert!(
-            matches!(results[0], Ok(crate::AnyRequest::Completed(_))),
-            "Expected request to be completed"
-        );
-
-        // Verify batch metadata was passed to HTTP client
-        let calls = http_client.get_calls();
-        assert_eq!(calls.len(), 1, "Expected exactly one HTTP call");
-
-        let call = &calls[0];
-        assert_eq!(
-            call.batch_metadata.len(),
-            4,
-            "Expected 4 batch metadata fields"
-        );
-
-        // Verify each configured field was passed through
-        assert!(
-            call.batch_metadata.contains_key("id"),
-            "Expected batch id in metadata"
-        );
-        assert!(
-            call.batch_metadata.contains_key("endpoint"),
-            "Expected batch endpoint in metadata"
-        );
-        assert!(
-            call.batch_metadata.contains_key("created_at"),
-            "Expected batch created_at in metadata"
-        );
-        assert!(
-            call.batch_metadata.contains_key("completion_window"),
-            "Expected batch completion_window in metadata"
-        );
-
-        // Verify values are correct
-        assert_eq!(
-            call.batch_metadata.get("endpoint"),
-            Some(&"/v1/chat/completions".to_string()),
-            "Batch endpoint should match"
-        );
-        assert_eq!(
-            call.batch_metadata.get("completion_window"),
-            Some(&"24h".to_string()),
-            "Completion window should match"
-        );
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_batchless_flex_sets_async_completion_window_metadata(pool: sqlx::PgPool) {
-        let http_client = crate::http::MockHttpClient::new();
-        http_client.add_response(
-            "POST /v1/chat/completions",
-            Ok(crate::http::HttpResponse {
-                status: 200,
-                body: r#"{"id":"chatcmpl-flex","choices":[{"message":{"content":"test"}}]}"#
-                    .to_string(),
-            }),
-        );
-
-        let config = DaemonConfig {
-            claim_batch_size: 10,
-            claim_interval_ms: 10,
-            batch_claim_size: 10,
-            batch_claim_batch_size: 1,
-            batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: 10,
-            claim_query_timeout_ms: 180_000,
-            batch_claim_interval_ms: 10,
-            model_concurrency_limits: {
-                let m = Arc::new(dashmap::DashMap::new());
-                m.insert("test-model".to_string(), 10);
-                m
-            },
-
-            model_escalations: Arc::new(dashmap::DashMap::new()),
-            inject_deadline_priority: false,
-            max_retries: Some(3),
-            stop_before_deadline_ms: None,
-            backoff_ms: 100,
-            backoff_factor: 2,
-            max_backoff_ms: 1000,
-            first_chunk_timeout_ms: 5000,
-            chunk_timeout_ms: 5000,
-            body_timeout_ms: 86_400_000,
-            status_log_interval_ms: None,
-            heartbeat_interval_ms: 5000,
-            should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
-            pending_request_counts_timeout_ms: 60_000,
-            stale_daemon_threshold_ms: 30_000,
-            unclaim_batch_size: 100,
-            batch_metadata_fields: vec![
-                "id".to_string(),
-                "created_at".to_string(),
-                "completion_window".to_string(),
-            ],
-            cancellation_poll_interval_ms: 100,
-            purge_interval_ms: 0,
-            purge_batch_size: 1000,
-            purge_throttle_ms: 100,
-            streamable_endpoints: Vec::new(),
-            throughput_log_interval_ms: None,
-            urgency_weight: 0.0,
-            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
-            default_completion_window_ms: 86_400_000,
-            claim_ramp_exponent: 0.56,
-            leaks_per_window: 60.0,
-            model_filters_keep_per_model: 50,
-            model_filters_retention_ms: 604_800_000,
-        };
-
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                Arc::new(http_client.clone()),
-            )
-            .with_config(config),
-        );
-
-        let request_id = uuid::Uuid::new_v4();
-        manager
-            .create_flex(crate::request::CreateFlexInput {
-                request_id,
-                body: r#"{"model":"test-model","messages":[],"service_tier":"flex"}"#.to_string(),
-                model: "test-model".to_string(),
-                endpoint: "https://api.example.com".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
-                api_key: "batch-key".to_string(),
-                created_by: uuid::Uuid::new_v4().to_string(),
-            })
-            .await
-            .expect("create_flex should succeed");
-
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
-            .run(shutdown_token.clone())
-            .expect("Failed to start daemon");
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        shutdown_token.cancel();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let calls = http_client.get_calls();
-        assert_eq!(calls.len(), 1, "Expected exactly one HTTP call");
-        assert_eq!(
-            calls[0].batch_metadata.get("completion_window"),
-            Some(&"1h".to_string()),
-            "batchless flex should be identified to downstream analytics as Async"
-        );
-        assert!(
-            calls[0].batch_metadata.contains_key("created_at"),
-            "batchless flex should carry request creation time for historical pricing"
-        );
-        assert!(
-            !calls[0].batch_metadata.contains_key("id"),
-            "batchless flex must not emit an empty synthetic batch id"
-        );
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_batch_metadata_extracts_fields_from_json_metadata(pool: sqlx::PgPool) {
-        let http_client = crate::http::MockHttpClient::new();
-        http_client.add_response(
-            "POST /v1/chat/completions",
-            Ok(crate::http::HttpResponse {
-                status: 200,
-                body: r#"{"id":"chatcmpl-123","choices":[{"message":{"content":"test"}}]}"#
-                    .to_string(),
-            }),
-        );
-
-        // Configure batch_metadata_fields to include "request_source" which is stored
-        // inside the metadata JSON, not as a direct column
-        let config = DaemonConfig {
-            claim_batch_size: 10,
-            claim_interval_ms: 10,
-            batch_claim_size: 10,
-            batch_claim_batch_size: 1,
-            batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: 10,
-            claim_query_timeout_ms: 180_000,
-            batch_claim_interval_ms: 10,
-            model_concurrency_limits: {
-                let m = Arc::new(dashmap::DashMap::new());
-                m.insert("test-model".to_string(), 10);
-                m
-            },
-
-            model_escalations: Arc::new(dashmap::DashMap::new()),
-            inject_deadline_priority: false,
-            max_retries: Some(3),
-            stop_before_deadline_ms: None,
-            backoff_ms: 100,
-            backoff_factor: 2,
-            max_backoff_ms: 1000,
-            first_chunk_timeout_ms: 5000,
-            chunk_timeout_ms: 5000,
-            body_timeout_ms: 86_400_000,
-            status_log_interval_ms: None,
-            heartbeat_interval_ms: 5000,
-            should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
-            pending_request_counts_timeout_ms: 60_000,
-            stale_daemon_threshold_ms: 30_000,
-            unclaim_batch_size: 100,
-            batch_metadata_fields: vec![
-                "id".to_string(),
-                "endpoint".to_string(),
-                "completion_window".to_string(),
-                "request_source".to_string(), // This comes from metadata JSON
-            ],
-            cancellation_poll_interval_ms: 100,
-            purge_interval_ms: 0, // Disabled in tests
-            purge_batch_size: 1000,
-            purge_throttle_ms: 100,
-            streamable_endpoints: Vec::new(),
-            throughput_log_interval_ms: None,
-            urgency_weight: 0.0,
-            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
-            default_completion_window_ms: 86_400_000,
-            claim_ramp_exponent: 0.56,
-            leaks_per_window: 60.0,
-            model_filters_keep_per_model: 50,
-            model_filters_retention_ms: 604_800_000,
-        };
-
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                Arc::new(http_client.clone()),
-            )
-            .with_config(config),
-        );
-
-        // Create a batch with metadata containing request_source
-        let file_id = manager
-            .create_file(
-                "test-file".to_string(),
-                Some("Test metadata JSON extraction".to_string()),
-                vec![crate::RequestTemplateInput {
-                    custom_id: None,
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/chat/completions".to_string(),
-                    body: r#"{"prompt":"test"}"#.to_string(),
-                    model: "test-model".to_string(),
-                    api_key: "test-key".to_string(),
-                }],
-            )
-            .await
-            .expect("Failed to create file");
-
-        let batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: Some(serde_json::json!({
-                    "request_source": "api",
-                    "created_by": "user-123"
-                })),
-                created_by: Some("test-user".to_string()),
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .expect("Failed to create batch");
-        mark_model_live_for_test(manager.as_ref(), "test-model").await;
-
-        let requests = manager
-            .get_batch_requests(batch.id)
-            .await
-            .expect("Failed to get batch requests");
-        let request_id = requests[0].id();
-
-        // Start the daemon
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
-            .run(shutdown_token.clone())
-            .expect("Failed to start daemon");
-
-        // Wait for request to be processed
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        shutdown_token.cancel();
-
-        // Wait a bit for shutdown
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Verify the request was completed
-        let results = manager
-            .get_requests(vec![request_id])
-            .await
-            .expect("Failed to get request");
-
-        assert_eq!(results.len(), 1);
-        assert!(
-            matches!(results[0], Ok(crate::AnyRequest::Completed(_))),
-            "Expected request to be completed"
-        );
-
-        // Verify batch metadata was passed to HTTP client
-        let calls = http_client.get_calls();
-        assert_eq!(calls.len(), 1, "Expected exactly one HTTP call");
-
-        let call = &calls[0];
-        assert_eq!(
-            call.batch_metadata.len(),
-            4,
-            "Expected 4 batch metadata fields (id, endpoint, completion_window, request_source)"
-        );
-
-        // Verify direct column fields
-        assert!(
-            call.batch_metadata.contains_key("id"),
-            "Expected batch id in metadata"
-        );
-        assert_eq!(
-            call.batch_metadata.get("endpoint"),
-            Some(&"/v1/chat/completions".to_string()),
-            "Batch endpoint should match"
-        );
-
-        // Verify request_source was extracted from metadata JSON
-        assert_eq!(
-            call.batch_metadata.get("request_source"),
-            Some(&"api".to_string()),
-            "request_source should be extracted from metadata JSON"
-        );
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_batch_api_key_overrides_template_api_key(pool: sqlx::PgPool) {
-        // Setup: Create HTTP client with mock response
-        let http_client = Arc::new(MockHttpClient::new());
-        http_client.add_response(
-            "POST /v1/test",
-            Ok(HttpResponse {
-                status: 200,
-                body: r#"{"result":"success"}"#.to_string(),
-            }),
-        );
-
-        let config = DaemonConfig {
-            claim_batch_size: 10,
-            claim_interval_ms: 10,
-            batch_claim_size: 10,
-            batch_claim_batch_size: 1,
-            batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: 10,
-            claim_query_timeout_ms: 180_000,
-            batch_claim_interval_ms: 10,
-            model_concurrency_limits: {
-                let m = Arc::new(dashmap::DashMap::new());
-                m.insert("test-model".to_string(), 10);
-                m
-            },
-            model_escalations: Arc::new(dashmap::DashMap::new()),
-            inject_deadline_priority: false,
-            max_retries: Some(3),
-            stop_before_deadline_ms: None,
-            backoff_ms: 100,
-            backoff_factor: 2,
-            max_backoff_ms: 1000,
-            first_chunk_timeout_ms: 5000,
-            chunk_timeout_ms: 5000,
-            body_timeout_ms: 86_400_000,
-            status_log_interval_ms: None,
-            heartbeat_interval_ms: 5000,
-            should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
-            pending_request_counts_timeout_ms: 60_000,
-            stale_daemon_threshold_ms: 30_000,
-            unclaim_batch_size: 100,
-            batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100,
-            purge_interval_ms: 0,
-            purge_batch_size: 1000,
-            purge_throttle_ms: 100,
-            streamable_endpoints: Vec::new(),
-            throughput_log_interval_ms: None,
-            urgency_weight: 0.0,
-            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
-            default_completion_window_ms: 86_400_000,
-            claim_ramp_exponent: 0.56,
-            leaks_per_window: 60.0,
-            model_filters_keep_per_model: 50,
-            model_filters_retention_ms: 604_800_000,
-        };
-
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
-
-        // Create file with template using the file uploader's key
-        let file_id = manager
-            .create_file(
-                "test-file".to_string(),
-                Some("Test file".to_string()),
-                vec![crate::RequestTemplateInput {
-                    custom_id: None,
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/test".to_string(),
-                    body: r#"{"prompt":"test"}"#.to_string(),
-                    model: "test-model".to_string(),
-                    api_key: "template-key".to_string(),
-                }],
-            )
-            .await
-            .expect("Failed to create file");
-
-        // Create batch with a different key (the batch creator's key)
-        let batch = manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: Some("batch-creator-key".to_string()),
-                total_requests: None,
-            })
-            .await
-            .expect("Failed to create batch");
-        mark_model_live_for_test(manager.as_ref(), "test-model").await;
-
-        let requests = manager
-            .get_batch_requests(batch.id)
-            .await
-            .expect("Failed to get batch requests");
-        assert_eq!(requests.len(), 1);
-        let request_id = requests[0].id();
-
-        // Start the daemon
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
-            .run(shutdown_token.clone())
-            .expect("Failed to start daemon");
-
-        // Poll for completion
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(5);
-        let mut completed = false;
-
-        while start.elapsed() < timeout {
-            let results = manager
-                .get_requests(vec![request_id])
-                .await
-                .expect("Failed to get request");
-
-            if let Some(Ok(any_request)) = results.first()
-                && any_request.is_terminal()
-            {
-                completed = true;
-                break;
-            }
-
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        shutdown_token.cancel();
-        assert!(completed, "Request did not complete within timeout");
-
-        // Verify the daemon used the batch creator's key, not the template key
-        assert_eq!(http_client.call_count(), 1);
-        let calls = http_client.get_calls();
-        assert_eq!(
-            calls[0].api_key, "batch-creator-key",
-            "Daemon should use batch creator's API key, not the template's"
-        );
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_daemon_injects_deadline_priority_into_body(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        http_client.add_response(
-            "POST /v1/test",
-            Ok(HttpResponse {
-                status: 200,
-                body: r#"{"result":"success"}"#.to_string(),
-            }),
-        );
-
-        let config = DaemonConfig {
-            claim_batch_size: 10,
-            claim_interval_ms: 10,
-            batch_claim_size: 10,
-            batch_claim_batch_size: 1,
-            batch_claim_require_live: false,
-            claim_loop_max_consecutive_failures: 10,
-            claim_query_timeout_ms: 180_000,
-            batch_claim_interval_ms: 10,
-            model_concurrency_limits: {
-                let m = Arc::new(dashmap::DashMap::new());
-                m.insert("test-model".to_string(), 10);
-                m
-            },
-            model_escalations: Arc::new(dashmap::DashMap::new()),
-            inject_deadline_priority: true,
-            max_retries: Some(3),
-            stop_before_deadline_ms: None,
-            backoff_ms: 100,
-            backoff_factor: 2,
-            max_backoff_ms: 1000,
-            first_chunk_timeout_ms: 5000,
-            chunk_timeout_ms: 5000,
-            body_timeout_ms: 86_400_000,
-            status_log_interval_ms: None,
-            heartbeat_interval_ms: 5000,
-            should_retry: Arc::new(default_should_retry),
-            claim_timeout_ms: 60000,
-            processing_timeout_ms: 600000,
-            pending_request_counts_timeout_ms: 60_000,
-            stale_daemon_threshold_ms: 30_000,
-            unclaim_batch_size: 100,
-            batch_metadata_fields: vec![],
-            cancellation_poll_interval_ms: 100,
-            purge_interval_ms: 0,
-            purge_batch_size: 1000,
-            purge_throttle_ms: 100,
-            streamable_endpoints: Vec::new(),
-            throughput_log_interval_ms: None,
-            urgency_weight: 0.0,
-            service_tier_completion_windows_ms: HashMap::from([("flex".to_string(), 3_600_000)]),
-            default_completion_window_ms: 86_400_000,
-            claim_ramp_exponent: 0.56,
-            leaks_per_window: 60.0,
-            model_filters_keep_per_model: 50,
-            model_filters_retention_ms: 604_800_000,
-        };
-
-        let manager = Arc::new(
-            PostgresRequestManager::with_client(
-                TestDbPools::new(pool.clone()).await.unwrap(),
-                http_client.clone(),
-            )
-            .with_config(config),
-        );
-
-        let file_id = manager
-            .create_file(
-                "priority-test".to_string(),
-                None,
-                vec![crate::RequestTemplateInput {
-                    custom_id: None,
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/test".to_string(),
-                    body: r#"{"prompt":"hello"}"#.to_string(),
-                    model: "test-model".to_string(),
-                    api_key: "test-key".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        manager
-            .create_batch(crate::batch::BatchInput {
-                file_id,
-                endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "24h".to_string(),
-                metadata: None,
-                created_by: None,
-                api_key_id: None,
-                api_key: None,
-                total_requests: None,
-            })
-            .await
-            .unwrap();
-        mark_model_live_for_test(manager.as_ref(), "test-model").await;
-
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        manager
-            .clone()
-            .run(shutdown_token.clone())
-            .expect("Failed to start daemon");
-
-        let start = tokio::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(5) {
-            if http_client.call_count() > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        shutdown_token.cancel();
-
-        assert_eq!(http_client.call_count(), 1);
-        let calls = http_client.get_calls();
-        let body: serde_json::Value = serde_json::from_str(&calls[0].body).unwrap();
-        let priority = body
-            .pointer("/nvext/agent_hints/priority")
-            .and_then(|v| v.as_i64())
-            .expect("Request body should contain nvext.agent_hints.priority");
-        let expected = -(chrono::Utc::now() + chrono::Duration::hours(24)).timestamp();
-        assert!(
-            (priority - expected).abs() <= 10,
-            "Priority should be the negated deadline Unix timestamp (~{expected}), got {priority}"
-        );
-        assert_eq!(
-            body["prompt"].as_str().unwrap(),
-            "hello",
-            "Original body fields should be preserved"
-        );
-        assert!(
-            body.get("priority").is_none(),
-            "Top-level `priority` field must NOT be set (Dynamo rejects unknown OpenAI fields)"
-        );
     }
 }
