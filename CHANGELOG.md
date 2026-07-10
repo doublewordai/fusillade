@@ -1,5 +1,19 @@
 # Changelog
 
+## [21.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v21.0.0...fusillade-v21.0.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* package sqlx metadata with storage crate ([#332](https://github.com/doublewordai/fusillade/issues/332)) ([3123839](https://github.com/doublewordai/fusillade/commit/31238392c883c8007b78e89732a4797bd16d404b))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * fusillade-arsenal bumped from 1.0.0 to 1.0.1
+
 ## [21.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v20.0.3...fusillade-v21.0.0) (2026-07-10)
 
 
