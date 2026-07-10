@@ -37,6 +37,7 @@ crate_version_available() {
   local crate="$1"
   local version="$2"
   curl --fail --silent --show-error \
+    --user-agent "fusillade-release-script (https://github.com/doublewordai/fusillade)" \
     "https://crates.io/api/v1/crates/${crate}/${version}" \
     >/dev/null
 }
