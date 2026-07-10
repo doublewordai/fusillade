@@ -4,6 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
+export SQLX_OFFLINE=true
+
 if [[ -d .sqlx ]]; then
   echo "SQLx cache should live under crates/fusillade-arsenal/.sqlx, not at the workspace root." >&2
   exit 1
@@ -22,5 +24,5 @@ fi
 
 (
   cd crates/fusillade-arsenal
-  SQLX_OFFLINE=true cargo sqlx prepare --check
+  cargo sqlx prepare --check
 )
