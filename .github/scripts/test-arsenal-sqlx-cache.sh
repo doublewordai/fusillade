@@ -22,5 +22,5 @@ fi
 
 (
   cd crates/fusillade-arsenal
-  cargo sqlx prepare --check
+  SQLX_OFFLINE=true cargo sqlx prepare --check
 )
