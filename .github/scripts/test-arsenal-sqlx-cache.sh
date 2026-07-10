@@ -22,7 +22,4 @@ if ! grep -q '^\.sqlx/query-.*\.json$' <<<"$package_list"; then
   exit 1
 fi
 
-(
-  cd crates/fusillade-arsenal
-  cargo sqlx prepare --check
-)
+cargo package --package fusillade-arsenal --allow-dirty
