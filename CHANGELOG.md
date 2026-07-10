@@ -1,5 +1,24 @@
 # Changelog
 
+## [21.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v20.0.3...fusillade-v21.0.0) (2026-07-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* split storage and daemon crates ([#323](https://github.com/doublewordai/fusillade/issues/323))
+
+### Features
+
+* split storage and daemon crates ([#323](https://github.com/doublewordai/fusillade/issues/323)) ([bd309b3](https://github.com/doublewordai/fusillade/commit/bd309b343843a5b05e1bfafa68ac091a0731a172))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * fusillade-core bumped from 0.1.0 to 1.0.0
+    * fusillade-arsenal bumped from 0.1.0 to 1.0.0
+
 ## [20.0.3](https://github.com/doublewordai/fusillade/compare/fusillade-v20.0.2...fusillade-v20.0.3) (2026-07-09)
 
 
