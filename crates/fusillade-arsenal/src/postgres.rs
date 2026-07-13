@@ -4452,11 +4452,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         }
 
         let mut results = Vec::new();
+        let mut retried_batches: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
 
         for (id, request_result) in ids.iter().zip(get_results) {
             let result = match request_result {
                 Ok(AnyRequest::Failed(req)) => {
                     // Reset to pending state with retry_attempt = 0
+                    let batch_id = req.data.batch_id;
                     let pending_request = Request {
                         state: Pending {
                             retry_attempt: 0,
@@ -4467,6 +4469,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     };
 
                     self.persist(&pending_request).await?;
+                    if let Some(batch_id) = batch_id {
+                        retried_batches.insert(*batch_id as Uuid);
+                    }
                     Ok(())
                 }
                 Ok(_) => Err(crate::error::FusilladeError::InvalidState(
@@ -4478,6 +4483,39 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             };
 
             results.push(result);
+        }
+
+        // Un-terminalize the parent batches of the retried rows: same reset
+        // as retry_failed_requests_for_batch. A retried row makes its batch
+        // non-terminal again, so the terminal timestamps, notification claim,
+        // and FROZEN COUNTS must all clear (a frozen batch would otherwise
+        // keep serving stale counters and never show the pending row), and
+        // retry_version must bump — the CAS rule: any writer that
+        // un-terminalizes a batch bumps it, so an in-flight stamp/freeze
+        // computed against the pre-retry state cannot land afterwards.
+        if !retried_batches.is_empty() {
+            let batch_ids: Vec<Uuid> = retried_batches.into_iter().collect();
+            sqlx::query!(
+                r#"
+                UPDATE batches
+                SET completed_at = NULL,
+                    failed_at = NULL,
+                    finalizing_at = NULL,
+                    notification_sent_at = NULL,
+                    counts_frozen_at = NULL,
+                    completed_requests = 0,
+                    failed_requests = 0,
+                    canceled_requests = 0,
+                    retry_version = retry_version + 1
+                WHERE id = ANY($1)
+                "#,
+                &batch_ids,
+            )
+            .execute(self.write_executor())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to reset batch terminal state: {}", e))
+            })?;
         }
 
         // For any missing requests, add an error result
@@ -9179,6 +9217,85 @@ mod tests {
         assert!(
             frozen_at(&pool, batch_id).await.is_some(),
             "re-terminalization must re-freeze"
+        );
+    }
+
+    /// Single-request retry (retry_failed_requests, by id) must un-freeze
+    /// the parent batch exactly like the whole-batch retry: clear terminal
+    /// state + frozen counters and bump retry_version. Otherwise a frozen
+    /// batch would keep serving stale counts and never show the retried row.
+    #[sqlx::test]
+    async fn test_single_request_retry_unfreezes_parent_batch(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_freeze_test_batch(&manager, "freeze-single-retry", 2).await;
+
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200, response_body = '{}' WHERE batch_id = $1 AND id IN (SELECT id FROM requests WHERE batch_id = $1 LIMIT 1)",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "UPDATE requests SET state = 'failed', failed_at = NOW(), error = 'test-error' WHERE batch_id = $1 AND state <> 'completed'",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Freeze via lazy finalization.
+        let batch = manager.get_batch(batch_id).await.unwrap();
+        assert_eq!((batch.completed_requests, batch.failed_requests), (1, 1));
+        assert!(frozen_at(&pool, batch_id).await.is_some());
+        let version_before: i64 = sqlx::query_scalar!(
+            "SELECT retry_version FROM batches WHERE id = $1",
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Retry ONE failed request by id.
+        let failed_id = sqlx::query_scalar!(
+            "SELECT id FROM requests WHERE batch_id = $1 AND state = 'failed'",
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let results = manager
+            .retry_failed_requests(vec![RequestId(failed_id)])
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.is_ok()));
+
+        // Parent batch must be un-frozen, un-terminalized, version-bumped.
+        assert!(
+            frozen_at(&pool, batch_id).await.is_none(),
+            "single-request retry must clear the parent batch freeze"
+        );
+        let version_after: i64 = sqlx::query_scalar!(
+            "SELECT retry_version FROM batches WHERE id = $1",
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(version_after, version_before + 1);
+        let batch = manager.get_batch(batch_id).await.unwrap();
+        assert!(batch.completed_at.is_none() && batch.failed_at.is_none());
+        assert_eq!(
+            (
+                batch.completed_requests,
+                batch.failed_requests,
+                batch.pending_requests
+            ),
+            (1, 0, 1),
+            "reads must count live again and show the retried row"
         );
     }
 
