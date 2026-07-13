@@ -5520,6 +5520,28 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         batch_id: BatchId,
         executor: crate::db::RetryingPgPool,
     ) -> Result<Batch> {
+        self.get_batch_from_pool_inner(batch_id, executor, true)
+            .await
+    }
+
+    /// Inner body of [`Self::get_batch_from_pool`]. `retry_on_lost_race`
+    /// bounds the re-read recursion to depth 1: when the terminal-stamping
+    /// UPDATE loses its race (another reader stamped first, or a retry/
+    /// cancel un-terminalized the batch), every locally-held value is a
+    /// pre-race snapshot, so the only fully consistent response is a fresh
+    /// read — which lands in whichever branch now applies. If the re-read
+    /// ALSO loses (a second race inside microseconds), it returns its own
+    /// SELECT snapshot untouched: internally consistent, momentarily stale,
+    /// self-healing on the next read.
+    async fn get_batch_from_pool_inner(
+        &self,
+        batch_id: BatchId,
+        executor: crate::db::RetryingPgPool,
+        retry_on_lost_race: bool,
+    ) -> Result<Batch> {
+        // Kept aside for the (rare) lost-race re-read; the SELECT below
+        // consumes the original.
+        let executor_for_retry = executor.clone();
         let mut query_builder = QueryBuilder::new(
             r#"
             SELECT
@@ -5674,29 +5696,31 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             })?;
 
             // Only report the stamp if it actually landed. Zero rows means a
-            // guard rejected it, for one of two reasons with different
-            // correct answers: a concurrent reader already stamped (batch IS
-            // terminal — with their timestamps), or a concurrent retry/cancel
-            // un-terminalized it (batch is NOT terminal). Re-fetch the
-            // persisted timestamps so the response reflects whichever
-            // actually happened, rather than guessing.
+            // guard rejected it: either a concurrent reader already stamped
+            // (batch IS terminal, with their timestamps and freeze) or a
+            // concurrent retry/cancel un-terminalized it (batch is NOT
+            // terminal). Every value this call holds — counts, timestamps,
+            // freeze marker — is a pre-race snapshot, so patching any single
+            // field would produce a frankenstein response. Re-read the whole
+            // batch instead (bounded to one retry; see
+            // get_batch_from_pool_inner docs for the double-loss fallback).
             if stamp_result.rows_affected() > 0 {
                 (finalizing, completed, failed)
+            } else if retry_on_lost_race {
+                tracing::debug!(
+                    %batch_id,
+                    "Terminal stamp lost a race; re-reading batch for a consistent view"
+                );
+                return Box::pin(self.get_batch_from_pool_inner(
+                    batch_id,
+                    executor_for_retry,
+                    false,
+                ))
+                .await;
             } else {
-                let persisted = sqlx::query!(
-                    r#"SELECT finalizing_at, completed_at, failed_at FROM batches WHERE id = $1"#,
-                    *batch_id as Uuid,
-                )
-                .fetch_one(self.write_executor())
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to refetch terminal timestamps: {}", e))
-                })?;
-                (
-                    persisted.finalizing_at,
-                    persisted.completed_at,
-                    persisted.failed_at,
-                )
+                // Second consecutive lost race: return this pass's SELECT
+                // snapshot untouched (consistent, momentarily stale).
+                (finalizing_at_db, completed_at, failed_at)
             }
         } else {
             // Freeze-only path: the batch already carries a terminal
