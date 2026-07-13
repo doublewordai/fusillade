@@ -31,7 +31,11 @@ ALTER TABLE batches
     ADD COLUMN IF NOT EXISTS completed_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS failed_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS canceled_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS counts_frozen_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS counts_frozen_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0;
+
+COMMENT ON COLUMN batches.generation IS
+    'Optimistic concurrency token for terminal stamping/freezing. Batch retry increments it while resetting terminal state; the stamping/freezing UPDATEs require the generation captured at read time, so a stamp computed before a concurrent retry cannot land after it (the retried row is otherwise indistinguishable from a never-stamped one, and lock-wait qual re-checks only see target-row columns).';
 
 COMMENT ON COLUMN batches.counts_frozen_at IS
     'When set, the *_requests counter columns hold the final frozen counts and reads must not recount from requests. Set once every request row is in an actual terminal state; cleared by batch retry.';

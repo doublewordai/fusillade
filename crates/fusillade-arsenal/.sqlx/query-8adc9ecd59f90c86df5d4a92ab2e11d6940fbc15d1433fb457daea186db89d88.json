@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE batches\n                SET finalizing_at = COALESCE(finalizing_at, $2),\n                    completed_at = COALESCE(completed_at, $3),\n                    failed_at = COALESCE(failed_at, $4),\n                    completed_requests = $5,\n                    failed_requests = $6,\n                    canceled_requests = $7,\n                    counts_frozen_at = COALESCE(counts_frozen_at, $2)\n                WHERE id = $1\n                  AND generation = $8\n                  AND completed_at IS NULL\n                  AND failed_at IS NULL\n                  AND cancelled_at IS NULL\n                  AND NOT EXISTS (\n                      SELECT 1 FROM requests r\n                      WHERE r.batch_id = $1\n                        AND r.state NOT IN ('completed', 'failed', 'canceled')\n                  )\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Timestamptz",
+        "Timestamptz",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8adc9ecd59f90c86df5d4a92ab2e11d6940fbc15d1433fb457daea186db89d88"
+}

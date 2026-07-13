@@ -4,3 +4,5 @@ ALTER TABLE batches
     DROP COLUMN IF EXISTS canceled_requests;
 ALTER TABLE batches
     DROP COLUMN IF EXISTS counts_frozen_at;
+ALTER TABLE batches
+    DROP COLUMN IF EXISTS generation;
