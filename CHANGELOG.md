@@ -1,5 +1,25 @@
 # Changelog
 
+## [21.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v21.0.1...fusillade-v21.1.0) (2026-07-13)
+
+
+### Features
+
+* freeze terminal batch counts on the batches row ([#329](https://github.com/doublewordai/fusillade/issues/329)) ([3e51c4c](https://github.com/doublewordai/fusillade/commit/3e51c4cf53588626fe29e8536b10a875ca484999))
+
+
+### Bug Fixes
+
+* allow arsenal package verify to skip during lockstep releases ([#338](https://github.com/doublewordai/fusillade/issues/338)) ([150927d](https://github.com/doublewordai/fusillade/commit/150927d003211eeaab2c0a1d3e3f5741581a8de0))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * fusillade-core bumped from 1.0.0 to 1.1.0
+    * fusillade-arsenal bumped from 1.0.1 to 1.1.0
+
 ## [21.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v21.0.0...fusillade-v21.0.1) (2026-07-10)
 
 
