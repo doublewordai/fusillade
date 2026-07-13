@@ -20,7 +20,7 @@ use crate::error::Result;
 use crate::http::HttpClient;
 use crate::manager::{DaemonStorage, Storage};
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
-use crate::request::{Claimed, DaemonId, Request, RequestCompletionResult};
+use crate::request::{Claimed, DaemonId, FailureReason, Request, RequestCompletionResult};
 
 pub use config::{
     DaemonConfig, DaemonMode, ModelEscalationConfig, ShouldRetryFn, default_should_retry,
@@ -34,6 +34,57 @@ pub use fusillade_core::daemon_record::{
 struct UserThroughputStats {
     completed: AtomicU64,
     failed: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+enum TerminalRequestStatus<'a> {
+    Success,
+    Failed(&'a FailureReason),
+    Cancelled,
+}
+
+fn record_terminal_request_metrics(
+    model: &str,
+    user_id: &str,
+    completion_window: &str,
+    status: TerminalRequestStatus<'_>,
+) {
+    let status_label = match status {
+        TerminalRequestStatus::Success => "success",
+        TerminalRequestStatus::Failed(_) => "failed",
+        TerminalRequestStatus::Cancelled => "cancelled",
+    };
+
+    match status {
+        TerminalRequestStatus::Failed(reason) => {
+            counter!(
+                "fusillade_requests_completed_total",
+                "model" => model.to_string(),
+                "status" => status_label,
+                "reason" => reason.metric_label(),
+                "status_code" => reason.status_code_label(),
+                "completion_window" => completion_window.to_string()
+            )
+            .increment(1);
+        }
+        TerminalRequestStatus::Success | TerminalRequestStatus::Cancelled => {
+            counter!(
+                "fusillade_requests_completed_total",
+                "model" => model.to_string(),
+                "status" => status_label,
+                "completion_window" => completion_window.to_string()
+            )
+            .increment(1);
+        }
+    }
+
+    counter!(
+        "fusillade_user_requests_completed_total",
+        "user" => user_id.to_string(),
+        "status" => status_label,
+        "completion_window" => completion_window.to_string()
+    )
+    .increment(1);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -749,8 +800,12 @@ where
                                 completed: AtomicU64::new(0),
                                 failed: AtomicU64::new(0),
                             }).completed.fetch_add(1, Ordering::Relaxed);
-                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
-                            counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "success", "completion_window" => completion_window.clone()).increment(1);
+                            record_terminal_request_metrics(
+                                &model_clone,
+                                &user_id,
+                                &completion_window,
+                                TerminalRequestStatus::Success,
+                            );
                             histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
                                 .record(processing_start.elapsed().as_secs_f64());
                             histogram!("fusillade_retry_attempts_on_success", "model" => model_clone.clone())
@@ -820,8 +875,12 @@ where
                                             completed: AtomicU64::new(0),
                                             failed: AtomicU64::new(0),
                                         }).failed.fetch_add(1, Ordering::Relaxed);
-                                        counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
-                                        counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
+                                        record_terminal_request_metrics(
+                                            &model_clone,
+                                            &user_id,
+                                            &completion_window,
+                                            TerminalRequestStatus::Failed(&failed.state.reason),
+                                        );
                                         histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                             .record(processing_start.elapsed().as_secs_f64());
                                         if failed.state.failed_at > batch_expires_at {
@@ -848,8 +907,12 @@ where
                                     completed: AtomicU64::new(0),
                                     failed: AtomicU64::new(0),
                                 }).failed.fetch_add(1, Ordering::Relaxed);
-                                counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
-                                counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
+                                record_terminal_request_metrics(
+                                    &model_clone,
+                                    &user_id,
+                                    &completion_window,
+                                    TerminalRequestStatus::Failed(&failed.state.reason),
+                                );
                                 histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                     .record(processing_start.elapsed().as_secs_f64());
                                 if failed.state.failed_at > batch_expires_at {
@@ -876,8 +939,12 @@ where
                             // Keep the pre-split counter shape alive so existing
                             // dashboards/alerts on completed_total{status="cancelled"}
                             // don't silently break (deprecation window).
-                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled").increment(1);
-                            counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "cancelled", "completion_window" => completion_window.clone()).increment(1);
+                            record_terminal_request_metrics(
+                                &model_clone,
+                                &user_id,
+                                &completion_window,
+                                TerminalRequestStatus::Cancelled,
+                            );
                             Ok(())
                         }
                         Err(FusilladeError::Shutdown) => {
@@ -1346,6 +1413,62 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request::FailureReason;
+    use metrics_util::debugging::DebuggingRecorder;
+    use std::collections::HashMap;
+
+    #[test]
+    fn terminal_request_metrics_include_completion_window() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let failure = FailureReason::NonRetriableHttpStatus {
+            status: 500,
+            body: String::new(),
+        };
+
+        metrics::with_local_recorder(&recorder, || {
+            record_terminal_request_metrics(
+                "test-model",
+                "test-user",
+                "1h",
+                TerminalRequestStatus::Success,
+            );
+            record_terminal_request_metrics(
+                "test-model",
+                "test-user",
+                "1h",
+                TerminalRequestStatus::Failed(&failure),
+            );
+            record_terminal_request_metrics(
+                "test-model",
+                "test-user",
+                "1h",
+                TerminalRequestStatus::Cancelled,
+            );
+        });
+
+        let labels_by_status: HashMap<String, HashMap<String, String>> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == "fusillade_requests_completed_total")
+            .map(|(key, _, _, _)| {
+                let labels: HashMap<String, String> = key
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect();
+                (labels["status"].clone(), labels)
+            })
+            .collect();
+
+        for status in ["success", "failed", "cancelled"] {
+            assert_eq!(
+                labels_by_status[status]["completion_window"], "1h",
+                "{status} terminal metrics should identify their completion window"
+            );
+        }
+    }
 
     #[test]
     fn claim_failure_backoff_grows_exponentially_and_caps() {
