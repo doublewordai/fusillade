@@ -5572,7 +5572,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             //   stamping over a concurrent cancel).
             // - NOT EXISTS non-terminal rows: re-verifies against writers
             //   that do not touch the batches row.
-            sqlx::query!(
+            let stamp_result = sqlx::query!(
                 r#"
                 UPDATE batches
                 SET finalizing_at = COALESCE(finalizing_at, $2),
@@ -5608,7 +5608,17 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
             })?;
 
-            (finalizing, completed, failed)
+            // Only report the stamp if it actually landed. When a guard
+            // rejected it (a concurrent retry or cancel won the race), the
+            // batch is NOT terminal in the database — returning the locally
+            // computed timestamps would claim a finalization that never
+            // happened. Fall back to the values from the original SELECT
+            // (all unset in this branch); the next read sees the live state.
+            if stamp_result.rows_affected() > 0 {
+                (finalizing, completed, failed)
+            } else {
+                (finalizing_at_db, completed_at, failed_at)
+            }
         } else {
             // Freeze-only path: the batch already carries a terminal
             // timestamp (typically cancelled_at — cancellation stamps
