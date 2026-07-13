@@ -8931,6 +8931,52 @@ mod tests {
         assert_eq!(status.completed_requests, 2);
         assert_eq!(status.failed_requests, 1);
 
+        // File-scoped listing path (file details page).
+        let file_id = batch.file_id.expect("freeze test batch has a file_id");
+        let file_batches = manager.list_file_batches(file_id).await.unwrap();
+        let file_row = file_batches
+            .iter()
+            .find(|b| b.batch_id == batch_id)
+            .unwrap();
+        assert_eq!(
+            (
+                file_row.completed_requests,
+                file_row.failed_requests,
+                file_row.canceled_requests
+            ),
+            (2, 1, 0),
+            "list_file_batches must serve frozen counts without request rows"
+        );
+
+        // Output-file lookup path (results download).
+        let output_file_id = manager
+            .create_file("freeze-survive-output".to_string(), None, vec![])
+            .await
+            .unwrap();
+        sqlx::query!(
+            "UPDATE batches SET output_file_id = $2 WHERE id = $1",
+            *batch_id as Uuid,
+            *output_file_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let by_output = manager
+            .get_batch_by_output_file_id(output_file_id, OutputFileType::Output)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_output.id, batch_id);
+        assert_eq!(
+            (
+                by_output.completed_requests,
+                by_output.failed_requests,
+                by_output.canceled_requests
+            ),
+            (2, 1, 0),
+            "get_batch_by_output_file_id must serve frozen counts without request rows"
+        );
+
         let listed = manager
             .list_batches(crate::batch::ListBatchesFilter::default())
             .await
