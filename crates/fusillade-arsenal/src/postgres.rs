@@ -5513,6 +5513,13 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             // in this branch, so projected == actual and the counts are
             // final). From here on reads serve the frozen columns and never
             // touch this batch's request rows again.
+            //
+            // The NOT EXISTS guard re-verifies at write time that every
+            // request row is still terminal: our counts come from an earlier
+            // SELECT, and a concurrent retry_failed_requests_for_batch can
+            // commit in between (re-pending failed rows and clearing the
+            // batch's terminal state). Without the guard we would re-stamp
+            // terminal timestamps and freeze stale counts over the retry.
             sqlx::query!(
                 r#"
                 UPDATE batches
@@ -5524,6 +5531,11 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     canceled_requests = $7,
                     counts_frozen_at = COALESCE(counts_frozen_at, $2)
                 WHERE id = $1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM requests r
+                      WHERE r.batch_id = $1
+                        AND r.state NOT IN ('completed', 'failed', 'canceled')
+                  )
                 "#,
                 *batch_id as Uuid,
                 finalizing,
@@ -5545,8 +5557,12 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             // timestamp (typically cancelled_at — cancellation stamps
             // eagerly while rows are still aborting) and its rows have now
             // all settled. Persist the final counts so future reads skip
-            // the recount. Guarded on counts_frozen_at IS NULL for
-            // idempotency under concurrent readers.
+            // the recount. Guards: counts_frozen_at IS NULL for idempotency
+            // under concurrent readers; a terminal timestamp still present
+            // AND all rows still terminal re-verified at write time, since
+            // our counts come from an earlier SELECT and a concurrent batch
+            // retry can commit in between (re-pending rows and clearing the
+            // terminal state) — freezing then would persist stale counts.
             if is_actually_terminal
                 && (completed_at.is_some() || failed_at.is_some() || cancelled_at.is_some())
             {
@@ -5557,7 +5573,14 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                         failed_requests = $3,
                         canceled_requests = $4,
                         counts_frozen_at = NOW()
-                    WHERE id = $1 AND counts_frozen_at IS NULL
+                    WHERE id = $1
+                      AND counts_frozen_at IS NULL
+                      AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR cancelled_at IS NOT NULL)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM requests r
+                          WHERE r.batch_id = $1
+                            AND r.state NOT IN ('completed', 'failed', 'canceled')
+                      )
                     "#,
                     *batch_id as Uuid,
                     completed_requests,
