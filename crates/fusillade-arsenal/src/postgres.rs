@@ -5564,7 +5564,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     failed_requests,
                     canceled_actual,
                 )
-                .execute(self.pools.write())
+                .execute(self.write_executor())
                 .await
                 .map_err(|e| {
                     FusilladeError::Other(anyhow!("Failed to freeze batch counts: {}", e))
@@ -5601,88 +5601,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             notification_sent_at: row.get("notification_sent_at"),
             api_key_id: row.get::<Option<Uuid>, _>("api_key_id"),
         })
-    }
-
-    /// Backfill: freeze counts for one chunk of batches that terminalized
-    /// before the frozen-counts columns existed.
-    ///
-    /// Walks batches newest-first from `before` (None = start). Returns
-    /// `(frozen, next_cursor)`; loop passing the cursor back (with a pause to
-    /// throttle) until `next_cursor` is None. Kill-safe and idempotent: only
-    /// rows with `counts_frozen_at IS NULL` are touched, and a batch is only
-    /// frozen once every request row is in an actual terminal state —
-    /// stragglers (terminal-stamped batches with stuck non-terminal rows,
-    /// e.g. the cancel/populate race) are skipped, not frozen wrongly, and
-    /// the cursor advances past them so the loop always terminates.
-    ///
-    /// The cursor is the composite `(created_at, id)`: created_at alone is
-    /// not unique, and a strict `<` on it would silently skip the remainder
-    /// of a timestamp group whenever a chunk boundary lands inside one.
-    pub async fn backfill_frozen_batch_counts(
-        &self,
-        before: Option<(DateTime<Utc>, Uuid)>,
-        chunk_size: i64,
-    ) -> Result<(u64, Option<(DateTime<Utc>, Uuid)>)> {
-        let (before_created_at, before_id) = match before {
-            Some((c, i)) => (Some(c), Some(i)),
-            None => (None, None),
-        };
-        let row = sqlx::query!(
-            r#"
-            WITH todo AS (
-                SELECT b.id, b.created_at
-                FROM batches b
-                WHERE b.counts_frozen_at IS NULL
-                  AND b.deleted_at IS NULL
-                  AND (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
-                  AND ($1::TIMESTAMPTZ IS NULL OR (b.created_at, b.id) < ($1, $3::UUID))
-                ORDER BY b.created_at DESC, b.id DESC
-                LIMIT $2
-            ),
-            counted AS (
-                SELECT t.id,
-                       COALESCE(c.completed, 0) AS completed,
-                       COALESCE(c.failed, 0) AS failed,
-                       COALESCE(c.canceled, 0) AS canceled,
-                       COALESCE(c.non_terminal, 0) AS non_terminal
-                FROM todo t
-                LEFT JOIN LATERAL (
-                    SELECT COUNT(*) FILTER (WHERE state = 'completed') AS completed,
-                           COUNT(*) FILTER (WHERE state = 'failed') AS failed,
-                           COUNT(*) FILTER (WHERE state = 'canceled') AS canceled,
-                           COUNT(*) FILTER (WHERE state NOT IN ('completed', 'failed', 'canceled')) AS non_terminal
-                    FROM requests r WHERE r.batch_id = t.id
-                ) c ON TRUE
-            ),
-            frozen AS (
-                UPDATE batches b
-                SET completed_requests = counted.completed,
-                    failed_requests = counted.failed,
-                    canceled_requests = counted.canceled,
-                    counts_frozen_at = NOW()
-                FROM counted
-                WHERE b.id = counted.id
-                  AND counted.non_terminal = 0
-                  AND b.counts_frozen_at IS NULL
-                RETURNING b.id
-            )
-            SELECT (SELECT COUNT(*) FROM frozen) AS "frozen!",
-                   (SELECT t.created_at FROM todo t ORDER BY t.created_at ASC, t.id ASC LIMIT 1) AS cursor_created_at,
-                   (SELECT t.id FROM todo t ORDER BY t.created_at ASC, t.id ASC LIMIT 1) AS cursor_id
-            "#,
-            before_created_at,
-            chunk_size,
-            before_id,
-        )
-        .fetch_one(self.pools.write())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to backfill frozen counts: {}", e)))?;
-
-        let cursor = match (row.cursor_created_at, row.cursor_id) {
-            (Some(c), Some(i)) => Some((c, i)),
-            _ => None,
-        };
-        Ok((row.frozen as u64, cursor))
     }
 
     /// Find terminal batches that need notification, finalize if needed, and claim atomically.
@@ -9164,6 +9082,88 @@ mod tests {
         assert_eq!(batch.completed_requests, 2);
     }
 
+    /// One chunk of the OPERATIONAL BACKFILL — the same SQL run by the
+    /// deploy-repo script (backfill-frozen-counts.sh) that freezes counts
+    /// for batches that terminalized before the frozen-counts columns
+    /// existed. The backfill is deliberately NOT library API (fresh DBs
+    /// never need it — freezing happens organically from the migration
+    /// onward), but its cursor semantics, straggler handling, and
+    /// idempotency are covered here so the script's logic stays proven.
+    ///
+    /// Cursor is the composite `(created_at, id)`: created_at alone is not
+    /// unique, and a strict `<` on it would skip the remainder of a
+    /// timestamp group whenever a chunk boundary lands inside one.
+    async fn backfill_chunk(
+        pool: &sqlx::PgPool,
+        before: Option<(DateTime<Utc>, Uuid)>,
+        chunk_size: i64,
+    ) -> (i64, Option<(DateTime<Utc>, Uuid)>) {
+        assert!(chunk_size > 0, "chunk_size must be > 0");
+        let (before_created_at, before_id) = match before {
+            Some((c, i)) => (Some(c), Some(i)),
+            None => (None, None),
+        };
+        let row = sqlx::query(
+            r#"
+            WITH todo AS (
+                SELECT b.id, b.created_at
+                FROM batches b
+                WHERE b.counts_frozen_at IS NULL
+                  AND b.deleted_at IS NULL
+                  AND (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
+                  AND ($1::TIMESTAMPTZ IS NULL OR (b.created_at, b.id) < ($1, $3::UUID))
+                ORDER BY b.created_at DESC, b.id DESC
+                LIMIT $2
+            ),
+            counted AS (
+                SELECT t.id,
+                       COALESCE(c.completed, 0) AS completed,
+                       COALESCE(c.failed, 0) AS failed,
+                       COALESCE(c.canceled, 0) AS canceled,
+                       COALESCE(c.non_terminal, 0) AS non_terminal
+                FROM todo t
+                LEFT JOIN LATERAL (
+                    SELECT COUNT(*) FILTER (WHERE state = 'completed') AS completed,
+                           COUNT(*) FILTER (WHERE state = 'failed') AS failed,
+                           COUNT(*) FILTER (WHERE state = 'canceled') AS canceled,
+                           COUNT(*) FILTER (WHERE state NOT IN ('completed', 'failed', 'canceled')) AS non_terminal
+                    FROM requests r WHERE r.batch_id = t.id
+                ) c ON TRUE
+            ),
+            frozen AS (
+                UPDATE batches b
+                SET completed_requests = counted.completed,
+                    failed_requests = counted.failed,
+                    canceled_requests = counted.canceled,
+                    counts_frozen_at = NOW()
+                FROM counted
+                WHERE b.id = counted.id
+                  AND counted.non_terminal = 0
+                  AND b.counts_frozen_at IS NULL
+                RETURNING b.id
+            )
+            SELECT (SELECT COUNT(*) FROM frozen) AS frozen,
+                   (SELECT t.created_at FROM todo t ORDER BY t.created_at ASC, t.id ASC LIMIT 1) AS cursor_created_at,
+                   (SELECT t.id FROM todo t ORDER BY t.created_at ASC, t.id ASC LIMIT 1) AS cursor_id
+            "#,
+        )
+        .bind(before_created_at)
+        .bind(chunk_size)
+        .bind(before_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let frozen: i64 = row.get("frozen");
+        let cursor = match (
+            row.get::<Option<DateTime<Utc>>, _>("cursor_created_at"),
+            row.get::<Option<Uuid>, _>("cursor_id"),
+        ) {
+            (Some(c), Some(i)) => Some((c, i)),
+            _ => None,
+        };
+        (frozen, cursor)
+    }
+
     /// Backfill: freezes historic terminal batches in cursor-driven chunks,
     /// skips stragglers (terminal-stamped with stuck non-terminal rows)
     /// without livelocking, and is idempotent.
@@ -9232,13 +9232,10 @@ mod tests {
 
         // Walk the backfill with a small chunk to exercise the cursor.
         let mut cursor = None;
-        let mut total_frozen = 0u64;
+        let mut total_frozen = 0i64;
         let mut iterations = 0;
         loop {
-            let (frozen, next) = manager
-                .backfill_frozen_batch_counts(cursor, 2)
-                .await
-                .unwrap();
+            let (frozen, next) = backfill_chunk(&pool, cursor, 2).await;
             total_frozen += frozen;
             iterations += 1;
             assert!(iterations < 20, "backfill must terminate");
@@ -9260,10 +9257,7 @@ mod tests {
         );
 
         // Idempotent: a second full pass freezes nothing new.
-        let (frozen_again, _) = manager
-            .backfill_frozen_batch_counts(None, 100)
-            .await
-            .unwrap();
+        let (frozen_again, _) = backfill_chunk(&pool, None, 100).await;
         assert_eq!(frozen_again, 0);
     }
 

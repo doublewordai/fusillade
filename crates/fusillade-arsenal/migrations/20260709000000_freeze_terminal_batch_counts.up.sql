@@ -20,7 +20,13 @@
 -- (20250107000008) and were removed along with their race-prone maintenance
 -- (20250118000000_remove_wal_use_on_demand_counting). This brings back
 -- storage only — no triggers; the writers are the terminal-stamping UPDATEs
--- (lazy finalization on reads, the notification poller) and the backfill.
+-- (lazy finalization on reads, the notification poller).
+--
+-- Existing databases: batches that terminalized BEFORE this migration keep
+-- recounting until frozen by the one-off, throttled, idempotent side-script
+-- backfill-frozen-counts.sh (internal/scripts; run once per DB, safe to
+-- kill and rerun). Fresh databases never need it. The script's SQL is
+-- covered by fusillade-arsenal's test_backfill_frozen_counts.
 ALTER TABLE batches
     ADD COLUMN IF NOT EXISTS completed_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS failed_requests BIGINT NOT NULL DEFAULT 0,
