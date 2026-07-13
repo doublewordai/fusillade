@@ -39,7 +39,7 @@ fi
 # Skip ONLY on an explicit 404 (version genuinely unpublished — the lockstep
 # case). Any other outcome (network failure, 429, 5xx) must fail the job
 # rather than silently degrade the verify coverage.
-status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
   --user-agent "fusillade-release-script (https://github.com/doublewordai/fusillade)" \
   "https://crates.io/api/v1/crates/fusillade-core/${core_version}" || true)"
 if [[ "$status" == "200" ]]; then
