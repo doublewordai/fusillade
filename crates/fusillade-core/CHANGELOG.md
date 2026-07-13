@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-core-v1.0.0...fusillade-core-v1.1.0) (2026-07-13)
+
+
+### Features
+
+* freeze terminal batch counts on the batches row ([#329](https://github.com/doublewordai/fusillade/issues/329)) ([3e51c4c](https://github.com/doublewordai/fusillade/commit/3e51c4cf53588626fe29e8536b10a875ca484999))
+
 ## [1.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-core-v0.1.0...fusillade-core-v1.0.0) (2026-07-10)
 
 
