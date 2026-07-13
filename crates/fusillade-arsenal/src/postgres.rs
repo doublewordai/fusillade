@@ -4576,6 +4576,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(results)
     }
 
+    /// Retries failed AND canceled requests for a batch and un-cancels it
+    /// (completed requests are never redone). See the trait doc.
     async fn retry_failed_requests_for_batch(&self, batch_id: BatchId) -> Result<u64> {
         tracing::debug!(%batch_id, "Retrying failed/canceled requests for batch");
 
@@ -4614,7 +4616,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         )
         .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to retry failed requests: {}", e)))?;
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to retry failed/canceled requests: {}", e))
+        })?;
 
         let count = result.rows_affected();
 
