@@ -4451,70 +4451,104 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             );
         }
 
-        let mut results = Vec::new();
-
-        // Un-terminalize AND un-cancel the parent batches BEFORE re-pending
-        // rows (same reset as retry_failed_requests_for_batch): retry is a
-        // deliberate action that overturns cancellation, and a re-pended row
-        // must never sit under a terminal/frozen/cancelled batch — it would
-        // be unclaimable (cancelling_at claim gate) and invisible (frozen
-        // counters). Reset-first ordering makes a mid-way crash benign: an
-        // un-terminalized batch with still-terminal rows simply re-stamps
-        // and re-freezes on the next read.
-        //
-        // retry_version bump per the CAS rule: any writer that
-        // un-terminalizes a batch bumps it, so an in-flight stamp/freeze
+        // Row re-pend and parent-batch reset happen in ONE transaction (same
+        // shape as retry_failed_requests_for_batch): no intermediate state
+        // is ever visible, so a concurrent read/poller can neither re-freeze
+        // the reset batch before the rows re-pend, nor observe a pending row
+        // under a terminal/frozen/cancelled batch. The batch reset also
+        // un-cancels — retry is a deliberate action that overturns
+        // cancellation — and bumps retry_version per the CAS rule: any
+        // writer that un-terminalizes a batch bumps it, so a stamp/freeze
         // computed against the pre-retry state cannot land afterwards.
-        let retried_batches: std::collections::HashSet<Uuid> = get_results
+        let retryable: Vec<(Uuid, Option<Uuid>)> = get_results
             .iter()
             .filter_map(|r| match r {
-                Ok(AnyRequest::Failed(req)) => req.data.batch_id.map(|b| *b),
+                Ok(AnyRequest::Failed(req)) => Some((*req.data.id, req.data.batch_id.map(|b| *b))),
                 _ => None,
             })
             .collect();
-        if !retried_batches.is_empty() {
-            let batch_ids: Vec<Uuid> = retried_batches.into_iter().collect();
-            sqlx::query!(
+
+        let repended: std::collections::HashSet<Uuid> = if retryable.is_empty() {
+            Default::default()
+        } else {
+            let retry_ids: Vec<Uuid> = retryable.iter().map(|(id, _)| *id).collect();
+            let mut tx = self.begin_write().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
+            // The state = 'failed' re-check makes concurrently changed rows
+            // drop out (reported as InvalidState below via RETURNING).
+            let repended: Vec<Uuid> = sqlx::query_scalar!(
                 r#"
-                UPDATE batches
-                SET completed_at = NULL,
+                UPDATE requests
+                SET state = 'pending',
+                    retry_attempt = 0,
+                    not_before = NULL,
+                    error = NULL,
                     failed_at = NULL,
-                    finalizing_at = NULL,
-                    cancelling_at = NULL,
-                    cancelled_at = NULL,
-                    notification_sent_at = NULL,
-                    counts_frozen_at = NULL,
-                    completed_requests = 0,
-                    failed_requests = 0,
-                    canceled_requests = 0,
-                    retry_version = retry_version + 1
-                WHERE id = ANY($1)
+                    daemon_id = NULL,
+                    claimed_at = NULL,
+                    started_at = NULL
+                WHERE id = ANY($1) AND state = 'failed'
+                RETURNING id
                 "#,
-                &batch_ids,
+                &retry_ids,
             )
-            .execute(self.write_executor())
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to reset batch terminal state: {}", e))
+                FusilladeError::Other(anyhow!("Failed to retry failed requests: {}", e))
             })?;
-        }
+            let repended: std::collections::HashSet<Uuid> = repended.into_iter().collect();
 
+            let batch_ids: Vec<Uuid> = retryable
+                .iter()
+                .filter(|(id, _)| repended.contains(id))
+                .filter_map(|(_, b)| *b)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            if !batch_ids.is_empty() {
+                sqlx::query!(
+                    r#"
+                    UPDATE batches
+                    SET completed_at = NULL,
+                        failed_at = NULL,
+                        finalizing_at = NULL,
+                        cancelling_at = NULL,
+                        cancelled_at = NULL,
+                        notification_sent_at = NULL,
+                        counts_frozen_at = NULL,
+                        completed_requests = 0,
+                        failed_requests = 0,
+                        canceled_requests = 0,
+                        retry_version = retry_version + 1
+                    WHERE id = ANY($1)
+                    "#,
+                    &batch_ids,
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to reset batch terminal state: {}", e))
+                })?;
+            }
+
+            tx.commit().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e))
+            })?;
+            repended
+        };
+
+        let mut results = Vec::new();
         for (id, request_result) in ids.iter().zip(get_results) {
             let result = match request_result {
-                Ok(AnyRequest::Failed(req)) => {
-                    // Reset to pending state with retry_attempt = 0
-                    let pending_request = Request {
-                        state: Pending {
-                            retry_attempt: 0,
-                            not_before: None,
-                            batch_expires_at: req.state.batch_expires_at,
-                        },
-                        data: req.data,
-                    };
-
-                    self.persist(&pending_request).await?;
-                    Ok(())
-                }
+                Ok(AnyRequest::Failed(_)) if repended.contains(&(**id)) => Ok(()),
+                Ok(AnyRequest::Failed(_)) => Err(crate::error::FusilladeError::InvalidState(
+                    *id,
+                    "state changed concurrently".to_string(),
+                    "failed state".to_string(),
+                )),
                 Ok(_) => Err(crate::error::FusilladeError::InvalidState(
                     *id,
                     "non-failed state".to_string(),
