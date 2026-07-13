@@ -5614,11 +5614,19 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// stragglers (terminal-stamped batches with stuck non-terminal rows,
     /// e.g. the cancel/populate race) are skipped, not frozen wrongly, and
     /// the cursor advances past them so the loop always terminates.
+    ///
+    /// The cursor is the composite `(created_at, id)`: created_at alone is
+    /// not unique, and a strict `<` on it would silently skip the remainder
+    /// of a timestamp group whenever a chunk boundary lands inside one.
     pub async fn backfill_frozen_batch_counts(
         &self,
-        before: Option<DateTime<Utc>>,
+        before: Option<(DateTime<Utc>, Uuid)>,
         chunk_size: i64,
-    ) -> Result<(u64, Option<DateTime<Utc>>)> {
+    ) -> Result<(u64, Option<(DateTime<Utc>, Uuid)>)> {
+        let (before_created_at, before_id) = match before {
+            Some((c, i)) => (Some(c), Some(i)),
+            None => (None, None),
+        };
         let row = sqlx::query!(
             r#"
             WITH todo AS (
@@ -5627,8 +5635,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 WHERE b.counts_frozen_at IS NULL
                   AND b.deleted_at IS NULL
                   AND (b.completed_at IS NOT NULL OR b.failed_at IS NOT NULL OR b.cancelled_at IS NOT NULL)
-                  AND ($1::TIMESTAMPTZ IS NULL OR b.created_at < $1)
-                ORDER BY b.created_at DESC
+                  AND ($1::TIMESTAMPTZ IS NULL OR (b.created_at, b.id) < ($1, $3::UUID))
+                ORDER BY b.created_at DESC, b.id DESC
                 LIMIT $2
             ),
             counted AS (
@@ -5659,16 +5667,22 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 RETURNING b.id
             )
             SELECT (SELECT COUNT(*) FROM frozen) AS "frozen!",
-                   (SELECT MIN(created_at) FROM todo) AS cursor
+                   (SELECT t.created_at FROM todo t ORDER BY t.created_at ASC, t.id ASC LIMIT 1) AS cursor_created_at,
+                   (SELECT t.id FROM todo t ORDER BY t.created_at ASC, t.id ASC LIMIT 1) AS cursor_id
             "#,
-            before,
+            before_created_at,
             chunk_size,
+            before_id,
         )
         .fetch_one(self.pools.write())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to backfill frozen counts: {}", e)))?;
 
-        Ok((row.frozen as u64, row.cursor))
+        let cursor = match (row.cursor_created_at, row.cursor_id) {
+            (Some(c), Some(i)) => Some((c, i)),
+            _ => None,
+        };
+        Ok((row.frozen as u64, cursor))
     }
 
     /// Find terminal batches that need notification, finalize if needed, and claim atomically.
@@ -9195,6 +9209,22 @@ mod tests {
         sqlx::query!(
             "UPDATE batches SET finalizing_at = NOW(), completed_at = NOW() WHERE id = $1",
             *straggler as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Force every batch onto the SAME created_at: created_at is not
+        // unique, and with chunk_size=2 the chunk boundary lands inside the
+        // timestamp group — a created_at-only cursor would silently skip the
+        // rest of the group. The composite (created_at, id) cursor must not.
+        sqlx::query!(
+            "UPDATE batches SET created_at = '2020-01-01T00:00:00Z' WHERE id = ANY($1)",
+            &historic
+                .iter()
+                .map(|b| **b as Uuid)
+                .chain(std::iter::once(*straggler as Uuid))
+                .collect::<Vec<_>>()
         )
         .execute(&pool)
         .await
