@@ -4630,36 +4630,45 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // re-pend: a crash can never strand pending rows under a
         // terminal/frozen/cancelled batch.
         //
+        // The reset applies when rows were re-pended OR the batch is
+        // cancelling: retrying immediately after cancel (rows still
+        // pending/in-flight, none failed or canceled yet) must still
+        // un-cancel so those rows become claimable again — that is the
+        // pause-resume flow. Rows the cancellation abort already settled to
+        // canceled can be picked up by a subsequent retry. A retry of a
+        // fully-completed, non-cancelled batch stays a complete no-op
+        // (no notification re-send, no retry_version churn).
+        //
         // retry_version bump: the CAS token that makes this reset win races.
         // A finalization read may have computed terminal counts just before
         // this commits; its stamping/freezing UPDATE carries the pre-retry
         // retry_version and becomes a no-op. Any future writer that
         // un-terminalizes a batch must bump retry_version the same way.
-        if count > 0 {
-            sqlx::query!(
-                r#"
-                UPDATE batches
-                SET completed_at = NULL,
-                    failed_at = NULL,
-                    finalizing_at = NULL,
-                    cancelling_at = NULL,
-                    cancelled_at = NULL,
-                    notification_sent_at = NULL,
-                    counts_frozen_at = NULL,
-                    completed_requests = 0,
-                    failed_requests = 0,
-                    canceled_requests = 0,
-                    retry_version = retry_version + 1
-                WHERE id = $1
-                "#,
-                *batch_id as Uuid,
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to reset batch terminal state: {}", e))
-            })?;
-        }
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET completed_at = NULL,
+                failed_at = NULL,
+                finalizing_at = NULL,
+                cancelling_at = NULL,
+                cancelled_at = NULL,
+                notification_sent_at = NULL,
+                counts_frozen_at = NULL,
+                completed_requests = 0,
+                failed_requests = 0,
+                canceled_requests = 0,
+                retry_version = retry_version + 1
+            WHERE id = $1
+              AND ($2::BIGINT > 0 OR cancelling_at IS NOT NULL)
+            "#,
+            *batch_id as Uuid,
+            count as i64,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to reset batch terminal state: {}", e))
+        })?;
 
         tx.commit()
             .await
@@ -9570,6 +9579,77 @@ mod tests {
             (1, 1),
             "only the retried row re-pends; other canceled rows stay canceled"
         );
+    }
+
+    /// The pause-resume flow at its tightest: retry immediately after
+    /// cancel, before any row has settled to canceled. Zero rows re-pend,
+    /// but the batch must still un-cancel so its pending rows become
+    /// claimable again.
+    #[sqlx::test]
+    async fn test_retry_immediately_after_cancel_resumes_batch(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_freeze_test_batch(&manager, "freeze-fast-resume", 2).await;
+
+        // Cancel while both rows are still pending; retry before the
+        // cancellation cascade settles anything.
+        manager.cancel_batch(batch_id).await.unwrap();
+        let retried = manager
+            .retry_failed_requests_for_batch(batch_id)
+            .await
+            .unwrap();
+        assert_eq!(retried, 0, "nothing to re-pend yet");
+
+        let batch = manager.get_batch(batch_id).await.unwrap();
+        assert!(
+            batch.cancelled_at.is_none() && batch.cancelling_at.is_none(),
+            "immediate retry must still un-cancel (pause-resume)"
+        );
+        assert_eq!(
+            batch.pending_requests, 2,
+            "rows are pending (claimable) again, not projected as canceled"
+        );
+        assert!(frozen_at(&pool, batch_id).await.is_none());
+
+        // Control: retrying a fully-completed, non-cancelled batch stays a
+        // complete no-op (no un-terminalize, no notification re-send risk).
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200, response_body = '{}' WHERE batch_id = $1",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let batch = manager.get_batch(batch_id).await.unwrap();
+        assert!(batch.completed_at.is_some());
+        assert!(frozen_at(&pool, batch_id).await.is_some());
+        let version: i64 = sqlx::query_scalar!(
+            "SELECT retry_version FROM batches WHERE id = $1",
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let retried = manager
+            .retry_failed_requests_for_batch(batch_id)
+            .await
+            .unwrap();
+        assert_eq!(retried, 0);
+        let batch = manager.get_batch(batch_id).await.unwrap();
+        assert!(
+            batch.completed_at.is_some() && frozen_at(&pool, batch_id).await.is_some(),
+            "no-op retry of a completed batch must not un-terminalize"
+        );
+        let version_after: i64 = sqlx::query_scalar!(
+            "SELECT retry_version FROM batches WHERE id = $1",
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(version_after, version, "no retry_version churn on no-op");
     }
 
     /// The notification poller is the other lazy-finalization site: it must
