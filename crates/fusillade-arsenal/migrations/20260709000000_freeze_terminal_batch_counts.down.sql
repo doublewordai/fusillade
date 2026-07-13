@@ -5,4 +5,4 @@ ALTER TABLE batches
 ALTER TABLE batches
     DROP COLUMN IF EXISTS counts_frozen_at;
 ALTER TABLE batches
-    DROP COLUMN IF EXISTS generation;
+    DROP COLUMN IF EXISTS retry_version;

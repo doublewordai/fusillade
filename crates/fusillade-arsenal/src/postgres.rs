@@ -4524,6 +4524,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // blocks completed_at from ever being set. The frozen counters are
         // un-frozen too — the batch is live again, so reads must recount
         // until it re-terminalizes and re-freezes.
+        //
+        // retry_version bump: the CAS token that makes this reset win races.
+        // A finalization read may have computed terminal counts just before
+        // this commits; its stamping/freezing UPDATE carries the pre-retry
+        // retry_version and becomes a no-op. Any future writer that
+        // un-terminalizes a batch must bump retry_version the same way.
         if count > 0 {
             sqlx::query!(
                 r#"
@@ -4536,7 +4542,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     completed_requests = 0,
                     failed_requests = 0,
                     canceled_requests = 0,
-                    generation = generation + 1
+                    retry_version = retry_version + 1
                 WHERE id = $1
                 "#,
                 *batch_id as Uuid,
@@ -5427,7 +5433,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 b.notification_sent_at,
                 b.api_key_id,
                 b.counts_frozen_at,
-                b.generation,
+                b.retry_version,
                 CASE WHEN b.counts_frozen_at IS NOT NULL THEN 0
                      ELSE COALESCE(counts.pending, 0) END::BIGINT as pending_requests,
                 CASE WHEN b.counts_frozen_at IS NOT NULL THEN 0
@@ -5474,7 +5480,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         let canceled_requests: i64 = row.get("canceled_requests");
         let canceled_actual: i64 = row.get("canceled_actual");
         let counts_frozen_at: Option<DateTime<Utc>> = row.get("counts_frozen_at");
-        let generation: i64 = row.get("generation");
+        let retry_version: i64 = row.get("retry_version");
         let total_requests: i64 = row.get("total_requests");
         let completed_at: Option<DateTime<Utc>> = row.get("completed_at");
         let failed_at: Option<DateTime<Utc>> = row.get("failed_at");
@@ -5519,7 +5525,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             //
             // Write-time race guards — our counts come from an earlier
             // SELECT, and a concurrent retry/cancel can commit in between:
-            // - generation CAS: batch retry increments generation while
+            // - retry_version CAS: batch retry increments retry_version while
             //   resetting terminal state. The retried row is otherwise
             //   indistinguishable from a never-stamped one, and this is a
             //   target-row condition, so it stays correct even when this
@@ -5539,7 +5545,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     canceled_requests = $7,
                     counts_frozen_at = COALESCE(counts_frozen_at, $2)
                 WHERE id = $1
-                  AND generation = $8
+                  AND retry_version = $8
                   AND completed_at IS NULL
                   AND failed_at IS NULL
                   AND cancelled_at IS NULL
@@ -5556,7 +5562,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 completed_requests,
                 failed_requests,
                 canceled_requests,
-                generation,
+                retry_version,
             )
             .execute(self.write_executor()) // Use the provided pool parameter here too
             .await
@@ -5587,7 +5593,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                         canceled_requests = $4,
                         counts_frozen_at = NOW()
                     WHERE id = $1
-                      AND generation = $5
+                      AND retry_version = $5
                       AND counts_frozen_at IS NULL
                       AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR cancelled_at IS NOT NULL)
                       AND NOT EXISTS (
@@ -5600,7 +5606,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     completed_requests,
                     failed_requests,
                     canceled_actual,
-                    generation,
+                    retry_version,
                 )
                 .execute(self.write_executor())
                 .await
@@ -5666,7 +5672,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             -- and serve their persisted counters.
             WITH candidates AS (
                 SELECT b.id,
-                       b.generation,
+                       b.retry_version,
                        CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.completed_requests
                             ELSE COALESCE(counts.completed, 0) END::BIGINT as completed_requests,
                        CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.failed_requests
@@ -5720,10 +5726,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 FROM candidates c
                 WHERE b.id = c.id
                   AND b.notification_sent_at IS NULL  -- Re-check to handle concurrent pollers
-                  -- generation CAS: a concurrent batch retry resets terminal
-                  -- state and bumps generation; target-row condition, so it
+                  -- retry_version CAS: a concurrent batch retry resets terminal
+                  -- state and bumps retry_version; target-row condition, so it
                   -- holds even when this UPDATE resumes from a lock wait.
-                  AND b.generation = c.generation
+                  AND b.retry_version = c.retry_version
                 RETURNING b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
                           b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                           b.expires_at, b.cancelling_at, b.errors, b.total_requests,
@@ -9094,10 +9100,10 @@ mod tests {
         assert_eq!((batch.completed_requests, batch.failed_requests), (1, 1));
         assert!(frozen_at(&pool, batch_id).await.is_some());
 
-        // Capture the pre-retry generation: a stale stamp/freeze computed
+        // Capture the pre-retry retry_version: a stale stamp/freeze computed
         // before the retry must not be able to land after it.
-        let gen_before: i64 = sqlx::query_scalar!(
-            "SELECT generation FROM batches WHERE id = $1",
+        let version_before: i64 = sqlx::query_scalar!(
+            "SELECT retry_version FROM batches WHERE id = $1",
             *batch_id as Uuid
         )
         .fetch_one(&pool)
@@ -9115,27 +9121,31 @@ mod tests {
             "retry must clear the freeze"
         );
 
-        // Retry must bump the generation (the CAS token for stale writes).
-        let gen_after: i64 = sqlx::query_scalar!(
-            "SELECT generation FROM batches WHERE id = $1",
+        // Retry must bump the retry_version (the CAS token for stale writes).
+        let version_after: i64 = sqlx::query_scalar!(
+            "SELECT retry_version FROM batches WHERE id = $1",
             *batch_id as Uuid
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(gen_after, gen_before + 1, "retry must bump generation");
+        assert_eq!(
+            version_after,
+            version_before + 1,
+            "retry must bump retry_version"
+        );
 
         // Simulate the race: a freeze computed against the pre-retry state
-        // (old generation) arriving after the retry — must be a no-op.
+        // (old retry_version) arriving after the retry — must be a no-op.
         let stale = sqlx::query!(
             r#"
             UPDATE batches
             SET completed_requests = 999, failed_requests = 999, canceled_requests = 999,
                 counts_frozen_at = NOW()
-            WHERE id = $1 AND generation = $2 AND counts_frozen_at IS NULL
+            WHERE id = $1 AND retry_version = $2 AND counts_frozen_at IS NULL
             "#,
             *batch_id as Uuid,
-            gen_before,
+            version_before,
         )
         .execute(&pool)
         .await
@@ -9143,7 +9153,7 @@ mod tests {
         assert_eq!(
             stale.rows_affected(),
             0,
-            "stale-generation freeze must not land after a retry"
+            "stale-retry_version freeze must not land after a retry"
         );
         let batch = manager.get_batch(batch_id).await.unwrap();
         assert_eq!(
@@ -9236,7 +9246,7 @@ mod tests {
         let row = sqlx::query(
             r#"
             WITH todo AS (
-                SELECT b.id, b.created_at, b.generation
+                SELECT b.id, b.created_at, b.retry_version
                 FROM batches b
                 WHERE b.counts_frozen_at IS NULL
                   AND b.deleted_at IS NULL
@@ -9246,7 +9256,7 @@ mod tests {
                 LIMIT $2
             ),
             counted AS (
-                SELECT t.id, t.generation,
+                SELECT t.id, t.retry_version,
                        COALESCE(c.completed, 0) AS completed,
                        COALESCE(c.failed, 0) AS failed,
                        COALESCE(c.canceled, 0) AS canceled,
@@ -9270,7 +9280,7 @@ mod tests {
                 WHERE b.id = counted.id
                   AND counted.non_terminal = 0
                   AND b.counts_frozen_at IS NULL
-                  AND b.generation = counted.generation
+                  AND b.retry_version = counted.retry_version
                 RETURNING b.id
             )
             SELECT (SELECT COUNT(*) FROM frozen) AS frozen,

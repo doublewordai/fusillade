@@ -32,10 +32,10 @@ ALTER TABLE batches
     ADD COLUMN IF NOT EXISTS failed_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS canceled_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS counts_frozen_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS retry_version BIGINT NOT NULL DEFAULT 0;
 
-COMMENT ON COLUMN batches.generation IS
-    'Optimistic concurrency token for terminal stamping/freezing. Batch retry increments it while resetting terminal state; the stamping/freezing UPDATEs require the generation captured at read time, so a stamp computed before a concurrent retry cannot land after it (the retried row is otherwise indistinguishable from a never-stamped one, and lock-wait qual re-checks only see target-row columns).';
+COMMENT ON COLUMN batches.retry_version IS
+    'Optimistic-concurrency token guarding terminal stamping and count freezing against concurrent batch retry. Retry increments it in the same UPDATE that resets terminal state; every stamping/freezing write carries AND retry_version = <value captured at read time>, so a write computed before a retry cannot land after it. Needed because a retried row is otherwise indistinguishable from a never-stamped one (all timestamps NULL, counters 0), and Postgres lock-wait qual re-checks (EvalPlanQual) only re-evaluate target-row columns — subquery guards keep the old snapshot. ANY future writer that un-terminalizes a batch must bump this. Not related to LLM generations; named retry_version deliberately.';
 
 COMMENT ON COLUMN batches.counts_frozen_at IS
     'When set, the *_requests counter columns hold the final frozen counts and reads must not recount from requests. Set once every request row is in an actual terminal state; cleared by batch retry.';
