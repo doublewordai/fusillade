@@ -4452,88 +4452,26 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         }
 
         let mut results = Vec::new();
-        let mut retried_batches: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
 
-        // Rows under a cancelling/cancelled batch must not be retried: the
-        // claim gate excludes such batches, so a re-pended row could never be
-        // claimed (and, with cancelling_at set, would be displayed as
-        // canceled while sitting pending forever). Cancellation is a
-        // deliberate user action — un-cancelling is not a row-retry side
-        // effect. Reject those ids instead.
-        let candidate_batches: Vec<Uuid> = get_results
+        // Un-terminalize AND un-cancel the parent batches BEFORE re-pending
+        // rows (same reset as retry_failed_requests_for_batch): retry is a
+        // deliberate action that overturns cancellation, and a re-pended row
+        // must never sit under a terminal/frozen/cancelled batch — it would
+        // be unclaimable (cancelling_at claim gate) and invisible (frozen
+        // counters). Reset-first ordering makes a mid-way crash benign: an
+        // un-terminalized batch with still-terminal rows simply re-stamps
+        // and re-freezes on the next read.
+        //
+        // retry_version bump per the CAS rule: any writer that
+        // un-terminalizes a batch bumps it, so an in-flight stamp/freeze
+        // computed against the pre-retry state cannot land afterwards.
+        let retried_batches: std::collections::HashSet<Uuid> = get_results
             .iter()
             .filter_map(|r| match r {
                 Ok(AnyRequest::Failed(req)) => req.data.batch_id.map(|b| *b),
                 _ => None,
             })
             .collect();
-        let cancelled_batches: std::collections::HashSet<Uuid> = if candidate_batches.is_empty() {
-            Default::default()
-        } else {
-            sqlx::query_scalar!(
-                "SELECT id FROM batches WHERE id = ANY($1) AND cancelling_at IS NOT NULL",
-                &candidate_batches,
-            )
-            .fetch_all(self.read_executor())
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to check batch cancellation: {}", e))
-            })?
-            .into_iter()
-            .collect()
-        };
-
-        for (id, request_result) in ids.iter().zip(get_results) {
-            let result = match request_result {
-                Ok(AnyRequest::Failed(req))
-                    if req
-                        .data
-                        .batch_id
-                        .is_some_and(|b| cancelled_batches.contains(&b)) =>
-                {
-                    Err(crate::error::FusilladeError::InvalidState(
-                        *id,
-                        "failed under a cancelled batch".to_string(),
-                        "failed under an active batch".to_string(),
-                    ))
-                }
-                Ok(AnyRequest::Failed(req)) => {
-                    // Reset to pending state with retry_attempt = 0
-                    let batch_id = req.data.batch_id;
-                    let pending_request = Request {
-                        state: Pending {
-                            retry_attempt: 0,
-                            not_before: None,
-                            batch_expires_at: req.state.batch_expires_at,
-                        },
-                        data: req.data,
-                    };
-
-                    self.persist(&pending_request).await?;
-                    if let Some(batch_id) = batch_id {
-                        retried_batches.insert(*batch_id);
-                    }
-                    Ok(())
-                }
-                Ok(_) => Err(crate::error::FusilladeError::InvalidState(
-                    *id,
-                    "non-failed state".to_string(),
-                    "failed state".to_string(),
-                )),
-                Err(e) => Err(e),
-            };
-
-            results.push(result);
-        }
-
-        // Un-terminalize the parent batches of the retried rows: same reset
-        // as retry_failed_requests_for_batch. A retried row makes its batch
-        // non-terminal again, so the terminal timestamps, notification claim,
-        // and FROZEN COUNTS must all clear (a frozen batch would otherwise
-        // keep serving stale counters and never show the pending row), and
-        // retry_version must bump — the CAS rule: any writer that
-        // un-terminalizes a batch bumps it, so an in-flight stamp/freeze
-        // computed against the pre-retry state cannot land afterwards.
         if !retried_batches.is_empty() {
             let batch_ids: Vec<Uuid> = retried_batches.into_iter().collect();
             sqlx::query!(
@@ -4542,6 +4480,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 SET completed_at = NULL,
                     failed_at = NULL,
                     finalizing_at = NULL,
+                    cancelling_at = NULL,
+                    cancelled_at = NULL,
                     notification_sent_at = NULL,
                     counts_frozen_at = NULL,
                     completed_requests = 0,
@@ -4559,6 +4499,33 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             })?;
         }
 
+        for (id, request_result) in ids.iter().zip(get_results) {
+            let result = match request_result {
+                Ok(AnyRequest::Failed(req)) => {
+                    // Reset to pending state with retry_attempt = 0
+                    let pending_request = Request {
+                        state: Pending {
+                            retry_attempt: 0,
+                            not_before: None,
+                            batch_expires_at: req.state.batch_expires_at,
+                        },
+                        data: req.data,
+                    };
+
+                    self.persist(&pending_request).await?;
+                    Ok(())
+                }
+                Ok(_) => Err(crate::error::FusilladeError::InvalidState(
+                    *id,
+                    "non-failed state".to_string(),
+                    "failed state".to_string(),
+                )),
+                Err(e) => Err(e),
+            };
+
+            results.push(result);
+        }
+
         // For any missing requests, add an error result
         for _ in 0..(ids.len() - found_count) {
             results.push(Err(FusilladeError::Other(anyhow!(
@@ -4570,29 +4537,20 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     }
 
     async fn retry_failed_requests_for_batch(&self, batch_id: BatchId) -> Result<u64> {
-        tracing::debug!(%batch_id, "Retrying all failed requests for batch");
-
-        // Same rule as the per-request path: a cancelled batch cannot be
-        // retried — its rows would be unclaimable under the cancelling_at
-        // claim gate. Un-cancelling must stay a deliberate separate action.
-        let cancelling: Option<DateTime<Utc>> = sqlx::query_scalar!(
-            "SELECT cancelling_at FROM batches WHERE id = $1",
-            *batch_id as Uuid
-        )
-        .fetch_one(self.read_executor())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to check batch state: {}", e)))?;
-        if cancelling.is_some() {
-            return Err(FusilladeError::ValidationError(format!(
-                "Batch {batch_id} is cancelled and cannot be retried"
-            )));
-        }
+        tracing::debug!(%batch_id, "Retrying failed/canceled requests for batch");
 
         let mut tx = self
             .begin_write()
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
+        // Batch retry drives the whole batch back toward completion: failed
+        // AND canceled rows re-pend; completed rows are never redone (no
+        // wasted compute/credits). Cancellation does not block retry — both
+        // are deliberate user actions and the later one wins, so cancel can
+        // serve as a pause that retry resumes (see the batch reset below,
+        // which un-cancels). Without the un-cancel, re-pended rows would sit
+        // unclaimable forever under the cancelling_at claim gate.
         let result = sqlx::query!(
             r#"
             UPDATE requests
@@ -4601,10 +4559,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 not_before = NULL,
                 error = NULL,
                 failed_at = NULL,
+                canceled_at = NULL,
                 daemon_id = NULL,
                 claimed_at = NULL,
                 started_at = NULL
-            WHERE batch_id = $1 AND state = 'failed'
+            WHERE batch_id = $1 AND state IN ('failed', 'canceled')
             "#,
             *batch_id as Uuid,
         )
@@ -4614,11 +4573,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
         let count = result.rows_affected();
 
-        // Reset batch terminal timestamps so lazy finalization can re-evaluate
-        // once the retried requests complete. Without this, a stale failed_at
-        // blocks completed_at from ever being set. The frozen counters are
-        // un-frozen too — the batch is live again, so reads must recount
-        // until it re-terminalizes and re-freezes.
+        // Reset batch terminal state so lazy finalization can re-evaluate
+        // once the retried requests complete, INCLUDING the cancellation
+        // stamps (retry overturns cancel). The frozen counters are un-frozen
+        // too — the batch is live again, so reads must recount until it
+        // re-terminalizes and re-freezes. Same transaction as the row
+        // re-pend: a crash can never strand pending rows under a
+        // terminal/frozen/cancelled batch.
         //
         // retry_version bump: the CAS token that makes this reset win races.
         // A finalization read may have computed terminal counts just before
@@ -4632,6 +4593,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 SET completed_at = NULL,
                     failed_at = NULL,
                     finalizing_at = NULL,
+                    cancelling_at = NULL,
+                    cancelled_at = NULL,
                     notification_sent_at = NULL,
                     counts_frozen_at = NULL,
                     completed_requests = 0,
@@ -4645,7 +4608,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .execute(&mut *tx)
             .await
             .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to reset batch terminal timestamps: {}", e))
+                FusilladeError::Other(anyhow!("Failed to reset batch terminal state: {}", e))
             })?;
         }
 
@@ -4653,7 +4616,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
-        tracing::debug!(%batch_id, count, "Retried failed requests for batch");
+        tracing::debug!(%batch_id, count, "Retried failed/canceled requests for batch");
 
         Ok(count)
     }
@@ -9366,20 +9329,118 @@ mod tests {
         );
     }
 
-    /// Retries against a cancelled batch must be rejected on both paths:
-    /// re-pended rows would be unclaimable under the cancelling_at claim
-    /// gate, and un-cancelling must stay a deliberate separate action. The
-    /// frozen counts stay intact.
+    /// Retry overturns cancellation: cancel can serve as a pause, and a
+    /// deliberate retry resumes the batch — failed AND canceled rows re-pend,
+    /// completed rows are never redone, the cancellation stamps clear, the
+    /// freeze clears, and retry_version bumps.
     #[sqlx::test]
-    async fn test_retry_rejected_for_cancelled_batch(pool: sqlx::PgPool) {
+    async fn test_batch_retry_uncancels_and_resumes(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         );
-        let batch_id = setup_freeze_test_batch(&manager, "freeze-cancel-retry", 2).await;
+        let batch_id = setup_freeze_test_batch(&manager, "freeze-uncancel", 3).await;
 
-        // One row fails, then the batch is cancelled; the other row settles
-        // as canceled. Batch ends terminal (cancelled) and freezes.
+        // One row completed, one failed, then cancel; the third settles as
+        // canceled. Batch ends terminal (cancelled) and freezes.
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200, response_body = '{}' WHERE batch_id = $1 AND id IN (SELECT id FROM requests WHERE batch_id = $1 LIMIT 1)",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "UPDATE requests SET state = 'failed', failed_at = NOW(), error = 'test-error' WHERE batch_id = $1 AND id IN (SELECT id FROM requests WHERE batch_id = $1 AND state = 'pending' LIMIT 1)",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager.cancel_batch(batch_id).await.unwrap();
+        sqlx::query!(
+            "UPDATE requests SET state = 'canceled', canceled_at = NOW() WHERE batch_id = $1 AND state = 'pending'",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let batch = manager.get_batch(batch_id).await.unwrap();
+        assert_eq!(
+            (
+                batch.completed_requests,
+                batch.failed_requests,
+                batch.canceled_requests
+            ),
+            (1, 1, 1)
+        );
+        assert!(batch.cancelled_at.is_some());
+        assert!(frozen_at(&pool, batch_id).await.is_some());
+        let version_before: i64 = sqlx::query_scalar!(
+            "SELECT retry_version FROM batches WHERE id = $1",
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Retry the batch: un-cancels and re-pends failed + canceled rows.
+        let retried = manager
+            .retry_failed_requests_for_batch(batch_id)
+            .await
+            .unwrap();
+        assert_eq!(retried, 2, "failed and canceled rows re-pend");
+
+        let batch = manager.get_batch(batch_id).await.unwrap();
+        assert!(
+            batch.cancelled_at.is_none() && batch.cancelling_at.is_none(),
+            "retry must overturn cancellation"
+        );
+        assert!(frozen_at(&pool, batch_id).await.is_none());
+        assert_eq!(
+            (
+                batch.completed_requests,
+                batch.pending_requests,
+                batch.failed_requests,
+                batch.canceled_requests
+            ),
+            (1, 2, 0, 0),
+            "completed work kept; failed + canceled rows pending again"
+        );
+        let version_after: i64 = sqlx::query_scalar!(
+            "SELECT retry_version FROM batches WHERE id = $1",
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(version_after, version_before + 1);
+
+        // Drive the resumed rows to completion: re-terminalizes + re-freezes.
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200, response_body = '{}' WHERE batch_id = $1 AND state = 'pending'",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let batch = manager.get_batch(batch_id).await.unwrap();
+        assert_eq!(batch.completed_requests, 3);
+        assert!(batch.completed_at.is_some());
+        assert!(frozen_at(&pool, batch_id).await.is_some());
+    }
+
+    /// Per-request retry under a cancelled batch: un-cancels the parent
+    /// batch (retry overturns cancel) but re-pends ONLY the requested row —
+    /// other canceled rows stay canceled.
+    #[sqlx::test]
+    async fn test_single_request_retry_uncancels_parent(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_freeze_test_batch(&manager, "freeze-single-uncancel", 2).await;
+
         sqlx::query!(
             "UPDATE requests SET state = 'failed', failed_at = NOW(), error = 'test-error' WHERE batch_id = $1 AND id IN (SELECT id FROM requests WHERE batch_id = $1 LIMIT 1)",
             *batch_id as Uuid
@@ -9395,18 +9456,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let batch = manager.get_batch(batch_id).await.unwrap();
-        assert_eq!((batch.failed_requests, batch.canceled_requests), (1, 1));
+        let _ = manager.get_batch(batch_id).await.unwrap();
         assert!(frozen_at(&pool, batch_id).await.is_some());
 
-        // Whole-batch retry: rejected outright.
-        let err = manager.retry_failed_requests_for_batch(batch_id).await;
-        assert!(
-            matches!(err, Err(FusilladeError::ValidationError(_))),
-            "whole-batch retry of a cancelled batch must be rejected"
-        );
-
-        // Per-request retry: that id gets an error result.
         let failed_id = sqlx::query_scalar!(
             "SELECT id FROM requests WHERE batch_id = $1 AND state = 'failed'",
             *batch_id as Uuid
@@ -9418,24 +9470,19 @@ mod tests {
             .retry_failed_requests(vec![RequestId(failed_id)])
             .await
             .unwrap();
-        assert!(
-            matches!(results[0], Err(FusilladeError::InvalidState(_, _, _))),
-            "per-request retry under a cancelled batch must be rejected"
-        );
+        assert!(results.iter().all(|r| r.is_ok()));
 
-        // Nothing changed: row still failed, batch still frozen + cancelled.
-        let state: String = sqlx::query_scalar!(
-            r#"SELECT state as "state!: String" FROM requests WHERE id = $1"#,
-            failed_id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(state, "failed");
-        assert!(frozen_at(&pool, batch_id).await.is_some());
         let batch = manager.get_batch(batch_id).await.unwrap();
-        assert!(batch.cancelled_at.is_some());
-        assert_eq!((batch.failed_requests, batch.canceled_requests), (1, 1));
+        assert!(
+            batch.cancelled_at.is_none() && batch.cancelling_at.is_none(),
+            "per-request retry must also overturn cancellation"
+        );
+        assert!(frozen_at(&pool, batch_id).await.is_none());
+        assert_eq!(
+            (batch.pending_requests, batch.canceled_requests),
+            (1, 1),
+            "only the retried row re-pends; other canceled rows stay canceled"
+        );
     }
 
     /// The notification poller is the other lazy-finalization site: it must
