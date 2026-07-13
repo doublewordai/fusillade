@@ -5656,22 +5656,36 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 canceled_requests,
                 retry_version,
             )
-            .execute(self.write_executor()) // Use the provided pool parameter here too
+            .execute(self.write_executor())
             .await
             .map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to update terminal timestamps: {}", e))
             })?;
 
-            // Only report the stamp if it actually landed. When a guard
-            // rejected it (a concurrent retry or cancel won the race), the
-            // batch is NOT terminal in the database — returning the locally
-            // computed timestamps would claim a finalization that never
-            // happened. Fall back to the values from the original SELECT
-            // (all unset in this branch); the next read sees the live state.
+            // Only report the stamp if it actually landed. Zero rows means a
+            // guard rejected it, for one of two reasons with different
+            // correct answers: a concurrent reader already stamped (batch IS
+            // terminal — with their timestamps), or a concurrent retry/cancel
+            // un-terminalized it (batch is NOT terminal). Re-fetch the
+            // persisted timestamps so the response reflects whichever
+            // actually happened, rather than guessing.
             if stamp_result.rows_affected() > 0 {
                 (finalizing, completed, failed)
             } else {
-                (finalizing_at_db, completed_at, failed_at)
+                let persisted = sqlx::query!(
+                    r#"SELECT finalizing_at, completed_at, failed_at FROM batches WHERE id = $1"#,
+                    *batch_id as Uuid,
+                )
+                .fetch_one(self.write_executor())
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to refetch terminal timestamps: {}", e))
+                })?;
+                (
+                    persisted.finalizing_at,
+                    persisted.completed_at,
+                    persisted.failed_at,
+                )
             }
         } else {
             // Freeze-only path: the batch already carries a terminal
