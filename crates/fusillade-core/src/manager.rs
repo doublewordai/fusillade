@@ -366,14 +366,20 @@ pub trait Storage: Send + Sync {
     /// - Request is not in failed state
     async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>>;
 
-    /// Retry all failed requests for a batch in a single database operation.
+    /// Retry a batch: re-pend its FAILED and CANCELED requests in a single
+    /// database operation (completed requests are never redone).
     ///
-    /// This is much more efficient than `retry_failed_requests` when retrying all failed
-    /// requests for a batch, as it performs a single UPDATE query instead of loading
-    /// all requests into memory.
+    /// Retry drives the batch back toward completion and overturns
+    /// cancellation — the batch's terminal timestamps, cancellation stamps,
+    /// and frozen counts are all reset, so cancel can serve as a pause that
+    /// retry resumes. (The name predates canceled-row support and is kept
+    /// for API stability.)
+    ///
+    /// This is much more efficient than `retry_failed_requests`, as it
+    /// performs bulk UPDATEs instead of loading requests into memory.
     ///
     /// # Returns
-    /// The number of requests that were retried.
+    /// The number of requests that were retried (failed + canceled).
     async fn retry_failed_requests_for_batch(&self, batch_id: BatchId) -> Result<u64>;
 
     /// Get request counts grouped by model and deadline window.
