@@ -1,6 +1,6 @@
 //! Shared daemon configuration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::http::HttpResponse;
@@ -137,7 +137,7 @@ pub struct DaemonConfig {
     /// HTTP statuses retried in addition to those selected by `should_retry`.
     ///
     /// Defaults to `[499]`. Set this to an empty list to disable additional
-    /// status-based retries.
+    /// status-based retries. Values below 400 are ignored.
     #[serde(default = "default_additional_retryable_statuses")]
     pub additional_retryable_statuses: Vec<u16>,
     pub claim_timeout_ms: u64,
@@ -281,7 +281,12 @@ impl Default for DaemonConfig {
 impl DaemonConfig {
     pub(crate) fn retry_predicate(&self) -> ShouldRetryFn {
         let should_retry = self.should_retry.clone();
-        let additional_retryable_statuses = self.additional_retryable_statuses.clone();
+        let additional_retryable_statuses: HashSet<u16> = self
+            .additional_retryable_statuses
+            .iter()
+            .copied()
+            .filter(|status| *status >= 400)
+            .collect();
 
         Arc::new(move |response| {
             should_retry(response) || additional_retryable_statuses.contains(&response.status)
@@ -361,12 +366,14 @@ mod tests {
         assert!(disabled_predicate(&response(500, "")));
 
         let overridden_config = DaemonConfig {
-            additional_retryable_statuses: vec![418],
+            additional_retryable_statuses: vec![200, 204, 418],
             ..DaemonConfig::default()
         };
         let overridden_predicate = overridden_config.retry_predicate();
         assert!(overridden_predicate(&response(418, "")));
         assert!(!overridden_predicate(&response(499, "")));
+        assert!(!overridden_predicate(&response(200, "")));
+        assert!(!overridden_predicate(&response(204, "")));
 
         let custom_config = DaemonConfig {
             should_retry: Arc::new(|response| response.status == 409),
