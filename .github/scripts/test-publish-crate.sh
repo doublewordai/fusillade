@@ -59,3 +59,32 @@ if ! grep -q 'bash .release-tools/.github/scripts/publish-crate.sh "$RELEASE_TAG
   echo "publish workflow should run release tooling from the current workflow branch, not the checked-out release tag" >&2
   exit 1
 fi
+
+if grep -q '"always-link-local"[[:space:]]*:[[:space:]]*true' release-please-config.json; then
+  echo "release-please must not bump unreleased local workspace crates" >&2
+  exit 1
+fi
+
+manifest_version() {
+  sed -n 's/^version = "\([^"]*\)".*/\1/p' "$1" | head -n 1
+}
+
+release_manifest_version() {
+  local package_path="$1"
+  awk -v key="\"${package_path}\":" '
+    $1 == key {
+      gsub(/[\",]/, "", $2)
+      print $2
+    }
+  ' .release-please-manifest.json
+}
+
+for package_path in crates/fusillade-core crates/fusillade-arsenal; do
+  declared_version="$(manifest_version "${package_path}/Cargo.toml")"
+  released_version="$(release_manifest_version "$package_path")"
+
+  if [[ "$declared_version" != "$released_version" ]]; then
+    echo "${package_path}/Cargo.toml declares ${declared_version}, but release-please tracks ${released_version}" >&2
+    exit 1
+  fi
+done
