@@ -445,20 +445,20 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
-async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
+async fn test_daemon_retries_configured_and_default_statuses(pool: sqlx::PgPool) {
     // Setup: Create HTTP client with failing responses, then success
     let http_client = Arc::new(MockHttpClient::new());
 
-    // First attempt: fails with 500
+    // First attempt: fails with the additionally configured default status
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
-            status: 500,
-            body: r#"{"error":"internal error"}"#.to_string(),
+            status: 499,
+            body: r#"{"error":"arbitrary upstream cancellation"}"#.to_string(),
         }),
     );
 
-    // Second attempt: fails with 503
+    // Second attempt: fails with a built-in default status
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {

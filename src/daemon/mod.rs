@@ -225,6 +225,12 @@ where
         config: DaemonConfig,
         shutdown_token: tokio_util::sync::CancellationToken,
     ) -> Self {
+        let should_retry = config.retry_predicate();
+        let config = DaemonConfig {
+            should_retry,
+            ..config
+        };
+
         Self {
             daemon_id: DaemonId::from(uuid::Uuid::new_v4()),
             storage,
