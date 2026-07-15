@@ -1,5 +1,12 @@
 # Changelog
 
+## [21.1.2](https://github.com/doublewordai/fusillade/compare/fusillade-v21.1.1...fusillade-v21.1.2) (2026-07-15)
+
+
+### Bug Fixes
+
+* preserve non-SSE streaming error bodies ([#340](https://github.com/doublewordai/fusillade/issues/340)) ([d2fd3e2](https://github.com/doublewordai/fusillade/commit/d2fd3e2466d49d9ba4d7fe722bdbdee0b175e220))
+
 ## [21.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v21.1.0...fusillade-v21.1.1) (2026-07-15)
 
 
