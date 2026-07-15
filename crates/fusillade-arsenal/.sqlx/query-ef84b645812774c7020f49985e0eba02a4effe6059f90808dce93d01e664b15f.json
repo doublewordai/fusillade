@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE requests\n                    SET state = 'failed',\n                        failed_at = COALESCE(failed_at, NOW()),\n                        error = COALESCE(error, $2),\n                        daemon_id = NULL,\n                        attempt_id = NULL,\n                        response_size = CASE\n                            WHEN COALESCE(response_size, 0) = 0\n                                THEN octet_length(COALESCE(error, $2))\n                            ELSE response_size\n                        END\n                    WHERE batch_id = $1\n                      AND state IN ('pending', 'claimed', 'processing')\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ef84b645812774c7020f49985e0eba02a4effe6059f90808dce93d01e664b15f"
+}

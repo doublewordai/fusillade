@@ -10,8 +10,8 @@ use crate::batch::{
 use crate::daemon_record::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::request::{
-    AnyRequest, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput, DaemonId,
-    ListRequestsFilter, PersistCompletedRealtimeInput, Request, RequestDetail, RequestId,
+    AnyRequest, AttemptId, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput,
+    DaemonId, ListRequestsFilter, PersistCompletedRealtimeInput, Request, RequestDetail, RequestId,
     RequestListResult, RequestState, ServiceTierFilter,
 };
 use async_trait::async_trait;
@@ -727,28 +727,58 @@ pub trait Storage: Send + Sync {
     where
         AnyRequest: From<Request<T>>;
 
-    /// Reschedule an in-flight request back to `pending` for an automatic retry,
-    /// fenced on the worker that currently owns it.
+    /// Persist a state transition owned by one exact daemon attempt.
     ///
-    /// This is the daemon's per-attempt retry path. Unlike [`Storage::persist`]
-    /// (which matches on `id` only, so the manual retry path can intentionally
-    /// resurrect a `failed` row), this transition is guarded by
-    /// `state = 'processing' AND daemon_id = <owner>`: it applies ONLY if the row
-    /// is still the in-flight claim held by `daemon_id`.
+    /// Implementations must compare-and-set on the request's current state and
+    /// `attempt_id`.
+    /// `Ok(false)` means the attempt lost ownership and the stale transition
+    /// was discarded; this is an expected concurrency outcome.
+    async fn persist_attempt<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+        attempt_id: AttemptId,
+    ) -> Result<bool>
+    where
+        AnyRequest: From<Request<T>>;
+
+    /// Reschedule a failed in-memory execution from `claimed` or `processing`.
     ///
-    /// The guard prevents a finalize-then-resurrect race: if another writer (a
-    /// zombie/duplicate worker, or a stale-claim reclaim) has already moved the
-    /// row to a terminal state — and a finalizer has sealed the parent batch as a
-    /// result — a late retry from this worker must NOT flip it back to `pending`,
-    /// orphaning it under a completed batch.
+    /// This recovery path is used when a per-request processor errors or
+    /// panics. The caller supplies the retry count and backoff computed by the
+    /// normal retry policy, so deterministic failures cannot replay forever
+    /// without advancing toward a terminal state.
+    async fn recover_attempt_for_retry(
+        &self,
+        request_id: RequestId,
+        owner: DaemonId,
+        attempt_id: AttemptId,
+        retry_attempt: u32,
+        not_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool>;
+
+    /// Legacy owner-fenced retry hook retained for Storage compatibility.
     ///
-    /// Returns `true` if the row was rescheduled, `false` if the worker no longer
-    /// owns it (lost the race). A `false` result is normal under contention and
-    /// should be logged, not treated as an error.
+    /// New daemon code calls [`Storage::reschedule_attempt_for_retry`]. Postgres
+    /// limits this legacy method to pre-fencing rows whose attempt ID is null,
+    /// allowing rolling upgrades without letting an owner-only write mutate a
+    /// newer attempt belonging to the same daemon.
     async fn reschedule_for_retry(
         &self,
         request_id: RequestId,
         owner: DaemonId,
+        retry_attempt: u32,
+        not_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool>;
+
+    /// Attempt-aware variant of [`Storage::reschedule_for_retry`].
+    ///
+    /// Implementations must include `attempt_id` in the compare-and-set.
+    /// `Ok(false)` is a normal ownership-loss outcome.
+    async fn reschedule_attempt_for_retry(
+        &self,
+        request_id: RequestId,
+        owner: DaemonId,
+        attempt_id: AttemptId,
         retry_attempt: u32,
         not_before: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<bool>;

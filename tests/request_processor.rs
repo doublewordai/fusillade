@@ -23,7 +23,7 @@ use fusillade::processor::{
     CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry,
 };
 use fusillade::request::{
-    AnyRequest, Claimed, Completed, Failed, Request, RequestCompletionResult,
+    AnyRequest, Claimed, Completed, FailureReason, Request, RequestCompletionResult,
 };
 use fusillade_arsenal::{PostgresRequestManager as PostgresStore, TestDbPools};
 use tokio_util::sync::CancellationToken;
@@ -171,6 +171,334 @@ async fn default_processor_preserves_batch_path(pool: sqlx::PgPool) {
     shutdown_token.cancel();
 }
 
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+#[test_log::test]
+async fn default_processor_persists_non_retriable_builder_error(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    http_client.add_response(
+        "POST /v1/test",
+        Err(fusillade::FusilladeError::HttpRequestBuilder(
+            "synthetic invalid header".into(),
+        )),
+    );
+
+    let shutdown_token = CancellationToken::new();
+    let config = fast_test_config();
+    let manager = postgres_store(pool, &config).await;
+    let daemon = Arc::new(postgres_daemon(
+        manager.clone(),
+        http_client.clone(),
+        config,
+    ));
+    let _handle = daemon.run(shutdown_token.clone()).unwrap();
+
+    let request_id = submit_one_request(&manager).await;
+    wait_until_completed(&manager, request_id).await;
+
+    let AnyRequest::Failed(req) = fetch_any_request(&manager, request_id).await else {
+        panic!("expected Failed variant");
+    };
+    assert_eq!(
+        req.state.reason,
+        FailureReason::RequestBuilderError {
+            error: "synthetic invalid header".into(),
+        }
+    );
+
+    shutdown_token.cancel();
+}
+
+struct FailOnceProcessor {
+    invocations: Arc<AtomicUsize>,
+    inner: DefaultRequestProcessor,
+}
+
+#[async_trait]
+impl<S, H> RequestProcessor<S, H> for FailOnceProcessor
+where
+    S: Storage + Sync,
+    H: HttpClient + 'static,
+{
+    async fn process(
+        &self,
+        request: Request<Claimed>,
+        http: H,
+        storage: &S,
+        should_retry: ShouldRetry,
+        cancellation: CancellationFuture,
+    ) -> fusillade::Result<RequestCompletionResult> {
+        if self.invocations.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
+                "synthetic processor failure"
+            )));
+        }
+        self.inner
+            .process(request, http, storage, should_retry, cancellation)
+            .await
+    }
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+#[test_log::test]
+async fn processor_error_recovers_exact_attempt_for_retry(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"ok":true}"#.into(),
+        }),
+    );
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let processor = Arc::new(FailOnceProcessor {
+        invocations: invocations.clone(),
+        inner: DefaultRequestProcessor,
+    });
+    let shutdown_token = CancellationToken::new();
+    let config = fast_test_config();
+    let manager = postgres_store(pool, &config).await;
+    let daemon = Arc::new(
+        postgres_daemon(manager.clone(), http_client.clone(), config).with_processor(processor),
+    );
+    let _handle = daemon.run(shutdown_token.clone()).unwrap();
+
+    let request_id = submit_one_request(&manager).await;
+    wait_until_completed(&manager, request_id).await;
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        fetch_any_request(&manager, request_id).await,
+        AnyRequest::Completed(_)
+    ));
+    assert_eq!(http_client.call_count(), 1);
+
+    shutdown_token.cancel();
+}
+
+struct AlwaysErrorProcessor {
+    invocations: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl<S, H> RequestProcessor<S, H> for AlwaysErrorProcessor
+where
+    S: Storage + Sync,
+    H: HttpClient + 'static,
+{
+    async fn process(
+        &self,
+        _request: Request<Claimed>,
+        _http: H,
+        _storage: &S,
+        _should_retry: ShouldRetry,
+        _cancellation: CancellationFuture,
+    ) -> fusillade::Result<RequestCompletionResult> {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
+            "deterministic processor failure"
+        )))
+    }
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+#[test_log::test]
+async fn deterministic_processor_error_obeys_retry_limit(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let processor = Arc::new(AlwaysErrorProcessor {
+        invocations: invocations.clone(),
+    });
+    let shutdown_token = CancellationToken::new();
+    let mut config = fast_test_config();
+    config.max_retries = Some(1);
+    config.backoff_ms = 1;
+    let manager = postgres_store(pool, &config).await;
+    let daemon = Arc::new(
+        postgres_daemon(manager.clone(), http_client.clone(), config).with_processor(processor),
+    );
+    let _handle = daemon.run(shutdown_token.clone()).unwrap();
+
+    let request_id = submit_one_request(&manager).await;
+    wait_until_completed(&manager, request_id).await;
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 2);
+    let AnyRequest::Failed(failed) = fetch_any_request(&manager, request_id).await else {
+        panic!("deterministic processor failure must become terminal");
+    };
+    assert_eq!(failed.state.retry_attempt, 1);
+    assert!(matches!(
+        failed.state.reason,
+        FailureReason::NetworkError { .. }
+    ));
+    assert_eq!(http_client.call_count(), 0);
+
+    shutdown_token.cancel();
+}
+
+struct PanicOnceProcessor {
+    invocations: Arc<AtomicUsize>,
+    inner: DefaultRequestProcessor,
+}
+
+#[async_trait]
+impl<S, H> RequestProcessor<S, H> for PanicOnceProcessor
+where
+    S: Storage + Sync,
+    H: HttpClient + 'static,
+{
+    async fn process(
+        &self,
+        request: Request<Claimed>,
+        http: H,
+        storage: &S,
+        should_retry: ShouldRetry,
+        cancellation: CancellationFuture,
+    ) -> fusillade::Result<RequestCompletionResult> {
+        if self.invocations.fetch_add(1, Ordering::SeqCst) == 0 {
+            let request_data = request.data.clone();
+            let api_key = request_data.api_key.clone();
+            let _processing = request
+                .process(storage, async move {
+                    http.execute(&request_data, &api_key).await
+                })
+                .await?;
+            tokio::task::yield_now().await;
+            panic!("synthetic processor panic");
+        }
+        self.inner
+            .process(request, http, storage, should_retry, cancellation)
+            .await
+    }
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+#[test_log::test]
+async fn processor_panic_recovers_exact_attempt_for_retry(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    let _blocked_first_attempt = http_client.add_response_with_trigger(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"stale":true}"#.into(),
+        }),
+    );
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"ok":true}"#.into(),
+        }),
+    );
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let processor = Arc::new(PanicOnceProcessor {
+        invocations: invocations.clone(),
+        inner: DefaultRequestProcessor,
+    });
+    let shutdown_token = CancellationToken::new();
+    let config = fast_test_config();
+    let manager = postgres_store(pool, &config).await;
+    let daemon = Arc::new(
+        postgres_daemon(manager.clone(), http_client.clone(), config).with_processor(processor),
+    );
+    let _handle = daemon.run(shutdown_token.clone()).unwrap();
+
+    let request_id = submit_one_request(&manager).await;
+    wait_until_completed(&manager, request_id).await;
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        fetch_any_request(&manager, request_id).await,
+        AnyRequest::Completed(_)
+    ));
+    assert_eq!(http_client.call_count(), 2);
+    assert_eq!(
+        http_client.in_flight_count(),
+        0,
+        "unwinding the processor must cancel its old upstream future"
+    );
+
+    shutdown_token.cancel();
+}
+
+struct UpstreamTaskPanicOnceProcessor {
+    invocations: Arc<AtomicUsize>,
+    inner: DefaultRequestProcessor,
+}
+
+#[async_trait]
+impl<S, H> RequestProcessor<S, H> for UpstreamTaskPanicOnceProcessor
+where
+    S: Storage + Sync,
+    H: HttpClient + 'static,
+{
+    async fn process(
+        &self,
+        request: Request<Claimed>,
+        http: H,
+        storage: &S,
+        should_retry: ShouldRetry,
+        cancellation: CancellationFuture,
+    ) -> fusillade::Result<RequestCompletionResult> {
+        if self.invocations.fetch_add(1, Ordering::SeqCst) == 0 {
+            let processing = request
+                .process(storage, async {
+                    if std::hint::black_box(true) {
+                        panic!("synthetic upstream task panic");
+                    }
+                    Ok(HttpResponse {
+                        status: 200,
+                        body: "unreachable".into(),
+                    })
+                })
+                .await?;
+            return processing.complete(storage, |_| false, cancellation).await;
+        }
+        self.inner
+            .process(request, http, storage, should_retry, cancellation)
+            .await
+    }
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+#[test_log::test]
+async fn terminated_upstream_task_is_retried(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"ok":true}"#.into(),
+        }),
+    );
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let processor = Arc::new(UpstreamTaskPanicOnceProcessor {
+        invocations: invocations.clone(),
+        inner: DefaultRequestProcessor,
+    });
+    let shutdown_token = CancellationToken::new();
+    let config = fast_test_config();
+    let manager = postgres_store(pool, &config).await;
+    let daemon = Arc::new(
+        postgres_daemon(manager.clone(), http_client.clone(), config).with_processor(processor),
+    );
+    let _handle = daemon.run(shutdown_token.clone()).unwrap();
+
+    let request_id = submit_one_request(&manager).await;
+    wait_until_completed(&manager, request_id).await;
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        fetch_any_request(&manager, request_id).await,
+        AnyRequest::Completed(_)
+    ));
+    assert_eq!(http_client.call_count(), 1);
+
+    shutdown_token.cancel();
+}
+
 /// Counting processor: wraps DefaultRequestProcessor and records how many
 /// times it was invoked. Validates that the daemon's spawn task actually
 /// dispatches through the trait object.
@@ -258,28 +586,19 @@ where
         _http: H,
         storage: &S,
         _should_retry: ShouldRetry,
-        _cancellation: CancellationFuture,
+        cancellation: CancellationFuture,
     ) -> fusillade::Result<RequestCompletionResult> {
-        // Synthesize a non-retriable failure so the daemon persists the
-        // terminal state and we can observe it via the manager.
-        let model = request.data.model.clone();
-        let retry_attempt = request.state.retry_attempt;
-        let batch_expires_at = request.state.batch_expires_at;
-        let failed = Request {
-            data: request.data,
-            state: Failed {
-                reason: fusillade::request::FailureReason::NonRetriableHttpStatus {
+        // Synthesize a non-retriable upstream response while still using the
+        // attempt-aware Claimed -> Processing -> Failed typestate path.
+        let processing = request
+            .process(storage, async {
+                Ok(HttpResponse {
                     status: 400,
                     body: "synthetic test failure".into(),
-                },
-                failed_at: chrono::Utc::now(),
-                retry_attempt,
-                batch_expires_at,
-                routed_model: model,
-            },
-        };
-        storage.persist(&failed).await?;
-        Ok(RequestCompletionResult::Failed(failed))
+                })
+            })
+            .await?;
+        processing.complete(storage, |_| false, cancellation).await
     }
 }
 

@@ -153,7 +153,11 @@ pub struct DaemonConfig {
     /// status-based retries. Values below 400 are ignored.
     #[serde(default = "default_additional_retryable_statuses")]
     pub additional_retryable_statuses: Vec<u16>,
+    /// Maximum age of a claim that has not entered processing. Reclaiming this
+    /// state is safe because the upstream future is gated on the processing CAS.
     pub claim_timeout_ms: u64,
+    /// Retained for configuration compatibility; request age no longer drives
+    /// automatic reclamation.
     pub processing_timeout_ms: u64,
     #[serde(default = "default_pending_request_counts_timeout_ms")]
     pub pending_request_counts_timeout_ms: u64,
@@ -330,7 +334,7 @@ impl Default for DaemonConfig {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             pending_request_counts_timeout_ms: default_pending_request_counts_timeout_ms(),
-            stale_daemon_threshold_ms: 30_000,
+            stale_daemon_threshold_ms: 300_000,
             unclaim_batch_size: 100,
             cancellation_poll_interval_ms: 5000,
             batch_metadata_fields: default_batch_metadata_fields(),

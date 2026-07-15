@@ -61,6 +61,11 @@ pub type ShouldRetry = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
 /// Implementations must drive a `Request<Claimed>` to a terminal state,
 /// returning the appropriate [`RequestCompletionResult`]. The daemon will
 /// then handle retry persistence and metric emission against that outcome.
+///
+/// Daemon claims must use the attempt-aware typestate methods (`process`, then
+/// `complete` or `cancel`). Calling [`Storage::persist`] directly for a claimed
+/// execution bypasses attempt fencing and is reserved for manual or proxy-owned
+/// transitions.
 #[async_trait]
 pub trait RequestProcessor<S, H>: Send + Sync
 where

@@ -9,7 +9,8 @@ overwriting a newer execution while retaining dead-daemon recovery.
 **Architecture:** PostgreSQL assigns a UUID attempt token atomically during
 claim. The core typestate carries it through claimed and processing states.
 Daemon-owned storage operations compare-and-set on request ID, expected state,
-and attempt ID. Reclaim is based only on owner liveness and revokes the token.
+and attempt ID. Processing reclaim is based only on owner liveness; expired
+pre-dispatch claims remain safely recoverable because of the start gate.
 
 **Tech stack:** Rust, Tokio, SQLx, PostgreSQL.
 
@@ -63,7 +64,7 @@ and attempt ID. Reclaim is based only on owner liveness and revokes the token.
 4. Abort/drop the gated task on database error or ownership loss.
 5. Rerun processor and core tests.
 
-## Task 4: Make reclaim owner-liveness-only
+## Task 4: Make processing reclaim owner-liveness-only
 
 **Files:**
 
@@ -71,14 +72,37 @@ and attempt ID. Reclaim is based only on owner liveness and revokes the token.
 - Modify: `crates/fusillade-arsenal/src/lib.rs`
 - Modify: `src/daemon/config.rs`
 
-1. Change the healthy-daemon age tests to assert no reclaim even beyond the old
-   claim and processing timeouts.
+1. Change the healthy-daemon age tests to assert safe claim recovery but no
+   processing reclaim beyond the old processing timeout.
 2. Add assertions that dead/stale-owner reclaim clears `attempt_id`.
 3. Confirm the updated tests fail against the current time-based fallback.
-4. Remove the age-only SQL branch and raise both public defaults to 300,000 ms.
+4. Remove processing-age reclaim, retain gated claim-age recovery, and raise
+   the stale-daemon default to 300,000 ms.
 5. Rerun all stale-reclaim tests.
 
-## Task 5: Verify and publish
+## Task 5: Close attempt-liveness and escape-hatch paths
+
+**Files:**
+
+- Modify: `crates/fusillade-core/src/manager.rs`
+- Modify: `crates/fusillade-core/src/request/transitions.rs`
+- Modify: `crates/fusillade-arsenal/src/postgres.rs`
+- Modify: `src/daemon/mod.rs`
+- Modify: `tests/request_processor.rs`
+
+1. Persist non-retriable request-builder failures through the attempt CAS.
+2. Recover the exact attempt after unexpected processor errors or panics using
+   normal retry limits, backoff, and terminalization.
+3. Cancel the upstream future when panic unwinding drops its processing
+   receiver.
+4. Refuse ordinary and realtime ID-only persistence while a row has an active
+   attempt.
+5. Require attempt-aware Storage operations; preserve the legacy retry method
+   only for pre-fencing null-attempt rows during rolling upgrades.
+6. Retry transient errors from all post-processor attempt outcome writes until
+   success, ownership loss, or daemon shutdown.
+
+## Task 6: Verify and publish
 
 **Files:**
 
@@ -90,7 +114,6 @@ and attempt ID. Reclaim is based only on owner liveness and revokes the token.
 3. Run `DATABASE_URL=... cargo test --workspace`.
 4. Run `cd crates/fusillade-arsenal && DATABASE_URL=... cargo sqlx prepare --check`.
 5. Review `git diff`, `git diff --check`, and migration rollback.
-6. Commit with a conventional `fix:` subject, push `agent/fence-request-attempts`,
-   and open a PR describing guarantees, rollout caveat, and at-least-once
-   failover semantics.
-
+6. Commit with a conventional breaking-change footer, push
+   `agent/fence-request-attempts`, and open a PR describing guarantees, rollout
+   caveat, public typestate API change, and at-least-once failover semantics.

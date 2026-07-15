@@ -110,8 +110,8 @@ use tracing::Instrument;
 use crate::{FusilladeError, error::Result, manager::Storage};
 
 use super::types::{
-    Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, HttpResponse, Pending,
-    Processing, Request, RequestCompletionResult,
+    AttemptId, Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, HttpResponse,
+    Pending, Processing, Request, RequestCompletionResult,
 };
 
 /// Reason for cancelling a request.
@@ -133,6 +133,7 @@ impl Request<Pending> {
             data: self.data,
             state: Claimed {
                 daemon_id,
+                attempt_id: AttemptId::from(uuid::Uuid::new_v4()),
                 claimed_at: chrono::Utc::now(),
                 retry_attempt: self.state.retry_attempt, // Carry over retry attempt
                 batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
@@ -140,7 +141,15 @@ impl Request<Pending> {
                 leak: None,
             },
         };
-        storage.persist(&request).await?;
+        if !storage
+            .persist_attempt(&request, request.state.attempt_id)
+            .await?
+        {
+            return Err(FusilladeError::RequestAttemptLost {
+                id: request.data.id,
+                attempt_id: request.state.attempt_id,
+            });
+        }
         Ok(request)
     }
 
@@ -158,6 +167,7 @@ impl Request<Pending> {
 
 impl Request<Claimed> {
     pub async fn unclaim<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Pending>> {
+        let attempt_id = self.state.attempt_id;
         let request = Request {
             data: self.data,
             state: Pending {
@@ -166,18 +176,29 @@ impl Request<Claimed> {
                 batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
             },
         };
-        storage.persist(&request).await?;
+        if !storage.persist_attempt(&request, attempt_id).await? {
+            return Err(FusilladeError::RequestAttemptLost {
+                id: request.data.id,
+                attempt_id,
+            });
+        }
         Ok(request)
     }
 
     pub async fn cancel<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Canceled>> {
+        let attempt_id = self.state.attempt_id;
         let request = Request {
             data: self.data,
             state: Canceled {
                 canceled_at: chrono::Utc::now(),
             },
         };
-        storage.persist(&request).await?;
+        if !storage.persist_attempt(&request, attempt_id).await? {
+            return Err(FusilladeError::RequestAttemptLost {
+                id: request.data.id,
+                attempt_id,
+            });
+        }
         Ok(request)
     }
 
@@ -190,22 +211,40 @@ impl Request<Claimed> {
         S: Storage,
         Fut: std::future::Future<Output = Result<HttpResponse>> + Send + 'static,
     {
-        // Create a channel for the HTTP result
+        let attempt_id = self.state.attempt_id;
+
+        // Create a channel for the HTTP result and a separate start gate. The
+        // task may be spawned so we have an abort handle to store in the
+        // typestate, but it cannot poll `response_fut` until the fenced
+        // claimed-to-processing write commits.
         let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
 
         // Spawn the HTTP request as an async task, propagating the current
         // span so that the execute span becomes a child of process_request.
         let current_span = tracing::Span::current();
         let task_handle = tokio::spawn(
             async move {
-                let result = response_fut.await;
-                let _ = tx.send(result).await; // Ignore send errors (receiver dropped)
+                if start_rx.await.is_err() {
+                    return;
+                }
+                tokio::select! {
+                    // Dropping Request<Processing> (including unwinding from a
+                    // custom processor panic) closes the receiver. Dropping
+                    // response_fut here cancels the upstream HTTP execution
+                    // before the attempt is released for a retry.
+                    _ = tx.closed() => {}
+                    result = response_fut => {
+                        let _ = tx.send(result).await;
+                    }
+                }
             }
             .instrument(current_span),
         );
 
         let processing_state = Processing {
             daemon_id: self.state.daemon_id,
+            attempt_id: self.state.attempt_id,
             claimed_at: self.state.claimed_at,
             started_at: chrono::Utc::now(),
             retry_attempt: self.state.retry_attempt,
@@ -219,11 +258,27 @@ impl Request<Claimed> {
             state: processing_state,
         };
 
-        // Persist the Processing state so we can cancel it if needed
-        // If persist fails, abort the spawned HTTP task
-        if let Err(e) = storage.persist(&request).await {
-            request.state.abort_handle.abort();
-            return Err(e);
+        // Persist ownership before allowing the upstream future to start.
+        match storage.persist_attempt(&request, attempt_id).await {
+            Ok(true) => {
+                if start_tx.send(()).is_err() {
+                    request.state.abort_handle.abort();
+                    return Err(FusilladeError::Other(anyhow::anyhow!(
+                        "HTTP start gate closed before request execution"
+                    )));
+                }
+            }
+            Ok(false) => {
+                request.state.abort_handle.abort();
+                return Err(FusilladeError::RequestAttemptLost {
+                    id: request.data.id,
+                    attempt_id,
+                });
+            }
+            Err(e) => {
+                request.state.abort_handle.abort();
+                return Err(e);
+            }
         }
 
         Ok(request)
@@ -334,6 +389,8 @@ impl Request<Processing> {
         F: Fn(&HttpResponse) -> bool,
         Fut: std::future::Future<Output = CancellationReason>,
     {
+        let attempt_id = self.state.attempt_id;
+
         // Await the result from the channel (lock the mutex to access the receiver)
         // We use an enum to track whether we got a result or cancellation so we can
         // drop the mutex guard before calling self.cancel()
@@ -417,7 +474,12 @@ impl Request<Processing> {
                         data: self.data,
                         state: failed_state,
                     };
-                    storage.persist(&request).await?;
+                    if !storage.persist_attempt(&request, attempt_id).await? {
+                        return Err(FusilladeError::RequestAttemptLost {
+                            id: request.data.id,
+                            attempt_id,
+                        });
+                    }
                     Ok(RequestCompletionResult::Failed(request))
                 } else {
                     // HTTP request completed successfully
@@ -433,7 +495,12 @@ impl Request<Processing> {
                         data: self.data,
                         state: completed_state,
                     };
-                    storage.persist(&request).await?;
+                    if !storage.persist_attempt(&request, attempt_id).await? {
+                        return Err(FusilladeError::RequestAttemptLost {
+                            id: request.data.id,
+                            attempt_id,
+                        });
+                    }
                     Ok(RequestCompletionResult::Completed(request))
                 }
             }
@@ -472,6 +539,14 @@ impl Request<Processing> {
                     data: self.data,
                     state: failed_state,
                 };
+                if !request.state.reason.is_retriable()
+                    && !storage.persist_attempt(&request, attempt_id).await?
+                {
+                    return Err(FusilladeError::RequestAttemptLost {
+                        id: request.data.id,
+                        attempt_id,
+                    });
+                }
                 Ok(RequestCompletionResult::Failed(request))
             }
             None => {
@@ -487,7 +562,6 @@ impl Request<Processing> {
                     data: self.data,
                     state: failed_state,
                 };
-                storage.persist(&request).await?;
                 Ok(RequestCompletionResult::Failed(request))
             }
         }
@@ -496,6 +570,7 @@ impl Request<Processing> {
     pub async fn cancel<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Canceled>> {
         // Abort the in-flight HTTP request
         self.state.abort_handle.abort();
+        let attempt_id = self.state.attempt_id;
 
         let request = Request {
             data: self.data,
@@ -503,7 +578,12 @@ impl Request<Processing> {
                 canceled_at: chrono::Utc::now(),
             },
         };
-        storage.persist(&request).await?;
+        if !storage.persist_attempt(&request, attempt_id).await? {
+            return Err(FusilladeError::RequestAttemptLost {
+                id: request.data.id,
+                attempt_id,
+            });
+        }
         Ok(request)
     }
 }

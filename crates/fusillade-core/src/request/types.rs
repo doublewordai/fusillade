@@ -165,6 +165,9 @@ pub struct LeakStamp {
 #[derive(Debug, Clone, Serialize)]
 pub struct Claimed {
     pub daemon_id: DaemonId,
+    /// Unique identity for this claim. A new value is assigned every time the
+    /// request moves from pending to claimed, even when the daemon is the same.
+    pub attempt_id: AttemptId,
     pub claimed_at: DateTime<Utc>,
     /// Number of times this request has been attempted (carried over from Pending)
     pub retry_attempt: u32,
@@ -182,6 +185,8 @@ impl RequestState for Claimed {}
 #[derive(Debug, Clone, Serialize)]
 pub struct Processing {
     pub daemon_id: DaemonId,
+    /// The exact claim that owns this in-flight HTTP execution.
+    pub attempt_id: AttemptId,
     pub claimed_at: DateTime<Utc>,
     pub started_at: DateTime<Utc>,
     /// Number of times this request has been attempted (carried over from Claimed)
@@ -414,6 +419,34 @@ impl From<Uuid> for DaemonId {
 
 impl std::ops::Deref for DaemonId {
     type Target = Uuid;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Unique identifier for a single daemon execution attempt.
+///
+/// Unlike [`DaemonId`], this changes on every claim and therefore fences two
+/// overlapping executions started by the same daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct AttemptId(pub Uuid);
+
+impl std::fmt::Display for AttemptId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", &self.0.to_string()[..8])
+    }
+}
+
+impl From<Uuid> for AttemptId {
+    fn from(uuid: Uuid) -> Self {
+        AttemptId(uuid)
+    }
+}
+
+impl std::ops::Deref for AttemptId {
+    type Target = Uuid;
+
     fn deref(&self) -> &Self::Target {
         &self.0
     }
