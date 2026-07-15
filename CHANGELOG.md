@@ -1,5 +1,12 @@
 # Changelog
 
+## [21.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v21.1.0...fusillade-v21.1.1) (2026-07-15)
+
+
+### Bug Fixes
+
+* make retryable HTTP statuses configurable ([#341](https://github.com/doublewordai/fusillade/issues/341)) ([948f3a6](https://github.com/doublewordai/fusillade/commit/948f3a68c02943c544819666b3514911f54b04a3))
+
 ## [21.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v21.0.1...fusillade-v21.1.0) (2026-07-13)
 
 
