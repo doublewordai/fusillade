@@ -8,12 +8,32 @@ use crate::http::HttpResponse;
 /// Predicate function to determine if a response should be retried.
 pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
 
-/// Default retry predicate: retry on server errors, rate limits, timeouts, and not found.
+fn is_dynamo_request_cancelled(response: &HttpResponse) -> bool {
+    if response.status != 499 {
+        return false;
+    }
+
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&response.body) else {
+        return false;
+    };
+
+    body.pointer("/error/code")
+        .and_then(serde_json::Value::as_u64)
+        == Some(499)
+        && body
+            .pointer("/error/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("request_cancelled")
+}
+
+/// Default retry predicate: retry on server errors, rate limits, timeouts, not found, and
+/// Dynamo-shaped 499 request-cancelled errors.
 pub fn default_should_retry(response: &HttpResponse) -> bool {
     response.status >= 500
         || response.status == 429
         || response.status == 408
         || response.status == 404
+        || is_dynamo_request_cancelled(response)
 }
 
 fn default_should_retry_fn() -> ShouldRetryFn {
@@ -275,6 +295,74 @@ impl From<&DaemonConfig> for crate::request::transitions::RetryConfig {
             backoff_ms: config.backoff_ms,
             backoff_factor: config.backoff_factor,
             max_backoff_ms: config.max_backoff_ms,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(status: u16, body: &str) -> HttpResponse {
+        HttpResponse {
+            status,
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn retries_dynamo_request_cancelled_499() {
+        let bodies = [
+            r#"{"error":{"code":499,"message":"CancelledError: ","type":"request_cancelled"}}"#,
+            r#"{"error":{"code":499,"type":"request_cancelled"}}"#,
+            r#"{"error":{"code":499,"message":"arbitrary message","type":"request_cancelled"}}"#,
+        ];
+
+        for body in bodies {
+            assert!(
+                default_should_retry(&response(499, body)),
+                "expected retry for body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_retry_other_499_responses() {
+        let bodies = [
+            r#"{"error":{"code":499,"type":"other"}}"#,
+            r#"{"error":{"code":500,"type":"request_cancelled"}}"#,
+            r#"{"error":{"code":"499","type":"request_cancelled"}}"#,
+            r#"{"error":{"type":"request_cancelled"}}"#,
+            r#"{"error":{"code":499}}"#,
+            r#"{"error":{"code":499,"message":"CancelledError: "}}"#,
+            r#"{"error":"request_cancelled"}"#,
+            "not json",
+            "",
+        ];
+
+        for body in bodies {
+            assert!(
+                !default_should_retry(&response(499, body)),
+                "unexpected retry for body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_cancelled_body_does_not_override_other_statuses() {
+        let body = r#"{"error":{"code":499,"type":"request_cancelled"}}"#;
+
+        assert!(!default_should_retry(&response(400, body)));
+    }
+
+    #[test]
+    fn preserves_existing_default_retry_statuses() {
+        for status in [404, 408, 429, 500, 503] {
+            assert!(default_should_retry(&response(status, "")));
+        }
+
+        for status in [200, 400, 401, 403, 422, 498, 499] {
+            assert!(!default_should_retry(&response(status, "")));
         }
     }
 }
