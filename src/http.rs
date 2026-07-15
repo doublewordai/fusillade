@@ -438,7 +438,7 @@ impl ReqwestHttpClient {
         .await
         .map_err(|_| {
             crate::error::FusilladeError::FirstChunkTimeout(format!(
-                "No first token from {} within {}ms",
+                "No response headers from {} within {}ms",
                 url,
                 self.first_chunk_timeout.as_millis()
             ))
@@ -494,7 +494,7 @@ impl ReqwestHttpClient {
         .await
         .map_err(|_| {
             crate::error::FusilladeError::FirstChunkTimeout(format!(
-                "No first token from {} within {}ms",
+                "No first SSE event from {} within {}ms",
                 url,
                 self.first_chunk_timeout.as_millis()
             ))
@@ -1226,7 +1226,7 @@ mod tests {
 
         match err {
             crate::error::FusilladeError::FirstChunkTimeout(msg) => {
-                assert!(msg.contains("No first token from"));
+                assert!(msg.contains("No response headers from"));
             }
             other => panic!("Expected FirstChunkTimeout, got: {:?}", other),
         }
