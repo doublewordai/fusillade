@@ -8,36 +8,20 @@ use crate::http::HttpResponse;
 /// Predicate function to determine if a response should be retried.
 pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
 
-fn is_dynamo_request_cancelled(response: &HttpResponse) -> bool {
-    if response.status != 499 {
-        return false;
-    }
-
-    let Ok(body) = serde_json::from_str::<serde_json::Value>(&response.body) else {
-        return false;
-    };
-
-    body.pointer("/error/code")
-        .and_then(serde_json::Value::as_u64)
-        == Some(499)
-        && body
-            .pointer("/error/type")
-            .and_then(serde_json::Value::as_str)
-            == Some("request_cancelled")
-}
-
-/// Default retry predicate: retry on server errors, rate limits, timeouts, not found, and
-/// Dynamo-shaped 499 request-cancelled errors.
+/// Default retry predicate: retry on server errors, rate limits, timeouts, and not found.
 pub fn default_should_retry(response: &HttpResponse) -> bool {
     response.status >= 500
         || response.status == 429
         || response.status == 408
         || response.status == 404
-        || is_dynamo_request_cancelled(response)
 }
 
 fn default_should_retry_fn() -> ShouldRetryFn {
     Arc::new(default_should_retry)
+}
+
+fn default_additional_retryable_statuses() -> Vec<u16> {
+    vec![499]
 }
 
 fn default_model_escalations() -> Arc<dashmap::DashMap<String, ModelEscalationConfig>> {
@@ -150,6 +134,12 @@ pub struct DaemonConfig {
     pub heartbeat_interval_ms: u64,
     #[serde(skip, default = "default_should_retry_fn")]
     pub should_retry: ShouldRetryFn,
+    /// HTTP statuses retried in addition to those selected by `should_retry`.
+    ///
+    /// Defaults to `[499]`. Set this to an empty list to disable additional
+    /// status-based retries.
+    #[serde(default = "default_additional_retryable_statuses")]
+    pub additional_retryable_statuses: Vec<u16>,
     pub claim_timeout_ms: u64,
     pub processing_timeout_ms: u64,
     #[serde(default = "default_pending_request_counts_timeout_ms")]
@@ -264,6 +254,7 @@ impl Default for DaemonConfig {
             status_log_interval_ms: Some(2000),
             heartbeat_interval_ms: 5000,
             should_retry: Arc::new(default_should_retry),
+            additional_retryable_statuses: default_additional_retryable_statuses(),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             pending_request_counts_timeout_ms: default_pending_request_counts_timeout_ms(),
@@ -284,6 +275,17 @@ impl Default for DaemonConfig {
             model_filters_keep_per_model: default_model_filters_keep_per_model(),
             model_filters_retention_ms: default_model_filters_retention_ms(),
         }
+    }
+}
+
+impl DaemonConfig {
+    pub(crate) fn retry_predicate(&self) -> ShouldRetryFn {
+        let should_retry = self.should_retry.clone();
+        let additional_retryable_statuses = self.additional_retryable_statuses.clone();
+
+        Arc::new(move |response| {
+            should_retry(response) || additional_retryable_statuses.contains(&response.status)
+        })
     }
 }
 
@@ -311,51 +313,6 @@ mod tests {
     }
 
     #[test]
-    fn retries_dynamo_request_cancelled_499() {
-        let bodies = [
-            r#"{"error":{"code":499,"message":"CancelledError: ","type":"request_cancelled"}}"#,
-            r#"{"error":{"code":499,"type":"request_cancelled"}}"#,
-            r#"{"error":{"code":499,"message":"arbitrary message","type":"request_cancelled"}}"#,
-        ];
-
-        for body in bodies {
-            assert!(
-                default_should_retry(&response(499, body)),
-                "expected retry for body: {body}"
-            );
-        }
-    }
-
-    #[test]
-    fn does_not_retry_other_499_responses() {
-        let bodies = [
-            r#"{"error":{"code":499,"type":"other"}}"#,
-            r#"{"error":{"code":500,"type":"request_cancelled"}}"#,
-            r#"{"error":{"code":"499","type":"request_cancelled"}}"#,
-            r#"{"error":{"type":"request_cancelled"}}"#,
-            r#"{"error":{"code":499}}"#,
-            r#"{"error":{"code":499,"message":"CancelledError: "}}"#,
-            r#"{"error":"request_cancelled"}"#,
-            "not json",
-            "",
-        ];
-
-        for body in bodies {
-            assert!(
-                !default_should_retry(&response(499, body)),
-                "unexpected retry for body: {body}"
-            );
-        }
-    }
-
-    #[test]
-    fn request_cancelled_body_does_not_override_other_statuses() {
-        let body = r#"{"error":{"code":499,"type":"request_cancelled"}}"#;
-
-        assert!(!default_should_retry(&response(400, body)));
-    }
-
-    #[test]
     fn preserves_existing_default_retry_statuses() {
         for status in [404, 408, 429, 500, 503] {
             assert!(default_should_retry(&response(status, "")));
@@ -363,6 +320,77 @@ mod tests {
 
         for status in [200, 400, 401, 403, 422, 498, 499] {
             assert!(!default_should_retry(&response(status, "")));
+        }
+    }
+
+    #[test]
+    fn default_config_serializes_additional_retryable_statuses() {
+        let config = serde_json::to_value(DaemonConfig::default()).unwrap();
+
+        assert_eq!(
+            config["additional_retryable_statuses"],
+            serde_json::json!([499])
+        );
+    }
+
+    #[test]
+    fn missing_additional_retryable_statuses_deserializes_to_default() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("additional_retryable_statuses");
+
+        let config: DaemonConfig = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(config.additional_retryable_statuses, vec![499]);
+    }
+
+    #[test]
+    fn additional_retryable_statuses_are_additive_and_overridable() {
+        let default_config = DaemonConfig::default();
+        let default_predicate = default_config.retry_predicate();
+        assert!(default_predicate(&response(499, "arbitrary upstream body")));
+
+        let disabled_config = DaemonConfig {
+            additional_retryable_statuses: vec![],
+            ..DaemonConfig::default()
+        };
+        let disabled_predicate = disabled_config.retry_predicate();
+        assert!(!disabled_predicate(&response(499, "")));
+        assert!(disabled_predicate(&response(500, "")));
+
+        let overridden_config = DaemonConfig {
+            additional_retryable_statuses: vec![418],
+            ..DaemonConfig::default()
+        };
+        let overridden_predicate = overridden_config.retry_predicate();
+        assert!(overridden_predicate(&response(418, "")));
+        assert!(!overridden_predicate(&response(499, "")));
+
+        let custom_config = DaemonConfig {
+            should_retry: Arc::new(|response| response.status == 409),
+            additional_retryable_statuses: vec![418],
+            ..DaemonConfig::default()
+        };
+        let custom_predicate = custom_config.retry_predicate();
+        assert!(custom_predicate(&response(409, "")));
+        assert!(custom_predicate(&response(418, "")));
+        assert!(!custom_predicate(&response(500, "")));
+    }
+
+    #[test]
+    fn explicit_additional_retryable_statuses_round_trip() {
+        for statuses in [vec![], vec![418, 499]] {
+            let config = DaemonConfig {
+                additional_retryable_statuses: statuses.clone(),
+                ..DaemonConfig::default()
+            };
+
+            let serialized = serde_json::to_value(config).unwrap();
+            let deserialized: DaemonConfig = serde_json::from_value(serialized).unwrap();
+
+            assert_eq!(deserialized.additional_retryable_statuses, statuses);
         }
     }
 }
