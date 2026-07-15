@@ -5437,6 +5437,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 to_insert.iter().map(|r| r.status_code as i16).collect();
             let insert_errors: Vec<Option<String>> =
                 to_insert.iter().map(|r| to_failure_error(r)).collect();
+            // Real timing from the outlet middleware (request arrival →
+            // response completion). Without these the synthesized row set both
+            // started_at and completed_at to NOW(), so duration_ms was always 0.
+            let started_ats: Vec<DateTime<Utc>> = to_insert.iter().map(|r| r.started_at).collect();
+            let completed_ats: Vec<DateTime<Utc>> =
+                to_insert.iter().map(|r| r.completed_at).collect();
 
             sqlx::query!(
                 r#"
@@ -5461,10 +5467,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert realtime templates: {}", e)))?;
 
             // Mirror create_realtime's row shape: daemon_id = nil sentinel,
-            // service_tier = 'priority', claimed_at = started_at = NOW(). 2xx rows
-            // land in 'completed' with completed_at set; any other status lands in
+            // service_tier = 'priority', claimed_at = started_at = the request's
+            // real arrival time. 2xx rows land in 'completed' with completed_at
+            // set to the real completion instant; any other status lands in
             // 'failed' with failed_at + error set (failed_fields_check), matching
-            // the UPDATE branch above. NULLIF(TRIM(...), '') on created_by mirrors
+            // the UPDATE branch above. created_at is pinned to started_at too, so
+            // the row's Created timestamp reflects arrival rather than this
+            // (buffered) insert moment. NULLIF(TRIM(...), '') on created_by mirrors
             // create_realtime's coercion of empty-string to NULL (XOR check
             // rejects empty attribution loudly rather than producing a phantom row).
             sqlx::query!(
@@ -5473,19 +5482,20 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     id, batch_id, template_id, model, custom_id,
                     state, retry_attempt, service_tier, created_by,
                     daemon_id, claimed_at, started_at, completed_at, failed_at,
-                    response_status, response_body, response_size, error
+                    response_status, response_body, response_size, error, created_at
                 )
                 SELECT id, NULL, template_id, model, NULL,
                        CASE WHEN status BETWEEN 200 AND 299 THEN 'completed' ELSE 'failed' END,
                        0, 'priority', NULLIF(TRIM(created_by), ''),
-                       $1, NOW(), NOW(),
-                       CASE WHEN status BETWEEN 200 AND 299 THEN NOW() ELSE NULL END,
-                       CASE WHEN status BETWEEN 200 AND 299 THEN NULL ELSE NOW() END,
-                       status, body, size, error
+                       $1, started_at, started_at,
+                       CASE WHEN status BETWEEN 200 AND 299 THEN completed_at ELSE NULL END,
+                       CASE WHEN status BETWEEN 200 AND 299 THEN NULL ELSE completed_at END,
+                       status, body, size, error, started_at
                 FROM UNNEST(
                     $2::uuid[], $3::uuid[], $4::text[], $5::text[],
-                    $6::smallint[], $7::text[], $8::bigint[], $9::text[]
-                ) AS v(id, template_id, model, created_by, status, body, size, error)
+                    $6::smallint[], $7::text[], $8::bigint[], $9::text[],
+                    $10::timestamptz[], $11::timestamptz[]
+                ) AS v(id, template_id, model, created_by, status, body, size, error, started_at, completed_at)
                 ON CONFLICT (id) DO NOTHING
                 "#,
                 Uuid::nil(),
@@ -5497,6 +5507,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 &insert_response_bodies as &[&str],
                 &insert_response_sizes as &[i64],
                 &insert_errors as &[Option<String>],
+                &started_ats as &[DateTime<Utc>],
+                &completed_ats as &[DateTime<Utc>],
             )
             .execute(&mut *tx)
             .await
@@ -19158,6 +19170,11 @@ mod tests {
             http_client,
         );
 
+        // Real request timing threaded through from the outlet middleware:
+        // arrival, then completion 1500ms later. The synthesized row must
+        // preserve this so duration_ms is the true latency, not zero.
+        let started_at = Utc::now() - chrono::Duration::seconds(5);
+        let completed_at = started_at + chrono::Duration::milliseconds(1500);
         let request_id = uuid::Uuid::new_v4();
         manager
             .persist_completed_realtime_batch(&[crate::request::PersistCompletedRealtimeInput {
@@ -19171,6 +19188,8 @@ mod tests {
                 path: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "user-1".to_string(),
+                started_at,
+                completed_at,
             }])
             .await
             .expect("batch should succeed");
@@ -19188,8 +19207,21 @@ mod tests {
             Some(r#"{"output":"done"}"#.to_string())
         );
         assert_eq!(detail.response_status, Some(200));
-        assert!(detail.completed_at.is_some());
         assert!(detail.body.is_some());
+        // Regression: duration must reflect the real request timing, not 0.
+        // Previously started_at and completed_at were both NOW() at insert.
+        assert_eq!(
+            detail.completed_at,
+            Some(completed_at),
+            "completed_at must be the real completion instant"
+        );
+        let duration_ms = detail.duration_ms.expect("duration_ms should be populated");
+        assert!(
+            (duration_ms - 1500.0).abs() < 1.0,
+            "duration_ms should be ~1500 (real latency), got {duration_ms}"
+        );
+        // created_at is pinned to arrival, so the timeline isn't inverted.
+        assert_eq!(detail.created_at, started_at);
     }
 
     #[sqlx::test]
@@ -19243,6 +19275,9 @@ mod tests {
                 path: String::new(),
                 api_key: String::new(),
                 created_by: "this-user-should-be-ignored".to_string(),
+                // Ignored on the UPDATE path (row keeps create_realtime's timing).
+                started_at: Utc::now(),
+                completed_at: Utc::now(),
             }])
             .await
             .expect("batch should succeed");
@@ -19304,6 +19339,8 @@ mod tests {
                     path: String::new(),
                     api_key: String::new(),
                     created_by: String::new(),
+                    started_at: Utc::now(),
+                    completed_at: Utc::now(),
                 },
                 crate::request::PersistCompletedRealtimeInput {
                     request_id: new_id,
@@ -19316,6 +19353,8 @@ mod tests {
                     path: "/v1/responses".to_string(),
                     api_key: String::new(),
                     created_by: "user-nonbg".to_string(),
+                    started_at: Utc::now(),
+                    completed_at: Utc::now(),
                 },
             ])
             .await
@@ -19392,6 +19431,8 @@ mod tests {
                 path: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "user-3".to_string(),
+                started_at: Utc::now(),
+                completed_at: Utc::now(),
             }])
             .await
             .expect("batch should succeed");
