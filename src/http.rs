@@ -401,10 +401,12 @@ impl ReqwestHttpClient {
     /// - chunk_timeout: max idle time between subsequent SSE events.
     /// - body_timeout: max total time for the entire response body.
     ///
-    /// The response is parsed as an SSE stream via `eventsource-stream`. All events
-    /// are collected, then passed to the stream reassembler (which skips `[DONE]`
-    /// and empty events internally). Without a reassembler, the fallback path
-    /// filters these events and newline-joins the remaining data payloads.
+    /// Successful and SSE error responses are parsed via `eventsource-stream`.
+    /// Non-SSE error responses are returned verbatim so provider error details
+    /// survive downstream persistence. SSE events are collected, then passed to
+    /// the stream reassembler (which skips `[DONE]` and empty events internally).
+    /// Without a reassembler, the fallback path filters these events and
+    /// newline-joins the remaining data payloads.
     async fn execute_streaming(
         &self,
         request: &RequestData,
@@ -415,41 +417,84 @@ impl ReqwestHttpClient {
         use eventsource_stream::Eventsource;
         use futures::StreamExt;
 
-        // Phase 1: connect, get headers, and wait for the first SSE event
-        // within first_chunk_timeout (time-to-first-token).
-        let (mut stream, status, first_event) = tokio::time::timeout(
-            self.first_chunk_timeout,
-            async {
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(map_reqwest_error)
-                    .inspect_err(|e| {
-                        tracing::error!(
-                            request_id = %request.id,
-                            url.full = %url,
-                            error = %e,
-                            custom_id = ?request.custom_id,
-                            batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
-                            "HTTP request failed"
-                        );
-                    })?;
-                let status = resp.status().as_u16();
-                let mut stream = resp.bytes_stream().eventsource();
-                let first = match stream.next().await {
-                    Some(Ok(event)) => Some(event),
-                    Some(Err(e)) => {
-                        return Err(anyhow::anyhow!("SSE parse error from {}: {}", url, e).into());
-                    }
-                    None => None,
-                };
-                Ok::<_, crate::error::FusilladeError>((stream, status, first))
-            },
-        )
+        // Phase 1: connect, get headers, and wait for the first SSE event within
+        // one shared first_chunk_timeout deadline (time-to-first-token).
+        let first_chunk_deadline = tokio::time::Instant::now() + self.first_chunk_timeout;
+        let resp = tokio::time::timeout_at(first_chunk_deadline, async {
+            req.send()
+                .await
+                .map_err(map_reqwest_error)
+                .inspect_err(|e| {
+                    tracing::error!(
+                        request_id = %request.id,
+                        url.full = %url,
+                        error = %e,
+                        custom_id = ?request.custom_id,
+                        batch_metadata_keys = ?request.batch_metadata.keys().collect::<Vec<_>>(),
+                        "HTTP request failed"
+                    );
+                })
+        })
         .await
         .map_err(|_| {
             crate::error::FusilladeError::FirstChunkTimeout(format!(
-                "No first token from {} within {}ms",
+                "No response headers from {} within {}ms",
+                url,
+                self.first_chunk_timeout.as_millis()
+            ))
+        })??;
+
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let is_event_stream = content_type
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
+
+        // A streamable request can be rejected before streaming begins. In
+        // that case providers commonly return an ordinary JSON error body;
+        // feeding it into an SSE parser produces zero events and loses the
+        // diagnostic. Read non-SSE errors directly instead.
+        if status >= 400 && !is_event_stream {
+            let body = tokio::time::timeout(self.body_timeout, resp.text())
+                .await
+                .map_err(|_| {
+                    crate::error::FusilladeError::BodyTimeout(format!(
+                        "Total body read from {} exceeded {}ms",
+                        url,
+                        self.body_timeout.as_millis()
+                    ))
+                })?
+                .map_err(map_reqwest_error)?;
+
+            tracing::debug!(
+                request_id = %request.id,
+                status = status,
+                content_type = %content_type,
+                response_len = body.len(),
+                "Non-SSE streaming error response completed"
+            );
+
+            return Ok(HttpResponse { status, body });
+        }
+
+        let mut stream = resp.bytes_stream().eventsource();
+        let first_event = tokio::time::timeout_at(first_chunk_deadline, async {
+            match stream.next().await {
+                Some(Ok(event)) => Ok::<_, crate::error::FusilladeError>(Some(event)),
+                Some(Err(e)) => Err(anyhow::anyhow!("SSE parse error from {}: {}", url, e).into()),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|_| {
+            crate::error::FusilladeError::FirstChunkTimeout(format!(
+                "No first SSE event from {} within {}ms",
                 url,
                 self.first_chunk_timeout.as_millis()
             ))
@@ -1181,7 +1226,7 @@ mod tests {
 
         match err {
             crate::error::FusilladeError::FirstChunkTimeout(msg) => {
-                assert!(msg.contains("No first token from"));
+                assert!(msg.contains("No response headers from"));
             }
             other => panic!("Expected FirstChunkTimeout, got: {:?}", other),
         }
@@ -1421,6 +1466,61 @@ mod tests {
             "raw multi-chunk body should not parse as a single reassembled object, got: {}",
             response.body
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_json_error_preserves_body() {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+
+        let expected = serde_json::json!({
+            "error": {
+                "code": "unsupported_parameter",
+                "message": "Unsupported parameter 'chat_template_kwargs.enable_thinking'; use 'reasoning_effort'.",
+                "param": "chat_template_kwargs.enable_thinking",
+                "type": "invalid_request_error"
+            }
+        });
+        let response_body = expected.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let body = response_body.clone();
+                async move { (StatusCode::BAD_REQUEST, Json(body)) }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: format!("http://{}", addr),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#.to_string(),
+            model: "gpt-4".to_string(),
+            api_key: "".to_string(),
+            created_by: String::new(),
+            batch_metadata: std::collections::HashMap::new(),
+        };
+
+        let client = ReqwestHttpClient::new(
+            ONE_DAY_DURATION,
+            ONE_DAY_DURATION,
+            ONE_DAY_DURATION,
+            vec!["/v1/chat/completions".to_string()],
+        );
+        let response = client.execute(&request, "").await.unwrap();
+
+        assert_eq!(response.status, 400);
+        let body: serde_json::Value = serde_json::from_str(&response.body)
+            .expect("JSON provider error body should be preserved");
+        assert_eq!(body, expected);
     }
 
     /// Captures every event's `data` field into a shared Vec. Used by
