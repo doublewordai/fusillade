@@ -279,9 +279,12 @@ pub struct PersistCompletedRealtimeInput {
     /// already carries a real `started_at`.
     pub started_at: DateTime<Utc>,
     /// Wall-clock instant the response completed (`started_at + outlet
-    /// duration`). INSERT path only: becomes `completed_at` (2xx) or `failed_at`
-    /// (non-2xx), so `completed_at - started_at` is the true request duration
-    /// rather than zero. Ignored on the UPDATE path.
+    /// duration`). INSERT path only: stored as the row's `completed_at` on 2xx
+    /// (so the listing's `duration_ms = completed_at - started_at` reflects the
+    /// true latency instead of zero) or as `failed_at` on non-2xx. Note
+    /// `duration_ms` is derived from the `completed_at` column, so it is NULL for
+    /// failed rows — the completion instant is still recorded there, in
+    /// `failed_at`. Ignored on the UPDATE path.
     pub completed_at: DateTime<Utc>,
 }
 

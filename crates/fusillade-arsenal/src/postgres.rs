@@ -19173,7 +19173,11 @@ mod tests {
         // Real request timing threaded through from the outlet middleware:
         // arrival, then completion 1500ms later. The synthesized row must
         // preserve this so duration_ms is the true latency, not zero.
-        let started_at = Utc::now() - chrono::Duration::seconds(5);
+        // Use fixed, microsecond-aligned instants: Postgres timestamptz has
+        // microsecond precision, so a nanosecond-precision Utc::now() would not
+        // survive the round-trip byte-for-byte and the equality asserts below
+        // would be flaky. Millisecond literals round-trip exactly.
+        let started_at = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
         let completed_at = started_at + chrono::Duration::milliseconds(1500);
         let request_id = uuid::Uuid::new_v4();
         manager
