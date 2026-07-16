@@ -201,7 +201,7 @@ pub trait ResponseStepStore: Send + Sync {
     async fn get_step(&self, id: StepId) -> Result<Option<ResponseStep>>;
 
     /// Fetch the step (if any) whose `request_id` matches the given
-    /// fusillade request id. Used by analytics + outlet plumbing to
+    /// fusillade request id. Used by analytics + request-logging plumbing to
     /// resolve "which step does this upstream HTTP fire belong to".
     /// Returns `None` for `tool_call` steps (which don't carry a
     /// `request_id`) and for any non-multi-step fusillade row.

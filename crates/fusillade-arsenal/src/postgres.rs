@@ -5322,9 +5322,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Bulk UPDATE for rows that already exist in 'processing' state.
-        // These are the background-realtime case: middleware called
+        // These are the background-realtime case: the caller invoked
         // create_realtime inline before returning 202, and now the proxied
-        // call has come back through outlet.
+        // call has completed.
         let ids: Vec<Uuid> = records.iter().map(|r| r.request_id).collect();
         let response_bodies: Vec<&str> = records.iter().map(|r| r.response_body.as_str()).collect();
         let response_sizes: Vec<i64> = records
@@ -5437,7 +5437,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 to_insert.iter().map(|r| r.status_code as i16).collect();
             let insert_errors: Vec<Option<String>> =
                 to_insert.iter().map(|r| to_failure_error(r)).collect();
-            // Real timing from the outlet middleware (request arrival →
+            // Real timing supplied by the caller (request arrival →
             // response completion). Without these the synthesized row set both
             // started_at and completed_at to NOW(), so duration_ms was always 0.
             let started_ats: Vec<DateTime<Utc>> = to_insert.iter().map(|r| r.started_at).collect();
@@ -19170,7 +19170,7 @@ mod tests {
             http_client,
         );
 
-        // Real request timing threaded through from the outlet middleware:
+        // Real request timing threaded through from the caller:
         // arrival, then completion 1500ms later. The synthesized row must
         // preserve this so duration_ms is the true latency, not zero.
         // Use fixed, microsecond-aligned instants: Postgres timestamptz has

@@ -273,13 +273,13 @@ pub struct PersistCompletedRealtimeInput {
     pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
-    /// Wall-clock instant the request arrived (the outlet middleware's request
-    /// timestamp). INSERT path only: becomes the synthesized row's `created_at`,
+    /// Wall-clock instant the request arrived, as recorded by the caller.
+    /// INSERT path only: becomes the synthesized row's `created_at`,
     /// `claimed_at`, and `started_at`. Ignored on the UPDATE path, where the row
     /// already carries a real `started_at`.
     pub started_at: DateTime<Utc>,
-    /// Wall-clock instant the response completed (`started_at + outlet
-    /// duration`). INSERT path only: stored as the row's `completed_at` on 2xx
+    /// Wall-clock instant the response completed (`started_at` plus the caller's
+    /// measured request duration). INSERT path only: stored as the row's `completed_at` on 2xx
     /// (so the listing's `duration_ms = completed_at - started_at` reflects the
     /// true latency instead of zero) or as `failed_at` on non-2xx. Note
     /// `duration_ms` is derived from the `completed_at` column, so it is NULL for
