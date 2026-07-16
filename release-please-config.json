@@ -8,7 +8,7 @@
       "component": "fusillade",
       "package-name": "fusillade",
       "release-type": "simple",
-      "extra-files": ["Cargo.toml"]
+      "extra-files": [{"type": "generic", "path": "Cargo.toml"}]
     },
     "crates/fusillade-core": {
       "component": "fusillade-core",
