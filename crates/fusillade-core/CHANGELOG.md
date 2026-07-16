@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-core-v1.1.0...fusillade-core-v1.1.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* preserve independent workspace crate versions ([#345](https://github.com/doublewordai/fusillade/issues/345)) ([80824e2](https://github.com/doublewordai/fusillade/commit/80824e26109d20f3bf22c320641e8da11c12fa3b))
+
 ## [1.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-core-v1.0.0...fusillade-core-v1.1.0) (2026-07-13)
 
 

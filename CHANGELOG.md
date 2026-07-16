@@ -1,5 +1,21 @@
 # Changelog
 
+## [21.1.3](https://github.com/doublewordai/fusillade/compare/fusillade-v21.1.2...fusillade-v21.1.3) (2026-07-16)
+
+
+### Bug Fixes
+
+* preserve independent workspace crate versions ([#345](https://github.com/doublewordai/fusillade/issues/345)) ([80824e2](https://github.com/doublewordai/fusillade/commit/80824e26109d20f3bf22c320641e8da11c12fa3b))
+* restore fusillade_daemon_up liveness gauge lost in workspace split ([#348](https://github.com/doublewordai/fusillade/issues/348)) ([d72030c](https://github.com/doublewordai/fusillade/commit/d72030ceaac9849cc77517982c58af440d64e686))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * fusillade-core bumped from 1.1.0 to 1.1.1
+    * fusillade-arsenal bumped from 1.1.0 to 1.1.1
+
 ## [21.1.2](https://github.com/doublewordai/fusillade/compare/fusillade-v21.1.1...fusillade-v21.1.2) (2026-07-15)
 
 
