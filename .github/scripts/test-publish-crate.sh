@@ -79,6 +79,22 @@ release_manifest_version() {
   ' .release-please-manifest.json
 }
 
+# Root uses release-type "simple" with a generic annotated updater (the rust
+# strategy stamps every workspace member's manifest with the root version —
+# the #350 bug). The annotation is what the updater keys on: if it vanishes,
+# releases silently stop bumping the root manifest.
+if ! grep -q 'x-release-please-version' Cargo.toml; then
+  echo "root Cargo.toml version line must carry the x-release-please-version annotation" >&2
+  exit 1
+fi
+
+root_declared="$(manifest_version Cargo.toml)"
+root_tracked="$(release_manifest_version .)"
+if [[ "$root_declared" != "$root_tracked" ]]; then
+  echo "Cargo.toml declares ${root_declared}, but release-please tracks ${root_tracked}" >&2
+  exit 1
+fi
+
 for package_path in crates/fusillade-core crates/fusillade-arsenal; do
   declared_version="$(manifest_version "${package_path}/Cargo.toml")"
   released_version="$(release_manifest_version "$package_path")"
