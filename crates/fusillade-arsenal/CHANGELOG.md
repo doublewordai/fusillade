@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v1.1.1...fusillade-arsenal-v1.2.0) (2026-07-16)
+
+
+### Features
+
+* add batch_requests_archive schema and routing columns (phase 3 … ([#349](https://github.com/doublewordai/fusillade/issues/349)) ([0e548d9](https://github.com/doublewordai/fusillade/commit/0e548d971fe0563e32b00dff71fc403dfc34739b))
+
 ## [1.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v1.1.0...fusillade-arsenal-v1.1.1) (2026-07-16)
 
 
