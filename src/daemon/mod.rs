@@ -847,16 +847,8 @@ where
 
                     let completion_result = match completion_result {
                         Ok(result) => result,
-                        Err(panic_payload) => {
+                        Err(_panic_payload) => {
                             tracing::Span::current().record("outcome", "panic");
-                            let panic_message = panic_payload
-                                .downcast_ref::<&str>()
-                                .copied()
-                                .or_else(|| {
-                                    panic_payload.downcast_ref::<String>().map(String::as_str)
-                                })
-                                .unwrap_or("non-string panic payload")
-                                .to_string();
                             let failed = Request {
                                 data: recovery_data.clone(),
                                 state: Failed {
@@ -900,7 +892,6 @@ where
                                 %attempt_id,
                                 recovery = recovery_kind,
                                 applied,
-                                panic = panic_message,
                                 "request.processor_panicked"
                             );
                             return Ok(());
@@ -1099,9 +1090,7 @@ where
                             let failed = Request {
                                 data: recovery_data.clone(),
                                 state: Failed {
-                                    reason: FailureReason::NetworkError {
-                                        error: "processor returned an unexpected error".to_string(),
-                                    },
+                                    reason: FailureReason::ProcessorError,
                                     failed_at: chrono::Utc::now(),
                                     retry_attempt: retry_attempt_at_completion,
                                     batch_expires_at,

@@ -2988,7 +2988,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
                             FusilladeError::Other(anyhow!("Missing daemon_id for claimed request"))
                         })?),
-                        attempt_id: AttemptId(row.attempt_id.unwrap_or_default()),
+                        // Legacy and proxy-owned rows have no daemon attempt.
+                        attempt_id: AttemptId(row.attempt_id.unwrap_or_else(Uuid::nil)),
                         claimed_at: row.claimed_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!("Missing claimed_at for claimed request"))
                         })?,
@@ -3014,7 +3015,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     "Missing daemon_id for processing request"
                                 ))
                             })?),
-                            attempt_id: AttemptId(row.attempt_id.unwrap_or_default()),
+                            // Legacy and proxy-owned rows have no daemon attempt.
+                            attempt_id: AttemptId(row.attempt_id.unwrap_or_else(Uuid::nil)),
                             claimed_at: row.claimed_at.ok_or_else(|| {
                                 FusilladeError::Other(anyhow!(
                                     "Missing claimed_at for processing request"
@@ -5504,7 +5506,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 "Missing daemon_id for claimed execution"
                             ))
                         })?),
-                        attempt_id: AttemptId(row.attempt_id.unwrap_or_default()),
+                        // Legacy and proxy-owned rows have no daemon attempt.
+                        attempt_id: AttemptId(row.attempt_id.unwrap_or_else(Uuid::nil)),
                         claimed_at: row.claimed_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!(
                                 "Missing claimed_at for claimed execution"
@@ -5527,7 +5530,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     "Missing daemon_id for processing execution"
                                 ))
                             })?),
-                            attempt_id: AttemptId(row.attempt_id.unwrap_or_default()),
+                            // Legacy and proxy-owned rows have no daemon attempt.
+                            attempt_id: AttemptId(row.attempt_id.unwrap_or_else(Uuid::nil)),
                             claimed_at: row.claimed_at.ok_or_else(|| {
                                 FusilladeError::Other(anyhow!(
                                     "Missing claimed_at for processing execution"

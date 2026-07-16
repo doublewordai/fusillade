@@ -327,10 +327,7 @@ async fn deterministic_processor_error_obeys_retry_limit(pool: sqlx::PgPool) {
         panic!("deterministic processor failure must become terminal");
     };
     assert_eq!(failed.state.retry_attempt, 1);
-    assert!(matches!(
-        failed.state.reason,
-        FailureReason::NetworkError { .. }
-    ));
+    assert_eq!(failed.state.reason, FailureReason::ProcessorError);
     assert_eq!(http_client.call_count(), 0);
 
     shutdown_token.cancel();

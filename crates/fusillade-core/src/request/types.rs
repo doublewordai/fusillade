@@ -236,6 +236,10 @@ pub enum FailureReason {
     /// These are transient infrastructure issues that should be retried.
     NetworkError { error: String },
 
+    /// A custom request processor returned an unexpected internal error.
+    /// This is retriable because the processor may recover on a later attempt.
+    ProcessorError,
+
     /// Request timed out before receiving a response.
     /// These are transient and should be retried.
     Timeout { error: String },
@@ -261,6 +265,7 @@ impl FailureReason {
             FailureReason::RetriableHttpStatus { .. } => true,
             FailureReason::NonRetriableHttpStatus { .. } => false,
             FailureReason::NetworkError { .. } => true,
+            FailureReason::ProcessorError => true,
             FailureReason::Timeout { .. } => true,
             FailureReason::TaskTerminated => true,
             FailureReason::RequestBuilderError { .. } => false,
@@ -274,6 +279,7 @@ impl FailureReason {
             FailureReason::RetriableHttpStatus { .. } => "retriable_http_status",
             FailureReason::NonRetriableHttpStatus { .. } => "non_retriable_http_status",
             FailureReason::NetworkError { .. } => "network_error",
+            FailureReason::ProcessorError => "processor_error",
             FailureReason::Timeout { .. } => "timeout",
             FailureReason::TaskTerminated => "task_terminated",
             FailureReason::RequestBuilderError { .. } => "builder_error",
@@ -314,6 +320,9 @@ impl FailureReason {
             }
             FailureReason::NetworkError { error } => {
                 format!("Network error: {}", error)
+            }
+            FailureReason::ProcessorError => {
+                "Request processor returned an unexpected error".to_string()
             }
             FailureReason::Timeout { error } => {
                 format!("Request timed out: {}", error)
@@ -427,14 +436,17 @@ impl std::ops::Deref for DaemonId {
 /// Unique identifier for a single daemon execution attempt.
 ///
 /// Unlike [`DaemonId`], this changes on every claim and therefore fences two
-/// overlapping executions started by the same daemon.
+/// overlapping executions started by the same daemon. Read-only status
+/// reconstruction represents legacy or proxy-owned rows without an attempt
+/// token as `Uuid::nil()`. That sentinel is not a valid daemon attempt and
+/// must never authorize an ownership transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct AttemptId(pub Uuid);
 
 impl std::fmt::Display for AttemptId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &self.0.to_string()[..8])
+        self.0.fmt(f)
     }
 }
 
@@ -449,6 +461,18 @@ impl std::ops::Deref for AttemptId {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod attempt_id_tests {
+    use super::*;
+
+    #[test]
+    fn display_uses_the_full_uuid() {
+        let uuid = Uuid::parse_str("12345678-1234-4567-89ab-1234567890ab").unwrap();
+
+        assert_eq!(AttemptId(uuid).to_string(), uuid.to_string());
     }
 }
 
