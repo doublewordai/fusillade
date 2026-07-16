@@ -516,20 +516,25 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 // Additional methods for PostgresRequestManager (not part of Storage trait)
 impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Disambiguate a zero-row `persist()` UPDATE: either the row is gone
-    /// (genuine `RequestNotFound`, the pre-existing contract) or it reached a
-    /// TERMINAL state first — in which case the late transition is DROPPED
-    /// and persist returns `Ok(None)`.
+    /// (genuine `RequestNotFound`, the pre-existing contract) or the UPDATE
+    /// was fenced out by a state guard — in which case the late transition
+    /// is DROPPED and persist returns `Ok(None)`.
     ///
-    /// Terminal request states (completed/failed/canceled) are immutable to
-    /// the daemon's persist path. The load-bearing case (observed on prod
-    /// 2026-07-16, batch 2bdfb32f): cancel's cascade marks in-flight rows
-    /// `canceled`; the daemon, mid-HTTP-call, later persists Completed. The
-    /// previously unguarded UPDATE stomped canceled→completed AFTER the
-    /// batch's counts froze, leaving frozen counters that disagreed with the
-    /// rows — the one condition Phase 2 must never allow, and under the
-    /// Phase 3 archive the row would already have MOVED. Dropping the late
-    /// result keeps storage consistent with what cancel already told the
-    /// user. Do not "fix" a state-conflict here by removing the arm guards.
+    /// The transition matrix this backstops (settled with hamish
+    /// 2026-07-16, after the prod incident on batch 2bdfb32f):
+    /// - `completed`/`failed` are HARD terminals: once reached, subsequent
+    ///   daemon persists are dropped here — first terminal result wins
+    ///   (zombie replays, duplicate enqueues).
+    /// - `canceled` is a SOFT terminal and is NOT protected from terminal
+    ///   results: cancellation is async + best-effort, and in-flight work
+    ///   that ran anyway was billed, so persist(Completed/Failed) SUPERSEDES
+    ///   it — see those arms for the atomic frozen-counter repair. A
+    ///   canceled row only lands here from the lifecycle arms
+    ///   (Claimed/Processing), which must not resurrect it into flight, and
+    ///   from persist(Canceled) re-cancels.
+    ///
+    /// Do not "fix" a state-conflict here by weakening the arm guards; the
+    /// guards and this helper are two halves of the same matrix.
     async fn dropped_or_missing(&self, request_id: RequestId) -> Result<Option<RequestId>> {
         let current: Option<String> =
             sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
@@ -546,9 +551,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 tracing::warn!(
                     request_id = %request_id,
                     current_state = %state,
-                    "Dropped late request transition: row reached a terminal state while \
-                     in flight (e.g. cancel-cascade raced the daemon). Result discarded \
-                     to keep terminal states immutable and frozen batch counts truthful."
+                    "Dropped late request transition fenced out by the terminal-state \
+                     guards (duplicate terminal result, or a lifecycle write against a \
+                     terminal row). First terminal result wins; billed results supersede \
+                     cancellation via the Completed/Failed persist arms instead."
                 );
                 Ok(None)
             }
