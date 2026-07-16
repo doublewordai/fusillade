@@ -99,7 +99,9 @@ done
 # major. This check forces the manual requirement bump into the same release.
 dependency_requirement() {
   local manifest="$1" crate="$2"
-  sed -n "s/^${crate} = { version = \"\([^\"]*\)\".*/\1/p" "$manifest" | head -n 1
+  # Tolerant of indentation and inline-table field order (path before
+  # version, etc.); still anchored so other crate names can't match.
+  sed -n "s/^[[:space:]]*${crate}[[:space:]]*=.*version[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$manifest" | head -n 1
 }
 
 major_of() {
@@ -109,6 +111,11 @@ major_of() {
 while read -r manifest crate tracked_path; do
   requirement="$(dependency_requirement "$manifest" "$crate")"
   tracked="$(release_manifest_version "$tracked_path")"
+
+  if [[ -z "$tracked" ]]; then
+    echo "could not find tracked version for ${tracked_path} in .release-please-manifest.json" >&2
+    exit 1
+  fi
 
   if [[ -z "$requirement" ]]; then
     echo "could not find internal dependency ${crate} in ${manifest}" >&2
