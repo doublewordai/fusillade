@@ -56,7 +56,11 @@ async fn archive_mirrors_requests_columns_plus_trailing_bucket(pool: PgPool) {
     // Exactly one extra column, and it is archive_bucket, appended last.
     let bucket = archive.pop().expect("archive has columns");
     assert_eq!(
-        (bucket.name.as_str(), bucket.data_type.as_str(), bucket.is_nullable.as_str()),
+        (
+            bucket.name.as_str(),
+            bucket.data_type.as_str(),
+            bucket.is_nullable.as_str()
+        ),
         ("archive_bucket", "date", "NO"),
         "archive's final column must be archive_bucket DATE NOT NULL; \
          found {bucket:?}. If a migration appended a new column to the archive \
@@ -106,7 +110,10 @@ async fn archive_has_no_foreign_keys(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("failed to count archive foreign keys");
-    assert_eq!(fk_count, 0, "batch_requests_archive must not gain foreign keys");
+    assert_eq!(
+        fk_count, 0,
+        "batch_requests_archive must not gain foreign keys"
+    );
 }
 
 #[sqlx::test]

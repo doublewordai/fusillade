@@ -22,7 +22,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use super::{DaemonStorage, ModelFilter, ModelFilterState, Storage};
+use super::{ArchiveOutcome, DaemonStorage, ModelFilter, ModelFilterState, Storage};
 use crate::PostgresStorageConfig;
 use crate::batch::{
     Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchNotification,
@@ -7075,6 +7075,215 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         Ok(total)
     }
 
+    async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome> {
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
+        // Lock the batch row for the whole move. Retry / cancel / freeze all
+        // UPDATE this row, so they queue behind the move (and vice versa) —
+        // no interleaving is possible while we hold the lock. The bucket is
+        // derived HERE, once, in UTC (`AT TIME ZONE 'UTC'` so the ISO-week
+        // Monday can never depend on the session TimeZone) and stamped;
+        // every later reader uses the stamped value, never re-derives.
+        let batch = sqlx::query!(
+            r#"
+            SELECT retry_version,
+                   location,
+                   counts_frozen_at,
+                   COALESCE(
+                       archive_bucket,
+                       date_trunc('week', created_at AT TIME ZONE 'UTC')::date
+                   ) AS "bucket!"
+            FROM batches
+            WHERE id = $1 AND deleted_at IS NULL
+            FOR UPDATE
+            "#,
+            *batch_id as Uuid,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock batch for archive: {}", e)))?;
+
+        let Some(batch) = batch else {
+            return Ok(ArchiveOutcome::SkippedNotFound);
+        };
+        if batch.location != "live" {
+            return Ok(ArchiveOutcome::SkippedNotLive);
+        }
+        if batch.counts_frozen_at.is_none() {
+            return Ok(ArchiveOutcome::SkippedNotFrozen);
+        }
+
+        // Graceful degradation (§7 of the phase 3 plan): a missing partition
+        // means the batch stays live — fully served, exactly as today — and
+        // the caller alerts. Name derivation must match
+        // ensure_archive_partitions() exactly.
+        let partition_exists = sqlx::query_scalar!(
+            r#"
+            SELECT to_regclass(
+                'batch_requests_archive_y' || to_char($1::date, 'IYYY')
+                    || 'w' || to_char($1::date, 'IW')
+            ) IS NOT NULL AS "exists!"
+            "#,
+            batch.bucket,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to check archive partition: {}", e)))?;
+        if !partition_exists {
+            return Ok(ArchiveOutcome::SkippedNoPartition);
+        }
+
+        // Rows referenced by response_steps stay live until the batchless
+        // store re-homes them (phase 6); skip the whole batch — partial
+        // moves outside the retry path would create un-modeled states.
+        let has_response_steps = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM response_steps s
+                JOIN requests r ON r.id = s.request_id
+                WHERE r.batch_id = $1
+            ) AS "has!"
+            "#,
+            *batch_id as Uuid,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to check response_steps: {}", e)))?;
+        if has_response_steps {
+            return Ok(ArchiveOutcome::SkippedResponseSteps);
+        }
+
+        // Forward move. Positional alignment (`r.*, $bucket`) is guaranteed
+        // by the schema-parity test suite (archive = requests' columns +
+        // archive_bucket appended last). ON CONFLICT makes crash-resume
+        // replay a no-op for rows already copied.
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO batch_requests_archive
+            SELECT r.*, $2::date
+            FROM requests r
+            WHERE r.batch_id = $1
+            ON CONFLICT (id, archive_bucket) DO NOTHING
+            "#,
+        )
+        .bind(*batch_id as Uuid)
+        .bind(batch.bucket)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to copy rows to archive: {}", e)))?
+        .rows_affected();
+
+        // Exactly-one-table invariant, enforced structurally: only delete
+        // rows that verifiably exist in the archive, then prove nothing was
+        // left behind. A row can never be deleted un-copied, and a torn
+        // state aborts the transaction instead of committing.
+        let deleted = sqlx::query!(
+            r#"
+            DELETE FROM requests r
+            WHERE r.batch_id = $1
+              AND EXISTS (
+                  SELECT 1 FROM batch_requests_archive a
+                  WHERE a.id = r.id AND a.archive_bucket = $2
+              )
+            "#,
+            *batch_id as Uuid,
+            batch.bucket,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete archived rows: {}", e)))?
+        .rows_affected();
+
+        let left_behind = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "count!" FROM requests WHERE batch_id = $1"#,
+            *batch_id as Uuid,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to verify move completeness: {}", e)))?;
+        if left_behind != 0 {
+            // Rolls back via drop of `tx`.
+            return Err(FusilladeError::Other(anyhow!(
+                "archive move for batch {batch_id} would leave {left_behind} rows in live \
+                 (inserted {inserted}, deleted {deleted}); aborted to preserve the \
+                 exactly-one-table invariant"
+            )));
+        }
+
+        // Location stamp with retry_version CAS. The FOR UPDATE lock already
+        // excludes racing writers on this path; the CAS is belt-and-braces
+        // for any future caller that reaches this UPDATE via a weaker lock
+        // (EvalPlanQual re-checks target-row conditions after lock waits —
+        // see the Phase 2 retry_version column comment).
+        let stamped = sqlx::query!(
+            r#"
+            UPDATE batches
+            SET location = 'archive', archive_bucket = $2
+            WHERE id = $1
+              AND retry_version = $3
+              AND counts_frozen_at IS NOT NULL
+              AND location = 'live'
+            "#,
+            *batch_id as Uuid,
+            batch.bucket,
+            batch.retry_version,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to stamp batch location: {}", e)))?
+        .rows_affected();
+        if stamped == 0 {
+            return Ok(ArchiveOutcome::SkippedRetryRaced);
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit archive move: {}", e)))?;
+
+        tracing::info!(%batch_id, rows = deleted, "Archived batch rows");
+        Ok(ArchiveOutcome::Archived { rows: deleted })
+    }
+
+    async fn list_archivable_batches(
+        &self,
+        limit: i64,
+        oldest_first: bool,
+    ) -> Result<Vec<BatchId>> {
+        // Served by idx_batches_archivable (partial on the exact predicate);
+        // ORDER BY created_at rides the index in either direction.
+        let rows = if oldest_first {
+            sqlx::query_scalar!(
+                r#"
+                SELECT id FROM batches
+                WHERE location = 'live' AND counts_frozen_at IS NOT NULL AND deleted_at IS NULL
+                ORDER BY created_at ASC, id ASC
+                LIMIT $1
+                "#,
+                limit,
+            )
+            .fetch_all(self.read_executor())
+            .await
+        } else {
+            sqlx::query_scalar!(
+                r#"
+                SELECT id FROM batches
+                WHERE location = 'live' AND counts_frozen_at IS NOT NULL AND deleted_at IS NULL
+                ORDER BY created_at DESC, id DESC
+                LIMIT $1
+                "#,
+                limit,
+            )
+            .fetch_all(self.read_executor())
+            .await
+        }
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list archivable batches: {}", e)))?;
+
+        Ok(rows.into_iter().map(BatchId).collect())
+    }
+
     async fn purge_model_filter_events(
         &self,
         batch_size: i64,
@@ -10191,6 +10400,289 @@ mod tests {
         // Idempotent: a second full pass freezes nothing new.
         let (frozen_again, _) = backfill_chunk(&pool, None, 100).await;
         assert_eq!(frozen_again, 0);
+    }
+
+    /// Helper: a terminal, FROZEN batch with `n` completed rows — the only
+    /// state archive_batch accepts. Freezing goes through the real
+    /// freeze-on-read path (get_batch), not manual column writes.
+    async fn setup_frozen_batch(
+        manager: &PostgresRequestManager<TestDbPools>,
+        pool: &sqlx::PgPool,
+        name: &str,
+        n: usize,
+    ) -> BatchId {
+        let batch_id = setup_freeze_test_batch(manager, name, n).await;
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200, response_body = '{}' WHERE batch_id = $1",
+            *batch_id as Uuid
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        manager.get_batch(batch_id).await.unwrap(); // freeze-on-read
+        let frozen: bool = sqlx::query_scalar!(
+            r#"SELECT counts_frozen_at IS NOT NULL AS "f!" FROM batches WHERE id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(frozen, "freeze-on-read must have frozen the batch");
+        batch_id
+    }
+
+    async fn archive_state(
+        pool: &sqlx::PgPool,
+        batch_id: BatchId,
+    ) -> (String, Option<chrono::NaiveDate>, i64, i64) {
+        let b = sqlx::query!(
+            r#"SELECT location, archive_bucket,
+                      (SELECT COUNT(*) FROM requests WHERE batch_id = $1) AS "live!",
+                      (SELECT COUNT(*) FROM batch_requests_archive WHERE batch_id = $1) AS "archived!"
+               FROM batches WHERE id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (b.location, b.archive_bucket, b.live, b.archived)
+    }
+
+    #[sqlx::test]
+    async fn test_archive_batch_moves_rows_and_stamps_location(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_frozen_batch(&manager, &pool, "arch-happy", 3).await;
+        let frozen_before = sqlx::query!(
+            "SELECT completed_requests, counts_frozen_at FROM batches WHERE id = $1",
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let outcome = manager.archive_batch(batch_id).await.unwrap();
+        assert_eq!(outcome, ArchiveOutcome::Archived { rows: 3 });
+
+        let (location, bucket, live, archived) = archive_state(&pool, batch_id).await;
+        assert_eq!(location, "archive");
+        assert!(bucket.is_some(), "archive_bucket must be stamped");
+        assert_eq!((live, archived), (0, 3), "rows live in exactly one table");
+
+        // Frozen counters are untouched by the move — they are the durable
+        // record the archive design depends on.
+        let frozen_after = sqlx::query!(
+            "SELECT completed_requests, counts_frozen_at FROM batches WHERE id = $1",
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            frozen_after.completed_requests,
+            frozen_before.completed_requests
+        );
+        assert_eq!(
+            frozen_after.counts_frozen_at,
+            frozen_before.counts_frozen_at
+        );
+
+        // Idempotent: a second call is a clean no-op skip.
+        let again = manager.archive_batch(batch_id).await.unwrap();
+        assert_eq!(again, ArchiveOutcome::SkippedNotLive);
+    }
+
+    #[sqlx::test]
+    async fn test_archive_batch_refuses_unfrozen_and_active(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        // Active batch: rows still pending, nothing frozen.
+        let active = setup_freeze_test_batch(&manager, "arch-active", 2).await;
+        assert_eq!(
+            manager.archive_batch(active).await.unwrap(),
+            ArchiveOutcome::SkippedNotFrozen
+        );
+        let (_, _, live, archived) = archive_state(&pool, active).await;
+        assert_eq!(
+            (live, archived),
+            (2, 0),
+            "nothing may move for an active batch"
+        );
+
+        // Terminal-by-rows but never frozen (no get_batch read): also refused.
+        let unfrozen = setup_freeze_test_batch(&manager, "arch-unfrozen", 2).await;
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200, response_body = '{}' WHERE batch_id = $1",
+            *unfrozen as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            manager.archive_batch(unfrozen).await.unwrap(),
+            ArchiveOutcome::SkippedNotFrozen
+        );
+
+        // Unknown / soft-deleted batches: not found.
+        assert_eq!(
+            manager
+                .archive_batch(BatchId(Uuid::new_v4()))
+                .await
+                .unwrap(),
+            ArchiveOutcome::SkippedNotFound
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_archive_batch_missing_partition_degrades_gracefully(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_frozen_batch(&manager, &pool, "arch-nopart", 2).await;
+        // Shift the batch into a week with no partition (bootstrap only
+        // covers existing-batch weeks + 4 ahead; 2020 has none).
+        sqlx::query!(
+            "UPDATE batches SET created_at = '2020-01-06T12:00:00Z' WHERE id = $1",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::SkippedNoPartition
+        );
+        let (location, _, live, archived) = archive_state(&pool, batch_id).await;
+        assert_eq!(location, "live", "batch must stay fully live and served");
+        assert_eq!((live, archived), (2, 0));
+    }
+
+    #[sqlx::test]
+    async fn test_archive_batch_crash_resume_is_idempotent(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_frozen_batch(&manager, &pool, "arch-resume", 3).await;
+
+        // Simulate a crash after the INSERT copied one row but before the
+        // DELETE/stamp committed: pre-copy a single row into the archive
+        // exactly as the move would have.
+        sqlx::query(
+            "INSERT INTO batch_requests_archive
+             SELECT r.*, date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date
+             FROM requests r WHERE r.batch_id = $1
+             ORDER BY r.id LIMIT 1",
+        )
+        .bind(*batch_id as Uuid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Re-run completes the move: ON CONFLICT skips the pre-copied row,
+        // everything ends in exactly one table.
+        let outcome = manager.archive_batch(batch_id).await.unwrap();
+        assert_eq!(outcome, ArchiveOutcome::Archived { rows: 3 });
+        let (location, _, live, archived) = archive_state(&pool, batch_id).await;
+        assert_eq!(location, "archive");
+        assert_eq!((live, archived), (0, 3));
+    }
+
+    #[sqlx::test]
+    async fn test_archive_batch_skips_response_steps_referenced(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_frozen_batch(&manager, &pool, "arch-steps", 2).await;
+        sqlx::query(
+            "INSERT INTO response_steps (id, request_id, step_kind, step_sequence, request_payload, response_payload, state, retry_attempt, started_at, completed_at)
+             SELECT gen_random_uuid(), id, 'model_call', 1, '{}', '{}', 'completed', 0, NOW(), NOW()
+             FROM requests WHERE batch_id = $1 LIMIT 1",
+        )
+        .bind(*batch_id as Uuid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::SkippedResponseSteps
+        );
+        let (location, _, live, _) = archive_state(&pool, batch_id).await;
+        assert_eq!(location, "live");
+        assert_eq!(live, 2);
+    }
+
+    #[sqlx::test]
+    async fn test_list_archivable_batches_membership_and_order(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        // Three frozen batches with staggered ages.
+        let old = setup_frozen_batch(&manager, &pool, "list-old", 1).await;
+        let mid = setup_frozen_batch(&manager, &pool, "list-mid", 1).await;
+        let new = setup_frozen_batch(&manager, &pool, "list-new", 1).await;
+        for (id, days) in [(old, 30), (mid, 20), (new, 10)] {
+            sqlx::query(&format!(
+                "UPDATE batches SET created_at = NOW() - INTERVAL '{days} days' WHERE id = $1"
+            ))
+            .bind(*id as Uuid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Non-candidates: an active batch, and a frozen-but-deleted one.
+        let _active = setup_freeze_test_batch(&manager, "list-active", 1).await;
+        let deleted = setup_frozen_batch(&manager, &pool, "list-deleted", 1).await;
+        sqlx::query!(
+            "UPDATE batches SET deleted_at = NOW() WHERE id = $1",
+            *deleted as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let oldest = manager.list_archivable_batches(10, true).await.unwrap();
+        assert_eq!(oldest, vec![old, mid, new], "oldest-first backfill order");
+        let newest = manager.list_archivable_batches(10, false).await.unwrap();
+        assert_eq!(newest, vec![new, mid, old], "newest-first sweeper order");
+        let limited = manager.list_archivable_batches(1, true).await.unwrap();
+        assert_eq!(limited, vec![old]);
+        // Backdated weeks predate the bootstrap partitions (test DBs cover
+        // current week + 4 only) — create them the way the maintenance path
+        // would, then archive one batch; it leaves the candidate set.
+        sqlx::query(
+            r#"DO $$
+            DECLARE target date; part text;
+            BEGIN
+                FOR i IN 0..6 LOOP
+                    target := date_trunc('week', now())::date - (i * 7);
+                    part := 'batch_requests_archive_y' || to_char(target,'IYYY') || 'w' || to_char(target,'IW');
+                    IF to_regclass(part) IS NULL THEN
+                        EXECUTE format(
+                            'CREATE TABLE %I PARTITION OF batch_requests_archive FOR VALUES FROM (%L) TO (%L)',
+                            part, target, target + 7);
+                    END IF;
+                END LOOP;
+            END $$"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            manager.archive_batch(old).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 1 }
+        );
+        let after = manager.list_archivable_batches(10, true).await.unwrap();
+        assert_eq!(after, vec![mid, new]);
     }
 
     #[sqlx::test]

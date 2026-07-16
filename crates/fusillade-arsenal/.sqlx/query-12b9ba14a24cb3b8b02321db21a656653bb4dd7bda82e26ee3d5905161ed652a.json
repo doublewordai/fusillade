@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id FROM batches\n                WHERE location = 'live' AND counts_frozen_at IS NOT NULL AND deleted_at IS NULL\n                ORDER BY created_at ASC, id ASC\n                LIMIT $1\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "12b9ba14a24cb3b8b02321db21a656653bb4dd7bda82e26ee3d5905161ed652a"
+}

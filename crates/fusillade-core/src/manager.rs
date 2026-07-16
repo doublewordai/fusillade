@@ -20,6 +20,36 @@ use futures::stream::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
 
+/// Outcome of [`DaemonStorage::archive_batch`]. Skips are NORMAL sweeper
+/// flow, not errors: candidates are selected outside the move transaction,
+/// so by the time the batch row is locked the world may have moved on (a
+/// retry un-froze it, another sweeper archived it, a partition is missing).
+/// Callers log/alert per variant; only `SkippedNoPartition` warrants an
+/// alert (partitions-ahead runway failed), the rest are informational.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveOutcome {
+    /// Rows moved and location stamped; carries the row count moved.
+    Archived { rows: u64 },
+    /// Batch missing or soft-deleted (purge owns its rows, not the archive).
+    SkippedNotFound,
+    /// `location` was not `'live'` — already archived (idempotent no-op) or
+    /// mid-retry `'split'` (re-archive happens on re-terminalization).
+    SkippedNotLive,
+    /// Counts not frozen: the batch is active again (retry) or was never
+    /// finalized. It will re-candidate once frozen.
+    SkippedNotFrozen,
+    /// The weekly partition for this batch's bucket does not exist. The
+    /// batch stays live and fully served; fix partition creation and it
+    /// archives on a later pass. Alert-worthy.
+    SkippedNoPartition,
+    /// Some row is referenced by `response_steps`; the batch stays live
+    /// until the batchless store re-homes those rows.
+    SkippedResponseSteps,
+    /// The `retry_version` CAS on the final stamp failed — a retry raced
+    /// the move. Transaction rolled back; nothing moved.
+    SkippedRetryRaced,
+}
+
 /// Liveness state of a model on internal (self-hosted) infrastructure, as
 /// published by the controller into the `model_filters` append-only event log.
 ///
@@ -828,6 +858,45 @@ pub trait DaemonStorage: Send + Sync {
     /// Returns total rows deleted across both tables. Called periodically by
     /// the daemon purge task for right-to-erasure compliance.
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
+
+    /// Move one terminal batch's request rows from `requests` (live) into
+    /// `batch_requests_archive` in a single bounded transaction (batches are
+    /// capped at 50k rows), stamping `batches.location = 'archive'` and
+    /// `batches.archive_bucket`.
+    ///
+    /// Preconditions are checked inside the transaction; violations return a
+    /// `Skipped*` outcome rather than an error — the sweeper treats skips as
+    /// normal flow:
+    /// - batch exists, not soft-deleted, `location = 'live'`, counts frozen
+    ///   (`counts_frozen_at` set). **Only frozen batches move**: freezing
+    ///   guarantees rows are settled and the counters are the durable
+    ///   record, and it carries Phase 2's `retry_version` protection — any
+    ///   retry un-freezes and bumps the version first.
+    /// - the weekly archive partition for the batch's bucket exists;
+    ///   otherwise the batch simply stays live (fully served, exactly as
+    ///   today) and the caller alerts — graceful degradation, no failure.
+    /// - no row is referenced by `response_steps` (those stay live until the
+    ///   batchless store gives them a home).
+    ///
+    /// Transaction invariants (fusillade-requests-phase3-plan.md §1):
+    /// - forward move is `INSERT ... SELECT r.*, $bucket` with
+    ///   `ON CONFLICT DO NOTHING` — idempotent under crash-resume replay.
+    /// - the DELETE removes only rows verifiably present in the archive and
+    ///   the transaction aborts if any row would be left behind: a row lives
+    ///   in exactly one table, always.
+    /// - the location stamp re-checks `retry_version` (CAS) even though the
+    ///   batch-row lock makes a race impossible on this path — belt and
+    ///   braces against future callers taking weaker locks.
+    async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome>;
+
+    /// List batches eligible for archiving (`location = 'live'`, counts
+    /// frozen, not soft-deleted). `oldest_first = true` is the
+    /// historical-backfill order — the least-recently-created batches are
+    /// the least likely to ever be read again, so early-ramp issues have
+    /// minimal blast radius. The steady-state sweeper uses newest-first so
+    /// just-terminalized batches move promptly.
+    async fn list_archivable_batches(&self, limit: i64, oldest_first: bool)
+    -> Result<Vec<BatchId>>;
 
     /// Purge old `model_filters` events, ALWAYS retaining, per model, the most
     /// recent `keep_per_model` events (so the current-state lookup and a short

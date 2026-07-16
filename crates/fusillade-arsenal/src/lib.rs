@@ -12,7 +12,9 @@ pub mod postgres_response_step;
 pub mod transform;
 mod utils;
 
-pub use fusillade_core::manager::{DaemonStorage, ModelFilter, ModelFilterState, Storage};
+pub use fusillade_core::manager::{
+    ArchiveOutcome, DaemonStorage, ModelFilter, ModelFilterState, Storage,
+};
 pub use fusillade_core::request::AnyRequest;
 pub use fusillade_core::response_step;
 pub use postgres::{BatchInsertStrategy, PoolProvider, PostgresRequestManager, TestDbPools};
