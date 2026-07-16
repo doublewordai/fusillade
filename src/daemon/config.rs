@@ -88,6 +88,19 @@ pub enum DaemonMode {
     BatchOnly,
 }
 
+impl DaemonMode {
+    /// Stable label value for the `mode` dimension on daemon metrics
+    /// (e.g. `fusillade_daemon_up`). Matches the serde snake_case encoding so
+    /// config values and metric labels read identically on dashboards.
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            DaemonMode::Both => "both",
+            DaemonMode::RequestOnly => "request_only",
+            DaemonMode::BatchOnly => "batch_only",
+        }
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
     /// Claim-loop mode for this daemon process.
@@ -314,6 +327,21 @@ mod tests {
         HttpResponse {
             status,
             body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn daemon_mode_metric_labels_match_serde_encoding() {
+        // The `mode` label on daemon metrics (fusillade_daemon_up) must read
+        // identically to the config value that produced it, or dashboards
+        // filtering by mode silently diverge from deployed config.
+        for mode in [
+            DaemonMode::Both,
+            DaemonMode::RequestOnly,
+            DaemonMode::BatchOnly,
+        ] {
+            let serde_encoding = serde_json::to_value(mode).unwrap();
+            assert_eq!(serde_encoding.as_str().unwrap(), mode.metric_label());
         }
     }
 
