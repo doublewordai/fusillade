@@ -12,9 +12,14 @@
 --    The key is batch-constant: a batch's rows always colocate in exactly one
 --    partition, retries re-archive to the same one, partitions age naturally.
 --
---    Columns deliberately mirror `requests` 1:1 (via LIKE) so the move is
---    `INSERT ... SELECT *` in BOTH directions (archive on terminalize, back
---    to live on retry). Claim-machinery columns are NULL on terminal rows and
+--    Columns deliberately mirror `requests` 1:1 (via LIKE), with exactly one
+--    addition: `archive_bucket`, appended LAST. Moves therefore need no
+--    per-column transformation — archiving is literally
+--    `INSERT INTO batch_requests_archive SELECT r.*, $bucket FROM requests r`
+--    (positional alignment + appended key), and the retry move-back selects
+--    the `requests` column list, omitting only `archive_bucket`. That
+--    move-back list lives in one place in the move code and is covered by
+--    the same schema-parity test. Claim-machinery columns are NULL on terminal rows and
 --    NULLs cost one bit each — the slimming lives in the INDEX set (2 here
 --    vs 26 on requests), not the columns. Any future migration that changes
 --    `requests` columns MUST change this table in the same migration (a
