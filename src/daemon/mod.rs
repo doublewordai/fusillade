@@ -940,6 +940,19 @@ where
 
         let running_record = daemon_record.start(self.storage.as_ref()).await?;
         tracing::info!("Daemon registered in database");
+        // Liveness signal for dashboards/alerts: 1 while this daemon's run
+        // loop is alive, 0 once it exits (any non-panic path). A daemon dying
+        // inside a still-running pod is otherwise invisible to metrics
+        // (observed 2026-07-08: silent claim outage until a human bounced the
+        // pod). Originally added in #322 and lost in the #323 workspace
+        // split — verified absent from prod on 2026-07-15. Labeled by mode so
+        // that if a process ever hosts more than one daemon (or the fleet
+        // mixes modes), one daemon exiting cannot zero another's signal.
+        // Dashboards: `min by (pod) (fusillade_daemon_up)` catches any dead
+        // role; panics don't set 0, so alerting still pairs this with
+        // heartbeat-rate (FusilladeDaemonDown family).
+        let mode_label = self.config.mode.metric_label();
+        gauge!("fusillade_daemon_up", "mode" => mode_label).set(1.0);
 
         // Spawn periodic heartbeat task
         let storage = self.storage.clone();
@@ -1338,6 +1351,7 @@ where
             }
         };
         claim_daemons.abort_all();
+        gauge!("fusillade_daemon_up", "mode" => mode_label).set(0.0);
 
         // Wait for heartbeat task to complete (it will mark daemon as dead)
         tracing::info!("Waiting for heartbeat task to complete");
