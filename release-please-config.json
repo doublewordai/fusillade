@@ -3,7 +3,6 @@
   "release-type": "rust",
   "include-component-in-tag": true,
   "tag-separator": "-",
-  "plugins": ["cargo-workspace"],
   "packages": {
     ".": {
       "component": "fusillade",
