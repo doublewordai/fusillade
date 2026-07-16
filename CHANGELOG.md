@@ -1,5 +1,18 @@
 # Changelog
 
+## [21.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v21.1.3...fusillade-v21.2.0) (2026-07-16)
+
+
+### Features
+
+* add batch_requests_archive schema and routing columns (phase 3 … ([#349](https://github.com/doublewordai/fusillade/issues/349)) ([0e548d9](https://github.com/doublewordai/fusillade/commit/0e548d971fe0563e32b00dff71fc403dfc34739b))
+
+
+### Bug Fixes
+
+* drop cargo-workspace plugin that stamps unreleased crates with f… ([#351](https://github.com/doublewordai/fusillade/issues/351)) ([2fd16a1](https://github.com/doublewordai/fusillade/commit/2fd16a10059d4c6b074ae86a969554751f3eb12d))
+* release please root strategy ([#352](https://github.com/doublewordai/fusillade/issues/352)) ([7b823d2](https://github.com/doublewordai/fusillade/commit/7b823d296a8924abdcff39ba55a1bb58d543a993))
+
 ## [21.1.3](https://github.com/doublewordai/fusillade/compare/fusillade-v21.1.2...fusillade-v21.1.3) (2026-07-16)
 
 
