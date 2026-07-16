@@ -941,18 +941,34 @@ where
         let running_record = daemon_record.start(self.storage.as_ref()).await?;
         tracing::info!("Daemon registered in database");
         // Liveness signal for dashboards/alerts: 1 while this daemon's run
-        // loop is alive, 0 once it exits (any non-panic path). A daemon dying
-        // inside a still-running pod is otherwise invisible to metrics
-        // (observed 2026-07-08: silent claim outage until a human bounced the
-        // pod). Originally added in #322 and lost in the #323 workspace
-        // split — verified absent from prod on 2026-07-15. Labeled by mode so
-        // that if a process ever hosts more than one daemon (or the fleet
-        // mixes modes), one daemon exiting cannot zero another's signal.
-        // Dashboards: `min by (pod) (fusillade_daemon_up)` catches any dead
-        // role; panics don't set 0, so alerting still pairs this with
-        // heartbeat-rate (FusilladeDaemonDown family).
-        let mode_label = self.config.mode.metric_label();
+        // loop is alive, 0 once it stops being polled for ANY reason —
+        // normal shutdown, early `?` error return, panic unwind, or the
+        // future being dropped/cancelled (that's why it's a drop guard and
+        // not a pair of set() calls: an early return between them would
+        // strand a stale up=1 in a still-running process). A daemon dying
+        // inside a live pod is otherwise invisible to metrics (observed
+        // 2026-07-08: silent claim outage until a human bounced the pod).
+        // Originally added in #322, lost in the #323 workspace split —
+        // verified absent from prod on 2026-07-15.
+        //
+        // Labeled by the effective `mode` ARGUMENT, not `self.config.mode`:
+        // run_with_mode exists so split-fleet binaries override the config,
+        // and per-role labels are what let one role's exit never zero
+        // another's signal. Dashboards: `min by (pod) (fusillade_daemon_up)`
+        // catches any dead role. A hard process abort can still skip the
+        // final scrape, so alerting pairs this with heartbeat-rate
+        // (FusilladeDaemonDown family).
+        struct LivenessGaugeGuard {
+            mode_label: &'static str,
+        }
+        impl Drop for LivenessGaugeGuard {
+            fn drop(&mut self) {
+                gauge!("fusillade_daemon_up", "mode" => self.mode_label).set(0.0);
+            }
+        }
+        let mode_label = mode.metric_label();
         gauge!("fusillade_daemon_up", "mode" => mode_label).set(1.0);
+        let _liveness_gauge_guard = LivenessGaugeGuard { mode_label };
 
         // Spawn periodic heartbeat task
         let storage = self.storage.clone();
@@ -1351,7 +1367,6 @@ where
             }
         };
         claim_daemons.abort_all();
-        gauge!("fusillade_daemon_up", "mode" => mode_label).set(0.0);
 
         // Wait for heartbeat task to complete (it will mark daemon as dead)
         tracing::info!("Waiting for heartbeat task to complete");
