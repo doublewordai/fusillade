@@ -73,7 +73,7 @@ release_manifest_version() {
   local package_path="$1"
   awk -v key="\"${package_path}\":" '
     $1 == key {
-      gsub(/[\",]/, "", $2)
+      gsub(/[",]/, "", $2)
       print $2
     }
   ' .release-please-manifest.json
@@ -88,3 +88,39 @@ for package_path in crates/fusillade-core crates/fusillade-arsenal; do
     exit 1
   fi
 done
+
+# Internal dependency requirements must stay resolvable against the versions
+# release-please tracks. With the cargo-workspace plugin removed (it kept
+# stamping unreleased crates with other crates' versions — see #345 and #350),
+# nothing rewrites these requirement strings automatically. That is fine for
+# minor/patch releases: `version = "1.1.1"` means ^1.1.1 and resolves newer
+# 1.x automatically. It is NOT fine across a MAJOR bump — a stale ^1.x
+# requirement would make a published dependent silently build against the old
+# major. This check forces the manual requirement bump into the same release.
+dependency_requirement() {
+  local manifest="$1" crate="$2"
+  sed -n "s/^${crate} = { version = \"\([^\"]*\)\".*/\1/p" "$manifest" | head -n 1
+}
+
+major_of() {
+  echo "${1%%.*}"
+}
+
+while read -r manifest crate tracked_path; do
+  requirement="$(dependency_requirement "$manifest" "$crate")"
+  tracked="$(release_manifest_version "$tracked_path")"
+
+  if [[ -z "$requirement" ]]; then
+    echo "could not find internal dependency ${crate} in ${manifest}" >&2
+    exit 1
+  fi
+
+  if [[ "$(major_of "$requirement")" != "$(major_of "$tracked")" ]]; then
+    echo "${manifest} requires ${crate} ^${requirement}, but release-please tracks ${tracked}: bump the requirement in the same release as the major bump" >&2
+    exit 1
+  fi
+done <<'DEPS'
+Cargo.toml fusillade-core crates/fusillade-core
+Cargo.toml fusillade-arsenal crates/fusillade-arsenal
+crates/fusillade-arsenal/Cargo.toml fusillade-core crates/fusillade-core
+DEPS
