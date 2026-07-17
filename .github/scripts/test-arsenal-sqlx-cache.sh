@@ -43,7 +43,36 @@ status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code
   --user-agent "fusillade-release-script (https://github.com/doublewordai/fusillade)" \
   "https://crates.io/api/v1/crates/fusillade-core/${core_version}" || true)"
 if [[ "$status" == "200" ]]; then
-  cargo package --package fusillade-arsenal --allow-dirty
+  # The published core exists, so normally the isolated verify build must pass.
+  # The one tolerated exception is an in-flight *breaking* change: a feature PR
+  # can add API to fusillade-core and reference it from arsenal before core is
+  # republished (release-please only bumps the version — and thus publishes the
+  # new API — in the release PR, and its own release-script test forbids
+  # hand-editing Cargo.toml ahead of the manifest). In that window the isolated
+  # build fails resolving core symbols even though arsenal is perfectly correct
+  # against the local workspace copy of core. Detect that precise case — a
+  # core-symbol resolution failure that still builds inside the workspace — and
+  # defer to the publish-time verify (gated on wait_for_crate_version in
+  # publish-crate.sh), which cannot ship arsenal until the new core is live.
+  verify_log="$(mktemp)"
+  trap 'rm -f "$verify_log"' RETURN 2>/dev/null || true
+  if cargo package --package fusillade-arsenal --allow-dirty 2>&1 | tee "$verify_log"; then
+    :
+  elif grep -qiE 'fusillade[_-]core' "$verify_log" \
+    && grep -qE 'error\[E0(432|433|412|405|609|599|560|412|063)\]|no field|no method|no variant|unresolved import|cannot find' "$verify_log" \
+    && SQLX_OFFLINE=true cargo build --package fusillade-arsenal --all-features >/dev/null 2>&1; then
+    echo
+    echo "Isolated verify build failed only because arsenal references fusillade-core"
+    echo "API not present in the published ${core_version} (an in-flight breaking change)."
+    echo "arsenal builds against the local workspace core, and publish is still gated on"
+    echo "wait_for_crate_version, so nothing ships against a core that lacks the API."
+    echo "Deferring to publish-time verification."
+  else
+    echo "fusillade-arsenal failed to verify-package against published fusillade-core ${core_version}." >&2
+    rm -f "$verify_log"
+    exit 1
+  fi
+  rm -f "$verify_log"
 elif [[ "$status" == "404" ]]; then
   echo "fusillade-core ${core_version} is not on crates.io yet (lockstep release);"
   echo "skipping the package verify build — publish-time verification still applies."

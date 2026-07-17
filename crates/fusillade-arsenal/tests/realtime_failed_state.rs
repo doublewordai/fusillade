@@ -11,6 +11,7 @@
 //! Both write branches are covered: the bulk UPDATE (a row already exists in
 //! `processing` from create_realtime) and the synthesize INSERT (no row yet).
 
+use chrono::Utc;
 use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
 use fusillade_core::manager::Storage;
 use fusillade_core::{CreateRealtimeInput, FailureReason, PersistCompletedRealtimeInput};
@@ -54,6 +55,8 @@ fn realtime_input(
         path: "/v1/chat/completions".to_string(),
         api_key: "test-key".to_string(),
         created_by: "test-user".to_string(),
+        started_at: Utc::now(),
+        completed_at: Utc::now(),
     }
 }
 
