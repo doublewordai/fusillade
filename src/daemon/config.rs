@@ -425,10 +425,27 @@ mod tests {
         assert_eq!(c.batch_archive_partitions_weeks_ahead, 4);
         assert!(c.batch_archive_sweep_moves_per_tick > 0);
         assert!(c.batch_archive_backfill_moves_per_tick > 0);
-        // Old serialized configs (no archive keys) must keep deserializing.
-        let decoded: DaemonConfig =
-            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        // Old serialized configs (no archive keys) must keep deserializing:
+        // strip the new keys before decoding so the missing-field path is
+        // what the test actually exercises.
+        let mut serialized = serde_json::to_value(&c).unwrap();
+        let obj = serialized.as_object_mut().unwrap();
+        for key in [
+            "batch_archive_sweep_enabled",
+            "batch_archive_sweep_interval_ms",
+            "batch_archive_sweep_moves_per_tick",
+            "batch_archive_sweep_dwell_secs",
+            "batch_archive_cancel_grace_secs",
+            "batch_archive_backfill_enabled",
+            "batch_archive_backfill_interval_ms",
+            "batch_archive_backfill_moves_per_tick",
+            "batch_archive_partitions_weeks_ahead",
+        ] {
+            obj.remove(key);
+        }
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
         assert!(!decoded.batch_archive_sweep_enabled);
+        assert_eq!(decoded.batch_archive_partitions_weeks_ahead, 4);
     }
 
     #[test]

@@ -140,7 +140,7 @@ async fn forward_move_shape_compiles_and_round_trips(pool: PgPool) {
 
     sqlx::query(
         "INSERT INTO batch_requests_archive
-         SELECT r.*, date_trunc('week', now())::date
+         SELECT r.*, date_trunc('week', now() AT TIME ZONE 'UTC')::date
          FROM requests r WHERE r.batch_id = '11111111-1111-1111-1111-111111111111'",
     )
     .execute(&pool)

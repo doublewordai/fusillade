@@ -7655,9 +7655,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                    (SELECT COUNT(*) FROM generate_series(0, $1) AS w(i)
                     WHERE to_regclass(
                         'batch_requests_archive_y'
-                        || to_char(date_trunc('week', now())::date + (w.i * 7), 'IYYY')
+                        || to_char(date_trunc('week', now() AT TIME ZONE 'UTC')::date + (w.i * 7), 'IYYY')
                         || 'w'
-                        || to_char(date_trunc('week', now())::date + (w.i * 7), 'IW')
+                        || to_char(date_trunc('week', now() AT TIME ZONE 'UTC')::date + (w.i * 7), 'IW')
                     ) IS NOT NULL) AS "ahead!"
             "#,
             weeks_ahead,
@@ -11527,7 +11527,7 @@ mod tests {
             DECLARE target date; part text;
             BEGIN
                 FOR i IN 0..6 LOOP
-                    target := date_trunc('week', now())::date - (i * 7);
+                    target := date_trunc('week', now() AT TIME ZONE 'UTC')::date - (i * 7);
                     part := 'batch_requests_archive_y' || to_char(target,'IYYY') || 'w' || to_char(target,'IW');
                     IF to_regclass(part) IS NULL THEN
                         EXECUTE format(
