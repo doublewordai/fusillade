@@ -18,7 +18,7 @@ use crate::FusilladeError;
 use crate::batch::BatchId;
 use crate::error::Result;
 use crate::http::HttpClient;
-use crate::manager::{DaemonStorage, Storage};
+use crate::manager::{ArchiveOutcome, DaemonStorage, Storage};
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
 use crate::request::{Claimed, DaemonId, Request, RequestCompletionResult};
 
@@ -1322,6 +1322,158 @@ where
                 daemon_id = %self.daemon_id,
                 "Storage backend does not support batch claims; running request-only"
             );
+        }
+
+        // ---- Batch-archive maintenance + movers (phase 3) ----
+        // Only batch-mode daemons touch the archive. The partition-runway
+        // tick ALWAYS runs for them (partitions must exist before anyone
+        // flips the move flags); the sweep/backfill movers are config-gated:
+        // deploys never move data — only these flags do, and only once every
+        // pod in the fleet understands location routing (blue/green
+        // invariant, see batches.location column comment).
+        let batch_mode = claim_loop_kinds.contains(&ClaimLoopKind::Batch);
+        if batch_mode && supports_batch_claims {
+            {
+                let storage = self.storage.clone();
+                let shutdown_token = self.shutdown_token.clone();
+                let weeks_ahead = self.config.batch_archive_partitions_weeks_ahead;
+                tokio::spawn(async move {
+                    loop {
+                        match storage.ensure_archive_partitions(weeks_ahead).await {
+                            Ok((created, ahead)) => {
+                                gauge!("fusillade_archive_partitions_ahead").set(ahead as f64);
+                                if created > 0 {
+                                    tracing::info!(created, ahead, "Created archive partitions");
+                                }
+                            }
+                            Err(e) => {
+                                crate::background_error!("archive_partition_ensure_failed", Error, error = %e, "Failed to ensure archive partitions");
+                            }
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(86_400_000)) => {},
+                            _ = shutdown_token.cancelled() => break,
+                        }
+                    }
+                });
+            }
+
+            // The sweeper (new terminals) and the historical backfill are the
+            // SAME mover on different pacing knobs — one tested code path.
+            // Both run OLDEST-first: in steady state the sweeper drains its
+            // whole candidate set every few ticks so order is cosmetic; under
+            // a backlog, the oldest batches are the least likely to ever be
+            // re-read, so early issues have minimal blast radius (same
+            // argument as the historical drain).
+            for (worker, enabled, interval_ms, per_tick, dwell) in [
+                (
+                    "sweep",
+                    self.config.batch_archive_sweep_enabled,
+                    self.config.batch_archive_sweep_interval_ms,
+                    self.config.batch_archive_sweep_moves_per_tick,
+                    self.config.batch_archive_sweep_dwell_secs,
+                ),
+                (
+                    "backfill",
+                    self.config.batch_archive_backfill_enabled,
+                    self.config.batch_archive_backfill_interval_ms,
+                    self.config.batch_archive_backfill_moves_per_tick,
+                    0.0,
+                ),
+            ] {
+                if !enabled {
+                    continue;
+                }
+                let storage = self.storage.clone();
+                let shutdown_token = self.shutdown_token.clone();
+                let grace = self.config.batch_archive_cancel_grace_secs;
+                tokio::spawn(async move {
+                    // Misconfiguration guard: interval 0 would busy-loop the
+                    // DB, and per_tick <= 0 defeats "bounded per tick"
+                    // (Postgres treats LIMIT -1 as unlimited). Disable the
+                    // worker loudly rather than run it dangerously.
+                    if interval_ms == 0 || per_tick <= 0 {
+                        crate::background_error!(
+                            "archive_mover_invalid_config",
+                            Error,
+                            worker,
+                            interval_ms,
+                            per_tick,
+                            "Batch-archive mover disabled due to invalid config"
+                        );
+                        return;
+                    }
+                    tracing::info!(worker, interval_ms, per_tick, "Batch-archive mover started");
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {},
+                            _ = shutdown_token.cancelled() => {
+                                tracing::info!(worker, "Shutting down archive mover");
+                                break;
+                            }
+                        }
+
+                        // Bounded work per tick (orphan-purge pattern) —
+                        // never drain-until-empty, so the mover can never
+                        // monopolize its loop or the database.
+                        let ids = match storage
+                            .list_archivable_batches(per_tick, true, grace, dwell)
+                            .await
+                        {
+                            Ok(ids) => ids,
+                            Err(e) => {
+                                crate::background_error!("archive_list_failed", Error, error = %e, "Failed to list archivable batches");
+                                continue;
+                            }
+                        };
+
+                        for batch_id in ids {
+                            if shutdown_token.is_cancelled() {
+                                return;
+                            }
+                            let started = std::time::Instant::now();
+                            match storage.archive_batch(batch_id).await {
+                                Ok(ArchiveOutcome::Archived { rows }) => {
+                                    counter!("fusillade_archive_moves_total", "worker" => worker, "outcome" => "archived").increment(1);
+                                    counter!("fusillade_archive_moved_rows_total", "worker" => worker).increment(rows);
+                                    histogram!("fusillade_archive_move_duration_seconds", "worker" => worker)
+                                        .record(started.elapsed().as_secs_f64());
+                                }
+                                Ok(outcome) => {
+                                    let label = match outcome {
+                                        ArchiveOutcome::Archived { .. } => unreachable!(),
+                                        ArchiveOutcome::SkippedNotFound => "skipped_not_found",
+                                        ArchiveOutcome::SkippedNotLive => "skipped_not_live",
+                                        ArchiveOutcome::SkippedNotFrozen => "skipped_not_frozen",
+                                        ArchiveOutcome::SkippedNoPartition => {
+                                            "skipped_no_partition"
+                                        }
+                                        ArchiveOutcome::SkippedResponseSteps => {
+                                            "skipped_response_steps"
+                                        }
+                                        ArchiveOutcome::SkippedRetryRaced => "skipped_retry_raced",
+                                    };
+                                    counter!("fusillade_archive_moves_total", "worker" => worker, "outcome" => label).increment(1);
+                                    if outcome == ArchiveOutcome::SkippedNoPartition {
+                                        // The one alert-worthy skip: the
+                                        // partition runway failed. The batch
+                                        // stays live and fully served.
+                                        crate::background_error!("archive_partition_missing", Error, batch_id = %batch_id, "Archive partition missing for batch bucket");
+                                    }
+                                }
+                                Err(e) => {
+                                    crate::background_error!("archive_move_failed", Error, error = %e, batch_id = %batch_id, "Failed to archive batch");
+                                    break;
+                                }
+                            }
+                        }
+
+                        if let Ok(backlog) = storage.count_archivable_batches(grace).await {
+                            gauge!("fusillade_archive_backlog").set(backlog as f64);
+                        }
+                    }
+                });
+            }
         }
 
         for claim_loop_kind in claim_loop_kinds {

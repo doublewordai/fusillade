@@ -165,6 +165,45 @@ pub struct DaemonConfig {
     pub purge_interval_ms: u64,
     pub purge_batch_size: i64,
     pub purge_throttle_ms: u64,
+    /// Batch-archive sweeper (phase 3): moves frozen terminal batches' rows
+    /// from `requests` into `batch_requests_archive`. OFF by default — the
+    /// blue/green invariant is that deploys never move data; only flipping
+    /// this flag does, and only on a single-generation fleet (old pods read
+    /// `requests` directly and must all be gone first).
+    #[serde(default)]
+    pub batch_archive_sweep_enabled: bool,
+    #[serde(default = "default_archive_sweep_interval_ms")]
+    pub batch_archive_sweep_interval_ms: u64,
+    /// Bounded work per tick (orphan-purge pattern, never drain-until-empty):
+    /// at most this many batch moves per sweep tick.
+    #[serde(default = "default_archive_moves_per_tick")]
+    pub batch_archive_sweep_moves_per_tick: i64,
+    /// Post-freeze dwell before a batch becomes a sweep candidate. Default 0
+    /// (move immediately): reads are mid-move safe by construction, and the
+    /// sweep tick + queue already provide organic dwell. Raise only with
+    /// evidence from the download-source metrics.
+    #[serde(default)]
+    pub batch_archive_sweep_dwell_secs: f64,
+    /// Cancellation grace window: a batch with canceled rows that were IN
+    /// FLIGHT at cancel (claimed_at set) younger than this is not archived
+    /// yet, so late billed results can still supersede the cancel on the
+    /// live row. Default mirrors processing_timeout (~10 min); only
+    /// cancelled batches archive later, fully served from live meanwhile.
+    #[serde(default = "default_archive_cancel_grace_secs")]
+    pub batch_archive_cancel_grace_secs: f64,
+    /// Historical backfill worker: same move machinery as the sweeper on its
+    /// own pacing, oldest-first. OFF by default; enable after the sweeper is
+    /// live and steady, ramp via the per-tick knob, flip off to pause
+    /// instantly (resumable by construction — the queue is the data).
+    #[serde(default)]
+    pub batch_archive_backfill_enabled: bool,
+    #[serde(default = "default_archive_backfill_interval_ms")]
+    pub batch_archive_backfill_interval_ms: u64,
+    #[serde(default = "default_archive_moves_per_tick")]
+    pub batch_archive_backfill_moves_per_tick: i64,
+    /// Weekly-partition runway maintained by the daily maintenance tick.
+    #[serde(default = "default_archive_partitions_weeks_ahead")]
+    pub batch_archive_partitions_weeks_ahead: i32,
     pub throughput_log_interval_ms: Option<u64>,
     #[serde(default)]
     pub streamable_endpoints: Vec<String>,
@@ -225,6 +264,26 @@ fn default_claim_query_timeout_ms() -> u64 {
     180_000
 }
 
+fn default_archive_sweep_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_archive_moves_per_tick() -> i64 {
+    4
+}
+
+fn default_archive_cancel_grace_secs() -> f64 {
+    600.0
+}
+
+fn default_archive_backfill_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_archive_partitions_weeks_ahead() -> i32 {
+    4
+}
+
 fn default_claim_ramp_exponent() -> f64 {
     0.56
 }
@@ -276,6 +335,15 @@ impl Default for DaemonConfig {
             cancellation_poll_interval_ms: 5000,
             batch_metadata_fields: default_batch_metadata_fields(),
             purge_interval_ms: 600_000,
+            batch_archive_sweep_enabled: false,
+            batch_archive_sweep_interval_ms: default_archive_sweep_interval_ms(),
+            batch_archive_sweep_moves_per_tick: default_archive_moves_per_tick(),
+            batch_archive_sweep_dwell_secs: 0.0,
+            batch_archive_cancel_grace_secs: default_archive_cancel_grace_secs(),
+            batch_archive_backfill_enabled: false,
+            batch_archive_backfill_interval_ms: default_archive_backfill_interval_ms(),
+            batch_archive_backfill_moves_per_tick: default_archive_moves_per_tick(),
+            batch_archive_partitions_weeks_ahead: default_archive_partitions_weeks_ahead(),
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             throughput_log_interval_ms: Some(60_000),
@@ -343,6 +411,41 @@ mod tests {
             let serde_encoding = serde_json::to_value(mode).unwrap();
             assert_eq!(serde_encoding.as_str().unwrap(), mode.metric_label());
         }
+    }
+
+    #[test]
+    fn archive_flags_default_off_and_knobs_sane() {
+        // Deploys must never move data: both movers ship dark. The knobs
+        // exist so flag flips + pacing are config changes, not releases.
+        let c = DaemonConfig::default();
+        assert!(!c.batch_archive_sweep_enabled);
+        assert!(!c.batch_archive_backfill_enabled);
+        assert_eq!(c.batch_archive_sweep_dwell_secs, 0.0);
+        assert_eq!(c.batch_archive_cancel_grace_secs, 600.0);
+        assert_eq!(c.batch_archive_partitions_weeks_ahead, 4);
+        assert!(c.batch_archive_sweep_moves_per_tick > 0);
+        assert!(c.batch_archive_backfill_moves_per_tick > 0);
+        // Old serialized configs (no archive keys) must keep deserializing:
+        // strip the new keys before decoding so the missing-field path is
+        // what the test actually exercises.
+        let mut serialized = serde_json::to_value(&c).unwrap();
+        let obj = serialized.as_object_mut().unwrap();
+        for key in [
+            "batch_archive_sweep_enabled",
+            "batch_archive_sweep_interval_ms",
+            "batch_archive_sweep_moves_per_tick",
+            "batch_archive_sweep_dwell_secs",
+            "batch_archive_cancel_grace_secs",
+            "batch_archive_backfill_enabled",
+            "batch_archive_backfill_interval_ms",
+            "batch_archive_backfill_moves_per_tick",
+            "batch_archive_partitions_weeks_ahead",
+        ] {
+            obj.remove(key);
+        }
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert!(!decoded.batch_archive_sweep_enabled);
+        assert_eq!(decoded.batch_archive_partitions_weeks_ahead, 4);
     }
 
     #[test]
