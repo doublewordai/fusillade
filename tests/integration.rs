@@ -51,11 +51,15 @@ fn assert_next_retry_would_cross_effective_deadline(
     failed: &Request<Failed>,
     config: &DaemonConfig,
 ) {
+    let batch_expires_at = failed
+        .state
+        .batch_expires_at
+        .expect("this assertion is only valid for SLA requests");
     let effective_deadline = match config.stop_before_deadline_ms {
         Some(stop_before_deadline_ms) => {
-            failed.state.batch_expires_at - chrono::Duration::milliseconds(stop_before_deadline_ms)
+            batch_expires_at - chrono::Duration::milliseconds(stop_before_deadline_ms)
         }
-        None => failed.state.batch_expires_at,
+        None => batch_expires_at,
     };
     let next_retry_at = failed.state.failed_at
         + chrono::Duration::milliseconds(retry_backoff_ms(config, failed.state.retry_attempt));
