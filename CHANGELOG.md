@@ -1,5 +1,12 @@
 # Changelog
 
+## [22.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-v22.1.0...fusillade-v22.1.1) (2026-07-17)
+
+
+### Bug Fixes
+
+* raise internal dependency minimums to the released 2.1.0 versions ([#361](https://github.com/doublewordai/fusillade/issues/361)) ([22c4340](https://github.com/doublewordai/fusillade/commit/22c4340c4df2e55074a778e67b2193604863ee73))
+
 ## [22.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v22.0.1...fusillade-v22.1.0) (2026-07-17)
 
 
