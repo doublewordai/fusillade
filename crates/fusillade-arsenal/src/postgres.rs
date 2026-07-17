@@ -6370,9 +6370,20 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         // First, find the batch that owns this output file
         // Note: We allow streaming even for soft-deleted batches since the output file
         // represents completed work that users should be able to download
+        // The bucket is fetched unconditionally (COALESCE with the same UTC
+        // derivation the move uses): if the batch archives MID-stream, later
+        // pages already target the right partition. Downloads are then
+        // mid-move safe by construction — each page is one always-union
+        // statement over live + archive, a row lives in exactly one table at
+        // any snapshot (the move is atomic), and the keyset cursor values
+        // travel with the rows. No per-page location resolution needed.
         let batch_result = sqlx::query!(
             r#"
-            SELECT id
+            SELECT id,
+                   COALESCE(
+                       archive_bucket,
+                       date_trunc('week', created_at AT TIME ZONE 'UTC')::date
+                   ) AS "bucket!"
             FROM batches
             WHERE output_file_id = $1
             "#,
@@ -6381,8 +6392,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         .fetch_one(crate::db::RetryingPgPool::new(&pool, &retry_config))
         .await;
 
-        let batch_id = match batch_result {
-            Ok(row) => row.id,
+        let (batch_id, bucket) = match batch_result {
+            Ok(row) => (row.id, row.bucket),
             Err(e) => {
                 let _ = tx
                     .send(Err(FusilladeError::Other(anyhow!(
@@ -6411,14 +6422,28 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             };
             is_first_batch = false;
 
+            // Predicates live INSIDE each union arm so both sides use their
+            // (batch_id, completed_at, id)-shaped indexes and the archive arm
+            // prunes to one partition via the bucket equality.
             let request_batch = sqlx::query!(
                 r#"
-                SELECT id, custom_id, response_status, response_body, completed_at
-                FROM requests
-                WHERE batch_id = $1
-                  AND state = 'completed'
-                  AND ($2::TIMESTAMPTZ IS NULL OR completed_at > $2 OR (completed_at = $2 AND id > $3))
-                  AND ($6::text IS NULL OR LOWER(custom_id) LIKE $6)
+                SELECT id AS "id!", custom_id, response_status, response_body, completed_at
+                FROM (
+                    SELECT id, custom_id, response_status, response_body, completed_at
+                    FROM requests
+                    WHERE batch_id = $1
+                      AND state = 'completed'
+                      AND ($2::TIMESTAMPTZ IS NULL OR completed_at > $2 OR (completed_at = $2 AND id > $3))
+                      AND ($6::text IS NULL OR LOWER(custom_id) LIKE $6)
+                    UNION ALL
+                    SELECT id, custom_id, response_status, response_body, completed_at
+                    FROM batch_requests_archive
+                    WHERE archive_bucket = $7
+                      AND batch_id = $1
+                      AND state = 'completed'
+                      AND ($2::TIMESTAMPTZ IS NULL OR completed_at > $2 OR (completed_at = $2 AND id > $3))
+                      AND ($6::text IS NULL OR LOWER(custom_id) LIKE $6)
+                ) u
                 ORDER BY completed_at ASC, id ASC
                 OFFSET $4
                 LIMIT $5
@@ -6429,6 +6454,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 offset_val,
                 BATCH_SIZE,
                 search_pattern.as_deref(),
+                bucket,
             )
             .fetch_all(crate::db::RetryingPgPool::new(&pool, &retry_config))
             .await;
@@ -6508,9 +6534,15 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         // First, find the batch that owns this error file
         // Note: We allow streaming even for soft-deleted batches since the error file
         // represents completed work that users should be able to download
+        // Same mid-move-safe always-union design as stream_batch_output —
+        // see the comment there.
         let batch_result = sqlx::query!(
             r#"
-            SELECT id, expires_at
+            SELECT id, expires_at,
+                   COALESCE(
+                       archive_bucket,
+                       date_trunc('week', created_at AT TIME ZONE 'UTC')::date
+                   ) AS "bucket!"
             FROM batches
             WHERE error_file_id = $1
             "#,
@@ -6519,8 +6551,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         .fetch_one(crate::db::RetryingPgPool::new(&pool, &retry_config))
         .await;
 
-        let (batch_id, _expires_at) = match batch_result {
-            Ok(row) => (row.id, row.expires_at),
+        let (batch_id, bucket, _expires_at) = match batch_result {
+            Ok(row) => (row.id, row.bucket, row.expires_at),
             Err(e) => {
                 let _ = tx
                     .send(Err(FusilladeError::Other(anyhow!(
@@ -6549,28 +6581,44 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             };
             is_first_batch = false;
 
-            // Build dynamic query with error filter
+            // Build dynamic query with error filter. Two union arms (live +
+            // bucket-pruned archive) with the predicates inside each arm —
+            // see stream_batch_output for the mid-move safety argument.
             let mut query_builder = QueryBuilder::new(
                 r#"
+                SELECT id, custom_id, error, failed_at FROM (
                 SELECT id, custom_id, error, failed_at
                 FROM requests
                 WHERE batch_id = "#,
             );
-            query_builder.push_bind(batch_id);
-            query_builder.push(" AND state = 'failed' AND (");
-            query_builder.push_bind(cursor_time);
-            query_builder.push("::TIMESTAMPTZ IS NULL OR failed_at > ");
-            query_builder.push_bind(cursor_time);
-            query_builder.push(" OR (failed_at = ");
-            query_builder.push_bind(cursor_time);
-            query_builder.push(" AND id > ");
-            query_builder.push_bind(cursor_id);
-            query_builder.push(")) AND (");
-            query_builder.push_bind(search_pattern.as_deref());
-            query_builder.push("::text IS NULL OR LOWER(custom_id) LIKE ");
-            query_builder.push_bind(search_pattern.as_deref());
-            query_builder.push(")");
-            query_builder.push(" ORDER BY failed_at ASC, id ASC OFFSET ");
+            for source in ["live", "archive"] {
+                if source == "archive" {
+                    query_builder.push(
+                        r#"
+                UNION ALL
+                SELECT id, custom_id, error, failed_at
+                FROM batch_requests_archive
+                WHERE archive_bucket = "#,
+                    );
+                    query_builder.push_bind(bucket);
+                    query_builder.push(" AND batch_id = ");
+                }
+                query_builder.push_bind(batch_id);
+                query_builder.push(" AND state = 'failed' AND (");
+                query_builder.push_bind(cursor_time);
+                query_builder.push("::TIMESTAMPTZ IS NULL OR failed_at > ");
+                query_builder.push_bind(cursor_time);
+                query_builder.push(" OR (failed_at = ");
+                query_builder.push_bind(cursor_time);
+                query_builder.push(" AND id > ");
+                query_builder.push_bind(cursor_id);
+                query_builder.push(")) AND (");
+                query_builder.push_bind(search_pattern.as_deref());
+                query_builder.push("::text IS NULL OR LOWER(custom_id) LIKE ");
+                query_builder.push_bind(search_pattern.as_deref());
+                query_builder.push(")");
+            }
+            query_builder.push(" ) u ORDER BY failed_at ASC, id ASC OFFSET ");
             query_builder.push_bind(offset_val);
             query_builder.push(" LIMIT ");
             query_builder.push_bind(BATCH_SIZE);
@@ -10771,6 +10819,137 @@ mod tests {
         let (location, _, live, _) = archive_state(&pool, batch_id).await;
         assert_eq!(location, "live");
         assert_eq!(live, 2);
+    }
+
+    /// Downloads must serve archived batches transparently: the page query
+    /// is an always-union over live + bucket-pruned archive, so a fully
+    /// archived batch streams byte-identically to a live one.
+    #[sqlx::test]
+    async fn test_download_streams_serve_archived_batches(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_freeze_test_batch(&manager, "dl-arch", 3).await;
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200,
+             response_body = '{\"ok\":true}'
+             WHERE batch_id = $1 AND id IN (SELECT id FROM requests WHERE batch_id = $1 ORDER BY id LIMIT 2)",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "UPDATE requests SET state = 'failed', failed_at = NOW(), error = '{\"type\":\"test\"}'
+             WHERE batch_id = $1 AND state <> 'completed'",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager.get_batch(batch_id).await.unwrap(); // freeze
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 3 }
+        );
+
+        let b = sqlx::query!(
+            r#"SELECT output_file_id AS "o!", error_file_id AS "e!" FROM batches WHERE id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let output: Vec<_> = manager
+            .get_file_content_stream(FileId(b.o), 0, None)
+            .collect()
+            .await;
+        assert_eq!(output.len(), 2, "archived completions must stream");
+        for item in &output {
+            assert!(matches!(item.as_ref().unwrap(), FileContentItem::Output(_)));
+        }
+
+        let errors: Vec<_> = manager
+            .get_file_content_stream(FileId(b.e), 0, None)
+            .collect()
+            .await;
+        assert_eq!(errors.len(), 1, "archived failures must stream");
+    }
+
+    /// A partially-downloaded batch that archives between reads must
+    /// continue exactly where it left off: the keyset values travel with the
+    /// rows, and the union sees each row exactly once wherever it lives.
+    /// (The intra-stream page cursor takes the same union SQL path as the
+    /// offset used here; pages are 1000 rows, so the flip between pages and
+    /// the flip between streams are the same shape.)
+    #[sqlx::test]
+    async fn test_download_continues_across_archive_move(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_freeze_test_batch(&manager, "dl-flip", 3).await;
+        // Distinct completed_at values pin the keyset order.
+        sqlx::query!(
+            r#"
+            UPDATE requests r SET state = 'completed', response_status = 200,
+                   response_body = '{"n":' || o.rn || '}',
+                   completed_at = NOW() - (10 - o.rn) * INTERVAL '1 second'
+            FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn
+                  FROM requests WHERE batch_id = $1) o
+            WHERE r.id = o.id
+            "#,
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager.get_batch(batch_id).await.unwrap(); // freeze 3/0/0
+
+        let output_file = sqlx::query_scalar!(
+            r#"SELECT output_file_id AS "o!" FROM batches WHERE id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // First two items while the batch is live...
+        let first: Vec<_> = manager
+            .get_file_content_stream(FileId(output_file), 0, None)
+            .take(2)
+            .collect()
+            .await;
+        // ...then the rows move...
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 3 }
+        );
+        // ...and the continuation picks up the third from the archive.
+        let rest: Vec<_> = manager
+            .get_file_content_stream(FileId(output_file), 2, None)
+            .collect()
+            .await;
+        assert_eq!(
+            rest.len(),
+            1,
+            "exactly the one remaining row, no repeats or gaps"
+        );
+
+        let mut ids: Vec<String> = first
+            .iter()
+            .chain(rest.iter())
+            .map(|r| match r.as_ref().unwrap() {
+                FileContentItem::Output(o) => o.id.clone(),
+                other => panic!("expected output item, got {other:?}"),
+            })
+            .collect();
+        let total = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "3 distinct rows across the flip");
+        assert_eq!(total, 3);
     }
 
     /// Full archive round trip through retry: archive a mixed batch, retry
