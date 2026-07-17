@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v2.0.1...fusillade-arsenal-v2.1.0) (2026-07-17)
+
+
+### Features
+
+* batch archive moves ([#359](https://github.com/doublewordai/fusillade/issues/359)) ([10308dc](https://github.com/doublewordai/fusillade/commit/10308dc828b9fe8aada604acc892465fb9d169c0))
+
 ## [2.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v2.0.0...fusillade-arsenal-v2.0.1) (2026-07-17)
 
 
