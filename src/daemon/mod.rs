@@ -1388,6 +1388,21 @@ where
                 let shutdown_token = self.shutdown_token.clone();
                 let grace = self.config.batch_archive_cancel_grace_secs;
                 tokio::spawn(async move {
+                    // Misconfiguration guard: interval 0 would busy-loop the
+                    // DB, and per_tick <= 0 defeats "bounded per tick"
+                    // (Postgres treats LIMIT -1 as unlimited). Disable the
+                    // worker loudly rather than run it dangerously.
+                    if interval_ms == 0 || per_tick <= 0 {
+                        crate::background_error!(
+                            "archive_mover_invalid_config",
+                            Error,
+                            worker,
+                            interval_ms,
+                            per_tick,
+                            "Batch-archive mover disabled due to invalid config"
+                        );
+                        return;
+                    }
                     tracing::info!(worker, interval_ms, per_tick, "Batch-archive mover started");
                     loop {
                         tokio::select! {

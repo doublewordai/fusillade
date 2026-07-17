@@ -891,11 +891,13 @@ pub trait DaemonStorage: Send + Sync {
     async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome>;
 
     /// List batches eligible for archiving (`location = 'live'`, counts
-    /// frozen, not soft-deleted). `oldest_first = true` is the
-    /// historical-backfill order — the least-recently-created batches are
-    /// the least likely to ever be read again, so early-ramp issues have
-    /// minimal blast radius. The steady-state sweeper uses newest-first so
-    /// just-terminalized batches move promptly.
+    /// frozen, not soft-deleted). Both production movers — the steady-state
+    /// sweeper AND the historical backfill — pass `oldest_first = true`: in
+    /// steady state the sweeper drains its whole candidate set every few
+    /// ticks so order is cosmetic, and under any backlog the
+    /// least-recently-created batches are the least likely to ever be read
+    /// again, so early issues have minimal blast radius. `false`
+    /// (newest-first) exists as an ordering choice for other callers.
     ///
     /// `cancel_grace_secs` is the cancellation grace window: a batch is NOT
     /// a candidate while it has canceled rows that were IN FLIGHT at cancel
