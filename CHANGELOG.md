@@ -1,5 +1,12 @@
 # Changelog
 
+## [21.2.1](https://github.com/doublewordai/fusillade/compare/fusillade-v21.2.0...fusillade-v21.2.1) (2026-07-17)
+
+
+### Bug Fixes
+
+* terminal request states are immutable to the daemon persist path ([#353](https://github.com/doublewordai/fusillade/issues/353)) ([86cb76c](https://github.com/doublewordai/fusillade/commit/86cb76ccfb235a49c628bfaf731ea6d86ddb01cd))
+
 ## [21.2.0](https://github.com/doublewordai/fusillade/compare/fusillade-v21.1.3...fusillade-v21.2.0) (2026-07-16)
 
 
