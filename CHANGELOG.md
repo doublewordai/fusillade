@@ -1,5 +1,16 @@
 # Changelog
 
+## [22.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v21.2.1...fusillade-v22.0.0) (2026-07-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* record real duration for synthesized realtime rows ([#347](https://github.com/doublewordai/fusillade/issues/347))
+
+### Bug Fixes
+
+* record real duration for synthesized realtime rows ([#347](https://github.com/doublewordai/fusillade/issues/347)) ([3e2ff39](https://github.com/doublewordai/fusillade/commit/3e2ff39423ed6b6a2f7b9761c0cecadf7f4e906d))
+
 ## [21.2.1](https://github.com/doublewordai/fusillade/compare/fusillade-v21.2.0...fusillade-v21.2.1) (2026-07-17)
 
 
