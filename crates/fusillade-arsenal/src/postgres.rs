@@ -7251,30 +7251,54 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         &self,
         limit: i64,
         oldest_first: bool,
+        cancel_grace_secs: f64,
     ) -> Result<Vec<BatchId>> {
         // Served by idx_batches_archivable (partial on the exact predicate);
-        // ORDER BY created_at rides the index in either direction.
+        // ORDER BY created_at rides the index in either direction. The
+        // NOT EXISTS is the cancellation grace window (see the trait doc):
+        // canceled rows with claimed_at set were IN FLIGHT at cancel and
+        // their billed results may still supersede the cancel on the LIVE
+        // row — the batch must not move until that window has passed. The
+        // probe rides idx_requests_batch_state and finds rows only on
+        // recently-cancelled batches, so normal candidates pay one empty
+        // index probe.
         let rows = if oldest_first {
             sqlx::query_scalar!(
                 r#"
-                SELECT id FROM batches
-                WHERE location = 'live' AND counts_frozen_at IS NOT NULL AND deleted_at IS NULL
-                ORDER BY created_at ASC, id ASC
+                SELECT id FROM batches b
+                WHERE b.location = 'live' AND b.counts_frozen_at IS NOT NULL AND b.deleted_at IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM requests r
+                      WHERE r.batch_id = b.id
+                        AND r.state = 'canceled'
+                        AND r.claimed_at IS NOT NULL
+                        AND r.canceled_at > NOW() - make_interval(secs => $2)
+                  )
+                ORDER BY b.created_at ASC, b.id ASC
                 LIMIT $1
                 "#,
                 limit,
+                cancel_grace_secs,
             )
             .fetch_all(self.read_executor())
             .await
         } else {
             sqlx::query_scalar!(
                 r#"
-                SELECT id FROM batches
-                WHERE location = 'live' AND counts_frozen_at IS NOT NULL AND deleted_at IS NULL
-                ORDER BY created_at DESC, id DESC
+                SELECT id FROM batches b
+                WHERE b.location = 'live' AND b.counts_frozen_at IS NOT NULL AND b.deleted_at IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM requests r
+                      WHERE r.batch_id = b.id
+                        AND r.state = 'canceled'
+                        AND r.claimed_at IS NOT NULL
+                        AND r.canceled_at > NOW() - make_interval(secs => $2)
+                  )
+                ORDER BY b.created_at DESC, b.id DESC
                 LIMIT $1
                 "#,
                 limit,
+                cancel_grace_secs,
             )
             .fetch_all(self.read_executor())
             .await
@@ -10620,6 +10644,67 @@ mod tests {
         assert_eq!(live, 2);
     }
 
+    /// The cancellation grace window: a frozen batch with recently-canceled
+    /// IN-FLIGHT rows (claimed_at set — the cascade leaves daemon fields
+    /// intact) must not be an archive candidate until the grace passes, so
+    /// late billed results can still supersede the cancel on the live row.
+    /// Pending-canceled rows (claimed_at NULL) never delay archiving.
+    #[sqlx::test]
+    async fn test_archive_candidates_respect_cancel_grace(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        // Batch A: one row canceled WHILE IN FLIGHT (claimed_at set), 5 min ago.
+        let in_flight = setup_freeze_test_batch(&manager, "grace-inflight", 1).await;
+        sqlx::query!(
+            "UPDATE requests SET state = 'canceled', canceled_at = NOW() - INTERVAL '5 minutes',
+             claimed_at = NOW() - INTERVAL '6 minutes' WHERE batch_id = $1",
+            *in_flight as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager.get_batch(in_flight).await.unwrap(); // freeze
+
+        // Batch B: one row canceled while PENDING (claimed_at NULL), 5 min ago.
+        let pending_cancel = setup_freeze_test_batch(&manager, "grace-pending", 1).await;
+        sqlx::query!(
+            "UPDATE requests SET state = 'canceled', canceled_at = NOW() - INTERVAL '5 minutes',
+             claimed_at = NULL WHERE batch_id = $1",
+            *pending_cancel as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager.get_batch(pending_cancel).await.unwrap(); // freeze
+
+        // 10-minute grace: A is held back, B archives immediately.
+        let candidates = manager
+            .list_archivable_batches(10, true, 600.0)
+            .await
+            .unwrap();
+        assert!(
+            !candidates.contains(&in_flight),
+            "in-flight-canceled row inside the grace must hold the batch back"
+        );
+        assert!(
+            candidates.contains(&pending_cancel),
+            "pending-canceled rows never delay archiving"
+        );
+
+        // 2-minute grace (row canceled 5 min ago): A becomes a candidate.
+        let candidates = manager
+            .list_archivable_batches(10, true, 120.0)
+            .await
+            .unwrap();
+        assert!(
+            candidates.contains(&in_flight),
+            "once the grace passes, the batch archives normally"
+        );
+    }
+
     #[sqlx::test]
     async fn test_list_archivable_batches_membership_and_order(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
@@ -10650,11 +10735,17 @@ mod tests {
         .await
         .unwrap();
 
-        let oldest = manager.list_archivable_batches(10, true).await.unwrap();
+        let oldest = manager
+            .list_archivable_batches(10, true, 0.0)
+            .await
+            .unwrap();
         assert_eq!(oldest, vec![old, mid, new], "oldest-first backfill order");
-        let newest = manager.list_archivable_batches(10, false).await.unwrap();
+        let newest = manager
+            .list_archivable_batches(10, false, 0.0)
+            .await
+            .unwrap();
         assert_eq!(newest, vec![new, mid, old], "newest-first sweeper order");
-        let limited = manager.list_archivable_batches(1, true).await.unwrap();
+        let limited = manager.list_archivable_batches(1, true, 0.0).await.unwrap();
         assert_eq!(limited, vec![old]);
         // Backdated weeks predate the bootstrap partitions (test DBs cover
         // current week + 4 only) — create them the way the maintenance path
@@ -10681,7 +10772,10 @@ mod tests {
             manager.archive_batch(old).await.unwrap(),
             ArchiveOutcome::Archived { rows: 1 }
         );
-        let after = manager.list_archivable_batches(10, true).await.unwrap();
+        let after = manager
+            .list_archivable_batches(10, true, 0.0)
+            .await
+            .unwrap();
         assert_eq!(after, vec![mid, new]);
     }
 

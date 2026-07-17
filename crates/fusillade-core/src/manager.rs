@@ -895,8 +895,27 @@ pub trait DaemonStorage: Send + Sync {
     /// the least likely to ever be read again, so early-ramp issues have
     /// minimal blast radius. The steady-state sweeper uses newest-first so
     /// just-terminalized batches move promptly.
-    async fn list_archivable_batches(&self, limit: i64, oldest_first: bool)
-    -> Result<Vec<BatchId>>;
+    ///
+    /// `cancel_grace_secs` is the cancellation grace window: a batch is NOT
+    /// a candidate while it has canceled rows that were IN FLIGHT at cancel
+    /// (the cascade leaves `claimed_at` set on them; pending-canceled rows
+    /// have it NULL) with `canceled_at` younger than the grace. Cancellation
+    /// is async and best-effort, and billed in-flight results SUPERSEDE the
+    /// cancel (see the persist() transition matrix, fusillade 21.2.1) — the
+    /// supersede lands on the LIVE row, so the rows must not move until all
+    /// in-flight work has had time to declare itself. Default the grace to
+    /// the processing timeout (~10 min): only cancelled batches archive
+    /// later, fully served from live meanwhile; normal batches have no such
+    /// rows and are unaffected. A frozen batch can never GAIN such a row
+    /// (the cascade only touches non-terminal rows and freezing requires
+    /// all-terminal), so this selection-time check cannot be raced by the
+    /// move itself.
+    async fn list_archivable_batches(
+        &self,
+        limit: i64,
+        oldest_first: bool,
+        cancel_grace_secs: f64,
+    ) -> Result<Vec<BatchId>>;
 
     /// Purge old `model_filters` events, ALWAYS retaining, per model, the most
     /// recent `keep_per_model` events (so the current-state lookup and a short
