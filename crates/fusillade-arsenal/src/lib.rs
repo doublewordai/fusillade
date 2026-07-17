@@ -60,6 +60,11 @@ pub struct PostgresStorageConfig {
     pub urgency_weight: f64,
     #[serde(default)]
     pub batch_claim_require_live: bool,
+    /// Per-model in-flight ceiling below which explicitly requested background
+    /// backlog is exposed by pending-count queries. Zero hides background
+    /// demand and disables processing at the daemon layer.
+    #[serde(default)]
+    pub background_concurrency_limit: usize,
     #[serde(default = "default_leaks_per_window")]
     pub leaks_per_window: f64,
     #[serde(default = "default_model_filters_keep_per_model")]
@@ -119,6 +124,7 @@ impl Default for PostgresStorageConfig {
             claim_ramp_exponent: default_claim_ramp_exponent(),
             urgency_weight: 0.0,
             batch_claim_require_live: false,
+            background_concurrency_limit: 0,
             leaks_per_window: default_leaks_per_window(),
             model_filters_keep_per_model: default_model_filters_keep_per_model(),
             model_filters_retention_ms: default_model_filters_retention_ms(),
