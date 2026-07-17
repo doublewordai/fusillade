@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v2.0.0...fusillade-arsenal-v2.0.1) (2026-07-17)
+
+
+### Bug Fixes
+
+* resolve internal dependency requirements against the 2.0.0 major release ([#357](https://github.com/doublewordai/fusillade/issues/357)) ([0f30346](https://github.com/doublewordai/fusillade/commit/0f3034615b4abd2170e506040b8758071249fb10))
+
+## [2.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v1.2.1...fusillade-arsenal-v2.0.0) (2026-07-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* record real duration for synthesized realtime rows ([#347](https://github.com/doublewordai/fusillade/issues/347))
+
+### Bug Fixes
+
+* record real duration for synthesized realtime rows ([#347](https://github.com/doublewordai/fusillade/issues/347)) ([3e2ff39](https://github.com/doublewordai/fusillade/commit/3e2ff39423ed6b6a2f7b9761c0cecadf7f4e906d))
+
 ## [1.2.1](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v1.2.0...fusillade-arsenal-v1.2.1) (2026-07-17)
 
 
