@@ -2473,16 +2473,30 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let rows = sqlx::query!(
             r#"
             SELECT
-                r.id, r.batch_id as "batch_id!", r.template_id as "template_id?", r.state,
+                r.id as "id!", r.batch_id as "batch_id!", r.template_id as "template_id?", r.state as "state!",
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
                 t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
-                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
+                r.retry_attempt as "retry_attempt!", r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at, r.routed_model
-            FROM requests r
+            FROM (
+                -- Live-first union: a row lives in exactly one table, so the
+                -- union yields each id at most once. The archive arm has no
+                -- bucket to prune by (ids arrive without batch context) and
+                -- plans as an Append of cheap per-partition index probes —
+                -- fine for this admin/detail-shaped path.
+                SELECT id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
+                       claimed_at, started_at, response_status, response_body, completed_at,
+                       error, failed_at, canceled_at, routed_model
+                FROM requests WHERE id = ANY($1)
+                UNION ALL
+                SELECT id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
+                       claimed_at, started_at, response_status, response_body, completed_at,
+                       error, failed_at, canceled_at, routed_model
+                FROM batch_requests_archive WHERE id = ANY($1)
+            ) r
             LEFT JOIN active_request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
-            WHERE r.id = ANY($1)
             "#,
             &uuid_ids,
         )
@@ -4603,6 +4617,51 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
             })?;
 
+            // Phase 3: failed rows of ARCHIVED batches live in the archive —
+            // move them back as pending first (same one-step re-pend shape as
+            // the batch retry move-back; guarded delete keeps a row in
+            // exactly one table; ON CONFLICT keeps a crash-replay idempotent).
+            let unarchived: Vec<Uuid> = sqlx::query_scalar!(
+                r#"
+                INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, not_before,
+                                      daemon_id, claimed_at, started_at, response_status, response_body,
+                                      completed_at, error, failed_at, canceled_at, created_at, updated_at,
+                                      custom_id, model, response_size, routed_model, service_tier, created_by)
+                SELECT id, batch_id, template_id, 'pending', 0, NULL,
+                       NULL, NULL, NULL, NULL, NULL,
+                       NULL, NULL, NULL, NULL, created_at, NOW(),
+                       custom_id, model, 0, NULL, service_tier, created_by
+                FROM batch_requests_archive
+                WHERE id = ANY($1) AND state = 'failed'
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id
+                "#,
+                &retry_ids,
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to move archived rows back for retry: {}", e))
+            })?;
+            if !unarchived.is_empty() {
+                sqlx::query!(
+                    r#"
+                    DELETE FROM batch_requests_archive a
+                    WHERE a.id = ANY($1) AND a.state = 'failed'
+                      AND EXISTS (SELECT 1 FROM requests r WHERE r.id = a.id)
+                    "#,
+                    &unarchived,
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!(
+                        "Failed to delete moved-back archive rows: {}",
+                        e
+                    ))
+                })?;
+            }
+
             // The state = 'failed' re-check makes concurrently changed rows
             // drop out (reported as InvalidState below via RETURNING).
             let repended: Vec<Uuid> = sqlx::query_scalar!(
@@ -4632,7 +4691,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to retry failed requests: {}", e))
             })?;
-            let repended: std::collections::HashSet<Uuid> = repended.into_iter().collect();
+            let repended: std::collections::HashSet<Uuid> =
+                repended.into_iter().chain(unarchived).collect();
 
             let batch_ids: Vec<Uuid> = retryable
                 .iter()
@@ -4644,7 +4704,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             if !batch_ids.is_empty() {
                 sqlx::query!(
                     r#"
-                    UPDATE batches
+                    UPDATE batches b
                     SET completed_at = NULL,
                         failed_at = NULL,
                         finalizing_at = NULL,
@@ -4655,8 +4715,20 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         completed_requests = 0,
                         failed_requests = 0,
                         canceled_requests = 0,
-                        retry_version = retry_version + 1
-                    WHERE id = ANY($1)
+                        retry_version = retry_version + 1,
+                        -- Same phase 3 routing transition as the batch retry:
+                        -- archived parents of moved-back rows become 'split'
+                        -- (or fully 'live' if the archive side emptied);
+                        -- archive_bucket is never cleared.
+                        location = CASE
+                            WHEN b.location = 'live' THEN 'live'
+                            WHEN EXISTS (
+                                SELECT 1 FROM batch_requests_archive a
+                                WHERE a.archive_bucket = b.archive_bucket AND a.batch_id = b.id
+                            ) THEN 'split'
+                            ELSE 'live'
+                        END
+                    WHERE b.id = ANY($1)
                     "#,
                     &batch_ids,
                 )
@@ -4908,16 +4980,34 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let rows = sqlx::query!(
             r#"
             SELECT
-                r.id, r.batch_id as "batch_id!", r.template_id as "template_id?", r.state,
+                r.id as "id!", r.batch_id as "batch_id!", r.template_id as "template_id?", r.state as "state!",
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
                 t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
-                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
+                r.retry_attempt as "retry_attempt!", r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at, r.routed_model
-            FROM requests r
+            FROM (
+                -- Always-union over live + bucket-pruned archive: correct for
+                -- live, archived, and split batches alike (a row lives in
+                -- exactly one table). The archive arm resolves the bucket
+                -- from the batch row, so it prunes to one partition; for a
+                -- never-archived batch the bucket is NULL and the arm is
+                -- empty.
+                SELECT id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
+                       claimed_at, started_at, response_status, response_body, completed_at,
+                       error, failed_at, canceled_at, routed_model, created_at
+                FROM requests WHERE batch_id = $1
+                UNION ALL
+                SELECT a.id, a.batch_id, a.template_id, a.state, a.retry_attempt, a.not_before, a.daemon_id,
+                       a.claimed_at, a.started_at, a.response_status, a.response_body, a.completed_at,
+                       a.error, a.failed_at, a.canceled_at, a.routed_model, a.created_at
+                FROM batch_requests_archive a
+                WHERE a.archive_bucket = (SELECT archive_bucket FROM batches WHERE id = $1)
+                  AND a.batch_id = $1
+            ) r
             LEFT JOIN active_request_templates t ON r.template_id = t.id
             JOIN batches b ON r.batch_id = b.id
-            WHERE r.batch_id = $1 AND b.deleted_at IS NULL
+            WHERE b.deleted_at IS NULL
             ORDER BY r.created_at ASC
             "#,
             *batch_id as Uuid,
@@ -6158,8 +6248,20 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                           c.completed_requests, c.failed_requests, c.canceled_requests,
                           c.pending_requests, c.in_progress_requests
             )
-            SELECT u.*,
-                   f.name as input_file_name,
+            SELECT u.id AS "id!", u.file_id, u.endpoint AS "endpoint!",
+                   u.completion_window AS "completion_window!", u.metadata,
+                   u.output_file_id, u.error_file_id, u.created_by AS "created_by!",
+                   u.created_at AS "created_at!", u.expires_at AS "expires_at!", u.cancelling_at,
+                   u.errors, u.total_requests AS "total_requests!",
+                   u.requests_started_at, u.finalizing_at, u.completed_at,
+                   u.failed_at, u.cancelled_at, u.deleted_at,
+                   u.notification_sent_at, u.api_key_id,
+                   u.completed_requests AS "completed_requests!",
+                   u.failed_requests AS "failed_requests!",
+                   u.canceled_requests AS "canceled_requests!",
+                   u.pending_requests AS "pending_requests!",
+                   u.in_progress_requests AS "in_progress_requests!",
+                   f.name AS "input_file_name?",
                    f.description as input_file_description,
                    (SELECT string_agg(DISTINCT r.model, ', ') FROM requests r WHERE r.batch_id = u.id) as model
             FROM updated u
@@ -6197,11 +6299,11 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     deleted_at: row.deleted_at,
                     notification_sent_at: row.notification_sent_at,
                     api_key_id: row.api_key_id,
-                    pending_requests: row.pending_requests.unwrap_or(0),
-                    in_progress_requests: row.in_progress_requests.unwrap_or(0),
-                    completed_requests: row.completed_requests.unwrap_or(0),
-                    failed_requests: row.failed_requests.unwrap_or(0),
-                    canceled_requests: row.canceled_requests.unwrap_or(0),
+                    pending_requests: row.pending_requests,
+                    in_progress_requests: row.in_progress_requests,
+                    completed_requests: row.completed_requests,
+                    failed_requests: row.failed_requests,
+                    canceled_requests: row.canceled_requests,
                 },
                 model: row.model.unwrap_or_default(),
                 input_file_name: row.input_file_name,
@@ -7213,6 +7315,37 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge orphaned requests: {}", e)))?
         .rows_affected() as i64;
 
+        // Step 1b: the ARCHIVE twin of step 1 — compliance, not optimization.
+        // After a batch's rows move to batch_requests_archive, the erasure
+        // payload (prompt/response bodies) lives THERE; a purge that only
+        // reached `requests` would silently stop erasing anything for
+        // archived batches. Same tombstone-driven chunked pattern, and the
+        // bucket equality prunes each batch's delete to one partition.
+        let archived_deleted = sqlx::query!(
+            r#"
+            DELETE FROM batch_requests_archive
+            WHERE (id, archive_bucket) IN (
+                SELECT a.id, a.archive_bucket
+                FROM (SELECT id, archive_bucket FROM batches
+                      WHERE deleted_at IS NOT NULL AND archive_bucket IS NOT NULL) b,
+                LATERAL (
+                    SELECT id, archive_bucket FROM batch_requests_archive
+                    WHERE archive_bucket = b.archive_bucket AND batch_id = b.id
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                ) a
+                LIMIT $1
+            )
+            "#,
+            batch_size,
+        )
+        .execute(self.write_executor())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to purge orphaned archived requests: {}", e))
+        })?
+        .rows_affected() as i64;
+
         // Step 2: Delete request_templates whose parent file has been soft-deleted.
         // Note: delete_file already cancels dependent batches and unlinks them (sets
         // file_id = NULL on batches) without deleting the batches or their requests,
@@ -7244,9 +7377,14 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         })?
         .rows_affected() as i64;
 
-        let total = (requests_deleted + templates_deleted) as u64;
+        let total = (requests_deleted + archived_deleted + templates_deleted) as u64;
         if total > 0 {
-            tracing::info!(requests_deleted, templates_deleted, "Purged orphaned rows");
+            tracing::info!(
+                requests_deleted,
+                archived_deleted,
+                templates_deleted,
+                "Purged orphaned rows"
+            );
         }
 
         Ok(total)
@@ -10819,6 +10957,121 @@ mod tests {
         let (location, _, live, _) = archive_state(&pool, batch_id).await;
         assert_eq!(location, "live");
         assert_eq!(live, 2);
+    }
+
+    /// Archived batches stay fully readable: get_batch_requests and
+    /// get_requests union the archive, per-id retry moves archived failed
+    /// rows back (parent goes split), and the orphan purge erases archive
+    /// rows for deleted batches (right-to-erasure covers the archive).
+    #[sqlx::test]
+    async fn test_archived_batch_reads_retry_and_purge(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_freeze_test_batch(&manager, "reads-arch", 3).await;
+        // Synthetic terminal rows carry the full daemon lifecycle stamps —
+        // the AnyRequest parser (rightly) requires them.
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', claimed_at = NOW(), started_at = NOW(),
+             completed_at = NOW(), response_status = 200, response_body = '{}',
+             daemon_id = gen_random_uuid()
+             WHERE batch_id = $1 AND id IN (SELECT id FROM requests WHERE batch_id = $1 ORDER BY id LIMIT 2)",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "UPDATE requests SET state = 'failed', failed_at = NOW(),
+             error = '{\"type\":\"non_retriable_http_status\",\"status\":500,\"body\":\"boom\"}'
+             WHERE batch_id = $1 AND state <> 'completed'",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager.get_batch(batch_id).await.unwrap();
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 3 }
+        );
+
+        // get_batch_requests sees all archived rows.
+        let rows = manager.get_batch_requests(batch_id).await.unwrap();
+        assert_eq!(rows.len(), 3, "archived rows must remain listable");
+        let failed_id = rows
+            .iter()
+            .find_map(|r| match r {
+                AnyRequest::Failed(req) => Some(req.data.id),
+                _ => None,
+            })
+            .expect("the failed row must be visible");
+
+        // get_requests resolves archived ids too.
+        let fetched = manager.get_requests(vec![failed_id]).await.unwrap();
+        assert!(matches!(fetched[0], Ok(AnyRequest::Failed(_))));
+
+        // Per-id retry moves the archived failed row back; parent splits.
+        let results = manager
+            .retry_failed_requests(vec![failed_id])
+            .await
+            .unwrap();
+        assert!(
+            results[0].is_ok(),
+            "archived failed row must be retryable: {:?}",
+            results[0]
+        );
+        let b = sqlx::query!(
+            r#"SELECT location, retry_version, counts_frozen_at,
+                      (SELECT COUNT(*) FROM requests WHERE batch_id = $1 AND state = 'pending') AS "pending!",
+                      (SELECT COUNT(*) FROM batch_requests_archive WHERE batch_id = $1) AS "archived!"
+               FROM batches WHERE id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(b.location, "split");
+        assert_eq!((b.pending, b.archived), (1, 2));
+        assert!(b.counts_frozen_at.is_none());
+        assert_eq!(b.retry_version, 1);
+
+        // Re-terminalize + re-archive, then delete the batch: the purge must
+        // erase the ARCHIVE rows (compliance: the erasure payload lives
+        // there after the move).
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', claimed_at = NOW(), started_at = NOW(),
+             completed_at = NOW(), response_status = 200, response_body = '{}',
+             error = NULL, failed_at = NULL, daemon_id = gen_random_uuid()
+             WHERE batch_id = $1 AND state = 'pending'",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager.get_batch(batch_id).await.unwrap();
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 1 }
+        );
+        sqlx::query!(
+            "UPDATE batches SET deleted_at = NOW() WHERE id = $1",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let purged = manager.purge_orphaned_rows(100).await.unwrap();
+        assert!(purged >= 3, "purge must erase archived rows, got {purged}");
+        let remaining: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "c!" FROM batch_requests_archive WHERE batch_id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "right-to-erasure must reach the archive");
     }
 
     /// Downloads must serve archived batches transparently: the page query
