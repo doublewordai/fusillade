@@ -7594,7 +7594,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             sqlx::query_scalar!(
                 r#"
                 SELECT id FROM batches b
-                WHERE b.location = 'live' AND b.counts_frozen_at IS NOT NULL AND b.deleted_at IS NULL
+                WHERE b.location IN ('live', 'split') AND b.counts_frozen_at IS NOT NULL AND b.deleted_at IS NULL
                   AND b.counts_frozen_at <= NOW() - make_interval(secs => $3)
                   AND NOT EXISTS (
                       SELECT 1 FROM requests r
@@ -7616,7 +7616,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             sqlx::query_scalar!(
                 r#"
                 SELECT id FROM batches b
-                WHERE b.location = 'live' AND b.counts_frozen_at IS NOT NULL AND b.deleted_at IS NULL
+                WHERE b.location IN ('live', 'split') AND b.counts_frozen_at IS NOT NULL AND b.deleted_at IS NULL
                   AND b.counts_frozen_at <= NOW() - make_interval(secs => $3)
                   AND NOT EXISTS (
                       SELECT 1 FROM requests r
@@ -7644,7 +7644,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         sqlx::query_scalar!(
             r#"
             SELECT COUNT(*) AS "count!" FROM batches b
-            WHERE b.location = 'live' AND b.counts_frozen_at IS NOT NULL AND b.deleted_at IS NULL
+            WHERE b.location IN ('live', 'split') AND b.counts_frozen_at IS NOT NULL AND b.deleted_at IS NULL
               AND NOT EXISTS (
                   SELECT 1 FROM requests r
                   WHERE r.batch_id = b.id
@@ -11357,7 +11357,17 @@ mod tests {
         assert!(frozen.f, "split batch must re-freeze once resumed");
         assert_eq!((frozen.completed_requests, frozen.failed_requests), (3, 0));
 
-        // Re-archive: remaining live row moves into the SAME bucket.
+        // Re-archive: the re-frozen split batch must surface through the
+        // CANDIDATE LISTING (the sweeper's path — location IN (live, split)),
+        // and the remaining live row moves into the SAME bucket.
+        let candidates = manager
+            .list_archivable_batches(50, true, 0.0, 0.0)
+            .await
+            .unwrap();
+        assert!(
+            candidates.contains(&batch_id),
+            "re-frozen split batch must be a sweep candidate"
+        );
         assert_eq!(
             manager.archive_batch(batch_id).await.unwrap(),
             ArchiveOutcome::Archived { rows: 1 }
