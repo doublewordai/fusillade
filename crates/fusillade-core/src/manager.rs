@@ -428,9 +428,10 @@ pub trait Storage: Send + Sync {
     /// - `states`: request states to include (e.g. `["pending"]`, or
     ///   `["pending","claimed","processing"]`).
     /// - `model_filter`: optional model whitelist (empty = all).
-    /// - `service_tier_filter`: filter on `service_tier`. `Any` (default) applies
-    ///   no filter; `Include`/`Exclude` use `Option<String>` where `None`
-    ///   represents the batch tier (`service_tier IS NULL`).
+    /// - `service_tier_filter`: filter on `service_tier`. Background demand is
+    ///   isolated: `Any` and `Exclude` omit it, while `Include` returns it only
+    ///   when `Some("background")` is explicit. `None` represents the batch
+    ///   tier (`service_tier IS NULL`).
     /// - `priority_decay_window`: optional lookback in seconds. When set,
     ///   recently completed `service_tier = 'flex'` requests are added to
     ///   the `"1h"` bucket so realtime traffic can decay out of scheduling

@@ -25,7 +25,8 @@ pub fn service_tier_from_completion_window(completion_window: &str) -> Option<&'
 /// `None` in the inner vec represents the batch tier (`service_tier IS NULL`);
 /// named strings match specific tier values such as `"flex"` or `"priority"`.
 ///
-/// `Default` is `Any` — no filter applied.
+/// `Default` is `Any`. Storage backends isolate the background tier from this
+/// default; callers must explicitly include `Some("background")` to expose it.
 #[derive(Debug, Clone, Default)]
 pub enum ServiceTierFilter {
     /// No filter — match all tiers including batch (NULL).
