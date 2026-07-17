@@ -196,13 +196,17 @@ model. A later SLA arrival can still use the reserved ordinary capacity.
 
 Background processing also requires:
 
-- `DaemonMode::Both`, so request, batch, and background claims share one claim
-  mutex and the same in-memory counters;
-- PostgreSQL storage support for both batch and background claims;
+- PostgreSQL storage support for background claims;
 - an explicit latest `live` model-filter event (no event is not eligible); and
 - `inject_deadline_priority = true`. Background always overwrites caller
   `nvext.agent_hints.priority` with `i32::MIN`; SLA priority is clamped above
   that reserved value.
+
+The background loop can run with any `DaemonMode`. The selected mode controls
+which SLA claim loops share its process-local counters: `RequestOnly` accounts
+for batchless SLA work, `BatchOnly` accounts for batched SLA work, and `Both`
+accounts for both. Database-wide due-SLA gating and exact-live gating apply in
+all modes, and the node-level background priority remains strictly lowest.
 
 Background batches persist `service_tier = "background"` with
 `completion_window = NULL` and `expires_at = NULL`. They do not expire, escalate,
@@ -222,8 +226,8 @@ more conservative when multiple processes share a database.
 
 ## Claim daemons
 
-The daemon runs two SLA claim loops and, when background processing is enabled,
-a third background loop:
+The daemon can run two SLA claim loops and, when background processing is
+enabled, an additional background loop:
 
 - **Request daemon** — claims *batchless* pending rows (flex/async responses).
   Owns the leaky-bucket and deadline-ramp policy: rows for models that are not

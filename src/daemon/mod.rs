@@ -121,16 +121,6 @@ fn claim_loop_kinds_for_mode(
     inject_deadline_priority: bool,
 ) -> Result<Vec<ClaimLoopKind>> {
     if background_enabled {
-        if mode != DaemonMode::Both {
-            return Err(FusilladeError::Other(anyhow::anyhow!(
-                "background processing requires daemon mode 'both' so every SLA claim loop shares capacity"
-            )));
-        }
-        if !supports_batch_claims {
-            return Err(FusilladeError::Other(anyhow::anyhow!(
-                "background processing requires storage support for batch claims"
-            )));
-        }
         if !supports_background_claims {
             return Err(FusilladeError::Other(anyhow::anyhow!(
                 "background processing requires storage support for background claims"
@@ -1087,9 +1077,9 @@ where
     pub async fn run_with_mode(self: Arc<Self>, mode: DaemonMode) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
 
-        // Validate the complete claim topology before registering the daemon or
-        // spawning any maintenance tasks. Background safety depends on all
-        // three loops sharing this process's counters and claim mutex.
+        // Validate the configured claim topology before registering the daemon
+        // or spawning any maintenance tasks. Background shares this process's
+        // counters and claim mutex with whichever SLA loops the mode enables.
         let supports_batch_claims = self.storage.supports_batch_claims();
         let supports_background_claims = self.storage.supports_background_claims();
         let background_enabled = self.config.background_concurrency_limit > 0;
@@ -1648,10 +1638,18 @@ mod tests {
                 ClaimLoopKind::Background,
             ]
         );
-        assert!(
-            claim_loop_kinds_for_mode(DaemonMode::RequestOnly, true, true, true, true).is_err()
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::RequestOnly, false, true, true, true).unwrap(),
+            vec![ClaimLoopKind::Request, ClaimLoopKind::Background]
         );
-        assert!(claim_loop_kinds_for_mode(DaemonMode::Both, false, true, true, true).is_err());
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::BatchOnly, true, true, true, true).unwrap(),
+            vec![ClaimLoopKind::Batch, ClaimLoopKind::Background]
+        );
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::Both, false, true, true, true).unwrap(),
+            vec![ClaimLoopKind::Request, ClaimLoopKind::Background]
+        );
         assert!(claim_loop_kinds_for_mode(DaemonMode::Both, true, false, true, true).is_err());
         assert!(claim_loop_kinds_for_mode(DaemonMode::Both, true, true, true, false).is_err());
     }
