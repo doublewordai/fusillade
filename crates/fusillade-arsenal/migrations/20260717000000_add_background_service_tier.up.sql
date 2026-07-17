@@ -83,4 +83,3 @@ CREATE INDEX IF NOT EXISTS idx_batches_background_active
 ON batches (created_at, id)
 WHERE service_tier = 'background'
   AND deleted_at IS NULL;
-

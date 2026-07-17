@@ -45,4 +45,3 @@ ALTER TABLE batch_requests_archive
     ADD CONSTRAINT requests_service_tier_check
     CHECK (service_tier IN ('auto', 'default', 'flex', 'priority'))
     NOT VALID;
-
