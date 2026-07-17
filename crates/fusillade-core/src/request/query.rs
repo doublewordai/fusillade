@@ -29,7 +29,8 @@ pub fn service_tier_from_completion_window(completion_window: &str) -> Option<&'
 /// default; callers must explicitly include `Some("background")` to expose it.
 #[derive(Debug, Clone, Default)]
 pub enum ServiceTierFilter {
-    /// No filter — match all tiers including batch (NULL).
+    /// No caller-supplied filter. Storage backends include ordinary named tiers
+    /// and the batch tier (NULL), but keep background isolated.
     #[default]
     Any,
     /// Match only rows whose tier is in this set. Empty matches nothing.

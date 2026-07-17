@@ -1584,8 +1584,10 @@ mod tests {
     fn daemon_mode_defaults_to_both_and_roundtrips_through_config() {
         assert_eq!(DaemonConfig::default().mode, DaemonMode::Both);
 
-        let mut config = DaemonConfig::default();
-        config.mode = DaemonMode::BatchOnly;
+        let config = DaemonConfig {
+            mode: DaemonMode::BatchOnly,
+            ..Default::default()
+        };
 
         let json = serde_json::to_value(&config).expect("config should serialize");
         assert_eq!(json["mode"], serde_json::json!("batch_only"));
@@ -1679,7 +1681,10 @@ mod tests {
             sla_dynamo_priority(chrono::DateTime::<chrono::Utc>::MAX_UTC),
             MIN_SLA_DYNAMO_PRIORITY
         );
-        assert!(BACKGROUND_DYNAMO_PRIORITY < MIN_SLA_DYNAMO_PRIORITY);
+        assert!(
+            sla_dynamo_priority(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+                > BACKGROUND_DYNAMO_PRIORITY
+        );
     }
 
     #[test]
