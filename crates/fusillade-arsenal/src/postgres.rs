@@ -515,6 +515,52 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
 // Additional methods for PostgresRequestManager (not part of Storage trait)
 impl<P: PoolProvider> PostgresRequestManager<P> {
+    /// Disambiguate a zero-row `persist()` UPDATE: either the row is gone
+    /// (genuine `RequestNotFound`, the pre-existing contract) or the UPDATE
+    /// was fenced out by a state guard — in which case the late transition
+    /// is DROPPED and persist returns `Ok(None)`.
+    ///
+    /// The transition matrix this backstops (settled with hamish
+    /// 2026-07-16, after the prod incident on batch 2bdfb32f):
+    /// - `completed`/`failed` are HARD terminals: once reached, subsequent
+    ///   daemon persists are dropped here — first terminal result wins
+    ///   (zombie replays, duplicate enqueues).
+    /// - `canceled` is a SOFT terminal and is NOT protected from terminal
+    ///   results: cancellation is async + best-effort, and in-flight work
+    ///   that ran anyway was billed, so persist(Completed/Failed) SUPERSEDES
+    ///   it — see those arms for the atomic frozen-counter repair. A
+    ///   canceled row only lands here from the lifecycle arms
+    ///   (Claimed/Processing), which must not resurrect it into flight, and
+    ///   from persist(Canceled) re-cancels.
+    ///
+    /// Do not "fix" a state-conflict here by weakening the arm guards; the
+    /// guards and this helper are two halves of the same matrix.
+    async fn dropped_or_missing(&self, request_id: RequestId) -> Result<Option<RequestId>> {
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+                .bind(*request_id as Uuid)
+                .fetch_optional(self.write_executor())
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read state after persist miss: {}", e))
+                })?;
+
+        match current {
+            None => Err(FusilladeError::RequestNotFound(request_id)),
+            Some(state) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    current_state = %state,
+                    "Dropped late request transition fenced out by the terminal-state \
+                     guards (duplicate terminal result, or a lifecycle write against a \
+                     terminal row). First terminal result wins; billed results supersede \
+                     cancellation via the Completed/Failed persist arms instead."
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Unclaim stale requests that have been stuck in "claimed" or "processing" states
     /// for longer than the configured timeouts. This handles daemon crashes.
     ///
@@ -2078,6 +2124,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             let result: Result<Option<RequestId>> = async {
                 match any_request {
                     AnyRequest::Pending(req) => {
+                        // DELIBERATELY no terminal-state guard on this arm
+                        // (unlike every arm below): the manual retry path
+                        // uses persist(Pending) to intentionally move a
+                        // terminal `failed` row back to pending (see the
+                        // reschedule_for_retry comment). Daemon-side requeue
+                        // goes through reschedule_for_retry, which carries
+                        // its own state+owner fence.
                         let rows_affected = sqlx::query!(
                             r#"
                             UPDATE requests SET
@@ -2115,6 +2168,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 started_at = NULL,
                                 not_before = NULL
                             WHERE id = $1
+                              AND state NOT IN ('completed', 'failed', 'canceled')
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
@@ -2129,7 +2183,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .rows_affected();
 
                         if rows_affected == 0 {
-                            return Err(FusilladeError::RequestNotFound(req.data.id));
+                            return self.dropped_or_missing(req.data.id).await;
                         }
                     }
                     AnyRequest::Processing(req) => {
@@ -2142,6 +2196,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 claimed_at = $4,
                                 started_at = $5
                             WHERE id = $1
+                              AND state NOT IN ('completed', 'failed', 'canceled')
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
@@ -2157,7 +2212,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .rows_affected();
 
                         if rows_affected == 0 {
-                            return Err(FusilladeError::RequestNotFound(req.data.id));
+                            return self.dropped_or_missing(req.data.id).await;
                         }
                     }
                     AnyRequest::Completed(req) => {
@@ -2167,18 +2222,52 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 FusilladeError::Other(anyhow!("Response body too large"))
                             })?;
 
-                        let rows_affected = sqlx::query!(
+                        // Transition matrix (hamish, 2026-07-16): `canceled` is the
+                        // SOFT terminal — cancellation is async and best-effort, and
+                        // work that ran anyway was billed, so its terminal result
+                        // supersedes the cancel (the user gets what they paid for).
+                        // completed/failed are HARD terminals: only manual retry's
+                        // re-pend may follow them; duplicate terminal persists are
+                        // dropped (first result wins). Superseding a canceled row on
+                        // a FROZEN batch must repair the counters in the SAME atomic
+                        // statement (canceled-1 / completed+1, total conserved) or
+                        // frozen counts drift from the rows — the prod 2026-07-16
+                        // incident (batch 2bdfb32f). If a concurrent retry already
+                        // unfroze the batch, the counter fix no-ops: live recount is
+                        // truth again.
+                        let old_state = sqlx::query_scalar!(
                             r#"
-                            UPDATE requests SET
-                                state = 'completed',
-                                response_status = $2,
-                                response_body = $3,
-                                claimed_at = $4,
-                                started_at = $5,
-                                completed_at = $6,
-                                response_size = $7,
-                                routed_model = $8
-                            WHERE id = $1
+                            WITH prev AS (
+                                SELECT id, state AS old_state, batch_id
+                                FROM requests WHERE id = $1
+                                FOR UPDATE
+                            ),
+                            upd AS (
+                                UPDATE requests r SET
+                                    state = 'completed',
+                                    response_status = $2,
+                                    response_body = $3,
+                                    claimed_at = $4,
+                                    started_at = $5,
+                                    completed_at = $6,
+                                    response_size = $7,
+                                    routed_model = $8,
+                                    canceled_at = NULL
+                                FROM prev
+                                WHERE r.id = prev.id
+                                  AND r.state NOT IN ('completed', 'failed')
+                                RETURNING prev.old_state, prev.batch_id
+                            ),
+                            counter_fix AS (
+                                UPDATE batches b SET
+                                    canceled_requests = b.canceled_requests - 1,
+                                    completed_requests = b.completed_requests + 1
+                                FROM upd
+                                WHERE upd.old_state = 'canceled'
+                                  AND b.id = upd.batch_id
+                                  AND b.counts_frozen_at IS NOT NULL
+                            )
+                            SELECT old_state AS "old_state!" FROM upd
                             "#,
                             *req.data.id as Uuid,
                             req.state.response_status as i16,
@@ -2189,15 +2278,22 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             response_size,
                             req.state.routed_model,
                         )
-                        .execute(self.write_executor())
+                        .fetch_optional(self.write_executor())
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
-                        })?
-                        .rows_affected();
+                        })?;
 
-                        if rows_affected == 0 {
-                            return Err(FusilladeError::RequestNotFound(req.data.id));
+                        match old_state {
+                            Some(old) if old == "canceled" => {
+                                tracing::info!(
+                                    request_id = %req.data.id,
+                                    "Late completion superseded best-effort cancellation \
+                                     (result was billed; frozen counters repaired atomically)"
+                                );
+                            }
+                            Some(_) => {}
+                            None => return self.dropped_or_missing(req.data.id).await,
                         }
                     }
                     AnyRequest::Failed(req) => {
@@ -2215,16 +2311,39 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 FusilladeError::Other(anyhow!("Error message too large"))
                             })?;
 
-                        let rows_affected = sqlx::query!(
+                        // Same supersede-canceled semantics as the Completed arm
+                        // above (canceled = soft terminal; atomic counter repair).
+                        let old_state = sqlx::query_scalar!(
                             r#"
-                            UPDATE requests SET
-                                state = 'failed',
-                                retry_attempt = $2,
-                                error = $3,
-                                failed_at = $4,
-                                response_size = $5,
-                                routed_model = $6
-                            WHERE id = $1
+                            WITH prev AS (
+                                SELECT id, state AS old_state, batch_id
+                                FROM requests WHERE id = $1
+                                FOR UPDATE
+                            ),
+                            upd AS (
+                                UPDATE requests r SET
+                                    state = 'failed',
+                                    retry_attempt = $2,
+                                    error = $3,
+                                    failed_at = $4,
+                                    response_size = $5,
+                                    routed_model = $6,
+                                    canceled_at = NULL
+                                FROM prev
+                                WHERE r.id = prev.id
+                                  AND r.state NOT IN ('completed', 'failed')
+                                RETURNING prev.old_state, prev.batch_id
+                            ),
+                            counter_fix AS (
+                                UPDATE batches b SET
+                                    canceled_requests = b.canceled_requests - 1,
+                                    failed_requests = b.failed_requests + 1
+                                FROM upd
+                                WHERE upd.old_state = 'canceled'
+                                  AND b.id = upd.batch_id
+                                  AND b.counts_frozen_at IS NOT NULL
+                            )
+                            SELECT old_state AS "old_state!" FROM upd
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
@@ -2233,15 +2352,22 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             response_size,
                             req.state.routed_model,
                         )
-                        .execute(self.write_executor())
+                        .fetch_optional(self.write_executor())
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
-                        })?
-                        .rows_affected();
+                        })?;
 
-                        if rows_affected == 0 {
-                            return Err(FusilladeError::RequestNotFound(req.data.id));
+                        match old_state {
+                            Some(old) if old == "canceled" => {
+                                tracing::info!(
+                                    request_id = %req.data.id,
+                                    "Late failure superseded best-effort cancellation \
+                                     (frozen counters repaired atomically)"
+                                );
+                            }
+                            Some(_) => {}
+                            None => return self.dropped_or_missing(req.data.id).await,
                         }
                     }
                     AnyRequest::Canceled(req) => {
@@ -2251,6 +2377,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 state = 'canceled',
                                 canceled_at = $2
                             WHERE id = $1
+                              AND state NOT IN ('completed', 'failed')
                             "#,
                             *req.data.id as Uuid,
                             req.state.canceled_at,
@@ -2263,7 +2390,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .rows_affected();
 
                         if rows_affected == 0 {
-                            return Err(FusilladeError::RequestNotFound(req.data.id));
+                            return self.dropped_or_missing(req.data.id).await;
                         }
                     }
                 }
@@ -8661,6 +8788,200 @@ mod tests {
                 routed_model: req.data.model.clone(),
             },
         }
+    }
+
+    /// Transition-matrix regressions (prod incident 2026-07-16, batch
+    /// 2bdfb32f, semantics settled with hamish): `canceled` is the SOFT
+    /// terminal. Cancellation is async + best-effort, and in-flight work
+    /// that ran anyway was billed — so the late terminal result SUPERSEDES
+    /// the cancel (row flips, cancel residue cleared) and the parent's
+    /// FROZEN counters are repaired in the same atomic statement, so counts
+    /// never disagree with rows.
+    #[sqlx::test]
+    async fn persist_completed_supersedes_canceled_row(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+
+        // The cancel cascade catches the row while the daemon holds it.
+        sqlx::query(
+            "UPDATE requests SET state = 'canceled', canceled_at = NOW(), \
+             daemon_id = NULL, claimed_at = NULL, started_at = NULL WHERE id = $1",
+        )
+        .bind(*req.data.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Daemon finishes its HTTP call and stores the billed result.
+        manager
+            .persist(&completed_from(&req, "late result"))
+            .await
+            .unwrap();
+
+        let row = sqlx::query!(
+            r#"SELECT state, response_body, canceled_at, completed_at
+               FROM requests WHERE id = $1"#,
+            *req.data.id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.state, "completed",
+            "billed result supersedes best-effort cancel"
+        );
+        assert_eq!(row.response_body.as_deref(), Some("late result"));
+        assert!(row.canceled_at.is_none(), "cancel residue must be cleared");
+        assert!(row.completed_at.is_some());
+    }
+
+    #[sqlx::test]
+    async fn persist_failed_supersedes_canceled_row(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        sqlx::query("UPDATE requests SET state = 'canceled', canceled_at = NOW() WHERE id = $1")
+            .bind(*req.data.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        manager
+            .persist(&failed_from(
+                &req,
+                FailureReason::NonRetriableHttpStatus {
+                    status: 500,
+                    body: "late failure".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let row = sqlx::query!(
+            r#"SELECT state, error, canceled_at FROM requests WHERE id = $1"#,
+            *req.data.id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.state, "failed",
+            "truthful failure record supersedes cancel"
+        );
+        assert!(row.error.is_some());
+        assert!(row.canceled_at.is_none());
+    }
+
+    /// completed/failed are the HARD terminals: a duplicate terminal persist
+    /// (zombie replay, double enqueue) is dropped — first result wins.
+    #[sqlx::test]
+    async fn duplicate_terminal_persist_is_dropped(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        manager
+            .persist(&completed_from(&req, "first result"))
+            .await
+            .unwrap();
+        // Replay with a different body: must be dropped, first body retained.
+        manager
+            .persist(&completed_from(&req, "replayed result"))
+            .await
+            .unwrap();
+        let body = stored_response_body(&pool, req.data.id).await;
+        assert_eq!(body.as_deref(), Some("first result"));
+    }
+
+    /// The end-to-end shape of the prod incident: cancel-cascade, batch
+    /// freezes with the row canceled, THEN the daemon's late completion
+    /// arrives. The result supersedes the cancel AND the frozen counters are
+    /// repaired atomically — they must match a live recount afterwards.
+    #[sqlx::test]
+    async fn late_completion_repairs_frozen_counts(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        let batch_id = req.data.batch_id.expect("claimed row belongs to a batch");
+
+        // Cancel the batch + cascade its in-flight row.
+        manager.cancel_batch(batch_id).await.unwrap();
+        sqlx::query("UPDATE requests SET state = 'canceled', canceled_at = NOW() WHERE id = $1")
+            .bind(*req.data.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // All rows settled -> freeze-on-read captures 0/0/1.
+        manager.get_batch(batch_id).await.unwrap();
+        let frozen = sqlx::query!(
+            r#"SELECT counts_frozen_at IS NOT NULL AS "frozen!", canceled_requests
+               FROM batches WHERE id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            frozen.frozen,
+            "batch must freeze once the cascade settled it"
+        );
+        assert_eq!(frozen.canceled_requests, 1);
+
+        // The late completion lands after the freeze: row flips to
+        // completed and the counters swap in the same statement.
+        manager
+            .persist(&completed_from(&req, "too late"))
+            .await
+            .unwrap();
+
+        let check = sqlx::query!(
+            r#"SELECT b.canceled_requests, b.completed_requests,
+                      b.counts_frozen_at IS NOT NULL AS "still_frozen!",
+                      (SELECT COUNT(*) FROM requests WHERE batch_id = b.id AND state = 'canceled') AS "live_canceled!",
+                      (SELECT COUNT(*) FROM requests WHERE batch_id = b.id AND state = 'completed') AS "live_completed!"
+               FROM batches b WHERE b.id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(check.still_frozen, "supersede must not unfreeze the batch");
+        assert_eq!((check.canceled_requests, check.completed_requests), (0, 1));
+        assert_eq!(
+            (check.canceled_requests, check.completed_requests),
+            (check.live_canceled, check.live_completed),
+            "frozen counters must match the rows exactly after the repair"
+        );
+    }
+
+    /// The manual-retry contract survives: persist(Pending) may still move a
+    /// terminal failed row back to pending (deliberately unguarded arm).
+    #[sqlx::test]
+    async fn persist_pending_still_repends_failed_row(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        manager
+            .persist(&failed_from(
+                &req,
+                FailureReason::NonRetriableHttpStatus {
+                    status: 500,
+                    body: "boom".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let pending = Request {
+            data: req.data.clone(),
+            state: fusillade_core::request::Pending {
+                retry_attempt: 0,
+                not_before: None,
+                batch_expires_at: req.state.batch_expires_at,
+            },
+        };
+        manager.persist(&pending).await.unwrap();
+
+        let state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(*req.data.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            state, "pending",
+            "manual retry terminal->pending must keep working"
+        );
     }
 
     async fn stored_response_body(pool: &sqlx::PgPool, id: RequestId) -> Option<String> {
