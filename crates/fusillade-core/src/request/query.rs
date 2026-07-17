@@ -313,6 +313,31 @@ pub struct CreateFlexInput {
     pub created_by: String,
 }
 
+/// Input for creating a background response that the daemon will process only
+/// when the target model has spare live capacity.
+///
+/// Inserts a request template (no parent file) and a request row in `pending`
+/// state with `batch_id = NULL` and `service_tier = 'background'`.
+#[derive(Debug, Clone)]
+pub struct CreateBackgroundInput {
+    /// Pre-generated request ID. Becomes the request's primary key.
+    pub request_id: Uuid,
+    /// The request body as a JSON string.
+    pub body: String,
+    /// Model identifier.
+    pub model: String,
+    /// Base URL of the target endpoint (e.g., "http://localhost:3001/ai").
+    pub endpoint: String,
+    /// HTTP method (e.g., "POST").
+    pub method: String,
+    /// API path (e.g., "/v1/responses").
+    pub path: String,
+    /// API key for the request.
+    pub api_key: String,
+    /// User/org ID that owns this request.
+    pub created_by: String,
+}
+
 /// Result of a paginated request list query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestListResult {
@@ -324,4 +349,28 @@ pub struct RequestListResult {
     /// Planner estimates are typically within a few percent when table
     /// statistics are current, but may diverge more if stats are stale.
     pub total_count: i64,
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+
+    #[test]
+    fn background_input_has_the_async_batchless_contract() {
+        let request_id = Uuid::new_v4();
+        let input = CreateBackgroundInput {
+            request_id,
+            body: r#"{"model":"model-a"}"#.to_string(),
+            model: "model-a".to_string(),
+            endpoint: "http://localhost:3001".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            api_key: "test-key".to_string(),
+            created_by: "user-a".to_string(),
+        };
+
+        assert_eq!(input.request_id, request_id);
+        assert_eq!(input.model, "model-a");
+        assert_eq!(input.created_by, "user-a");
+    }
 }
