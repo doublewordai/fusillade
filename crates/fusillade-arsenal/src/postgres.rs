@@ -4713,6 +4713,89 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
+        // Lock the batch row first: archive_batch locks the same row for its
+        // whole move transaction, so retry and the sweeper serialize — rows
+        // can never be mid-move while we re-pend them. Also fetches the
+        // routing state for the archive move-back below.
+        let routing = sqlx::query!(
+            r#"
+            SELECT location, archive_bucket
+            FROM batches WHERE id = $1 AND deleted_at IS NULL
+            FOR UPDATE
+            "#,
+            *batch_id as Uuid,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock batch for retry: {}", e)))?;
+
+        let Some(routing) = routing else {
+            // Missing/deleted batch: preserve the pre-existing no-op contract
+            // (both UPDATEs below would have affected zero rows).
+            return Ok(0);
+        };
+
+        // Retry move-back (phase 3): for an archived or split batch, the
+        // failed/canceled rows live in the archive. Re-home them as PENDING
+        // in one INSERT (the re-pend transform applied inline — same field
+        // clears as the live UPDATE below), then delete them from the
+        // archive, guarded so a row is only removed once verifiably live
+        // again. ON CONFLICT keeps a crash-replay idempotent. Completed rows
+        // stay archived: the batch becomes 'split' and the split-aware
+        // read/freeze paths count them from the archive.
+        let unarchived = if routing.location != "live" {
+            let Some(bucket) = routing.archive_bucket else {
+                return Err(FusilladeError::Other(anyhow!(
+                    "batch {batch_id} has location '{}' but no archive_bucket \
+                     (batches_archived_have_bucket should make this impossible)",
+                    routing.location
+                )));
+            };
+            let moved = sqlx::query!(
+                r#"
+                INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, not_before,
+                                      daemon_id, claimed_at, started_at, response_status, response_body,
+                                      completed_at, error, failed_at, canceled_at, created_at, updated_at,
+                                      custom_id, model, response_size, routed_model, service_tier, created_by)
+                SELECT id, batch_id, template_id, 'pending', 0, NULL,
+                       NULL, NULL, NULL, NULL, NULL,
+                       NULL, NULL, NULL, NULL, created_at, NOW(),
+                       custom_id, model, 0, NULL, service_tier, created_by
+                FROM batch_requests_archive
+                WHERE archive_bucket = $2 AND batch_id = $1 AND state IN ('failed', 'canceled')
+                ON CONFLICT (id) DO NOTHING
+                "#,
+                *batch_id as Uuid,
+                bucket,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to move archived rows back to live: {}", e))
+            })?
+            .rows_affected();
+
+            sqlx::query!(
+                r#"
+                DELETE FROM batch_requests_archive a
+                WHERE a.archive_bucket = $2 AND a.batch_id = $1
+                  AND a.state IN ('failed', 'canceled')
+                  AND EXISTS (SELECT 1 FROM requests r WHERE r.id = a.id)
+                "#,
+                *batch_id as Uuid,
+                bucket,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to delete moved-back archive rows: {}", e))
+            })?;
+
+            moved
+        } else {
+            0
+        };
+
         // Batch retry drives the whole batch back toward completion: failed
         // AND canceled rows re-pend; completed rows are never redone (no
         // wasted compute/credits). Cancellation does not block retry — both
@@ -4747,7 +4830,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             FusilladeError::Other(anyhow!("Failed to retry failed/canceled requests: {}", e))
         })?;
 
-        let count = result.rows_affected();
+        let count = result.rows_affected() + unarchived;
 
         // Reset batch terminal state so lazy finalization can re-evaluate
         // once the retried requests complete, INCLUDING the cancellation
@@ -4773,7 +4856,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // un-terminalizes a batch must bump retry_version the same way.
         sqlx::query!(
             r#"
-            UPDATE batches
+            UPDATE batches b
             SET completed_at = NULL,
                 failed_at = NULL,
                 finalizing_at = NULL,
@@ -4784,9 +4867,23 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 completed_requests = 0,
                 failed_requests = 0,
                 canceled_requests = 0,
-                retry_version = retry_version + 1
-            WHERE id = $1
-              AND ($2::BIGINT > 0 OR cancelling_at IS NOT NULL)
+                retry_version = retry_version + 1,
+                -- Phase 3 routing: an archived batch whose failed/canceled
+                -- rows just moved back becomes 'split' (completed rows still
+                -- archived) — or fully 'live' again if the archive side is
+                -- now empty (nothing had completed). archive_bucket is NEVER
+                -- cleared: it is the immutable partition stamp that re-
+                -- archiving reuses so a batch can never scatter.
+                location = CASE
+                    WHEN b.location = 'live' THEN 'live'
+                    WHEN EXISTS (
+                        SELECT 1 FROM batch_requests_archive a
+                        WHERE a.archive_bucket = b.archive_bucket AND a.batch_id = b.id
+                    ) THEN 'split'
+                    ELSE 'live'
+                END
+            WHERE b.id = $1
+              AND ($2::BIGINT > 0 OR b.cancelling_at IS NOT NULL)
             "#,
             *batch_id as Uuid,
             count as i64,
@@ -5704,12 +5801,12 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 CASE WHEN b.counts_frozen_at IS NOT NULL THEN 0
                      ELSE COALESCE(counts.in_progress, 0) END::BIGINT as in_progress_requests,
                 CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.completed_requests
-                     ELSE COALESCE(counts.completed, 0) END::BIGINT as completed_requests,
+                     ELSE COALESCE(counts.completed, 0) + COALESCE(arch.completed, 0) END::BIGINT as completed_requests,
                 CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.failed_requests
-                     ELSE COALESCE(counts.failed, 0) END::BIGINT as failed_requests,
+                     ELSE COALESCE(counts.failed, 0) + COALESCE(arch.failed, 0) END::BIGINT as failed_requests,
                 CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.canceled_requests
-                     ELSE COALESCE(counts.canceled, 0) END::BIGINT as canceled_requests,
-                COALESCE(counts.canceled_actual, 0)::BIGINT as canceled_actual
+                     ELSE COALESCE(counts.canceled, 0) + COALESCE(arch.canceled, 0) END::BIGINT as canceled_requests,
+                (COALESCE(counts.canceled_actual, 0) + COALESCE(arch.canceled, 0))::BIGINT as canceled_actual
             FROM batches b
             LEFT JOIN LATERAL (
                 SELECT
@@ -5725,6 +5822,24 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                   -- one-time filter that skips this requests scan entirely.
                   AND b.counts_frozen_at IS NULL
             ) counts ON TRUE
+            -- Split batches (mid-retry of an archived batch) keep their
+            -- already-done rows in the archive: the live recount alone would
+            -- undercount and the batch could never re-terminalize. The
+            -- archive side is bucket-pruned to one partition and, by the
+            -- retry move-back's construction, holds only completed rows for
+            -- a split batch (failed/canceled were moved back to live) — the
+            -- failed/canceled counts here are belt-and-braces.
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                    COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                FROM batch_requests_archive a
+                WHERE b.location = 'split'
+                  AND b.counts_frozen_at IS NULL
+                  AND a.archive_bucket = b.archive_bucket
+                  AND a.batch_id = b.id
+            ) arch ON TRUE
             WHERE b.id = "#,
         );
         query_builder.push_bind(*batch_id as Uuid);
@@ -5965,11 +6080,11 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 SELECT b.id,
                        b.retry_version,
                        CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.completed_requests
-                            ELSE COALESCE(counts.completed, 0) END::BIGINT as completed_requests,
+                            ELSE COALESCE(counts.completed, 0) + COALESCE(arch.completed, 0) END::BIGINT as completed_requests,
                        CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.failed_requests
-                            ELSE COALESCE(counts.failed, 0) END::BIGINT as failed_requests,
+                            ELSE COALESCE(counts.failed, 0) + COALESCE(arch.failed, 0) END::BIGINT as failed_requests,
                        CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.canceled_requests
-                            ELSE COALESCE(counts.canceled, 0) END::BIGINT as canceled_requests,
+                            ELSE COALESCE(counts.canceled, 0) + COALESCE(arch.canceled, 0) END::BIGINT as canceled_requests,
                        CASE WHEN b.counts_frozen_at IS NOT NULL THEN 0
                             ELSE COALESCE(counts.pending, 0) END::BIGINT as pending_requests,
                        CASE WHEN b.counts_frozen_at IS NOT NULL THEN 0
@@ -5987,6 +6102,19 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     FROM requests WHERE batch_id = b.id
                       AND b.counts_frozen_at IS NULL
                 ) counts ON TRUE
+                -- Split batches: archived (already-done) rows count toward
+                -- terminal-by-count, same as in get_batch (see there).
+                LEFT JOIN LATERAL (
+                    SELECT
+                        COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                        COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                        COUNT(*) FILTER (WHERE state = 'canceled') as canceled
+                    FROM batch_requests_archive a
+                    WHERE b.location = 'split'
+                      AND b.counts_frozen_at IS NULL
+                      AND a.archive_bucket = b.archive_bucket
+                      AND a.batch_id = b.id
+                ) arch ON TRUE
                 WHERE b.notification_sent_at IS NULL  -- Not yet notified
                   AND b.deleted_at IS NULL            -- Not deleted
                   AND b.cancelling_at IS NULL         -- Not canceled (don't email on user-canceled batches)
@@ -5995,7 +6123,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                       -- Already frozen (terminal by definition), or terminal
                       -- by count: all requests reached terminal state
                       b.counts_frozen_at IS NOT NULL
-                      OR COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0) = b.total_requests
+                      OR COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0)
+                         + COALESCE(arch.completed, 0) + COALESCE(arch.failed, 0) + COALESCE(arch.canceled, 0) = b.total_requests
                   )
             ),
             -- Step 2: Atomically claim batches, set terminal timestamps, and
@@ -7109,7 +7238,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         let Some(batch) = batch else {
             return Ok(ArchiveOutcome::SkippedNotFound);
         };
-        if batch.location != "live" {
+        if batch.location == "archive" {
             return Ok(ArchiveOutcome::SkippedNotLive);
         }
         if batch.counts_frozen_at.is_none() {
@@ -7225,7 +7354,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             WHERE id = $1
               AND retry_version = $3
               AND counts_frozen_at IS NOT NULL
-              AND location = 'live'
+              AND location IN ('live', 'split')
             "#,
             *batch_id as Uuid,
             batch.bucket,
@@ -10642,6 +10771,167 @@ mod tests {
         let (location, _, live, _) = archive_state(&pool, batch_id).await;
         assert_eq!(location, "live");
         assert_eq!(live, 2);
+    }
+
+    /// Full archive round trip through retry: archive a mixed batch, retry
+    /// it (failed rows move back as pending, batch goes 'split'), verify the
+    /// split-aware read shows archive+live sums, resume to completion,
+    /// re-freeze with the summed counts, then re-archive into the same
+    /// bucket.
+    #[sqlx::test]
+    async fn test_retry_of_archived_batch_splits_resumes_and_rearchives(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        // 3 rows: 2 completed + 1 failed, frozen, archived.
+        let batch_id = setup_freeze_test_batch(&manager, "roundtrip", 3).await;
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200, response_body = '{}'
+             WHERE batch_id = $1 AND id IN (SELECT id FROM requests WHERE batch_id = $1 ORDER BY id LIMIT 2)",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "UPDATE requests SET state = 'failed', failed_at = NOW(), error = 'boom'
+             WHERE batch_id = $1 AND state <> 'completed'",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager.get_batch(batch_id).await.unwrap(); // freeze 2/1/0
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 3 }
+        );
+
+        // Retry: the failed row comes back as pending; batch is split.
+        let retried = manager
+            .retry_failed_requests_for_batch(batch_id)
+            .await
+            .unwrap();
+        assert_eq!(retried, 1);
+        let b = sqlx::query!(
+            r#"SELECT location, archive_bucket, counts_frozen_at, retry_version,
+                      (SELECT COUNT(*) FROM requests WHERE batch_id = $1) AS "live!",
+                      (SELECT COUNT(*) FROM requests WHERE batch_id = $1 AND state = 'pending') AS "live_pending!",
+                      (SELECT COUNT(*) FROM batch_requests_archive WHERE batch_id = $1) AS "archived!"
+               FROM batches WHERE id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(b.location, "split");
+        assert!(
+            b.archive_bucket.is_some(),
+            "bucket stamp survives the split"
+        );
+        assert!(b.counts_frozen_at.is_none(), "retry unfreezes");
+        assert_eq!(b.retry_version, 1);
+        assert_eq!(
+            (b.live, b.live_pending, b.archived),
+            (1, 1, 2),
+            "failed row re-pended live; completed rows stay archived"
+        );
+
+        // Split-aware read: completed counts include the archived rows.
+        let mid = manager.get_batch(batch_id).await.unwrap();
+        assert_eq!(mid.completed_requests, 2, "archived completions must count");
+        assert_eq!(mid.pending_requests, 1);
+
+        // Resume: the pending row completes; re-freeze must sum archive+live.
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200, response_body = '{}',
+             daemon_id = NULL, claimed_at = NULL, started_at = NULL
+             WHERE batch_id = $1 AND state = 'pending'",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let done = manager.get_batch(batch_id).await.unwrap();
+        assert_eq!(done.completed_requests, 3);
+        let frozen = sqlx::query!(
+            r#"SELECT counts_frozen_at IS NOT NULL AS "f!", completed_requests, failed_requests
+               FROM batches WHERE id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(frozen.f, "split batch must re-freeze once resumed");
+        assert_eq!((frozen.completed_requests, frozen.failed_requests), (3, 0));
+
+        // Re-archive: remaining live row moves into the SAME bucket.
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 1 }
+        );
+        let after = sqlx::query!(
+            r#"SELECT location,
+                      (SELECT COUNT(*) FROM requests WHERE batch_id = $1) AS "live!",
+                      (SELECT COUNT(*) FROM batch_requests_archive WHERE batch_id = $1) AS "archived!",
+                      (SELECT COUNT(DISTINCT archive_bucket) FROM batch_requests_archive WHERE batch_id = $1) AS "buckets!"
+               FROM batches WHERE id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after.location, "archive");
+        assert_eq!((after.live, after.archived), (0, 3));
+        assert_eq!(after.buckets, 1, "a batch never scatters across partitions");
+    }
+
+    /// Retry of an archived batch with NO completed rows empties the archive
+    /// side entirely — the batch returns to plain 'live', not 'split'.
+    #[sqlx::test]
+    async fn test_retry_of_fully_failed_archived_batch_returns_live(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_freeze_test_batch(&manager, "allfailed", 2).await;
+        sqlx::query!(
+            "UPDATE requests SET state = 'failed', failed_at = NOW(), error = 'boom' WHERE batch_id = $1",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager.get_batch(batch_id).await.unwrap(); // freeze 0/2/0 (failed batch)
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 2 }
+        );
+
+        assert_eq!(
+            manager
+                .retry_failed_requests_for_batch(batch_id)
+                .await
+                .unwrap(),
+            2
+        );
+        let b = sqlx::query!(
+            r#"SELECT location, archive_bucket,
+                      (SELECT COUNT(*) FROM requests WHERE batch_id = $1 AND state = 'pending') AS "pending!",
+                      (SELECT COUNT(*) FROM batch_requests_archive WHERE batch_id = $1) AS "archived!"
+               FROM batches WHERE id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            b.location, "live",
+            "empty archive side means fully live again"
+        );
+        assert!(b.archive_bucket.is_some(), "bucket stamp is never cleared");
+        assert_eq!((b.pending, b.archived), (2, 0));
     }
 
     /// The cancellation grace window: a frozen batch with recently-canceled

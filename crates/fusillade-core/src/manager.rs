@@ -32,8 +32,9 @@ pub enum ArchiveOutcome {
     Archived { rows: u64 },
     /// Batch missing or soft-deleted (purge owns its rows, not the archive).
     SkippedNotFound,
-    /// `location` was not `'live'` — already archived (idempotent no-op) or
-    /// mid-retry `'split'` (re-archive happens on re-terminalization).
+    /// `location` was `'archive'` — already fully archived (idempotent
+    /// no-op). Split batches ARE valid candidates: re-archiving after a
+    /// retry resumes moves the remaining live rows into the same bucket.
     SkippedNotLive,
     /// Counts not frozen: the batch is active again (retry) or was never
     /// finalized. It will re-candidate once frozen.
