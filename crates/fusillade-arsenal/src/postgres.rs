@@ -20329,6 +20329,47 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn background_creation_is_exposed_by_its_own_batch_filter(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let created =
+            create_background_batch_for_test(&manager, "filter-model", "filter-owner").await;
+
+        let background = manager
+            .list_batches(ListBatchesFilter {
+                service_tiers: Some(vec!["background".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(background.len(), 1);
+        assert_eq!(background[0].id, created.id);
+        assert_eq!(background[0].service_tier.as_deref(), Some("background"));
+        assert_eq!(background[0].completion_window, None);
+        assert_eq!(background[0].expires_at, None);
+
+        let sla_window = manager
+            .list_batches(ListBatchesFilter {
+                completion_windows: Some(vec!["24h".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(sla_window.is_empty());
+
+        let error = manager
+            .list_batches(ListBatchesFilter {
+                service_tiers: Some(vec!["unknown".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .expect_err("unknown service tiers must be rejected");
+        assert!(matches!(error, FusilladeError::ValidationError(_)));
+    }
+
+    #[sqlx::test]
     async fn test_create_realtime_processing(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
