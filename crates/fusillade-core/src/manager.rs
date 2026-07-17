@@ -911,12 +911,29 @@ pub trait DaemonStorage: Send + Sync {
     /// (the cascade only touches non-terminal rows and freezing requires
     /// all-terminal), so this selection-time check cannot be raced by the
     /// move itself.
+    /// `min_frozen_age_secs` is the post-freeze dwell: 0 means frozen
+    /// batches are candidates immediately (the default — reads are mid-move
+    /// safe by construction and the sweep cadence provides organic dwell).
     async fn list_archivable_batches(
         &self,
         limit: i64,
         oldest_first: bool,
         cancel_grace_secs: f64,
+        min_frozen_age_secs: f64,
     ) -> Result<Vec<BatchId>>;
+
+    /// Count of batches currently eligible for archiving (same predicate as
+    /// [`Self::list_archivable_batches`] minus the ordering/limit) — the
+    /// sweep-backlog gauge. Index-only on the partial sweep index.
+    async fn count_archivable_batches(&self, cancel_grace_secs: f64) -> Result<i64>;
+
+    /// Ensure weekly archive partitions exist through now + `weeks_ahead`
+    /// (create -> bounds CHECK -> attach; advisory-locked; idempotent).
+    /// Returns `(created, ahead)`: partitions created this call, and how
+    /// many future weeks (including the current one) now have partitions —
+    /// the `fusillade_archive_partitions_ahead` gauge, alert-worthy when it
+    /// shrinks below 2.
+    async fn ensure_archive_partitions(&self, weeks_ahead: i32) -> Result<(i64, i64)>;
 
     /// Purge old `model_filters` events, ALWAYS retaining, per model, the most
     /// recent `keep_per_model` events (so the current-state lookup and a short

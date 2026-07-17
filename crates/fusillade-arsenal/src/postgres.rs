@@ -7567,6 +7567,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         limit: i64,
         oldest_first: bool,
         cancel_grace_secs: f64,
+        min_frozen_age_secs: f64,
     ) -> Result<Vec<BatchId>> {
         // Served by idx_batches_archivable (partial on the exact predicate);
         // ORDER BY created_at rides the index in either direction. The
@@ -7582,6 +7583,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 r#"
                 SELECT id FROM batches b
                 WHERE b.location = 'live' AND b.counts_frozen_at IS NOT NULL AND b.deleted_at IS NULL
+                  AND b.counts_frozen_at <= NOW() - make_interval(secs => $3)
                   AND NOT EXISTS (
                       SELECT 1 FROM requests r
                       WHERE r.batch_id = b.id
@@ -7594,6 +7596,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 "#,
                 limit,
                 cancel_grace_secs,
+                min_frozen_age_secs,
             )
             .fetch_all(self.read_executor())
             .await
@@ -7602,6 +7605,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 r#"
                 SELECT id FROM batches b
                 WHERE b.location = 'live' AND b.counts_frozen_at IS NOT NULL AND b.deleted_at IS NULL
+                  AND b.counts_frozen_at <= NOW() - make_interval(secs => $3)
                   AND NOT EXISTS (
                       SELECT 1 FROM requests r
                       WHERE r.batch_id = b.id
@@ -7614,6 +7618,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 "#,
                 limit,
                 cancel_grace_secs,
+                min_frozen_age_secs,
             )
             .fetch_all(self.read_executor())
             .await
@@ -7621,6 +7626,48 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to list archivable batches: {}", e)))?;
 
         Ok(rows.into_iter().map(BatchId).collect())
+    }
+
+    async fn count_archivable_batches(&self, cancel_grace_secs: f64) -> Result<i64> {
+        sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) AS "count!" FROM batches b
+            WHERE b.location = 'live' AND b.counts_frozen_at IS NOT NULL AND b.deleted_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM requests r
+                  WHERE r.batch_id = b.id
+                    AND r.state = 'canceled'
+                    AND r.claimed_at IS NOT NULL
+                    AND r.canceled_at > NOW() - make_interval(secs => $1)
+              )
+            "#,
+            cancel_grace_secs,
+        )
+        .fetch_one(self.read_executor())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to count archivable batches: {}", e)))
+    }
+
+    async fn ensure_archive_partitions(&self, weeks_ahead: i32) -> Result<(i64, i64)> {
+        let row = sqlx::query!(
+            r#"
+            SELECT ensure_archive_partitions($1) AS "created!",
+                   (SELECT COUNT(*) FROM generate_series(0, $1) AS w(i)
+                    WHERE to_regclass(
+                        'batch_requests_archive_y'
+                        || to_char(date_trunc('week', now())::date + (w.i * 7), 'IYYY')
+                        || 'w'
+                        || to_char(date_trunc('week', now())::date + (w.i * 7), 'IW')
+                    ) IS NOT NULL) AS "ahead!"
+            "#,
+            weeks_ahead,
+        )
+        .fetch_one(self.write_executor())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to ensure archive partitions: {}", e))
+        })?;
+        Ok((i64::from(row.created), row.ahead))
     }
 
     async fn purge_model_filter_events(
@@ -11404,7 +11451,7 @@ mod tests {
 
         // 10-minute grace: A is held back, B archives immediately.
         let candidates = manager
-            .list_archivable_batches(10, true, 600.0)
+            .list_archivable_batches(10, true, 600.0, 0.0)
             .await
             .unwrap();
         assert!(
@@ -11418,7 +11465,7 @@ mod tests {
 
         // 2-minute grace (row canceled 5 min ago): A becomes a candidate.
         let candidates = manager
-            .list_archivable_batches(10, true, 120.0)
+            .list_archivable_batches(10, true, 120.0, 0.0)
             .await
             .unwrap();
         assert!(
@@ -11458,16 +11505,19 @@ mod tests {
         .unwrap();
 
         let oldest = manager
-            .list_archivable_batches(10, true, 0.0)
+            .list_archivable_batches(10, true, 0.0, 0.0)
             .await
             .unwrap();
         assert_eq!(oldest, vec![old, mid, new], "oldest-first backfill order");
         let newest = manager
-            .list_archivable_batches(10, false, 0.0)
+            .list_archivable_batches(10, false, 0.0, 0.0)
             .await
             .unwrap();
         assert_eq!(newest, vec![new, mid, old], "newest-first sweeper order");
-        let limited = manager.list_archivable_batches(1, true, 0.0).await.unwrap();
+        let limited = manager
+            .list_archivable_batches(1, true, 0.0, 0.0)
+            .await
+            .unwrap();
         assert_eq!(limited, vec![old]);
         // Backdated weeks predate the bootstrap partitions (test DBs cover
         // current week + 4 only) — create them the way the maintenance path
@@ -11495,7 +11545,7 @@ mod tests {
             ArchiveOutcome::Archived { rows: 1 }
         );
         let after = manager
-            .list_archivable_batches(10, true, 0.0)
+            .list_archivable_batches(10, true, 0.0, 0.0)
             .await
             .unwrap();
         assert_eq!(after, vec![mid, new]);

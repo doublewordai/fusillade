@@ -13,7 +13,9 @@ mod postgres;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresDaemon;
 
-pub use fusillade_core::manager::{DaemonStorage, ModelFilter, ModelFilterState, Storage};
+pub use fusillade_core::manager::{
+    ArchiveOutcome, DaemonStorage, ModelFilter, ModelFilterState, Storage,
+};
 
 /// Daemon executor trait for runtime orchestration.
 ///
