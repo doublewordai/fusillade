@@ -62,6 +62,13 @@ pub enum FusilladeError {
     #[error("First chunk timeout: {0}")]
     FirstChunkTimeout(String),
 
+    /// The request body upload made no progress for the configured stall window.
+    /// Distinguishes send-phase hangs (a wedged connection or a stalled write)
+    /// from a slow-to-respond upstream, which is governed by first_chunk_timeout:
+    /// uploading a request should take seconds even when the answer takes hours.
+    #[error("Upload stall timeout: {0}")]
+    UploadStallTimeout(String),
+
     /// Timed out waiting for the next chunk of response body tokens (streaming only)
     #[error("Tokens timeout: {0}")]
     TokensTimeout(String),

@@ -163,15 +163,34 @@ pub trait HttpClient: Send + Sync + Clone {
 /// - `first_chunk_timeout`: max time to first token (connect + headers + first body chunk)
 /// - `chunk_timeout`: max idle time between subsequent body chunks
 /// - `body_timeout`: max total time for the entire response body
+///
+/// In both modes the request body upload is additionally bounded by
+/// `upload_stall_timeout` (default 60s): if the transport accepts no body
+/// bytes for that long before the upload completes, the attempt is aborted
+/// with [`FusilladeError::UploadStallTimeout`] so the retry machinery can
+/// dispatch a fresh one. This keeps send-phase hangs (a wedged connection,
+/// a stalled write) from silently consuming the much longer response
+/// timeouts, which are sized for slow upstreams rather than slow uploads.
 #[derive(Clone)]
 pub struct ReqwestHttpClient {
     client: reqwest::Client,
     first_chunk_timeout: Duration,
     chunk_timeout: Duration,
     body_timeout: Duration,
+    upload_stall_timeout: Duration,
     stream_reassembler: Option<StreamReassembler>,
     streamable_endpoints: Vec<String>,
 }
+
+/// Default cap on how long a request body upload may make no progress.
+const DEFAULT_UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Request bodies are handed to the transport in chunks of this size so the
+/// upload watchdog can observe progress.
+const UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Poll interval for the upload stall watchdog.
+const UPLOAD_STALL_POLL: Duration = Duration::from_millis(100);
 
 impl ReqwestHttpClient {
     /// Create a new reqwest-based HTTP client with the given timeouts.
@@ -186,9 +205,19 @@ impl ReqwestHttpClient {
             first_chunk_timeout,
             chunk_timeout,
             body_timeout,
+            upload_stall_timeout: DEFAULT_UPLOAD_STALL_TIMEOUT,
             stream_reassembler: Some(openai_reassembler::reassemble),
             streamable_endpoints,
         }
+    }
+
+    /// Override how long the request body upload may make no progress before
+    /// the attempt is aborted (default 60s). This bounds only the send phase;
+    /// how long the upstream may take to answer is governed by the other
+    /// timeouts.
+    pub fn with_upload_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.upload_stall_timeout = timeout;
+        self
     }
 
     /// Set a stream reassembler function that converts collected SSE events
@@ -322,16 +351,25 @@ impl HttpClient for ReqwestHttpClient {
             tracing::trace!(request_id = %request.id, traceparent = %traceparent, "Added traceparent header for distributed tracing");
         }
 
-        // Only add body and Content-Type for methods that support a body
+        // Only add body and Content-Type for methods that support a body.
+        // The body is wrapped so the upload watchdog can observe progress;
+        // its exact size hint preserves Content-Length framing on the wire.
+        let mut upload: Option<Arc<UploadProgress>> = None;
         let method_upper = request.method.to_uppercase();
         if method_upper != "GET"
             && method_upper != "HEAD"
             && method_upper != "DELETE"
             && !request.body.is_empty()
         {
+            let body = bytes::Bytes::from(request.body.clone().into_bytes());
+            let progress = UploadProgress::new(body.len() as u64);
             req = req
                 .header("Content-Type", "application/json")
-                .body(request.body.clone());
+                .body(reqwest::Body::wrap(ProgressBody {
+                    remaining: body,
+                    progress: progress.clone(),
+                }));
+            upload = Some(progress);
             tracing::trace!(
                 request_id = %request.id,
                 body_len = request.body.len(),
@@ -343,9 +381,144 @@ impl HttpClient for ReqwestHttpClient {
         span.set_attribute("fusillade.streaming", stream);
         if stream {
             req = req.header("X-Fusillade-Stream", "true");
-            self.execute_streaming(request, req, &url, on_event).await
+            self.execute_streaming(request, req, &url, upload, on_event)
+                .await
         } else {
-            self.execute_non_streaming(request, req, &url).await
+            self.execute_non_streaming(request, req, &url, upload).await
+        }
+    }
+}
+
+/// Shared view of request-body upload progress between the instrumented body
+/// and the watchdog racing the send future.
+struct UploadProgress {
+    started: std::time::Instant,
+    last_progress_ms: std::sync::atomic::AtomicU64,
+    sent: std::sync::atomic::AtomicU64,
+    total: u64,
+    handed_off: std::sync::atomic::AtomicBool,
+}
+
+impl UploadProgress {
+    fn new(total: u64) -> Arc<Self> {
+        Arc::new(Self {
+            started: std::time::Instant::now(),
+            last_progress_ms: std::sync::atomic::AtomicU64::new(0),
+            sent: std::sync::atomic::AtomicU64::new(0),
+            total,
+            handed_off: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn record(&self, bytes: usize) {
+        use std::sync::atomic::Ordering;
+        self.sent.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.last_progress_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn finish(&self) {
+        self.handed_off
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn is_handed_off(&self) -> bool {
+        self.handed_off.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn stalled_for(&self) -> Duration {
+        let last = Duration::from_millis(
+            self.last_progress_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        self.started.elapsed().saturating_sub(last)
+    }
+
+    fn sent_bytes(&self) -> u64 {
+        self.sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Request body that reports upload progress to an [`UploadProgress`] handle.
+///
+/// The body is handed to the transport in [`UPLOAD_CHUNK_BYTES`] chunks; each
+/// chunk the transport accepts counts as progress. The exact `size_hint`
+/// preserves Content-Length framing, so the wire format is identical to
+/// sending the buffered body directly.
+struct ProgressBody {
+    remaining: bytes::Bytes,
+    progress: Arc<UploadProgress>,
+}
+
+impl http_body::Body for ProgressBody {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>>
+    {
+        let this = self.get_mut();
+        if this.remaining.is_empty() {
+            this.progress.finish();
+            return std::task::Poll::Ready(None);
+        }
+        let take = this.remaining.len().min(UPLOAD_CHUNK_BYTES);
+        let chunk = this.remaining.split_to(take);
+        this.progress.record(take);
+        if this.remaining.is_empty() {
+            // The final chunk is now owned by the transport; from here on the
+            // request is waiting on the upstream, which the response timeouts
+            // govern.
+            this.progress.finish();
+        }
+        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining.is_empty()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining.len() as u64)
+    }
+}
+
+/// Race `send` against an upload stall watchdog.
+///
+/// The watchdog fires only while the body is still being handed to the
+/// transport: if no chunk is accepted for `stall_timeout`, the attempt is
+/// aborted so the daemon's retry machinery can dispatch a fresh one. Once the
+/// body is fully handed off the watchdog disarms and `send`'s own timeouts
+/// take over. Requests without a body (`upload` is `None`) are unaffected.
+async fn race_upload_stall<T>(
+    send: impl std::future::Future<Output = T>,
+    upload: Option<Arc<UploadProgress>>,
+    stall_timeout: Duration,
+    url: &str,
+) -> Result<T> {
+    let Some(progress) = upload else {
+        return Ok(send.await);
+    };
+    tokio::pin!(send);
+    loop {
+        tokio::select! {
+            out = &mut send => return Ok(out),
+            _ = tokio::time::sleep(UPLOAD_STALL_POLL) => {
+                if progress.is_handed_off() {
+                    return Ok(send.await);
+                }
+                if progress.stalled_for() >= stall_timeout {
+                    return Err(crate::error::FusilladeError::UploadStallTimeout(format!(
+                        "request upload to {} stalled: {} of {} bytes handed to the transport, no progress for {}ms",
+                        url,
+                        progress.sent_bytes(),
+                        progress.total,
+                        stall_timeout.as_millis(),
+                    )));
+                }
+            }
         }
     }
 }
@@ -359,9 +532,25 @@ impl ReqwestHttpClient {
         request: &RequestData,
         req: reqwest::RequestBuilder,
         url: &str,
+        upload: Option<Arc<UploadProgress>>,
     ) -> Result<HttpResponse> {
         let total_timeout = self.first_chunk_timeout + self.body_timeout;
-        let response = req.timeout(total_timeout).send().await.map_err(|e| {
+        let response = race_upload_stall(
+            req.timeout(total_timeout).send(),
+            upload,
+            self.upload_stall_timeout,
+            url,
+        )
+        .await
+        .inspect_err(|e| {
+            tracing::error!(
+                request_id = %request.id,
+                url.full = %url,
+                error = %e,
+                "HTTP request upload stalled"
+            );
+        })?
+        .map_err(|e| {
             if e.is_builder() {
                 tracing::error!(
                     request_id = %request.id,
@@ -412,15 +601,17 @@ impl ReqwestHttpClient {
         request: &RequestData,
         req: reqwest::RequestBuilder,
         url: &str,
+        upload: Option<Arc<UploadProgress>>,
         on_event: Option<Arc<dyn StreamEventCallback>>,
     ) -> Result<HttpResponse> {
         use eventsource_stream::Eventsource;
         use futures::StreamExt;
 
         // Phase 1: connect, get headers, and wait for the first SSE event within
-        // one shared first_chunk_timeout deadline (time-to-first-token).
+        // one shared first_chunk_timeout deadline (time-to-first-token). The
+        // upload watchdog separately bounds the body send phase.
         let first_chunk_deadline = tokio::time::Instant::now() + self.first_chunk_timeout;
-        let resp = tokio::time::timeout_at(first_chunk_deadline, async {
+        let send = tokio::time::timeout_at(first_chunk_deadline, async {
             req.send()
                 .await
                 .map_err(map_reqwest_error)
@@ -434,15 +625,24 @@ impl ReqwestHttpClient {
                         "HTTP request failed"
                     );
                 })
-        })
-        .await
-        .map_err(|_| {
-            crate::error::FusilladeError::FirstChunkTimeout(format!(
-                "No response headers from {} within {}ms",
-                url,
-                self.first_chunk_timeout.as_millis()
-            ))
-        })??;
+        });
+        let resp = race_upload_stall(send, upload, self.upload_stall_timeout, url)
+            .await
+            .inspect_err(|e| {
+                tracing::error!(
+                    request_id = %request.id,
+                    url.full = %url,
+                    error = %e,
+                    "HTTP request upload stalled"
+                );
+            })?
+            .map_err(|_| {
+                crate::error::FusilladeError::FirstChunkTimeout(format!(
+                    "No response headers from {} within {}ms",
+                    url,
+                    self.first_chunk_timeout.as_millis()
+                ))
+            })??;
 
         let status = resp.status().as_u16();
         let content_type = resp
