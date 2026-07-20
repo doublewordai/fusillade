@@ -66,6 +66,15 @@ pub type ShouldRetry = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
 /// `complete` or `cancel`). Calling [`Storage::persist`] directly for a claimed
 /// execution bypasses attempt fencing and is reserved for manual or proxy-owned
 /// transitions.
+///
+/// # Panic safety
+///
+/// The daemon catches processor panics so it can recover the claimed request,
+/// but Rust invokes the process-wide panic hook before `catch_unwind` returns.
+/// Implementations must therefore avoid putting request bodies, credentials,
+/// or other secrets in panic payloads. Applications that install a custom
+/// panic hook are responsible for ensuring that hook also redacts sensitive
+/// values.
 #[async_trait]
 pub trait RequestProcessor<S, H>: Send + Sync
 where

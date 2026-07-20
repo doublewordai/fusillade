@@ -91,6 +91,33 @@ async fn fetch_terminal(pool: &sqlx::PgPool, id: Uuid) -> TerminalRow {
     }
 }
 
+#[sqlx::test]
+async fn bulk_realtime_completion_refuses_daemon_owned_processing_row(pool: sqlx::PgPool) {
+    let m = manager(pool.clone()).await;
+    let id = Uuid::new_v4();
+    let attempt_id = Uuid::new_v4();
+    m.create_realtime(processing_input(id)).await.unwrap();
+    sqlx::query("UPDATE requests SET attempt_id = $2 WHERE id = $1")
+        .bind(id)
+        .bind(attempt_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    m.persist_completed_realtime_batch(&[realtime_input(id, 200, r#"{"stale":true}"#)])
+        .await
+        .unwrap();
+
+    let (state, stored_attempt): (String, Option<Uuid>) =
+        sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "processing");
+    assert_eq!(stored_attempt, Some(attempt_id));
+}
+
 /// Assert the `error` column holds a `FailureReason::NonRetriableHttpStatus`
 /// carrying the given status and body. Parses the envelope structurally rather
 /// than substring-matching the serialized JSON.

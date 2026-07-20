@@ -59,6 +59,31 @@ fn claim_failure_backoff(consecutive_failures: u32, claim_interval_ms: u64) -> D
     )
 }
 
+/// Return a bounded, non-sensitive label for processor failures.
+///
+/// Processor errors may contain request bodies, credentials, or upstream
+/// responses supplied by custom implementations, so daemon telemetry must not
+/// format the error itself.
+fn processor_error_kind(error: &FusilladeError) -> &'static str {
+    match error {
+        FusilladeError::RequestNotFound(_) => "request_not_found",
+        FusilladeError::RequestStateConflict { .. } => "request_state_conflict",
+        FusilladeError::RequestAttemptLost { .. } => "request_attempt_lost",
+        FusilladeError::RequestCancelled(_) => "request_cancelled",
+        FusilladeError::Shutdown => "shutdown",
+        FusilladeError::InvalidState(_, _, _) => "invalid_state",
+        FusilladeError::ValidationError(_) => "validation_error",
+        FusilladeError::HttpClient(_) => "http_client",
+        FusilladeError::HttpRequestBuilder(_) => "http_request_builder",
+        FusilladeError::HttpClientTimeout(_) => "http_client_timeout",
+        FusilladeError::FirstChunkTimeout(_) => "first_chunk_timeout",
+        FusilladeError::TokensTimeout(_) => "tokens_timeout",
+        FusilladeError::BodyTimeout(_) => "body_timeout",
+        FusilladeError::Serialization(_) => "serialization",
+        FusilladeError::Other(_) => "other",
+    }
+}
+
 async fn attempt_write_until_resolved<F, Fut>(
     shutdown: &tokio_util::sync::CancellationToken,
     request_id: RequestId,
@@ -1130,7 +1155,7 @@ where
                                 %attempt_id,
                                 recovery = recovery_kind,
                                 applied,
-                                error = %e,
+                                error_kind = processor_error_kind(&e),
                                 "request.processor_error_recovered"
                             );
                             Ok(())
@@ -1804,8 +1829,10 @@ mod tests {
     fn daemon_mode_defaults_to_both_and_roundtrips_through_config() {
         assert_eq!(DaemonConfig::default().mode, DaemonMode::Both);
 
-        let mut config = DaemonConfig::default();
-        config.mode = DaemonMode::BatchOnly;
+        let config = DaemonConfig {
+            mode: DaemonMode::BatchOnly,
+            ..Default::default()
+        };
 
         let json = serde_json::to_value(&config).expect("config should serialize");
         assert_eq!(json["mode"], serde_json::json!("batch_only"));
@@ -1845,6 +1872,17 @@ mod tests {
     #[test]
     fn default_stale_daemon_threshold_is_five_minutes() {
         assert_eq!(DaemonConfig::default().stale_daemon_threshold_ms, 300_000);
+    }
+
+    #[test]
+    fn processor_error_kind_is_safe_to_log() {
+        let secret = "authorization=Bearer super-secret-token";
+        let error = FusilladeError::ValidationError(secret.to_string());
+
+        let kind = processor_error_kind(&error);
+
+        assert_eq!(kind, "validation_error");
+        assert!(!kind.contains(secret));
     }
 
     #[tokio::test]

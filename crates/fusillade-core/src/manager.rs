@@ -910,8 +910,9 @@ pub trait DaemonStorage: Send + Sync {
     ///   batchless store gives them a home).
     ///
     /// Transaction invariants (fusillade-requests-phase3-plan.md §1):
-    /// - forward move is `INSERT ... SELECT r.*, $bucket` with
-    ///   `ON CONFLICT DO NOTHING` — idempotent under crash-resume replay.
+    /// - forward move uses explicit source and target column lists with
+    ///   `ON CONFLICT DO NOTHING` — idempotent under crash-resume replay and
+    ///   independent of physical column order across database upgrades.
     /// - the DELETE removes only rows verifiably present in the archive and
     ///   the transaction aborts if any row would be left behind: a row lives
     ///   in exactly one table, always.

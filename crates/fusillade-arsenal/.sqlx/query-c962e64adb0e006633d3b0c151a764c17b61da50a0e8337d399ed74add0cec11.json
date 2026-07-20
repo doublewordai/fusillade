@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE requests\n                    SET state = 'canceled',\n                        canceled_at = COALESCE(canceled_at, NOW()),\n                        daemon_id = NULL,\n                        -- Pending rows have no executor. Preserve the exact\n                        -- token for claimed/processing rows so a result that\n                        -- won the cancellation race can still supersede this\n                        -- soft terminal, while stale attempts remain fenced.\n                        attempt_id = CASE\n                            WHEN state = 'pending' THEN NULL\n                            ELSE attempt_id\n                        END\n                    WHERE batch_id = $1\n                      AND state IN ('pending', 'claimed', 'processing')\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c962e64adb0e006633d3b0c151a764c17b61da50a0e8337d399ed74add0cec11"
+}
