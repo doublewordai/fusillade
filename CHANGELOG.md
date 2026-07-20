@@ -1,5 +1,12 @@
 # Changelog
 
+## [23.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v23.0.0...fusillade-v23.0.1) (2026-07-20)
+
+
+### Bug Fixes
+
+* synchronize workspace release dependencies ([#367](https://github.com/doublewordai/fusillade/issues/367)) ([00d3a49](https://github.com/doublewordai/fusillade/commit/00d3a49107b0a78117bc5a90260721a143618cfd))
+
 ## [23.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v22.1.2...fusillade-v23.0.0) (2026-07-20)
 
 
