@@ -27,10 +27,14 @@ manifest_version() {
   sed -n 's/^version = "\([^"]*\)".*/\1/p' "$manifest" | head -n 1
 }
 
-dependency_version() {
-  local manifest="$1"
-  local dependency="$2"
-  sed -n "s/^${dependency} = { version = \"\\([^\"]*\\)\".*/\\1/p" "$manifest" | head -n 1
+release_manifest_version() {
+  local package_path="$1"
+  awk -v key="\"${package_path}\":" '
+    $1 == key {
+      gsub(/[",]/, "", $2)
+      print $2
+    }
+  ' .release-please-manifest.json
 }
 
 crate_version_available() {
@@ -95,13 +99,12 @@ case "$package" in
   fusillade-arsenal)
     wait_for_crate_version \
       fusillade-core \
-      "$(dependency_version "$(manifest_for_package "$package")" fusillade-core)"
+      "$(release_manifest_version crates/fusillade-core)"
     publish_package "$package"
     ;;
   fusillade)
-    root_manifest="$(manifest_for_package "$package")"
-    wait_for_crate_version fusillade-core "$(dependency_version "$root_manifest" fusillade-core)"
-    wait_for_crate_version fusillade-arsenal "$(dependency_version "$root_manifest" fusillade-arsenal)"
+    wait_for_crate_version fusillade-core "$(release_manifest_version crates/fusillade-core)"
+    wait_for_crate_version fusillade-arsenal "$(release_manifest_version crates/fusillade-arsenal)"
     publish_package "$package"
     ;;
 esac

@@ -24,6 +24,10 @@ if [[ "$saw_user_agent" != 1 ]]; then
   echo "curl was called without a User-Agent" >&2
   exit 22
 fi
+
+if [[ -n "${CURL_LOG:-}" ]]; then
+  printf '%s\n' "$*" >>"$CURL_LOG"
+fi
 STUB
 
 cat >"$tmpdir/cargo" <<'STUB'
@@ -38,6 +42,22 @@ chmod +x "$tmpdir/curl" "$tmpdir/cargo"
 
 core_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' crates/fusillade-core/Cargo.toml | head -n 1)"
 PATH="$tmpdir:$PATH" .github/scripts/publish-crate.sh "fusillade-core-v${core_version}"
+
+arsenal_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' crates/fusillade-arsenal/Cargo.toml | head -n 1)"
+CURL_LOG="$tmpdir/curl.log" PATH="$tmpdir:$PATH" \
+  .github/scripts/publish-crate.sh "fusillade-arsenal-v${arsenal_version}"
+if ! grep -Fq "/fusillade-core/${core_version}" "$tmpdir/curl.log"; then
+  echo "arsenal publishing must wait for the concrete tracked core version" >&2
+  exit 1
+fi
+
+root_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+CURL_LOG="$tmpdir/curl.log" PATH="$tmpdir:$PATH" \
+  .github/scripts/publish-crate.sh "fusillade-v${root_version}"
+if ! grep -Fq "/fusillade-arsenal/${arsenal_version}" "$tmpdir/curl.log"; then
+  echo "root publishing must wait for the concrete tracked arsenal version" >&2
+  exit 1
+fi
 
 publish_job_block="$(awk '
   /^  publish:/ { in_publish = 1; print; next }
