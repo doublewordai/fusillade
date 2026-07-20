@@ -397,7 +397,6 @@ struct UploadProgress {
     last_progress_ms: std::sync::atomic::AtomicU64,
     sent: std::sync::atomic::AtomicU64,
     total: u64,
-    handed_off: std::sync::atomic::AtomicBool,
 }
 
 impl UploadProgress {
@@ -407,7 +406,6 @@ impl UploadProgress {
             last_progress_ms: std::sync::atomic::AtomicU64::new(0),
             sent: std::sync::atomic::AtomicU64::new(0),
             total,
-            handed_off: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -418,13 +416,8 @@ impl UploadProgress {
             .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 
-    fn finish(&self) {
-        self.handed_off
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn is_handed_off(&self) -> bool {
-        self.handed_off.load(std::sync::atomic::Ordering::Relaxed)
+    fn is_complete(&self) -> bool {
+        self.sent_bytes() >= self.total
     }
 
     fn stalled_for(&self) -> Duration {
@@ -451,6 +444,26 @@ struct ProgressBody {
     progress: Arc<UploadProgress>,
 }
 
+/// Owns one body chunk until Hyper has consumed it from its write buffer.
+/// Dropping the last `Bytes` reference is the closest per-request signal
+/// reqwest exposes that the transport writer accepted the complete chunk.
+struct TrackedUploadChunk {
+    bytes: bytes::Bytes,
+    progress: Arc<UploadProgress>,
+}
+
+impl AsRef<[u8]> for TrackedUploadChunk {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+impl Drop for TrackedUploadChunk {
+    fn drop(&mut self) {
+        self.progress.record(self.bytes.len());
+    }
+}
+
 impl http_body::Body for ProgressBody {
     type Data = bytes::Bytes;
     type Error = std::convert::Infallible;
@@ -462,19 +475,15 @@ impl http_body::Body for ProgressBody {
     {
         let this = self.get_mut();
         if this.remaining.is_empty() {
-            this.progress.finish();
             return std::task::Poll::Ready(None);
         }
         let take = this.remaining.len().min(UPLOAD_CHUNK_BYTES);
         let chunk = this.remaining.split_to(take);
-        this.progress.record(take);
-        if this.remaining.is_empty() {
-            // The final chunk is now owned by the transport; from here on the
-            // request is waiting on the upstream, which the response timeouts
-            // govern.
-            this.progress.finish();
-        }
-        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+        let tracked = bytes::Bytes::from_owner(TrackedUploadChunk {
+            bytes: chunk,
+            progress: this.progress.clone(),
+        });
+        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(tracked))))
     }
 
     fn is_end_stream(&self) -> bool {
@@ -488,11 +497,12 @@ impl http_body::Body for ProgressBody {
 
 /// Race `send` against an upload stall watchdog.
 ///
-/// The watchdog fires only while the body is still being handed to the
-/// transport: if no chunk is accepted for `stall_timeout`, the attempt is
-/// aborted so the daemon's retry machinery can dispatch a fresh one. Once the
-/// body is fully handed off the watchdog disarms and `send`'s own timeouts
-/// take over. Requests without a body (`upload` is `None`) are unaffected.
+/// The watchdog fires only while Hyper still owns queued request-body bytes:
+/// if the transport writer consumes no complete chunk for `stall_timeout`,
+/// the attempt is aborted so the daemon's retry machinery can dispatch a
+/// fresh one. Once all chunks have been consumed the watchdog disarms and
+/// `send`'s own timeouts take over. Requests without a body (`upload` is
+/// `None`) are unaffected.
 async fn race_upload_stall<T>(
     send: impl std::future::Future<Output = T>,
     upload: Option<Arc<UploadProgress>>,
@@ -507,12 +517,12 @@ async fn race_upload_stall<T>(
         tokio::select! {
             out = &mut send => return Ok(out),
             _ = tokio::time::sleep(UPLOAD_STALL_POLL) => {
-                if progress.is_handed_off() {
+                if progress.is_complete() {
                     return Ok(send.await);
                 }
                 if progress.stalled_for() >= stall_timeout {
                     return Err(crate::error::FusilladeError::UploadStallTimeout(format!(
-                        "request upload to {} stalled: {} of {} bytes handed to the transport, no progress for {}ms",
+                        "request upload to {} stalled: {} of {} bytes accepted by the transport writer, no progress for {}ms",
                         url,
                         progress.sent_bytes(),
                         progress.total,
@@ -1015,6 +1025,27 @@ impl Drop for InFlightGuard {
 mod tests {
     use super::*;
     use crate::request::RequestId;
+
+    #[test]
+    fn upload_completes_only_after_transport_releases_final_chunk() {
+        use http_body::Body as _;
+
+        let progress = UploadProgress::new(3);
+        let mut body = std::pin::pin!(ProgressBody {
+            remaining: bytes::Bytes::from_static(b"abc"),
+            progress: progress.clone(),
+        });
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        let frame = match body.as_mut().poll_frame(&mut context) {
+            std::task::Poll::Ready(Some(Ok(frame))) => frame.into_data().unwrap(),
+            other => panic!("expected a data frame, got {other:?}"),
+        };
+
+        assert_eq!(progress.sent_bytes(), 0);
+        drop(frame);
+        assert_eq!(progress.sent_bytes(), 3);
+    }
 
     #[tokio::test]
     async fn test_mock_client_basic() {

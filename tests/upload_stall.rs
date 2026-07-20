@@ -101,7 +101,7 @@ async fn upload_stall_aborts_after_stall_timeout() {
         stream.read_exact(&mut first).await.unwrap();
         // Stop reading but keep the connection open: the client's kernel
         // buffers fill and the upload can make no further progress.
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        std::future::pending::<()>().await;
         drop(stream);
     });
 
@@ -138,13 +138,13 @@ async fn slow_but_progressing_upload_is_not_killed() {
         assert!(headers.to_lowercase().contains("content-length"));
         let mut remaining = body_len;
         let mut chunk = vec![0u8; 1024 * 1024];
+        let mut pacing = tokio::time::interval(Duration::from_millis(100));
+        pacing.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         while remaining > 0 {
+            pacing.tick().await;
             let take = remaining.min(chunk.len());
             stream.read_exact(&mut chunk[..take]).await.unwrap();
             remaining -= take;
-            // Drain slowly: total upload takes several multiples of the
-            // stall timeout, but progress never pauses long enough to trip it.
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
@@ -156,6 +156,56 @@ async fn slow_but_progressing_upload_is_not_killed() {
     let response = client(Duration::from_millis(500))
         .execute(&request, "test-key")
         .await
+        .unwrap();
+    assert_eq!(response.status, 200);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn completed_upload_can_wait_longer_than_stall_timeout_for_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body_len = 128 * 1024;
+    let (body_read_tx, body_read_rx) = tokio::sync::oneshot::channel();
+    let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let headers = read_headers(&mut stream).await;
+        assert!(headers.to_lowercase().contains("content-length"));
+        let mut received = vec![0u8; body_len];
+        stream.read_exact(&mut received).await.unwrap();
+        body_read_tx.send(()).unwrap();
+        respond_rx.await.unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+
+    let request = test_request(format!("http://{addr}"), "x".repeat(body_len));
+    let mut client_task = tokio::spawn(async move {
+        client(Duration::from_millis(100))
+            .execute(&request, "test-key")
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), body_read_rx)
+        .await
+        .expect("server did not receive the complete body")
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut client_task)
+            .await
+            .is_err(),
+        "request completed while the server was deliberately withholding response headers"
+    );
+
+    respond_tx.send(()).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(5), client_task)
+        .await
+        .expect("request did not complete after response headers were released")
+        .unwrap()
         .unwrap();
     assert_eq!(response.status, 200);
     server.await.unwrap();
