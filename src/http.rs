@@ -183,7 +183,7 @@ pub struct ReqwestHttpClient {
 }
 
 /// Default cap on how long a request body upload may make no progress.
-const DEFAULT_UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const DEFAULT_UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Request bodies are handed to the transport in chunks of this size so the
 /// upload watchdog can observe progress.
@@ -296,6 +296,7 @@ impl HttpClient for ReqwestHttpClient {
 
         tracing::debug!(
             url.full = %url,
+            upload_stall_timeout_ms = self.upload_stall_timeout.as_millis() as u64,
             first_chunk_timeout_ms = self.first_chunk_timeout.as_millis() as u64,
             chunk_timeout_ms = self.chunk_timeout.as_millis() as u64,
             body_timeout_ms = self.body_timeout.as_millis() as u64,

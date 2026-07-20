@@ -140,8 +140,31 @@ pub struct DaemonConfig {
     pub backoff_ms: u64,
     pub backoff_factor: u64,
     pub max_backoff_ms: u64,
+    /// Maximum request-body upload idle time, in milliseconds.
+    ///
+    /// This watchdog covers outbound body progress for both streaming and
+    /// non-streaming requests. Keep it lower than `first_chunk_timeout_ms`:
+    /// both clocks can run during `send()`, and whichever expires first
+    /// determines the reported timeout.
+    #[serde(default = "default_upload_stall_timeout_ms")]
+    pub upload_stall_timeout_ms: u64,
+    /// Maximum time to the first streaming response event, in milliseconds.
+    ///
+    /// This includes connection setup, request upload, response headers, and
+    /// the first event. For non-streaming requests it contributes to the
+    /// combined overall request timeout with `body_timeout_ms`.
     pub first_chunk_timeout_ms: u64,
+    /// Maximum idle time between subsequent SSE events, in milliseconds.
+    ///
+    /// This only applies to endpoints listed in `streamable_endpoints` and
+    /// starts after the first event has arrived.
     pub chunk_timeout_ms: u64,
+    /// Maximum total response-body collection time, in milliseconds.
+    ///
+    /// For streaming requests this runs across the complete SSE collection
+    /// phase, alongside the per-event `chunk_timeout_ms`. For non-streaming
+    /// requests it contributes to the combined overall request timeout with
+    /// `first_chunk_timeout_ms`.
     pub body_timeout_ms: u64,
     pub status_log_interval_ms: Option<u64>,
     pub heartbeat_interval_ms: u64,
@@ -264,6 +287,10 @@ fn default_claim_query_timeout_ms() -> u64 {
     180_000
 }
 
+fn default_upload_stall_timeout_ms() -> u64 {
+    crate::http::DEFAULT_UPLOAD_STALL_TIMEOUT.as_millis() as u64
+}
+
 fn default_archive_sweep_interval_ms() -> u64 {
     5_000
 }
@@ -320,6 +347,7 @@ impl Default for DaemonConfig {
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
+            upload_stall_timeout_ms: default_upload_stall_timeout_ms(),
             first_chunk_timeout_ms: 540_000,
             chunk_timeout_ms: 540_000,
             body_timeout_ms: 60_000,
@@ -530,5 +558,31 @@ mod tests {
 
             assert_eq!(deserialized.additional_retryable_statuses, statuses);
         }
+    }
+
+    #[test]
+    fn upload_stall_timeout_defaults_when_missing() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("upload_stall_timeout_ms");
+
+        let config: DaemonConfig = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(config.upload_stall_timeout_ms, 60_000);
+    }
+
+    #[test]
+    fn upload_stall_timeout_explicit_value_round_trips() {
+        let config = DaemonConfig {
+            upload_stall_timeout_ms: 12_345,
+            ..DaemonConfig::default()
+        };
+
+        let serialized = serde_json::to_value(config).unwrap();
+        let deserialized: DaemonConfig = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(deserialized.upload_stall_timeout_ms, 12_345);
     }
 }
