@@ -1,8 +1,9 @@
 //! Integration tests for the request upload stall watchdog.
 //!
-//! These use raw TCP servers (no database) to control exactly how much of the
-//! request the "upstream" reads, exercising the send phase of
-//! `ReqwestHttpClient` in ways a well-behaved HTTP mock cannot.
+//! These use raw TCP servers (no database) to verify request framing and the
+//! boundary between upload completion and response waiting. Watchdog timing
+//! is covered by controlled unit tests in `http.rs`, independent of platform
+//! TCP buffer sizes.
 
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,9 @@ use fusillade::batch::{BatchId, TemplateId};
 use fusillade::http::{HttpClient, ReqwestHttpClient};
 use fusillade::{FusilladeError, RequestData, RequestId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
+
+const TEST_RECEIVE_BUFFER_BYTES: u32 = 16 * 1024;
 
 fn test_request(endpoint: String, body: String) -> RequestData {
     RequestData {
@@ -47,6 +50,20 @@ async fn read_headers(stream: &mut tokio::net::TcpStream) -> String {
         buf.push(byte[0]);
     }
     String::from_utf8(buf).unwrap()
+}
+
+fn backpressured_listener() -> TcpListener {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket
+        .set_recv_buffer_size(TEST_RECEIVE_BUFFER_BYTES)
+        .unwrap();
+    let effective_size = socket.recv_buffer_size().unwrap();
+    assert!(
+        effective_size < 1024 * 1024,
+        "test receive buffer is too large to enforce backpressure: {effective_size} bytes"
+    );
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    socket.listen(1).unwrap()
 }
 
 #[tokio::test]
@@ -92,15 +109,15 @@ async fn healthy_upload_preserves_content_length_framing() {
 
 #[tokio::test]
 async fn upload_stall_aborts_after_stall_timeout() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = backpressured_listener();
     let addr = listener.local_addr().unwrap();
 
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut first = vec![0u8; 1024];
         stream.read_exact(&mut first).await.unwrap();
-        // Stop reading but keep the connection open: the client's kernel
-        // buffers fill and the upload can make no further progress.
+        // Stop reading but keep the connection open. The deliberately small
+        // receive buffer ensures the client's upload cannot finish locally.
         std::future::pending::<()>().await;
         drop(stream);
     });
@@ -128,9 +145,10 @@ async fn upload_stall_aborts_after_stall_timeout() {
 
 #[tokio::test]
 async fn slow_but_progressing_upload_is_not_killed() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = backpressured_listener();
     let addr = listener.local_addr().unwrap();
     let body_len = 16 * 1024 * 1024;
+    let stall_timeout = Duration::from_millis(500);
 
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -153,11 +171,16 @@ async fn slow_but_progressing_upload_is_not_killed() {
     });
 
     let request = test_request(format!("http://{addr}"), "x".repeat(body_len));
-    let response = client(Duration::from_millis(500))
+    let started = Instant::now();
+    let response = client(stall_timeout)
         .execute(&request, "test-key")
         .await
         .unwrap();
     assert_eq!(response.status, 200);
+    assert!(
+        started.elapsed() > stall_timeout * 2,
+        "test did not span multiple complete stall windows"
+    );
     server.await.unwrap();
 }
 

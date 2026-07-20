@@ -1048,6 +1048,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_watchdog_aborts_when_progress_stops() {
+        let stall_timeout = Duration::from_millis(250);
+        let progress = UploadProgress::new(1);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            race_upload_stall(
+                std::future::pending::<()>(),
+                Some(progress),
+                stall_timeout,
+                "http://example.test",
+            ),
+        )
+        .await
+        .expect("watchdog did not enforce the stall timeout")
+        .unwrap_err();
+
+        assert!(matches!(
+            result,
+            crate::error::FusilladeError::UploadStallTimeout(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn upload_watchdog_allows_progress_across_multiple_stall_windows() {
+        const PROGRESS_STEPS: u64 = 24;
+        let stall_timeout = Duration::from_millis(250);
+        let progress = UploadProgress::new(PROGRESS_STEPS);
+        let watchdog_progress = progress.clone();
+        let (send_complete_tx, send_complete_rx) = tokio::sync::oneshot::channel();
+        let watchdog = tokio::spawn(async move {
+            race_upload_stall(
+                async move { send_complete_rx.await.unwrap() },
+                Some(watchdog_progress),
+                stall_timeout,
+                "http://example.test",
+            )
+            .await
+        });
+
+        let started = std::time::Instant::now();
+        let mut pacing = tokio::time::interval(Duration::from_millis(25));
+        pacing.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        for _ in 0..PROGRESS_STEPS {
+            pacing.tick().await;
+            progress.record(1);
+            assert!(
+                !watchdog.is_finished(),
+                "watchdog aborted despite continuing upload progress"
+            );
+        }
+        assert!(
+            started.elapsed() > stall_timeout * 2,
+            "test did not span multiple complete stall windows"
+        );
+
+        send_complete_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), watchdog)
+            .await
+            .expect("watchdog did not finish after upload and send completion")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_mock_client_basic() {
         let mock = MockHttpClient::new();
         mock.add_response(
