@@ -15,7 +15,42 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           token: ${{ secrets.RELEASE_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      - name: Resolve release PR branch
+        id: release-pr
+        env:
+          RELEASE_PRS: ${{ steps.release.outputs.prs }}
+        run: |
+          if [[ -z "$RELEASE_PRS" ]]; then
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "branch=$(jq -r '.[0].headBranchName // empty' <<<"$RELEASE_PRS")" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release PR
+        if: steps.release-pr.outputs.branch != ''
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.RELEASE_TOKEN }}
+          ref: ${{ steps.release-pr.outputs.branch }}
+
+      - name: Synchronize workspace dependency majors
+        if: steps.release-pr.outputs.branch != ''
+        run: |
+          python3 .github/scripts/sync-release-dependencies.py
+
+          if git diff --quiet -- Cargo.toml crates/fusillade-arsenal/Cargo.toml; then
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml crates/fusillade-arsenal/Cargo.toml
+          git commit -m "chore: sync workspace release dependencies"
+          git push origin HEAD:${{ steps.release-pr.outputs.branch }}

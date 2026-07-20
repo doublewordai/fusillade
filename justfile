@@ -36,6 +36,7 @@ test *args="":
 
 test-release-scripts:
     bash .github/scripts/test-publish-crate.sh
+    bash .github/scripts/test-sync-release-dependencies.sh
 
 test-arsenal-sqlx-cache:
     bash .github/scripts/test-arsenal-sqlx-cache.sh

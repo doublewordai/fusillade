@@ -30,9 +30,23 @@ fi
 # Skipping is safe: cargo publish runs the identical verify build at publish
 # time, gated behind wait_for_crate_version in publish-crate.sh, so nothing
 # ships unverified.
-core_version="$(sed -n 's/^fusillade-core = { version = "\([^"]*\)".*/\1/p' crates/fusillade-arsenal/Cargo.toml | head -n 1)"
+core_requirement="$(sed -n 's/^fusillade-core = { version = "\([^"]*\)".*/\1/p' crates/fusillade-arsenal/Cargo.toml | head -n 1)"
+if [[ -z "${core_requirement}" ]]; then
+  echo "Could not determine the fusillade-core requirement from crates/fusillade-arsenal/Cargo.toml." >&2
+  exit 1
+fi
+
+# A requirement may deliberately span multiple compatible majors, so query the
+# concrete version tracked for release instead of treating the requirement as
+# a crates.io version URL.
+core_version="$(awk '
+  $1 == "\"crates/fusillade-core\":" {
+    gsub(/[",]/, "", $2)
+    print $2
+  }
+' .release-please-manifest.json)"
 if [[ -z "${core_version}" ]]; then
-  echo "Could not determine the fusillade-core version from crates/fusillade-arsenal/Cargo.toml." >&2
+  echo "Could not determine the tracked fusillade-core version." >&2
   exit 1
 fi
 
