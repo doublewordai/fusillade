@@ -1,5 +1,5 @@
 {
-  ".": "22.1.2",
-  "crates/fusillade-core": "2.1.0",
+  ".": "23.0.0",
+  "crates/fusillade-core": "3.0.0",
   "crates/fusillade-arsenal": "2.1.2"
 }

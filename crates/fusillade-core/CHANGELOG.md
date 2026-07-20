@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-core-v2.1.0...fusillade-core-v3.0.0) (2026-07-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* bound the request upload phase with a progress watchdog ([#363](https://github.com/doublewordai/fusillade/issues/363))
+
+### Bug Fixes
+
+* bound the request upload phase with a progress watchdog ([#363](https://github.com/doublewordai/fusillade/issues/363)) ([dc4eaf8](https://github.com/doublewordai/fusillade/commit/dc4eaf82a0acaebfdc4e29c81d476db6432c379f))
+
 ## [2.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-core-v2.0.0...fusillade-core-v2.1.0) (2026-07-17)
 
 
