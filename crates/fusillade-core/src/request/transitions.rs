@@ -450,6 +450,9 @@ impl Request<Processing> {
                     FusilladeError::FirstChunkTimeout(msg) => {
                         FailureReason::Timeout { error: msg.clone() }
                     }
+                    FusilladeError::UploadStallTimeout(msg) => {
+                        FailureReason::Timeout { error: msg.clone() }
+                    }
                     FusilladeError::TokensTimeout(msg) => {
                         FailureReason::Timeout { error: msg.clone() }
                     }

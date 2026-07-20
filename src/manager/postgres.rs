@@ -55,12 +55,17 @@ where
     /// Build a PostgreSQL daemon runtime from an existing Arsenal store and
     /// the default Reqwest HTTP client.
     pub fn from_store(storage: Arc<PostgresStore<P>>, config: DaemonConfig) -> Self {
-        let http_client = Arc::new(ReqwestHttpClient::new(
-            Duration::from_millis(config.first_chunk_timeout_ms),
-            Duration::from_millis(config.chunk_timeout_ms),
-            Duration::from_millis(config.body_timeout_ms),
-            config.streamable_endpoints.clone(),
-        ));
+        let http_client = Arc::new(
+            ReqwestHttpClient::new(
+                Duration::from_millis(config.first_chunk_timeout_ms),
+                Duration::from_millis(config.chunk_timeout_ms),
+                Duration::from_millis(config.body_timeout_ms),
+                config.streamable_endpoints.clone(),
+            )
+            .with_upload_stall_timeout(Duration::from_millis(config.upload_stall_timeout_ms))
+            .with_upload_chunk_bytes(config.upload_chunk_bytes)
+            .with_upload_stall_poll_interval(Duration::from_millis(config.upload_stall_poll_ms)),
+        );
         Self::new(storage, http_client, config)
     }
 
