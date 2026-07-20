@@ -19,7 +19,7 @@ name = "fusillade"
 path = "src/lib.rs"
 
 [dependencies]
-fusillade-core = { version = "2.1.0", path = "crates/fusillade-core" }
+fusillade-core = { version = "3.0.0", path = "crates/fusillade-core" }
 fusillade-arsenal = { version = "2.1.0", path = "crates/fusillade-arsenal", optional = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
