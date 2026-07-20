@@ -62,7 +62,9 @@ where
                 Duration::from_millis(config.body_timeout_ms),
                 config.streamable_endpoints.clone(),
             )
-            .with_upload_stall_timeout(Duration::from_millis(config.upload_stall_timeout_ms)),
+            .with_upload_stall_timeout(Duration::from_millis(config.upload_stall_timeout_ms))
+            .with_upload_chunk_bytes(config.upload_chunk_bytes)
+            .with_upload_stall_poll_interval(Duration::from_millis(config.upload_stall_poll_ms)),
         );
         Self::new(storage, http_client, config)
     }

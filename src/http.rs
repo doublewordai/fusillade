@@ -178,6 +178,8 @@ pub struct ReqwestHttpClient {
     chunk_timeout: Duration,
     body_timeout: Duration,
     upload_stall_timeout: Duration,
+    upload_chunk_bytes: usize,
+    upload_stall_poll: Duration,
     stream_reassembler: Option<StreamReassembler>,
     streamable_endpoints: Vec<String>,
 }
@@ -187,10 +189,10 @@ pub(crate) const DEFAULT_UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60
 
 /// Request bodies are handed to the transport in chunks of this size so the
 /// upload watchdog can observe progress.
-const UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
+pub(crate) const DEFAULT_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Poll interval for the upload stall watchdog.
-const UPLOAD_STALL_POLL: Duration = Duration::from_millis(100);
+pub(crate) const DEFAULT_UPLOAD_STALL_POLL: Duration = Duration::from_millis(100);
 
 impl ReqwestHttpClient {
     /// Create a new reqwest-based HTTP client with the given timeouts.
@@ -206,6 +208,8 @@ impl ReqwestHttpClient {
             chunk_timeout,
             body_timeout,
             upload_stall_timeout: DEFAULT_UPLOAD_STALL_TIMEOUT,
+            upload_chunk_bytes: DEFAULT_UPLOAD_CHUNK_BYTES,
+            upload_stall_poll: DEFAULT_UPLOAD_STALL_POLL,
             stream_reassembler: Some(openai_reassembler::reassemble),
             streamable_endpoints,
         }
@@ -217,6 +221,38 @@ impl ReqwestHttpClient {
     /// timeouts.
     pub fn with_upload_stall_timeout(mut self, timeout: Duration) -> Self {
         self.upload_stall_timeout = timeout;
+        self
+    }
+
+    /// Override the request-body chunk size used to observe upload progress
+    /// (default 64 KiB). Smaller values provide finer progress granularity at
+    /// the cost of more body frames.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_bytes` is zero.
+    pub fn with_upload_chunk_bytes(mut self, chunk_bytes: usize) -> Self {
+        assert!(
+            chunk_bytes > 0,
+            "upload chunk size must be greater than zero"
+        );
+        self.upload_chunk_bytes = chunk_bytes;
+        self
+    }
+
+    /// Override how often the upload stall watchdog checks progress (default
+    /// 100ms). A stall may be detected up to roughly one poll interval after
+    /// `upload_stall_timeout` expires.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `interval` is zero.
+    pub fn with_upload_stall_poll_interval(mut self, interval: Duration) -> Self {
+        assert!(
+            !interval.is_zero(),
+            "upload stall poll interval must be greater than zero"
+        );
+        self.upload_stall_poll = interval;
         self
     }
 
@@ -297,6 +333,8 @@ impl HttpClient for ReqwestHttpClient {
         tracing::debug!(
             url.full = %url,
             upload_stall_timeout_ms = self.upload_stall_timeout.as_millis() as u64,
+            upload_chunk_bytes = self.upload_chunk_bytes,
+            upload_stall_poll_ms = self.upload_stall_poll.as_millis() as u64,
             first_chunk_timeout_ms = self.first_chunk_timeout.as_millis() as u64,
             chunk_timeout_ms = self.chunk_timeout.as_millis() as u64,
             body_timeout_ms = self.body_timeout.as_millis() as u64,
@@ -369,6 +407,7 @@ impl HttpClient for ReqwestHttpClient {
                 .body(reqwest::Body::wrap(ProgressBody {
                     remaining: body,
                     progress: progress.clone(),
+                    chunk_bytes: self.upload_chunk_bytes,
                 }));
             upload = Some(progress);
             tracing::trace!(
@@ -435,13 +474,14 @@ impl UploadProgress {
 
 /// Request body that reports upload progress to an [`UploadProgress`] handle.
 ///
-/// The body is handed to the transport in [`UPLOAD_CHUNK_BYTES`] chunks; each
-/// chunk the transport accepts counts as progress. The exact `size_hint`
-/// preserves Content-Length framing, so the wire format is identical to
-/// sending the buffered body directly.
+/// The body is handed to the transport in configurable chunks; each chunk
+/// the transport accepts counts as progress. The exact `size_hint` preserves
+/// Content-Length framing, so the wire format is identical to sending the
+/// buffered body directly.
 struct ProgressBody {
     remaining: bytes::Bytes,
     progress: Arc<UploadProgress>,
+    chunk_bytes: usize,
 }
 
 /// Owns one body chunk until Hyper has consumed it from its write buffer.
@@ -477,7 +517,7 @@ impl http_body::Body for ProgressBody {
         if this.remaining.is_empty() {
             return std::task::Poll::Ready(None);
         }
-        let take = this.remaining.len().min(UPLOAD_CHUNK_BYTES);
+        let take = this.remaining.len().min(this.chunk_bytes);
         let chunk = this.remaining.split_to(take);
         let tracked = bytes::Bytes::from_owner(TrackedUploadChunk {
             bytes: chunk,
@@ -507,6 +547,7 @@ async fn race_upload_stall<T>(
     send: impl std::future::Future<Output = T>,
     upload: Option<Arc<UploadProgress>>,
     stall_timeout: Duration,
+    poll_interval: Duration,
     url: &str,
 ) -> Result<T> {
     let Some(progress) = upload else {
@@ -516,7 +557,7 @@ async fn race_upload_stall<T>(
     loop {
         tokio::select! {
             out = &mut send => return Ok(out),
-            _ = tokio::time::sleep(UPLOAD_STALL_POLL) => {
+            _ = tokio::time::sleep(poll_interval) => {
                 if progress.is_complete() {
                     return Ok(send.await);
                 }
@@ -550,6 +591,7 @@ impl ReqwestHttpClient {
             req.timeout(total_timeout).send(),
             upload,
             self.upload_stall_timeout,
+            self.upload_stall_poll,
             url,
         )
         .await
@@ -637,23 +679,29 @@ impl ReqwestHttpClient {
                     );
                 })
         });
-        let resp = race_upload_stall(send, upload, self.upload_stall_timeout, url)
-            .await
-            .inspect_err(|e| {
-                tracing::error!(
-                    request_id = %request.id,
-                    url.full = %url,
-                    error = %e,
-                    "HTTP request upload stalled"
-                );
-            })?
-            .map_err(|_| {
-                crate::error::FusilladeError::FirstChunkTimeout(format!(
-                    "No response headers from {} within {}ms",
-                    url,
-                    self.first_chunk_timeout.as_millis()
-                ))
-            })??;
+        let resp = race_upload_stall(
+            send,
+            upload,
+            self.upload_stall_timeout,
+            self.upload_stall_poll,
+            url,
+        )
+        .await
+        .inspect_err(|e| {
+            tracing::error!(
+                request_id = %request.id,
+                url.full = %url,
+                error = %e,
+                "HTTP request upload stalled"
+            );
+        })?
+        .map_err(|_| {
+            crate::error::FusilladeError::FirstChunkTimeout(format!(
+                "No response headers from {} within {}ms",
+                url,
+                self.first_chunk_timeout.as_millis()
+            ))
+        })??;
 
         let status = resp.status().as_u16();
         let content_type = resp
@@ -1034,6 +1082,7 @@ mod tests {
         let mut body = std::pin::pin!(ProgressBody {
             remaining: bytes::Bytes::from_static(b"abc"),
             progress: progress.clone(),
+            chunk_bytes: DEFAULT_UPLOAD_CHUNK_BYTES,
         });
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
 
@@ -1047,6 +1096,97 @@ mod tests {
         assert_eq!(progress.sent_bytes(), 3);
     }
 
+    #[test]
+    fn configurable_upload_chunk_size_controls_progress_frames() {
+        use http_body::Body as _;
+
+        let progress = UploadProgress::new(6);
+        let mut body = std::pin::pin!(ProgressBody {
+            remaining: bytes::Bytes::from_static(b"abcdef"),
+            progress: progress.clone(),
+            chunk_bytes: 3,
+        });
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        let first = match body.as_mut().poll_frame(&mut context) {
+            std::task::Poll::Ready(Some(Ok(frame))) => frame.into_data().unwrap(),
+            other => panic!("expected first data frame, got {other:?}"),
+        };
+        assert_eq!(first.len(), 3);
+        drop(first);
+        assert_eq!(progress.sent_bytes(), 3);
+
+        let second = match body.as_mut().poll_frame(&mut context) {
+            std::task::Poll::Ready(Some(Ok(frame))) => frame.into_data().unwrap(),
+            other => panic!("expected second data frame, got {other:?}"),
+        };
+        assert_eq!(second.len(), 3);
+        drop(second);
+        assert_eq!(progress.sent_bytes(), 6);
+    }
+
+    #[test]
+    fn upload_watchdog_client_configuration_has_defaults_and_overrides() {
+        let client = ReqwestHttpClient::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            vec![],
+        );
+        assert_eq!(client.upload_chunk_bytes, 64 * 1024);
+        assert_eq!(client.upload_stall_poll, Duration::from_millis(100));
+
+        let client = client
+            .with_upload_chunk_bytes(8 * 1024)
+            .with_upload_stall_poll_interval(Duration::from_millis(25));
+        assert_eq!(client.upload_chunk_bytes, 8 * 1024);
+        assert_eq!(client.upload_stall_poll, Duration::from_millis(25));
+    }
+
+    #[test]
+    #[should_panic(expected = "upload chunk size must be greater than zero")]
+    fn zero_upload_chunk_size_is_rejected() {
+        let _ = ReqwestHttpClient::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            vec![],
+        )
+        .with_upload_chunk_bytes(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "upload stall poll interval must be greater than zero")]
+    fn zero_upload_stall_poll_interval_is_rejected() {
+        let _ = ReqwestHttpClient::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            vec![],
+        )
+        .with_upload_stall_poll_interval(Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn configurable_upload_stall_poll_controls_first_check() {
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            race_upload_stall(
+                std::future::pending::<()>(),
+                Some(UploadProgress::new(1)),
+                Duration::from_millis(1),
+                Duration::from_secs(5),
+                "http://example.test",
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "watchdog checked before the configured poll interval"
+        );
+    }
+
     #[tokio::test]
     async fn upload_watchdog_aborts_when_progress_stops() {
         let stall_timeout = Duration::from_millis(250);
@@ -1058,6 +1198,7 @@ mod tests {
                 std::future::pending::<()>(),
                 Some(progress),
                 stall_timeout,
+                DEFAULT_UPLOAD_STALL_POLL,
                 "http://example.test",
             ),
         )
@@ -1083,6 +1224,7 @@ mod tests {
                 async move { send_complete_rx.await.unwrap() },
                 Some(watchdog_progress),
                 stall_timeout,
+                DEFAULT_UPLOAD_STALL_POLL,
                 "http://example.test",
             )
             .await
