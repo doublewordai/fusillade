@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.2](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v2.1.1...fusillade-arsenal-v2.1.2) (2026-07-20)
+
+
+### Bug Fixes
+
+* migration fixes ([#364](https://github.com/doublewordai/fusillade/issues/364)) ([c0111f2](https://github.com/doublewordai/fusillade/commit/c0111f25c93ebab2e37f605bd5b5f312ed69b3d4))
+
 ## [2.1.1](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v2.1.0...fusillade-arsenal-v2.1.1) (2026-07-17)
 
 
