@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.3](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v2.1.2...fusillade-arsenal-v2.1.3) (2026-07-20)
+
+
+### Bug Fixes
+
+* synchronize workspace release dependencies ([#367](https://github.com/doublewordai/fusillade/issues/367)) ([00d3a49](https://github.com/doublewordai/fusillade/commit/00d3a49107b0a78117bc5a90260721a143618cfd))
+
 ## [2.1.2](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v2.1.1...fusillade-arsenal-v2.1.2) (2026-07-20)
 
 
