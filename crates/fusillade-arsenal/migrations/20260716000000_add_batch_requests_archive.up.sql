@@ -139,9 +139,7 @@ RETURNS integer
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    -- UTC, matching archive_batch's bucket derivation exactly: a session
-    -- with a non-UTC TimeZone must never compute a different Monday.
-    this_monday date := date_trunc('week', now() AT TIME ZONE 'UTC')::date;
+    this_monday date := date_trunc('week', now())::date;
     target date;
     part_name text;
     created integer := 0;
@@ -202,12 +200,12 @@ COMMENT ON FUNCTION ensure_archive_partitions(integer) IS
 DO $$
 DECLARE
     start_monday date;
-    end_monday date := date_trunc('week', now() AT TIME ZONE 'UTC')::date + 28;
+    end_monday date := date_trunc('week', now())::date + 28;
     target date;
     part_name text;
 BEGIN
-    SELECT COALESCE(date_trunc('week', min(created_at) AT TIME ZONE 'UTC')::date,
-                    date_trunc('week', now() AT TIME ZONE 'UTC')::date)
+    SELECT COALESCE(date_trunc('week', min(created_at))::date,
+                    date_trunc('week', now())::date)
     INTO start_monday
     FROM batches;
 
