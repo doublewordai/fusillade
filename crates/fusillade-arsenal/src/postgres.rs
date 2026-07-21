@@ -9,6 +9,7 @@ pub use sqlx_pool_router::{PoolProvider, TestDbPools};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -136,21 +137,29 @@ pub struct PostgresRequestManager<P: PoolProvider> {
 
 struct StateWriteLimiter {
     semaphore: Option<Semaphore>,
+    waiting: AtomicUsize,
+    in_flight: AtomicUsize,
 }
 
 impl StateWriteLimiter {
     fn new(limit: usize) -> Self {
         Self {
             semaphore: (limit > 0).then(|| Semaphore::new(limit)),
+            waiting: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
         }
     }
 
     async fn acquire(&self, operation: &'static str) -> Result<StateWritePermit<'_>> {
         let started = std::time::Instant::now();
         let waiting = self.semaphore.as_ref().map(|_| {
+            self.waiting.fetch_add(1, Ordering::Relaxed);
             metrics::gauge!("fusillade_state_writes_waiting", "operation" => operation)
                 .increment(1.0);
-            StateWriteWaitGuard { operation }
+            StateWriteWaitGuard {
+                operation,
+                waiting: &self.waiting,
+            }
         });
 
         let permit = match &self.semaphore {
@@ -168,20 +177,32 @@ impl StateWriteLimiter {
         .record(started.elapsed().as_secs_f64());
         metrics::gauge!("fusillade_state_writes_in_flight", "operation" => operation)
             .increment(1.0);
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
 
         Ok(StateWritePermit {
             _permit: permit,
             operation,
+            in_flight: &self.in_flight,
         })
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.waiting.load(Ordering::Relaxed),
+            self.in_flight.load(Ordering::Relaxed),
+        )
     }
 }
 
-struct StateWriteWaitGuard {
+struct StateWriteWaitGuard<'a> {
     operation: &'static str,
+    waiting: &'a AtomicUsize,
 }
 
-impl Drop for StateWriteWaitGuard {
+impl Drop for StateWriteWaitGuard<'_> {
     fn drop(&mut self) {
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
         metrics::gauge!(
             "fusillade_state_writes_waiting",
             "operation" => self.operation
@@ -193,10 +214,12 @@ impl Drop for StateWriteWaitGuard {
 struct StateWritePermit<'a> {
     _permit: Option<SemaphorePermit<'a>>,
     operation: &'static str,
+    in_flight: &'a AtomicUsize,
 }
 
 impl Drop for StateWritePermit<'_> {
     fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
         metrics::gauge!(
             "fusillade_state_writes_in_flight",
             "operation" => self.operation
@@ -2193,12 +2216,14 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             }
         }
 
-        let _state_write_permit = self.state_write_limiter.acquire("persist").await?;
-
         for attempt in 0..MAX_ATTEMPTS {
             tracing::debug!(request_id = %request.data.id, "Persisting request state");
             let any_request = any_request.clone();
 
+            // Limit active database attempts, not retry backoff. A failed write
+            // releases its slot before sleeping and queues fairly for its next
+            // attempt alongside fresh lifecycle transitions.
+            let state_write_permit = self.state_write_limiter.acquire("persist").await?;
             let result: Result<Option<RequestId>> = async {
                 match any_request {
                     AnyRequest::Pending(req) => {
@@ -2476,6 +2501,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 Ok(None)
             }
             .await;
+            drop(state_write_permit);
 
             match result {
                 Ok(val) => return Ok(val),
@@ -7837,6 +7863,21 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn zero_state_write_limit_is_unbounded() {
+        let limiter = StateWriteLimiter::new(0);
+        let (first, second, third) = tokio::join!(
+            limiter.acquire("first"),
+            limiter.acquire("second"),
+            limiter.acquire("third")
+        );
+        let permits = (first.unwrap(), second.unwrap(), third.unwrap());
+
+        assert_eq!(limiter.counts(), (0, 3));
+        drop(permits);
+        assert_eq!(limiter.counts(), (0, 0));
+    }
+
     fn expect_stream_success(result: FileStreamResult) -> FileId {
         match result {
             FileStreamResult::Success(file_id) => file_id,
@@ -9562,23 +9603,9 @@ mod tests {
 
         let blocked_writes = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                let count: i64 = sqlx::query_scalar(
-                    r#"
-                    SELECT COUNT(*)
-                    FROM pg_stat_activity
-                    WHERE datname = current_database()
-                      AND state = 'active'
-                      AND wait_event_type = 'Lock'
-                      AND query LIKE '%UPDATE requests%'
-                    "#,
-                )
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-                if count >= 2 {
-                    // Give an unbounded third write time to reach Postgres.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    break sqlx::query_scalar::<_, i64>(
+                let counts = manager.state_write_limiter.counts();
+                if counts == (1, 2) {
+                    let blocked = sqlx::query_scalar::<_, i64>(
                         r#"
                         SELECT COUNT(*)
                         FROM pg_stat_activity
@@ -9591,8 +9618,11 @@ mod tests {
                     .fetch_one(&pool)
                     .await
                     .unwrap();
+                    if blocked == 2 {
+                        break blocked;
+                    }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await

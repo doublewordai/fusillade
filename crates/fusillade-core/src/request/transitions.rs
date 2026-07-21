@@ -104,7 +104,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tracing::Instrument;
 
 use crate::{FusilladeError, error::Result, manager::Storage};
@@ -190,7 +190,10 @@ impl Request<Claimed> {
         S: Storage,
         Fut: std::future::Future<Output = Result<HttpResponse>> + Send + 'static,
     {
-        // Create a channel for the HTTP result
+        // Create channels for dispatching and receiving the HTTP result. The
+        // dispatch gate keeps the response future completely unpolled until
+        // the Processing transition is durable.
+        let (dispatch_tx, dispatch_rx) = oneshot::channel();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
 
         // Spawn the HTTP request as an async task, propagating the current
@@ -198,6 +201,9 @@ impl Request<Claimed> {
         let current_span = tracing::Span::current();
         let task_handle = tokio::spawn(
             async move {
+                if dispatch_rx.await.is_err() {
+                    return;
+                }
                 let result = response_fut.await;
                 let _ = tx.send(result).await; // Ignore send errors (receiver dropped)
             }
@@ -224,6 +230,13 @@ impl Request<Claimed> {
         if let Err(e) = storage.persist(&request).await {
             request.state.abort_handle.abort();
             return Err(e);
+        }
+
+        if dispatch_tx.send(()).is_err() {
+            request.state.abort_handle.abort();
+            return Err(FusilladeError::Other(anyhow::anyhow!(
+                "HTTP dispatch task terminated before request processing began"
+            )));
         }
 
         Ok(request)
