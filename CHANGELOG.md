@@ -1,5 +1,13 @@
 # Changelog
 
+## [23.0.2](https://github.com/doublewordai/fusillade/compare/fusillade-v23.0.1...fusillade-v23.0.2) (2026-07-21)
+
+
+### Bug Fixes
+
+* index for batch archive sweeper for the bulk movement job, then … ([#371](https://github.com/doublewordai/fusillade/issues/371)) ([5e8f825](https://github.com/doublewordai/fusillade/commit/5e8f8259cbeb5a5fe83e1b6a254a02546450cadb))
+* resolve tracked versions before publishing ([#369](https://github.com/doublewordai/fusillade/issues/369)) ([9d58d82](https://github.com/doublewordai/fusillade/commit/9d58d82b88f383ef1e98058ab39efc68c8e7df25))
+
 ## [23.0.1](https://github.com/doublewordai/fusillade/compare/fusillade-v23.0.0...fusillade-v23.0.1) (2026-07-20)
 
 
