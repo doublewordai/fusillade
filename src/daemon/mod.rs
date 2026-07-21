@@ -1447,17 +1447,21 @@ where
                                 let storage = storage.clone();
                                 async move {
                                     let started = std::time::Instant::now();
-                                    (*batch_id, started, storage.archive_batch(*batch_id).await)
+                                    let result = storage.archive_batch(*batch_id).await;
+                                    // Elapsed measured HERE, inside the future:
+                                    // after join_all it would include waiting
+                                    // for slower wave-mates.
+                                    (*batch_id, started.elapsed(), result)
                                 }
                             }))
                             .await;
-                            for (batch_id, started, result) in results {
+                            for (batch_id, elapsed, result) in results {
                                 match result {
                                     Ok(ArchiveOutcome::Archived { rows }) => {
                                         counter!("fusillade_archive_moves_total", "worker" => worker, "outcome" => "archived").increment(1);
                                         counter!("fusillade_archive_moved_rows_total", "worker" => worker).increment(rows);
                                         histogram!("fusillade_archive_move_duration_seconds", "worker" => worker)
-                                            .record(started.elapsed().as_secs_f64());
+                                            .record(elapsed.as_secs_f64());
                                     }
                                     Ok(outcome) => {
                                         let label = match outcome {
