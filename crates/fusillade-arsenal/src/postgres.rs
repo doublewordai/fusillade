@@ -18,7 +18,7 @@ use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::postgres::{PgListener, PgPool};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
@@ -124,6 +124,7 @@ impl Default for BatchInsertStrategy {
 pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
+    state_write_limiter: StateWriteLimiter,
     db_retry_config: crate::DbRetryConfig,
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
@@ -131,6 +132,77 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     /// error bodies before persistence; `None` is identity. Remove when stream
     /// reassembly moves into dwctl.
     response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
+}
+
+struct StateWriteLimiter {
+    semaphore: Option<Semaphore>,
+}
+
+impl StateWriteLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            semaphore: (limit > 0).then(|| Semaphore::new(limit)),
+        }
+    }
+
+    async fn acquire(&self, operation: &'static str) -> Result<StateWritePermit<'_>> {
+        let started = std::time::Instant::now();
+        let waiting = self.semaphore.as_ref().map(|_| {
+            metrics::gauge!("fusillade_state_writes_waiting", "operation" => operation)
+                .increment(1.0);
+            StateWriteWaitGuard { operation }
+        });
+
+        let permit = match &self.semaphore {
+            Some(semaphore) => Some(semaphore.acquire().await.map_err(|_| {
+                FusilladeError::Other(anyhow!("state write concurrency limiter closed"))
+            })?),
+            None => None,
+        };
+
+        drop(waiting);
+        metrics::histogram!(
+            "fusillade_state_write_wait_duration_seconds",
+            "operation" => operation
+        )
+        .record(started.elapsed().as_secs_f64());
+        metrics::gauge!("fusillade_state_writes_in_flight", "operation" => operation)
+            .increment(1.0);
+
+        Ok(StateWritePermit {
+            _permit: permit,
+            operation,
+        })
+    }
+}
+
+struct StateWriteWaitGuard {
+    operation: &'static str,
+}
+
+impl Drop for StateWriteWaitGuard {
+    fn drop(&mut self) {
+        metrics::gauge!(
+            "fusillade_state_writes_waiting",
+            "operation" => self.operation
+        )
+        .decrement(1.0);
+    }
+}
+
+struct StateWritePermit<'a> {
+    _permit: Option<SemaphorePermit<'a>>,
+    operation: &'static str,
+}
+
+impl Drop for StateWritePermit<'_> {
+    fn drop(&mut self) {
+        metrics::gauge!(
+            "fusillade_state_writes_in_flight",
+            "operation" => self.operation
+        )
+        .decrement(1.0);
+    }
 }
 
 struct ClaimedRequestRow {
@@ -224,9 +296,11 @@ macro_rules! batch_status_from_dynamic_row {
 impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Create a new PostgreSQL storage manager.
     pub fn new(pools: P, config: PostgresStorageConfig) -> Self {
+        let state_write_limiter = StateWriteLimiter::new(config.max_concurrent_state_writes);
         Self {
             pools,
             config,
+            state_write_limiter,
             db_retry_config: crate::DbRetryConfig::default(),
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
@@ -256,11 +330,13 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     ///
     /// This is a builder method that can be chained after `new()`.
     pub fn with_config(mut self, config: PostgresStorageConfig) -> Self {
+        self.state_write_limiter = StateWriteLimiter::new(config.max_concurrent_state_writes);
         self.config = config;
         self
     }
 
     pub fn set_config(&mut self, config: PostgresStorageConfig) {
+        self.state_write_limiter = StateWriteLimiter::new(config.max_concurrent_state_writes);
         self.config = config;
     }
 
@@ -773,45 +849,55 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         estimated_size: i64,
     ) -> Result<bool> {
         let lock_key = Self::file_lock_key(file_id);
-        let mut connection = crate::db::acquire_connection(pool, retry_config)
+        let mut transaction = crate::db::begin_transaction(pool, retry_config)
             .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to acquire connection: {}", e)))?;
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
-        // Try to acquire advisory lock (non-blocking)
-        let lock_acquired = match sqlx::query_scalar!("SELECT pg_try_advisory_lock($1)", lock_key)
-            .fetch_one(&mut *connection)
-            .await
-        {
-            Ok(Some(acquired)) => acquired,
-            Ok(None) => {
-                // Unexpected - pg_try_advisory_lock shouldn't return NULL
-                tracing::warn!(
-                    file_id = %file_id,
-                    "Advisory lock query returned NULL unexpectedly"
-                );
-                false
-            }
-            Err(e) => {
-                // Database error - this IS a problem
-                tracing::error!(
-                    file_id = %file_id,
-                    error = %e,
-                    "Database error while trying to acquire advisory lock"
-                );
-                return Err(FusilladeError::Other(anyhow!(
-                    "Failed to acquire lock: {}",
-                    e
-                )));
-            }
-        };
+        // A transaction-scoped lock keeps lock ownership, the guarded update,
+        // and lock release on one server transaction. This remains correct
+        // through PgBouncer transaction pooling and automatically releases on
+        // commit, rollback, cancellation, or connection failure.
+        let lock_acquired =
+            match sqlx::query_scalar!("SELECT pg_try_advisory_xact_lock($1)", lock_key)
+                .fetch_one(&mut *transaction)
+                .await
+            {
+                Ok(Some(acquired)) => acquired,
+                Ok(None) => {
+                    // Unexpected - pg_try_advisory_xact_lock shouldn't return NULL
+                    tracing::warn!(
+                        file_id = %file_id,
+                        "Advisory lock query returned NULL unexpectedly"
+                    );
+                    false
+                }
+                Err(e) => {
+                    // Database error - this IS a problem
+                    tracing::error!(
+                        file_id = %file_id,
+                        error = %e,
+                        "Database error while trying to acquire advisory lock"
+                    );
+                    return Err(FusilladeError::Other(anyhow!(
+                        "Failed to acquire lock: {}",
+                        e
+                    )));
+                }
+            };
 
         if !lock_acquired {
             // Another process is finalizing
+            transaction.rollback().await.map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to roll back file finalization transaction: {}",
+                    e
+                ))
+            })?;
             return Ok(false);
         }
 
         // We have the lock - finalize the file
-        let result = sqlx::query!(
+        sqlx::query!(
             r#"
             UPDATE files
             SET size_bytes = $2, size_finalized = TRUE
@@ -820,23 +906,13 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             *file_id as Uuid,
             estimated_size,
         )
-        .execute(&mut *connection)
+        .execute(&mut *transaction)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file size: {}", e)));
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file size: {}", e)))?;
 
-        // Release the lock - only log if release fails (which is unusual)
-        if let Err(e) = sqlx::query_scalar!("SELECT pg_advisory_unlock($1)", lock_key)
-            .fetch_one(&mut *connection)
-            .await
-        {
-            tracing::warn!(
-                file_id = %file_id,
-                error = %e,
-                "Failed to release advisory lock (will be released on connection return to pool)"
-            );
-        }
-
-        result?;
+        transaction.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to commit file finalization: {}", e))
+        })?;
         Ok(true)
     }
 
@@ -2117,6 +2193,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             }
         }
 
+        let _state_write_permit = self.state_write_limiter.acquire("persist").await?;
+
         for attempt in 0..MAX_ATTEMPTS {
             tracing::debug!(request_id = %request.data.id, "Persisting request state");
             let any_request = any_request.clone();
@@ -2431,6 +2509,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         retry_attempt: u32,
         not_before: Option<DateTime<Utc>>,
     ) -> Result<bool> {
+        let _state_write_permit = self.state_write_limiter.acquire("retry").await?;
+
         // Fenced retry: only re-pend the row if it is still the in-flight claim
         // held by `owner`. The `state = 'processing' AND daemon_id = $2` guard is
         // what distinguishes this from the manual retry path (which uses persist()
@@ -9394,6 +9474,138 @@ mod tests {
                 batch_expires_at: req.state.batch_expires_at,
                 routed_model: req.data.model.clone(),
             },
+        }
+    }
+
+    #[sqlx::test]
+    async fn request_state_writes_respect_configured_concurrency(pool: sqlx::PgPool) {
+        let config = crate::PostgresStorageConfig {
+            max_concurrent_state_writes: 2,
+            ..Default::default()
+        };
+        let manager = Arc::new(PostgresRequestManager::new(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            config,
+        ));
+
+        let templates = (0..3)
+            .map(|index| RequestTemplateInput {
+                custom_id: Some(format!("state-write-{index}")),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            })
+            .collect();
+        let file_id = manager
+            .create_file("state-write-limit-test".to_string(), None, templates)
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("test".to_string(), 3)]);
+        let claimed =
+            claim_batch_requests_for_test(&manager, 3, 1, daemon_id, &capacity, &HashMap::new())
+                .await;
+        assert_eq!(claimed.len(), 3);
+
+        let claimed_ids: Vec<Uuid> = claimed.iter().map(|request| *request.data.id).collect();
+        sqlx::query(
+            "UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = ANY($1)",
+        )
+        .bind(&claimed_ids)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Make all terminal updates wait inside Postgres after they acquire the
+        // storage permit. pg_stat_activity then exposes how many writes crossed
+        // the limiter without needing test-only hooks into the semaphore.
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE requests IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let mut handles = Vec::new();
+        {
+            let manager = manager.clone();
+            let request_id = claimed[0].data.id;
+            handles.push(tokio::spawn(async move {
+                let rescheduled = manager
+                    .reschedule_for_retry(request_id, daemon_id, 1, None)
+                    .await?;
+                assert!(rescheduled);
+                Ok::<(), FusilladeError>(())
+            }));
+        }
+        handles.extend(claimed[1..].iter().map(|request| {
+            let manager = manager.clone();
+            let completed = completed_from(request, "done");
+            tokio::spawn(async move { manager.persist(&completed).await.map(|_| ()) })
+        }));
+
+        let blocked_writes = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let count: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND state = 'active'
+                      AND wait_event_type = 'Lock'
+                      AND query LIKE '%UPDATE requests%'
+                    "#,
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if count >= 2 {
+                    // Give an unbounded third write time to reach Postgres.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    break sqlx::query_scalar::<_, i64>(
+                        r#"
+                        SELECT COUNT(*)
+                        FROM pg_stat_activity
+                        WHERE datname = current_database()
+                          AND state = 'active'
+                          AND wait_event_type = 'Lock'
+                          AND query LIKE '%UPDATE requests%'
+                        "#,
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("state writes never reached the database lock");
+
+        assert_eq!(
+            blocked_writes, 2,
+            "only the configured number of state writes may enter Postgres"
+        );
+
+        blocker.rollback().await.unwrap();
+        for handle in handles {
+            handle.await.unwrap().unwrap();
         }
     }
 

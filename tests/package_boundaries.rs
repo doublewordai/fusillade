@@ -98,3 +98,17 @@ fn root_crate_exposes_postgres_daemon_not_postgres_store() {
         );
     }
 }
+
+#[test]
+fn arsenal_pooling_paths_avoid_session_scoped_advisory_locks() {
+    let postgres = include_str!("../crates/fusillade-arsenal/src/postgres.rs");
+
+    assert!(
+        !postgres.contains("pg_try_advisory_lock("),
+        "pooled storage must use transaction-scoped advisory locks so it works with transaction pooling"
+    );
+    assert!(
+        !postgres.contains("pg_advisory_unlock("),
+        "transaction-scoped advisory locks must be released by commit or rollback, not a later pooled statement"
+    );
+}
