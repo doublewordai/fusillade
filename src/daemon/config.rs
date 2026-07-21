@@ -135,6 +135,12 @@ pub struct DaemonConfig {
     /// continue on a fresh connection instead of waiting for TCP keepalive.
     #[serde(default = "default_claim_query_timeout_ms")]
     pub claim_query_timeout_ms: u64,
+    /// Maximum number of request state transitions that may write to storage
+    /// concurrently. This is independent of inference concurrency so a large
+    /// claim can saturate downstream workers without opening the same number of
+    /// database connections. Set to `0` to disable the storage-side limit.
+    #[serde(default = "default_max_concurrent_state_writes")]
+    pub max_concurrent_state_writes: usize,
     pub max_retries: Option<u32>,
     pub stop_before_deadline_ms: Option<i64>,
     pub backoff_ms: u64,
@@ -304,6 +310,10 @@ fn default_claim_query_timeout_ms() -> u64 {
     180_000
 }
 
+fn default_max_concurrent_state_writes() -> usize {
+    64
+}
+
 fn default_upload_stall_timeout_ms() -> u64 {
     crate::http::DEFAULT_UPLOAD_STALL_TIMEOUT.as_millis() as u64
 }
@@ -367,6 +377,7 @@ impl Default for DaemonConfig {
             batch_claim_interval_ms: default_batch_claim_interval_ms(),
             claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
             claim_query_timeout_ms: default_claim_query_timeout_ms(),
+            max_concurrent_state_writes: default_max_concurrent_state_writes(),
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(0),
             backoff_ms: 1000,
@@ -619,5 +630,30 @@ mod tests {
         assert_eq!(deserialized.upload_stall_timeout_ms, 12_345);
         assert_eq!(deserialized.upload_chunk_bytes, 8 * 1024);
         assert_eq!(deserialized.upload_stall_poll_ms, 25);
+    }
+
+    #[test]
+    fn state_write_concurrency_defaults_when_missing() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("max_concurrent_state_writes");
+
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        let reencoded = serde_json::to_value(decoded).unwrap();
+
+        assert_eq!(reencoded["max_concurrent_state_writes"], 64);
+    }
+
+    #[test]
+    fn state_write_concurrency_explicit_value_round_trips() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized["max_concurrent_state_writes"] = serde_json::json!(17);
+
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        let reencoded = serde_json::to_value(decoded).unwrap();
+
+        assert_eq!(reencoded["max_concurrent_state_writes"], 17);
     }
 }

@@ -46,6 +46,10 @@ pub mod request {
 pub struct PostgresStorageConfig {
     #[serde(default = "default_pending_request_counts_timeout_ms")]
     pub pending_request_counts_timeout_ms: u64,
+    /// Maximum number of request state transitions that may write to Postgres
+    /// concurrently. Set to `0` to disable the limit.
+    #[serde(default = "default_max_concurrent_state_writes")]
+    pub max_concurrent_state_writes: usize,
     #[serde(default = "default_batch_metadata_fields")]
     pub batch_metadata_fields: Vec<String>,
     pub claim_timeout_ms: u64,
@@ -91,6 +95,10 @@ fn default_pending_request_counts_timeout_ms() -> u64 {
     60_000
 }
 
+fn default_max_concurrent_state_writes() -> usize {
+    64
+}
+
 fn default_claim_ramp_exponent() -> f64 {
     0.56
 }
@@ -111,6 +119,7 @@ impl Default for PostgresStorageConfig {
     fn default() -> Self {
         Self {
             pending_request_counts_timeout_ms: default_pending_request_counts_timeout_ms(),
+            max_concurrent_state_writes: default_max_concurrent_state_writes(),
             batch_metadata_fields: default_batch_metadata_fields(),
             claim_timeout_ms: 60_000,
             processing_timeout_ms: 600_000,
@@ -205,4 +214,34 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// Returns a migrator that can be run against a PostgreSQL pool.
 pub fn migrator() -> &'static sqlx::migrate::Migrator {
     &MIGRATOR
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_write_concurrency_defaults_when_missing() {
+        let mut serialized = serde_json::to_value(PostgresStorageConfig::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("max_concurrent_state_writes");
+
+        let decoded: PostgresStorageConfig = serde_json::from_value(serialized).unwrap();
+        let reencoded = serde_json::to_value(decoded).unwrap();
+
+        assert_eq!(reencoded["max_concurrent_state_writes"], 64);
+    }
+
+    #[test]
+    fn state_write_concurrency_explicit_value_round_trips() {
+        let mut serialized = serde_json::to_value(PostgresStorageConfig::default()).unwrap();
+        serialized["max_concurrent_state_writes"] = serde_json::json!(17);
+
+        let decoded: PostgresStorageConfig = serde_json::from_value(serialized).unwrap();
+        let reencoded = serde_json::to_value(decoded).unwrap();
+
+        assert_eq!(reencoded["max_concurrent_state_writes"], 17);
+    }
 }

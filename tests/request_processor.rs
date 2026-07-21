@@ -9,11 +9,15 @@
 //!
 //! These tests guard against accidental regressions in the spawn-task wiring.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use fusillade::PostgresDaemon;
 use fusillade::batch::{BatchInput, RequestTemplateInput};
 use fusillade::daemon::{DaemonConfig, default_should_retry};
@@ -23,13 +27,17 @@ use fusillade::processor::{
     CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry,
 };
 use fusillade::request::{
-    AnyRequest, Claimed, Completed, Failed, Request, RequestCompletionResult,
+    AnyRequest, Claimed, Completed, DaemonId, Failed, Request, RequestCompletionResult,
 };
 use fusillade_arsenal::{PostgresRequestManager as PostgresStore, TestDbPools};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 type TestStore = PostgresStore<TestDbPools>;
 type TestDaemon = PostgresDaemon<TestDbPools, MockHttpClient>;
+
+const PROCESSING_LOCK_KEY: i64 = 7_204_411_063;
 
 fn fast_test_config() -> DaemonConfig {
     let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
@@ -130,6 +138,87 @@ async fn postgres_store(pool: sqlx::PgPool, config: &DaemonConfig) -> Arc<TestSt
     ))
 }
 
+async fn install_processing_transition_blocker(pool: &sqlx::PgPool) {
+    sqlx::query(
+        r#"
+        CREATE FUNCTION block_processing_transition() RETURNS trigger AS $$
+        BEGIN
+            IF NEW.state = 'processing' AND OLD.state = 'claimed' THEN
+                PERFORM pg_advisory_xact_lock(7204411063);
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("install processing transition blocker function");
+    sqlx::query(
+        r#"
+        CREATE TRIGGER block_processing_transition
+        BEFORE UPDATE ON requests
+        FOR EACH ROW EXECUTE FUNCTION block_processing_transition()
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("install processing transition blocker trigger");
+}
+
+async fn wait_for_processing_transition_blocked(pool: &sqlx::PgPool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND state = 'active'
+                      AND wait_event_type = 'Lock'
+                      AND wait_event = 'advisory'
+                )
+                "#,
+            )
+            .fetch_one(pool)
+            .await
+            .expect("inspect blocked processing transition");
+            if blocked {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("processing transition never reached the database lock");
+}
+
+struct DispatchProbe {
+    polls: Arc<AtomicUsize>,
+    dropped: Option<oneshot::Sender<()>>,
+}
+
+impl Future for DispatchProbe {
+    type Output = fusillade::Result<HttpResponse>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(Ok(HttpResponse {
+            status: 200,
+            body: "{}".into(),
+        }))
+    }
+}
+
+impl Drop for DispatchProbe {
+    fn drop(&mut self) {
+        if let Some(dropped) = self.dropped.take() {
+            let _ = dropped.send(());
+        }
+    }
+}
+
 fn postgres_daemon(
     store: Arc<TestStore>,
     http_client: Arc<MockHttpClient>,
@@ -169,6 +258,149 @@ async fn default_processor_preserves_batch_path(pool: sqlx::PgPool) {
     assert!(req.state.response_body.contains("\"ok\":true"));
 
     shutdown_token.cancel();
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+#[test_log::test]
+async fn processing_state_is_durable_before_http_dispatch(pool: sqlx::PgPool) {
+    let config = fast_test_config();
+    let manager = postgres_store(pool.clone(), &config).await;
+    let request_id = submit_one_request(&manager).await;
+
+    let AnyRequest::Pending(pending) = fetch_any_request(&manager, request_id).await else {
+        panic!("expected Pending variant");
+    };
+    let claimed = pending
+        .claim(DaemonId::from(Uuid::new_v4()), &*manager)
+        .await
+        .expect("claim request");
+
+    install_processing_transition_blocker(&pool).await;
+
+    let mut blocker = pool.acquire().await.expect("acquire blocker connection");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(PROCESSING_LOCK_KEY)
+        .execute(&mut *blocker)
+        .await
+        .expect("hold processing transition lock");
+
+    let http_polls = Arc::new(AtomicUsize::new(0));
+    let process_handle = {
+        let manager = manager.clone();
+        let http_polls = http_polls.clone();
+        tokio::spawn(async move {
+            claimed
+                .process(&*manager, async move {
+                    http_polls.fetch_add(1, Ordering::SeqCst);
+                    Ok(HttpResponse {
+                        status: 200,
+                        body: "{}".into(),
+                    })
+                })
+                .await
+        })
+    };
+
+    wait_for_processing_transition_blocked(&pool).await;
+
+    assert_eq!(
+        http_polls.load(Ordering::SeqCst),
+        0,
+        "downstream HTTP must not start before Processing is durable"
+    );
+
+    let admitted_after = Utc::now();
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(PROCESSING_LOCK_KEY)
+        .execute(&mut *blocker)
+        .await
+        .expect("release processing transition lock");
+
+    let processing = process_handle
+        .await
+        .expect("processing task joined")
+        .expect("processing transition succeeded");
+    assert!(
+        processing.state.started_at >= admitted_after,
+        "in-memory processing timeout must start after storage admission"
+    );
+    let durable_started_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT started_at FROM requests WHERE id = $1")
+            .bind(*processing.data.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read durable processing timestamp");
+    assert!(
+        durable_started_at.expect("processing timestamp is set") >= admitted_after,
+        "durable processing timeout must start after the database wait"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while http_polls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("HTTP task was not dispatched after Processing became durable");
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+#[test_log::test]
+async fn canceling_queued_processing_transition_does_not_dispatch_http(pool: sqlx::PgPool) {
+    let config = fast_test_config();
+    let manager = postgres_store(pool.clone(), &config).await;
+    let request_id = submit_one_request(&manager).await;
+
+    let AnyRequest::Pending(pending) = fetch_any_request(&manager, request_id).await else {
+        panic!("expected Pending variant");
+    };
+    let claimed = pending
+        .claim(DaemonId::from(Uuid::new_v4()), &*manager)
+        .await
+        .expect("claim request");
+
+    install_processing_transition_blocker(&pool).await;
+    let mut blocker = pool.acquire().await.expect("acquire blocker connection");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(PROCESSING_LOCK_KEY)
+        .execute(&mut *blocker)
+        .await
+        .expect("hold processing transition lock");
+
+    let http_polls = Arc::new(AtomicUsize::new(0));
+    let (dropped_tx, dropped_rx) = oneshot::channel();
+    let process_handle = {
+        let manager = manager.clone();
+        let response_fut = DispatchProbe {
+            polls: http_polls.clone(),
+            dropped: Some(dropped_tx),
+        };
+        tokio::spawn(async move { claimed.process(&*manager, response_fut).await })
+    };
+
+    wait_for_processing_transition_blocked(&pool).await;
+    process_handle.abort();
+    assert!(
+        process_handle
+            .await
+            .expect_err("processing task should be canceled")
+            .is_cancelled()
+    );
+    tokio::time::timeout(Duration::from_secs(2), dropped_rx)
+        .await
+        .expect("gated HTTP task did not terminate")
+        .expect("dispatch probe drop signal was canceled");
+
+    assert_eq!(
+        http_polls.load(Ordering::SeqCst),
+        0,
+        "canceling a queued transition must leave the HTTP future unpolled"
+    );
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(PROCESSING_LOCK_KEY)
+        .execute(&mut *blocker)
+        .await
+        .expect("release processing transition lock");
 }
 
 /// Counting processor: wraps DefaultRequestProcessor and records how many
