@@ -11252,7 +11252,7 @@ mod tests {
         // Must return SkippedNotLive promptly instead of blocking until the
         // holder commits; the timeout proves the non-blocking property.
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(1),
             manager.archive_batch(batch_id),
         )
         .await
