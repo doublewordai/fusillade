@@ -45,6 +45,25 @@ async fn complete_request_succeeds_for_processing_row(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test]
+async fn complete_request_refuses_daemon_owned_processing_row(pool: sqlx::PgPool) {
+    let m = manager(pool.clone()).await;
+    let id = Uuid::new_v4();
+    m.create_realtime(processing_input(id)).await.unwrap();
+    sqlx::query("UPDATE requests SET attempt_id = $2 WHERE id = $1")
+        .bind(id)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let error = m
+        .complete_request(RequestId(id), r#"{"stale":true}"#, 200)
+        .await
+        .expect_err("realtime completion must not bypass daemon attempt fencing");
+    assert!(matches!(error, FusilladeError::RequestStateConflict { .. }));
+}
+
+#[sqlx::test]
 async fn complete_request_returns_state_conflict_when_already_completed(pool: sqlx::PgPool) {
     let m = manager(pool).await;
     let id = Uuid::new_v4();
@@ -128,6 +147,25 @@ async fn fail_request_returns_state_conflict_when_already_completed(pool: sqlx::
         }
         other => panic!("expected RequestStateConflict, got {other:?}"),
     }
+}
+
+#[sqlx::test]
+async fn fail_request_refuses_daemon_owned_processing_row(pool: sqlx::PgPool) {
+    let m = manager(pool.clone()).await;
+    let id = Uuid::new_v4();
+    m.create_realtime(processing_input(id)).await.unwrap();
+    sqlx::query("UPDATE requests SET attempt_id = $2 WHERE id = $1")
+        .bind(id)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let error = m
+        .fail_request(RequestId(id), "stale", 500)
+        .await
+        .expect_err("realtime failure must not bypass daemon attempt fencing");
+    assert!(matches!(error, FusilladeError::RequestStateConflict { .. }));
 }
 
 #[sqlx::test]

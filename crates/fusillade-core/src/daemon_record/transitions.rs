@@ -67,7 +67,9 @@ impl DaemonRecord<Running> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batch::BatchId;
     use crate::daemon_record::types::{AnyDaemonRecord, DaemonData, DaemonState, DaemonStatus};
+    use crate::manager::ArchiveOutcome;
     use crate::request::DaemonId;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
@@ -126,6 +128,28 @@ mod tests {
 
         async fn purge_orphaned_rows(&self, _batch_size: i64) -> Result<u64> {
             Ok(0)
+        }
+
+        async fn archive_batch(&self, _batch_id: BatchId) -> Result<ArchiveOutcome> {
+            Ok(ArchiveOutcome::SkippedNotFound)
+        }
+
+        async fn list_archivable_batches(
+            &self,
+            _limit: i64,
+            _oldest_first: bool,
+            _cancel_grace_secs: f64,
+            _min_frozen_age_secs: f64,
+        ) -> Result<Vec<BatchId>> {
+            Ok(Vec::new())
+        }
+
+        async fn count_archivable_batches(&self, _cancel_grace_secs: f64) -> Result<i64> {
+            Ok(0)
+        }
+
+        async fn ensure_archive_partitions(&self, _weeks_ahead: i32) -> Result<(i64, i64)> {
+            Ok((0, 0))
         }
 
         async fn purge_model_filter_events(

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH unavailable_daemons AS (\n                SELECT d.id\n                FROM daemons d\n                WHERE d.status = 'dead'\n                   OR d.last_heartbeat < NOW() - ($2 || ' milliseconds')::INTERVAL\n            ),\n            candidate_reasons AS (\n                -- Safe age fallback: claimed requests cannot poll upstream\n                -- until their claimed -> processing attempt CAS commits.\n                SELECT r.id, FALSE AS can_reclaim_processing\n                FROM requests r\n                WHERE r.state = 'claimed'\n                  AND r.attempt_id IS NOT NULL\n                  AND r.claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL\n                UNION ALL\n                SELECT r.id, TRUE AS can_reclaim_processing\n                FROM requests r\n                JOIN unavailable_daemons d ON d.id = r.daemon_id\n                WHERE r.state IN ('claimed', 'processing')\n            ),\n            candidates AS (\n                SELECT id, BOOL_OR(can_reclaim_processing) AS can_reclaim_processing\n                FROM candidate_reasons\n                GROUP BY id\n            ),\n            to_unclaim AS (\n                SELECT r.id\n                FROM requests r\n                JOIN candidates stale ON stale.id = r.id\n                WHERE r.state = 'claimed'\n                   OR (r.state = 'processing' AND stale.can_reclaim_processing)\n                ORDER BY r.id\n                LIMIT $3\n                FOR UPDATE OF r SKIP LOCKED\n            )\n            UPDATE requests r\n            SET\n                state = 'pending',\n                daemon_id = NULL,\n                attempt_id = NULL,\n                claimed_at = NULL,\n                started_at = NULL\n            FROM to_unclaim stale\n            WHERE r.id = stale.id\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0403e3c4478847697cb26f35feb604fa1002fe833a0e4e55ec05212a0b4ed847"
+}

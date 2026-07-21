@@ -7,6 +7,7 @@ use std::time::Duration;
 
 pub mod config;
 
+use futures::FutureExt;
 use metrics::{counter, gauge, histogram};
 use tokio::task::JoinSet;
 
@@ -20,7 +21,10 @@ use crate::error::Result;
 use crate::http::HttpClient;
 use crate::manager::{ArchiveOutcome, DaemonStorage, Storage};
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
-use crate::request::{Claimed, DaemonId, Request, RequestCompletionResult};
+use crate::request::{
+    AttemptId, Claimed, DaemonId, Failed, FailureReason, Request, RequestCompletionResult,
+    RequestId,
+};
 
 pub use config::{
     DaemonConfig, DaemonMode, ModelEscalationConfig, ShouldRetryFn, default_should_retry,
@@ -53,6 +57,122 @@ fn claim_failure_backoff(consecutive_failures: u32, claim_interval_ms: u64) -> D
             .saturating_mul(factor)
             .min(MAX_BACKOFF_MS),
     )
+}
+
+/// Return a bounded, non-sensitive label for processor failures.
+///
+/// Processor errors may contain request bodies, credentials, or upstream
+/// responses supplied by custom implementations, so daemon telemetry must not
+/// format the error itself.
+fn processor_error_kind(error: &FusilladeError) -> &'static str {
+    match error {
+        FusilladeError::RequestNotFound(_) => "request_not_found",
+        FusilladeError::RequestStateConflict { .. } => "request_state_conflict",
+        FusilladeError::RequestAttemptLost { .. } => "request_attempt_lost",
+        FusilladeError::RequestCancelled(_) => "request_cancelled",
+        FusilladeError::Shutdown => "shutdown",
+        FusilladeError::InvalidState(_, _, _) => "invalid_state",
+        FusilladeError::ValidationError(_) => "validation_error",
+        FusilladeError::HttpClient(_) => "http_client",
+        FusilladeError::HttpRequestBuilder(_) => "http_request_builder",
+        FusilladeError::HttpClientTimeout(_) => "http_client_timeout",
+        FusilladeError::FirstChunkTimeout(_) => "first_chunk_timeout",
+        FusilladeError::TokensTimeout(_) => "tokens_timeout",
+        FusilladeError::BodyTimeout(_) => "body_timeout",
+        FusilladeError::Serialization(_) => "serialization",
+        FusilladeError::Other(_) => "other",
+    }
+}
+
+async fn attempt_write_until_resolved<F, Fut>(
+    shutdown: &tokio_util::sync::CancellationToken,
+    request_id: RequestId,
+    attempt_id: AttemptId,
+    operation: &'static str,
+    mut write: F,
+) -> Result<bool>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
+    let mut failures = 0u32;
+    loop {
+        match write().await {
+            Ok(applied) => return Ok(applied),
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                let delay = Duration::from_millis(
+                    100u64
+                        .saturating_mul(2u64.saturating_pow(failures.saturating_sub(1).min(6)))
+                        .min(5_000),
+                );
+                crate::background_error!(
+                    "attempt_write_failed",
+                    Error,
+                    %request_id,
+                    %attempt_id,
+                    operation,
+                    failures,
+                    retry_after_ms = delay.as_millis(),
+                    error = %error,
+                    "Failed to persist request attempt outcome; retrying while daemon owns it"
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => return Err(FusilladeError::Shutdown),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
+    }
+}
+
+enum ProcessorRecovery {
+    Rescheduled(bool),
+    Terminal(bool),
+}
+
+async fn recover_processor_failure<S: Storage + ?Sized>(
+    storage: &S,
+    shutdown: &tokio_util::sync::CancellationToken,
+    failed: Request<Failed>,
+    owner: DaemonId,
+    attempt_id: AttemptId,
+    retry_config: crate::request::transitions::RetryConfig,
+) -> Result<ProcessorRecovery> {
+    let request_id = failed.data.id;
+    let retry_attempt = failed.state.retry_attempt;
+    match failed.can_retry(retry_attempt, retry_config) {
+        Ok(pending) => {
+            let applied = attempt_write_until_resolved(
+                shutdown,
+                request_id,
+                attempt_id,
+                "processor_recovery_retry",
+                || {
+                    storage.recover_attempt_for_retry(
+                        request_id,
+                        owner,
+                        attempt_id,
+                        pending.state.retry_attempt,
+                        pending.state.not_before,
+                    )
+                },
+            )
+            .await?;
+            Ok(ProcessorRecovery::Rescheduled(applied))
+        }
+        Err(failed) => {
+            let applied = attempt_write_until_resolved(
+                shutdown,
+                request_id,
+                attempt_id,
+                "processor_recovery_terminal",
+                || storage.persist_attempt(&*failed, attempt_id),
+            )
+            .await?;
+            Ok(ProcessorRecovery::Terminal(applied))
+        }
+    }
 }
 
 fn claim_loop_kinds_for_mode(
@@ -725,7 +845,10 @@ where
                     let batch_expires_at = request.state.batch_expires_at;
                     let retry_attempt_at_completion = request.state.retry_attempt;
                     let owning_daemon_id = request.state.daemon_id;
+                    let attempt_id = request.state.attempt_id;
+                    let recovery_data = request.data.clone();
 
+                    let recovery_shutdown_token = shutdown_token.clone();
                     let cancellation: crate::processor::CancellationFuture = Box::pin(async move {
                         tokio::select! {
                             _ = batch_cancellation_token.cancelled() => {
@@ -737,15 +860,68 @@ where
                         }
                     });
 
-                    let completion_result = processor
-                        .process(
-                            request,
-                            http_client,
-                            storage.as_ref(),
-                            should_retry.clone(),
-                            cancellation,
-                        )
-                        .await;
+                    let completion_result = std::panic::AssertUnwindSafe(processor.process(
+                        request,
+                        http_client,
+                        storage.as_ref(),
+                        should_retry.clone(),
+                        cancellation,
+                    ))
+                    .catch_unwind()
+                    .await;
+
+                    let completion_result = match completion_result {
+                        Ok(result) => result,
+                        Err(_panic_payload) => {
+                            tracing::Span::current().record("outcome", "panic");
+                            let failed = Request {
+                                data: recovery_data.clone(),
+                                state: Failed {
+                                    reason: FailureReason::TaskTerminated,
+                                    failed_at: chrono::Utc::now(),
+                                    retry_attempt: retry_attempt_at_completion,
+                                    batch_expires_at,
+                                    routed_model: model_clone.clone(),
+                                },
+                            };
+                            let recovery = match recover_processor_failure(
+                                storage.as_ref(),
+                                &recovery_shutdown_token,
+                                failed,
+                                owning_daemon_id,
+                                attempt_id,
+                                retry_config.clone(),
+                            )
+                            .await
+                            {
+                                Ok(recovery) => recovery,
+                                Err(FusilladeError::Shutdown) => return Ok(()),
+                                Err(error) => return Err(error),
+                            };
+                            let (recovery_kind, applied) = match recovery {
+                                ProcessorRecovery::Rescheduled(applied) => {
+                                    ("rescheduled", applied)
+                                }
+                                ProcessorRecovery::Terminal(applied) => ("terminal", applied),
+                            };
+                            counter!(
+                                "fusillade_request_processor_panics_total",
+                                "model" => model_clone.clone(),
+                                "recovery" => recovery_kind,
+                                "applied" => applied.to_string()
+                            )
+                            .increment(1);
+                            tracing::error!(
+                                request_id = %request_id,
+                                batch_id = ?batch_id,
+                                %attempt_id,
+                                recovery = recovery_kind,
+                                applied,
+                                "request.processor_panicked"
+                            );
+                            return Ok(());
+                        }
+                    };
 
                     match completion_result {
                         Ok(RequestCompletionResult::Completed(completed)) => {
@@ -783,14 +959,25 @@ where
                             if failed.state.reason.is_retriable() {
                                 match failed.can_retry(retry_attempt, retry_config.clone()) {
                                     Ok(pending) => {
-                                        let rescheduled = storage
-                                            .reschedule_for_retry(
+                                        let rescheduled = match attempt_write_until_resolved(
+                                            &recovery_shutdown_token,
+                                            request_id,
+                                            attempt_id,
+                                            "retry_reschedule",
+                                            || storage.reschedule_attempt_for_retry(
                                                 request_id,
                                                 owning_daemon_id,
+                                                attempt_id,
                                                 pending.state.retry_attempt,
                                                 pending.state.not_before,
-                                            )
-                                            .await?;
+                                            ),
+                                        )
+                                        .await
+                                        {
+                                            Ok(rescheduled) => rescheduled,
+                                            Err(FusilladeError::Shutdown) => return Ok(()),
+                                            Err(error) => return Err(error),
+                                        };
                                         if rescheduled {
                                             counter!(
                                                 "fusillade_requests_retried_total",
@@ -820,7 +1007,22 @@ where
                                         return Ok(());
                                     }
                                     Err(failed) => {
-                                        storage.persist(&*failed).await?;
+                                        let persisted = match attempt_write_until_resolved(
+                                            &recovery_shutdown_token,
+                                            request_id,
+                                            attempt_id,
+                                            "terminal_failure",
+                                            || storage.persist_attempt(&*failed, attempt_id),
+                                        )
+                                        .await
+                                        {
+                                            Ok(persisted) => persisted,
+                                            Err(FusilladeError::Shutdown) => return Ok(()),
+                                            Err(error) => return Err(error),
+                                        };
+                                        if !persisted {
+                                            return Ok(());
+                                        }
                                         requests_failed.fetch_add(1, Ordering::Relaxed);
                                         user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
                                             completed: AtomicU64::new(0),
@@ -893,9 +1095,70 @@ where
                             tracing::Span::current().record("outcome", "shutdown");
                             Ok(())
                         }
+                        Err(FusilladeError::RequestAttemptLost { .. }) => {
+                            tracing::Span::current().record("outcome", "ownership_lost");
+                            counter!(
+                                "fusillade_request_attempt_lost_total",
+                                "model" => model_clone.clone()
+                            )
+                            .increment(1);
+                            tracing::info!(
+                                request_id = %request_id,
+                                batch_id = ?batch_id,
+                                %attempt_id,
+                                "request.attempt_result_discarded"
+                            );
+                            Ok(())
+                        }
                         Err(e) => {
-                            tracing::Span::current().record("outcome", "error");
-                            Err(e)
+                            tracing::Span::current().record("outcome", "processor_error");
+                            let failed = Request {
+                                data: recovery_data.clone(),
+                                state: Failed {
+                                    reason: FailureReason::ProcessorError,
+                                    failed_at: chrono::Utc::now(),
+                                    retry_attempt: retry_attempt_at_completion,
+                                    batch_expires_at,
+                                    routed_model: model_clone.clone(),
+                                },
+                            };
+                            let recovery = match recover_processor_failure(
+                                storage.as_ref(),
+                                &recovery_shutdown_token,
+                                failed,
+                                owning_daemon_id,
+                                attempt_id,
+                                retry_config.clone(),
+                            )
+                            .await
+                            {
+                                Ok(recovery) => recovery,
+                                Err(FusilladeError::Shutdown) => return Ok(()),
+                                Err(error) => return Err(error),
+                            };
+                            let (recovery_kind, applied) = match recovery {
+                                ProcessorRecovery::Rescheduled(applied) => {
+                                    ("rescheduled", applied)
+                                }
+                                ProcessorRecovery::Terminal(applied) => ("terminal", applied),
+                            };
+                            counter!(
+                                "fusillade_request_processor_errors_total",
+                                "model" => model_clone.clone(),
+                                "recovery" => recovery_kind,
+                                "applied" => applied.to_string()
+                            )
+                            .increment(1);
+                            tracing::warn!(
+                                request_id = %request_id,
+                                batch_id = ?batch_id,
+                                %attempt_id,
+                                recovery = recovery_kind,
+                                applied,
+                                error_kind = processor_error_kind(&e),
+                                "request.processor_error_recovered"
+                            );
+                            Ok(())
                         }
                     }
                 }.instrument(process_span));
@@ -1566,8 +1829,10 @@ mod tests {
     fn daemon_mode_defaults_to_both_and_roundtrips_through_config() {
         assert_eq!(DaemonConfig::default().mode, DaemonMode::Both);
 
-        let mut config = DaemonConfig::default();
-        config.mode = DaemonMode::BatchOnly;
+        let config = DaemonConfig {
+            mode: DaemonMode::BatchOnly,
+            ..Default::default()
+        };
 
         let json = serde_json::to_value(&config).expect("config should serialize");
         assert_eq!(json["mode"], serde_json::json!("batch_only"));
@@ -1602,6 +1867,49 @@ mod tests {
     #[test]
     fn default_claim_query_timeout_is_three_minutes() {
         assert_eq!(DaemonConfig::default().claim_query_timeout_ms, 180_000);
+    }
+
+    #[test]
+    fn default_stale_daemon_threshold_is_five_minutes() {
+        assert_eq!(DaemonConfig::default().stale_daemon_threshold_ms, 300_000);
+    }
+
+    #[test]
+    fn processor_error_kind_is_safe_to_log() {
+        let secret = "authorization=Bearer super-secret-token";
+        let error = FusilladeError::ValidationError(secret.to_string());
+
+        let kind = processor_error_kind(&error);
+
+        assert_eq!(kind, "validation_error");
+        assert!(!kind.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn attempt_outcome_write_retries_transient_storage_errors() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request_id = RequestId::from(uuid::Uuid::new_v4());
+        let attempt_id = AttemptId::from(uuid::Uuid::new_v4());
+
+        let applied =
+            attempt_write_until_resolved(&shutdown, request_id, attempt_id, "test_write", || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call < 2 {
+                        Err(FusilladeError::Other(anyhow::anyhow!(
+                            "synthetic database outage"
+                        )))
+                    } else {
+                        Ok(true)
+                    }
+                }
+            })
+            .await
+            .expect("write should recover after transient failures");
+
+        assert!(applied);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

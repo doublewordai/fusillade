@@ -165,6 +165,9 @@ pub struct LeakStamp {
 #[derive(Debug, Clone, Serialize)]
 pub struct Claimed {
     pub daemon_id: DaemonId,
+    /// Unique identity for this claim. A new value is assigned every time the
+    /// request moves from pending to claimed, even when the daemon is the same.
+    pub attempt_id: AttemptId,
     pub claimed_at: DateTime<Utc>,
     /// Number of times this request has been attempted (carried over from Pending)
     pub retry_attempt: u32,
@@ -182,6 +185,8 @@ impl RequestState for Claimed {}
 #[derive(Debug, Clone, Serialize)]
 pub struct Processing {
     pub daemon_id: DaemonId,
+    /// The exact claim that owns this in-flight HTTP execution.
+    pub attempt_id: AttemptId,
     pub claimed_at: DateTime<Utc>,
     pub started_at: DateTime<Utc>,
     /// Number of times this request has been attempted (carried over from Claimed)
@@ -231,6 +236,10 @@ pub enum FailureReason {
     /// These are transient infrastructure issues that should be retried.
     NetworkError { error: String },
 
+    /// A custom request processor returned an unexpected internal error.
+    /// This is retriable because the processor may recover on a later attempt.
+    ProcessorError,
+
     /// Request timed out before receiving a response.
     /// These are transient and should be retried.
     Timeout { error: String },
@@ -256,6 +265,7 @@ impl FailureReason {
             FailureReason::RetriableHttpStatus { .. } => true,
             FailureReason::NonRetriableHttpStatus { .. } => false,
             FailureReason::NetworkError { .. } => true,
+            FailureReason::ProcessorError => true,
             FailureReason::Timeout { .. } => true,
             FailureReason::TaskTerminated => true,
             FailureReason::RequestBuilderError { .. } => false,
@@ -269,6 +279,7 @@ impl FailureReason {
             FailureReason::RetriableHttpStatus { .. } => "retriable_http_status",
             FailureReason::NonRetriableHttpStatus { .. } => "non_retriable_http_status",
             FailureReason::NetworkError { .. } => "network_error",
+            FailureReason::ProcessorError => "processor_error",
             FailureReason::Timeout { .. } => "timeout",
             FailureReason::TaskTerminated => "task_terminated",
             FailureReason::RequestBuilderError { .. } => "builder_error",
@@ -309,6 +320,9 @@ impl FailureReason {
             }
             FailureReason::NetworkError { error } => {
                 format!("Network error: {}", error)
+            }
+            FailureReason::ProcessorError => {
+                "Request processor returned an unexpected error".to_string()
             }
             FailureReason::Timeout { error } => {
                 format!("Request timed out: {}", error)
@@ -416,6 +430,49 @@ impl std::ops::Deref for DaemonId {
     type Target = Uuid;
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+/// Unique identifier for a single daemon execution attempt.
+///
+/// Unlike [`DaemonId`], this changes on every claim and therefore fences two
+/// overlapping executions started by the same daemon. Read-only status
+/// reconstruction represents legacy or proxy-owned rows without an attempt
+/// token as `Uuid::nil()`. That sentinel is not a valid daemon attempt and
+/// must never authorize an ownership transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct AttemptId(pub Uuid);
+
+impl std::fmt::Display for AttemptId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<Uuid> for AttemptId {
+    fn from(uuid: Uuid) -> Self {
+        AttemptId(uuid)
+    }
+}
+
+impl std::ops::Deref for AttemptId {
+    type Target = Uuid;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+mod attempt_id_tests {
+    use super::*;
+
+    #[test]
+    fn display_uses_the_full_uuid() {
+        let uuid = Uuid::parse_str("12345678-1234-4567-89ab-1234567890ab").unwrap();
+
+        assert_eq!(AttemptId(uuid).to_string(), uuid.to_string());
     }
 }
 

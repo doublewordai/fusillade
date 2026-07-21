@@ -48,7 +48,11 @@ pub struct PostgresStorageConfig {
     pub pending_request_counts_timeout_ms: u64,
     #[serde(default = "default_batch_metadata_fields")]
     pub batch_metadata_fields: Vec<String>,
+    /// Maximum age of a claim that has not entered processing. Reclaiming this
+    /// state is safe because the upstream future is gated on the processing CAS.
     pub claim_timeout_ms: u64,
+    /// Retained for configuration compatibility; request age no longer drives
+    /// automatic reclamation.
     pub processing_timeout_ms: u64,
     pub stale_daemon_threshold_ms: u64,
     pub unclaim_batch_size: usize,
@@ -114,7 +118,7 @@ impl Default for PostgresStorageConfig {
             batch_metadata_fields: default_batch_metadata_fields(),
             claim_timeout_ms: 60_000,
             processing_timeout_ms: 600_000,
-            stale_daemon_threshold_ms: 30_000,
+            stale_daemon_threshold_ms: 300_000,
             unclaim_batch_size: 100,
             service_tier_completion_windows_ms: default_service_tier_completion_windows_ms(),
             default_completion_window_ms: default_completion_window_ms(),
