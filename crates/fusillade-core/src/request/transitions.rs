@@ -220,7 +220,7 @@ impl Request<Claimed> {
             abort_handle: task_handle.abort_handle(),
         };
 
-        let request = Request {
+        let mut request = Request {
             data: self.data,
             state: processing_state,
         };
@@ -231,6 +231,11 @@ impl Request<Claimed> {
             request.state.abort_handle.abort();
             return Err(e);
         }
+
+        // Storage admission may have waited behind the state-write limiter.
+        // Keep in-memory timeout accounting aligned with actual dispatch;
+        // Postgres storage stamps its durable value after acquiring the permit.
+        request.state.started_at = chrono::Utc::now();
 
         if dispatch_tx.send(()).is_err() {
             request.state.abort_handle.abort();

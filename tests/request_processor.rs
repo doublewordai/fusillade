@@ -17,6 +17,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use fusillade::PostgresDaemon;
 use fusillade::batch::{BatchInput, RequestTemplateInput};
 use fusillade::daemon::{DaemonConfig, default_should_retry};
@@ -308,16 +309,31 @@ async fn processing_state_is_durable_before_http_dispatch(pool: sqlx::PgPool) {
         "downstream HTTP must not start before Processing is durable"
     );
 
+    let admitted_after = Utc::now();
     sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(PROCESSING_LOCK_KEY)
         .execute(&mut *blocker)
         .await
         .expect("release processing transition lock");
 
-    process_handle
+    let processing = process_handle
         .await
         .expect("processing task joined")
         .expect("processing transition succeeded");
+    assert!(
+        processing.state.started_at >= admitted_after,
+        "in-memory processing timeout must start after storage admission"
+    );
+    let durable_started_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT started_at FROM requests WHERE id = $1")
+            .bind(*processing.data.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read durable processing timestamp");
+    assert!(
+        durable_started_at.expect("processing timestamp is set") >= admitted_after,
+        "durable processing timeout must start after the database wait"
+    );
     tokio::time::timeout(Duration::from_secs(2), async {
         while http_polls.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;

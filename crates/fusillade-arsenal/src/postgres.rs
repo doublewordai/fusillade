@@ -2290,6 +2290,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         }
                     }
                     AnyRequest::Processing(req) => {
+                        let mut tx = self.begin_write().await.map_err(|e| {
+                            FusilladeError::Other(anyhow!(
+                                "Failed to begin processing transition: {}",
+                                e
+                            ))
+                        })?;
                         let rows_affected = sqlx::query!(
                             r#"
                             UPDATE requests SET
@@ -2297,7 +2303,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 retry_attempt = $2,
                                 daemon_id = $3,
                                 claimed_at = $4,
-                                started_at = $5
+                                started_at = clock_timestamp()
                             WHERE id = $1
                               AND state NOT IN ('completed', 'failed', 'canceled')
                             "#,
@@ -2305,9 +2311,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             req.state.retry_attempt as i32,
                             *req.state.daemon_id as Uuid,
                             req.state.claimed_at,
-                            req.state.started_at,
                         )
-                        .execute(self.write_executor())
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2315,8 +2320,41 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .rows_affected();
 
                         if rows_affected == 0 {
+                            tx.rollback().await.map_err(|e| {
+                                FusilladeError::Other(anyhow!(
+                                    "Failed to roll back processing transition: {}",
+                                    e
+                                ))
+                            })?;
                             return self.dropped_or_missing(req.data.id).await;
                         }
+
+                        // The guarded update above acquires the row lock and may
+                        // wait inside Postgres. Stamp only after that wait so stale
+                        // reclamation starts from durable dispatch admission, not
+                        // transaction or statement start.
+                        sqlx::query!(
+                            r#"
+                            UPDATE requests
+                            SET started_at = clock_timestamp()
+                            WHERE id = $1
+                            "#,
+                            *req.data.id as Uuid,
+                        )
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            FusilladeError::Other(anyhow!(
+                                "Failed to stamp processing start: {}",
+                                e
+                            ))
+                        })?;
+                        tx.commit().await.map_err(|e| {
+                            FusilladeError::Other(anyhow!(
+                                "Failed to commit processing transition: {}",
+                                e
+                            ))
+                        })?;
                     }
                     AnyRequest::Completed(req) => {
                         // Store the raw response body size
@@ -2351,10 +2389,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     response_status = $2,
                                     response_body = $3,
                                     claimed_at = $4,
-                                    started_at = $5,
-                                    completed_at = $6,
-                                    response_size = $7,
-                                    routed_model = $8,
+                                    completed_at = $5,
+                                    response_size = $6,
+                                    routed_model = $7,
                                     canceled_at = NULL
                                 FROM prev
                                 WHERE r.id = prev.id
@@ -2376,7 +2413,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             req.state.response_status as i16,
                             req.state.response_body,
                             req.state.claimed_at,
-                            req.state.started_at,
                             req.state.completed_at,
                             response_size,
                             req.state.routed_model,
@@ -9637,6 +9673,33 @@ mod tests {
         for handle in handles {
             handle.await.unwrap().unwrap();
         }
+    }
+
+    #[sqlx::test]
+    async fn completed_persist_preserves_durable_processing_start(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        let durable_started_at = (chrono::Utc::now() - chrono::Duration::minutes(5))
+            .with_nanosecond(0)
+            .unwrap();
+        sqlx::query("UPDATE requests SET state = 'processing', started_at = $2 WHERE id = $1")
+            .bind(*req.data.id)
+            .bind(durable_started_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        manager
+            .persist(&completed_from(&req, "done"))
+            .await
+            .unwrap();
+
+        let stored_started_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT started_at FROM requests WHERE id = $1")
+                .bind(*req.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_started_at, Some(durable_started_at));
     }
 
     /// Transition-matrix regressions (prod incident 2026-07-16, batch
