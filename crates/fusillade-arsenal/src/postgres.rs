@@ -7561,7 +7561,8 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // the same oldest-first candidate list, so with a waiting lock they
         // serialize behind whichever mover holds the current oldest batch
         // and burn its whole move duration discovering it's taken. Bouncing
-        // off a held row and reporting SkippedContended lets each mover
+        // off a held row and reporting SkippedNotLive (with the contention
+        // counted via fusillade_archive_contended_total) lets each mover
         // fall through to its next candidate — disjoint work, no
         // coordinator.
         let batch = sqlx::query!(
@@ -11248,8 +11249,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Must return SkippedContended promptly instead of blocking until
-        // the holder commits; the timeout proves the non-blocking property.
+        // Must return SkippedNotLive promptly instead of blocking until the
+        // holder commits; the timeout proves the non-blocking property.
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             manager.archive_batch(batch_id),
