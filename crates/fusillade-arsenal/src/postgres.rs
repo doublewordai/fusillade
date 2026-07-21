@@ -7585,10 +7585,12 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
 
         let Some(batch) = batch else {
             // No row can mean "missing/deleted" or "exists but locked by
-            // another mover" — SKIP LOCKED conflates them. Disambiguate so
-            // metrics stay truthful (Contended is routine under concurrent
-            // movers; NotFound persisting would be odd for a listed
-            // candidate).
+            // another mover" — SKIP LOCKED conflates them. Disambiguate:
+            // contention is routine under concurrent movers and is counted
+            // here (it deliberately does NOT get its own public outcome —
+            // to the caller the batch is simply not available, same as
+            // already-archived), while a persisting NotFound for a listed
+            // candidate would be odd.
             let exists = sqlx::query_scalar!(
                 r#"SELECT EXISTS(SELECT 1 FROM batches WHERE id = $1 AND deleted_at IS NULL) AS "exists!""#,
                 *batch_id as Uuid,
@@ -7599,7 +7601,8 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 FusilladeError::Other(anyhow!("Failed to check batch existence: {}", e))
             })?;
             return Ok(if exists {
-                ArchiveOutcome::SkippedContended
+                metrics::counter!("fusillade_archive_contended_total").increment(1);
+                ArchiveOutcome::SkippedNotLive
             } else {
                 ArchiveOutcome::SkippedNotFound
             });
@@ -11254,7 +11257,7 @@ mod tests {
         .await
         .expect("archive_batch must not queue behind a held batch lock")
         .unwrap();
-        assert_eq!(outcome, ArchiveOutcome::SkippedContended);
+        assert_eq!(outcome, ArchiveOutcome::SkippedNotLive);
 
         // Batch untouched by the bounce.
         let (location, _, live, archived) = archive_state(&pool, batch_id).await;
@@ -11267,9 +11270,9 @@ mod tests {
     }
 
     /// Two movers racing for the same batch: exactly one wins and moves it;
-    /// the loser reports a benign skip (Contended if it arrived mid-move,
-    /// NotLive if it arrived after the winner committed). Never two moves,
-    /// never an error.
+    /// the loser reports a benign SkippedNotLive whether it arrived mid-move
+    /// (lock bounce) or after the winner committed. Never two moves, never
+    /// an error.
     #[sqlx::test]
     async fn test_concurrent_archive_batch_exactly_one_wins(pool: sqlx::PgPool) {
         let manager = Arc::new(PostgresRequestManager::with_client(
@@ -11303,10 +11306,7 @@ mod tests {
             &a
         };
         assert!(
-            matches!(
-                loser,
-                ArchiveOutcome::SkippedContended | ArchiveOutcome::SkippedNotLive
-            ),
+            matches!(loser, ArchiveOutcome::SkippedNotLive),
             "loser must skip benignly, got {loser:?}"
         );
 

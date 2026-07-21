@@ -1452,7 +1452,6 @@ where
                                             "skipped_response_steps"
                                         }
                                         ArchiveOutcome::SkippedRetryRaced => "skipped_retry_raced",
-                                        ArchiveOutcome::SkippedContended => "skipped_contended",
                                     };
                                     counter!("fusillade_archive_moves_total", "worker" => worker, "outcome" => label).increment(1);
                                     if outcome == ArchiveOutcome::SkippedNoPartition {
