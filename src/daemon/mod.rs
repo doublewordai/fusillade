@@ -1324,7 +1324,7 @@ where
             );
         }
 
-        // ---- Batch-archive maintenance + movers (phase 3) ----
+        // ---- Batch-archive maintenance + movers ----
         // Only batch-mode daemons touch the archive. The partition-runway
         // tick ALWAYS runs for them (partitions must exist before anyone
         // flips the move flags); the sweep/backfill movers are config-gated:
@@ -1452,6 +1452,7 @@ where
                                             "skipped_response_steps"
                                         }
                                         ArchiveOutcome::SkippedRetryRaced => "skipped_retry_raced",
+                                        ArchiveOutcome::SkippedContended => "skipped_contended",
                                     };
                                     counter!("fusillade_archive_moves_total", "worker" => worker, "outcome" => label).increment(1);
                                     if outcome == ArchiveOutcome::SkippedNoPartition {

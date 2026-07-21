@@ -49,6 +49,13 @@ pub enum ArchiveOutcome {
     /// The `retry_version` CAS on the final stamp failed — a retry raced
     /// the move. Transaction rolled back; nothing moved.
     SkippedRetryRaced,
+    /// Another mover holds this batch's row lock right now (`FOR UPDATE
+    /// SKIP LOCKED` returned no row for an existing batch). Benign: the
+    /// batch is being archived by someone else; bounce to the next
+    /// candidate instead of queueing behind their whole move transaction.
+    /// This is what lets multiple concurrent movers scale instead of
+    /// serializing behind a single shared lock.
+    SkippedContended,
 }
 
 /// Liveness state of a model on internal (self-hosted) infrastructure, as
