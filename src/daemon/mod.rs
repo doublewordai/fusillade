@@ -1490,7 +1490,12 @@ where
                                         }
                                     }
                                     Err(e) => {
-                                        crate::background_error!("archive_move_failed", Error, error = %e, batch_id = %batch_id, "Failed to archive batch");
+                                        // One error per tick: a wave-wide DB
+                                        // failure would otherwise emit
+                                        // `concurrency` copies every tick.
+                                        if !abort_tick {
+                                            crate::background_error!("archive_move_failed", Error, error = %e, batch_id = %batch_id, "Failed to archive batch");
+                                        }
                                         abort_tick = true;
                                     }
                                 }
