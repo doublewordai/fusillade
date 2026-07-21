@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.4](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v2.1.3...fusillade-arsenal-v2.1.4) (2026-07-21)
+
+
+### Bug Fixes
+
+* index for batch archive sweeper for the bulk movement job, then … ([#371](https://github.com/doublewordai/fusillade/issues/371)) ([5e8f825](https://github.com/doublewordai/fusillade/commit/5e8f8259cbeb5a5fe83e1b6a254a02546450cadb))
+
 ## [2.1.3](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v2.1.2...fusillade-arsenal-v2.1.3) (2026-07-20)
 
 
