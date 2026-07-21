@@ -1,5 +1,12 @@
 # Changelog
 
+## [24.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v24.0.0...fusillade-v24.1.0) (2026-07-21)
+
+
+### Features
+
+* backfill concurrency ([#375](https://github.com/doublewordai/fusillade/issues/375)) ([e463c9c](https://github.com/doublewordai/fusillade/commit/e463c9c846cd0d38eaee410483c824d3560197fb))
+
 ## [24.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v23.0.2...fusillade-v24.0.0) (2026-07-21)
 
 
