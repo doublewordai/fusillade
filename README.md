@@ -1,4 +1,4 @@
-Fusillade has moved back to [control layer](https://github.com/doublewordai/control-layer), future versions of fusillade will be internal arefacts of control layer only.
+Fusillade has moved to [Control Layer](https://github.com/doublewordai/control-layer). Future versions of Fusillade will be internal artifacts of Control Layer only.
 
 ---
 
