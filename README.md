@@ -1,3 +1,7 @@
+Fusillade has moved back to [control layer](https://github.com/doublewordai/control-layer), future versions of fusillade will be internal arefacts of control layer only.
+
+---
+
 # Fusillade
 
 A batching system for HTTP requests with retry logic and per-model concurrency
